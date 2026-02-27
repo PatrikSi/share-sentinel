@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from enum import Enum
 
 import sqlalchemy as sa
 from sqlalchemy import ForeignKey, Index, UniqueConstraint
@@ -10,6 +11,15 @@ from app.db import Base
 from app.enums import AccessLevel, ErrorSeverity, ProjectRole, ResourceType, RunStatus, UITheme
 
 
+def value_enum(enum_cls: type[Enum], name: str) -> sa.Enum:
+    return sa.Enum(
+        enum_cls,
+        name=name,
+        values_callable=lambda enum_type: [member.value for member in enum_type],
+        validate_strings=True,
+    )
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -18,7 +28,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.true())
     is_sysadmin: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
-    ui_theme: Mapped[UITheme] = mapped_column(sa.Enum(UITheme, name="ui_theme"), nullable=False, server_default=UITheme.SYSTEM.value)
+    ui_theme: Mapped[UITheme] = mapped_column(value_enum(UITheme, name="ui_theme"), nullable=False, server_default=UITheme.SYSTEM.value)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
 
@@ -35,7 +45,7 @@ class ProjectMember(Base):
 
     project_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True)
     user_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    role: Mapped[ProjectRole] = mapped_column(sa.Enum(ProjectRole, name="project_role"), nullable=False)
+    role: Mapped[ProjectRole] = mapped_column(value_enum(ProjectRole, name="project_role"), nullable=False)
 
 
 class ApiToken(Base):
@@ -46,7 +56,7 @@ class ApiToken(Base):
     project_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
     token_hash: Mapped[str] = mapped_column(sa.String(128), nullable=False, unique=True, index=True)
     name: Mapped[str] = mapped_column(sa.String(120), nullable=False)
-    role: Mapped[ProjectRole] = mapped_column(sa.Enum(ProjectRole, name="token_role"), nullable=False)
+    role: Mapped[ProjectRole] = mapped_column(value_enum(ProjectRole, name="token_role"), nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
     revoked_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
@@ -74,13 +84,21 @@ class ScanRun(Base):
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_by_token_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, ForeignKey("api_tokens.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
-    status: Mapped[RunStatus] = mapped_column(sa.Enum(RunStatus, name="run_status"), nullable=False, server_default=RunStatus.PENDING_UPLOAD.value)
+    status: Mapped[RunStatus] = mapped_column(value_enum(RunStatus, name="run_status"), nullable=False, server_default=RunStatus.PENDING_UPLOAD.value)
     artifact_key: Mapped[str | None] = mapped_column(sa.String(512), nullable=True)
     artifact_sha256: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
     artifact_size: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
     artifact_content_type: Mapped[str | None] = mapped_column(sa.String(120), nullable=True)
-    summary: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{\"endpoints\":0,\"resources\":0,\"items\":0,\"errors\":0}'::jsonb"))
-    ingest_progress: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{\"line_offset\":0}'::jsonb"))
+    summary: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=sa.text("jsonb_build_object('endpoints', 0, 'resources', 0, 'items', 0, 'errors', 0)"),
+    )
+    ingest_progress: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=sa.text("jsonb_build_object('line_offset', 0)"),
+    )
 
 
 class Endpoint(Base):
@@ -111,10 +129,10 @@ class Resource(Base):
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
     run_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, ForeignKey("scan_runs.id", ondelete="CASCADE"), nullable=False)
     endpoint_id: Mapped[int] = mapped_column(sa.BigInteger, ForeignKey("endpoints.id", ondelete="CASCADE"), nullable=False)
-    resource_type: Mapped[ResourceType] = mapped_column(sa.Enum(ResourceType, name="resource_type"), nullable=False)
+    resource_type: Mapped[ResourceType] = mapped_column(value_enum(ResourceType, name="resource_type"), nullable=False)
     name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     remark: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
-    access_level: Mapped[AccessLevel] = mapped_column(sa.Enum(AccessLevel, name="access_level"), nullable=False)
+    access_level: Mapped[AccessLevel] = mapped_column(value_enum(AccessLevel, name="access_level"), nullable=False)
 
 
 class Item(Base):
@@ -140,7 +158,7 @@ class IngestError(Base):
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
     run_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, ForeignKey("scan_runs.id", ondelete="CASCADE"), nullable=False)
-    severity: Mapped[ErrorSeverity] = mapped_column(sa.Enum(ErrorSeverity, name="error_severity"), nullable=False)
+    severity: Mapped[ErrorSeverity] = mapped_column(value_enum(ErrorSeverity, name="error_severity"), nullable=False)
     code: Mapped[str] = mapped_column(sa.String(128), nullable=False)
     message: Mapped[str] = mapped_column(sa.Text, nullable=False)
     endpoint_key: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)

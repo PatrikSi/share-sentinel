@@ -16,13 +16,21 @@ depends_on = None
 
 
 def upgrade() -> None:
-    ui_theme = sa.Enum("light", "dark", "system", name="ui_theme")
-    project_role = sa.Enum("admin", "operator", "viewer", name="project_role")
-    token_role = sa.Enum("admin", "operator", "viewer", name="token_role")
-    run_status = sa.Enum("PENDING_UPLOAD", "UPLOADED", "INGESTING", "COMPLETE", "FAILED", name="run_status")
-    resource_type = sa.Enum("smb_share", name="resource_type")
-    access_level = sa.Enum("no_access", "list_only", "readable", name="access_level")
-    error_severity = sa.Enum("warn", "error", name="error_severity")
+    ui_theme = postgresql.ENUM("light", "dark", "system", name="ui_theme", create_type=False)
+    project_role = postgresql.ENUM("admin", "operator", "viewer", name="project_role", create_type=False)
+    token_role = postgresql.ENUM("admin", "operator", "viewer", name="token_role", create_type=False)
+    run_status = postgresql.ENUM(
+        "PENDING_UPLOAD",
+        "UPLOADED",
+        "INGESTING",
+        "COMPLETE",
+        "FAILED",
+        name="run_status",
+        create_type=False,
+    )
+    resource_type = postgresql.ENUM("smb_share", name="resource_type", create_type=False)
+    access_level = postgresql.ENUM("no_access", "list_only", "readable", name="access_level", create_type=False)
+    error_severity = postgresql.ENUM("warn", "error", name="error_severity", create_type=False)
 
     bind = op.get_bind()
     ui_theme.create(bind, checkfirst=True)
@@ -112,8 +120,18 @@ def upgrade() -> None:
         sa.Column("artifact_sha256", sa.String(length=64), nullable=True),
         sa.Column("artifact_size", sa.BigInteger(), nullable=True),
         sa.Column("artifact_content_type", sa.String(length=120), nullable=True),
-        sa.Column("summary", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default=sa.text("'{\"endpoints\":0,\"resources\":0,\"items\":0,\"errors\":0}'::jsonb")),
-        sa.Column("ingest_progress", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default=sa.text("'{\"line_offset\":0}'::jsonb")),
+        sa.Column(
+            "summary",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=False,
+            server_default=sa.text("jsonb_build_object('endpoints', 0, 'resources', 0, 'items', 0, 'errors', 0)"),
+        ),
+        sa.Column(
+            "ingest_progress",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=False,
+            server_default=sa.text("jsonb_build_object('line_offset', 0)"),
+        ),
         sa.ForeignKeyConstraint(["created_by_token_id"], ["api_tokens.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["created_by_user_id"], ["users.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["project_id"], ["projects.id"], ondelete="CASCADE"),
