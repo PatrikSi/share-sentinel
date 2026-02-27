@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import gzip
+import ipaddress
+import json
+import os
+import re
+import socket
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Iterable
+
+import requests
+
+try:
+    from impacket.smbconnection import SMBConnection, SessionError
+except Exception:  # noqa: BLE001
+    SMBConnection = None
+    SessionError = Exception
+
+
+@dataclass
+class Stats:
+    endpoints: int = 0
+    resources: int = 0
+    items: int = 0
+    errors: int = 0
+
+
+class NDJSONWriter:
+    def __init__(self, path: str | None, gzip_output: bool):
+        self._lock = threading.Lock()
+        self._path = path
+        self._gzip = gzip_output
+        self._closed = False
+
+        if path is None:
+            self._fp = sys.stdout
+            self._is_binary = False
+        else:
+            if gzip_output:
+                self._fp = gzip.open(path, "wt", encoding="utf-8")
+                self._is_binary = False
+            else:
+                self._fp = open(path, "w", encoding="utf-8")
+                self._is_binary = False
+
+    def emit(self, record: dict) -> None:
+        line = json.dumps(record, ensure_ascii=True)
+        with self._lock:
+            if self._closed:
+                return
+            self._fp.write(line + "\n")
+            self._fp.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._path is not None:
+                self._fp.close()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SMB one-off enumerator for Share Sentinel")
+    parser.add_argument("--cidr", action="append", default=[])
+    parser.add_argument("--hosts", type=str)
+
+    parser.add_argument("--domain", type=str, default="")
+    parser.add_argument("--username", type=str, required=True)
+    parser.add_argument("--password", type=str, default="")
+    parser.add_argument("--hashes", type=str)
+    parser.add_argument("--local-auth", action="store_true")
+    parser.add_argument("--kerberos", action="store_true")
+    parser.add_argument("--ccache", type=str)
+
+    parser.add_argument("--workers", type=int, default=100)
+    parser.add_argument("--timeout", type=float, default=3.0)
+    parser.add_argument("--max-depth", type=int, default=1)
+    parser.add_argument("--max-entries-per-share", type=int, default=5000)
+
+    parser.add_argument("--exclude-share", action="append", default=[])
+    parser.add_argument("--exclude-path-regex", type=str)
+    parser.add_argument("--extensions-only", type=str)
+
+    parser.add_argument("--output", type=str)
+    parser.add_argument("--gzip", action="store_true")
+    parser.add_argument("--operator-label", type=str)
+
+    parser.add_argument("--upload", action="store_true")
+    parser.add_argument("--api-base", type=str)
+    parser.add_argument("--project-id", type=str)
+    parser.add_argument("--api-token", type=str)
+    parser.add_argument("--run-name", type=str, default="SMB Collector Run")
+    return parser.parse_args()
+
+
+def parse_targets(cidrs: list[str], hosts_file: str | None) -> list[str]:
+    targets: set[str] = set()
+    for cidr in cidrs:
+        network = ipaddress.ip_network(cidr, strict=False)
+        for host in network.hosts():
+            targets.add(str(host))
+
+    if hosts_file:
+        for line in Path(hosts_file).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                targets.add(line)
+
+    return sorted(targets)
+
+
+def normalize_path(base: str, child: str) -> str:
+    base = base.replace("/", "\\")
+    child = child.replace("/", "\\")
+    if base.endswith("\\"):
+        joined = f"{base}{child}"
+    elif base:
+        joined = f"{base}\\{child}"
+    else:
+        joined = f"\\{child}"
+    return joined if joined.startswith("\\") else f"\\{joined}"
+
+
+def list_share_entries(
+    conn: SMBConnection,
+    share_name: str,
+    max_depth: int,
+    max_entries: int,
+    exclude_path_regex: re.Pattern[str] | None,
+    extensions: set[str] | None,
+):
+    queue: list[tuple[str, int]] = [("", 0)]
+    emitted = 0
+
+    while queue and emitted < max_entries:
+        rel_path, depth = queue.pop(0)
+        wildcard = f"{rel_path}\\*" if rel_path else "*"
+
+        try:
+            entries = conn.listPath(share_name, wildcard)
+        except SessionError:
+            continue
+
+        for entry in entries:
+            name = entry.get_longname()
+            if name in {".", ".."}:
+                continue
+
+            full_path = normalize_path(rel_path, name)
+            if exclude_path_regex and exclude_path_regex.search(full_path):
+                continue
+
+            is_dir = bool(entry.is_directory())
+            if extensions and not is_dir:
+                suffix = os.path.splitext(name)[1].lower()
+                if suffix not in extensions:
+                    continue
+
+            emitted += 1
+            yield {
+                "path": full_path,
+                "name": name,
+                "is_dir": is_dir,
+            }
+
+            if emitted >= max_entries:
+                break
+            if is_dir and depth + 1 < max_depth:
+                queue.append((full_path.strip("\\"), depth + 1))
+
+
+def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
+    endpoint_key = f"{host}:445"
+    if SMBConnection is None:
+        writer.emit(
+            {
+                "type": "error",
+                "run_id": run_id,
+                "severity": "error",
+                "code": "IMPACKET_NOT_AVAILABLE",
+                "message": "impacket is not installed in this runtime",
+                "endpoint_key": endpoint_key,
+            }
+        )
+        with lock:
+            stats.errors += 1
+        return False
+
+    try:
+        conn = SMBConnection(host, host, sess_port=445, timeout=args.timeout)
+        if args.kerberos:
+            conn.kerberosLogin(
+                args.username,
+                args.password,
+                args.domain,
+                lmhash="",
+                nthash="",
+                aesKey=None,
+                kdcHost=None,
+                TGT=None,
+                TGS=None,
+                useCache=bool(args.ccache),
+            )
+            auth_method = "kerberos"
+        else:
+            lmhash = ""
+            nthash = ""
+            if args.hashes and ":" in args.hashes:
+                lmhash, nthash = args.hashes.split(":", 1)
+            domain = "" if args.local_auth else args.domain
+            conn.login(args.username, args.password, domain=domain, lmhash=lmhash, nthash=nthash)
+            auth_method = "ntlm"
+
+        endpoint_record = {
+            "type": "endpoint",
+            "run_id": run_id,
+            "endpoint_key": endpoint_key,
+            "ip": host if _is_ip(host) else None,
+            "hostname": host if not _is_ip(host) else None,
+            "domain": args.domain or None,
+            "smb": {
+                "dialect": str(conn.getDialect()),
+                "signing": "enabled",
+            },
+            "auth": {
+                "method": auth_method,
+                "success": True,
+            },
+        }
+        writer.emit(endpoint_record)
+        with lock:
+            stats.endpoints += 1
+
+        excluded_shares = {s.upper() for s in args.exclude_share}
+        exclude_path_regex = re.compile(args.exclude_path_regex) if args.exclude_path_regex else None
+        extensions = None
+        if args.extensions_only:
+            extensions = {e.strip().lower() for e in args.extensions_only.split(",") if e.strip()}
+
+        shares = conn.listShares()
+        for share in shares:
+            share_name = share["shi1_netname"].rstrip("\x00")
+            if share_name.upper() in excluded_shares:
+                continue
+
+            remark = share.get("shi1_remark", "")
+            resource_record = {
+                "type": "resource",
+                "run_id": run_id,
+                "endpoint_key": endpoint_key,
+                "resource_type": "smb_share",
+                "name": share_name,
+                "remark": remark,
+                "access_level": "list_only",
+            }
+            writer.emit(resource_record)
+            with lock:
+                stats.resources += 1
+
+            try:
+                for entry in list_share_entries(
+                    conn,
+                    share_name,
+                    max_depth=max(1, args.max_depth),
+                    max_entries=max(1, args.max_entries_per_share),
+                    exclude_path_regex=exclude_path_regex,
+                    extensions=extensions,
+                ):
+                    writer.emit(
+                        {
+                            "type": "item",
+                            "run_id": run_id,
+                            "endpoint_key": endpoint_key,
+                            "resource_type": "smb_share",
+                            "resource_name": share_name,
+                            **entry,
+                        }
+                    )
+                    with lock:
+                        stats.items += 1
+            except Exception as exc:  # noqa: BLE001
+                writer.emit(
+                    {
+                        "type": "error",
+                        "run_id": run_id,
+                        "severity": "warn",
+                        "code": "LIST_FAILED",
+                        "message": str(exc),
+                        "endpoint_key": endpoint_key,
+                        "resource_name": share_name,
+                        "path": "\\",
+                    }
+                )
+                with lock:
+                    stats.errors += 1
+
+        try:
+            conn.logoff()
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    except (socket.timeout, TimeoutError):
+        writer.emit(
+            {
+                "type": "error",
+                "run_id": run_id,
+                "severity": "error",
+                "code": "SMB_TIMEOUT",
+                "message": "connection timeout",
+                "endpoint_key": endpoint_key,
+            }
+        )
+    except SessionError as exc:
+        writer.emit(
+            {
+                "type": "error",
+                "run_id": run_id,
+                "severity": "error",
+                "code": "SMB_AUTH_FAILED",
+                "message": str(exc),
+                "endpoint_key": endpoint_key,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        writer.emit(
+            {
+                "type": "error",
+                "run_id": run_id,
+                "severity": "error",
+                "code": "SMB_SCAN_FAILED",
+                "message": str(exc),
+                "endpoint_key": endpoint_key,
+            }
+        )
+
+    with lock:
+        stats.errors += 1
+    return False
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str) -> None:
+    if not args.upload:
+        return
+
+    if not args.api_base or not args.project_id or not args.api_token:
+        raise RuntimeError("--upload requires --api-base --project-id --api-token")
+
+    base = args.api_base.rstrip("/")
+    headers = {
+        "Authorization": f"Bearer {args.api_token}",
+    }
+
+    create_payload = {
+        "run_id": run_id,
+        "name": args.run_name,
+        "description": "collector upload",
+        "target_scope": {
+            "cidrs": args.cidr,
+            "hosts_file": bool(args.hosts),
+        },
+    }
+    create_url = f"{base}/projects/{args.project_id}/runs"
+    create_resp = requests.post(create_url, json=create_payload, headers=headers, timeout=30)
+    create_resp.raise_for_status()
+
+    upload_url = f"{base}/projects/{args.project_id}/runs/{run_id}/artifact"
+    content_type = "application/gzip" if artifact_path.endswith(".gz") else "application/x-ndjson"
+    with open(artifact_path, "rb") as fp:
+        upload_resp = requests.post(
+            upload_url,
+            data=fp,
+            headers={**headers, "Content-Type": content_type},
+            timeout=3600,
+        )
+    upload_resp.raise_for_status()
+
+    print(f"run_id={run_id}")
+    print(f"api_run_url={base}/projects/{args.project_id}/runs/{run_id}")
+
+
+def main() -> int:
+    args = parse_args()
+    targets = parse_targets(args.cidr, args.hosts)
+    run_id = str(uuid.uuid4())
+    started_at = datetime.now(tz=UTC)
+
+    temp_artifact: str | None = None
+    output_path = args.output
+
+    if args.upload and output_path is None:
+        suffix = ".ndjson.gz" if args.gzip else ".ndjson"
+        fd, temp_artifact = tempfile.mkstemp(prefix="smbguard-", suffix=suffix)
+        os.close(fd)
+        output_path = temp_artifact
+
+    writer = NDJSONWriter(output_path, args.gzip)
+    stats = Stats()
+    lock = threading.Lock()
+
+    writer.emit(
+        {
+            "type": "run_meta",
+            "schema_version": 1,
+            "tool": "smbguard-collector",
+            "tool_version": "0.1.0",
+            "run_id": run_id,
+            "started_at": started_at.isoformat(),
+            "operator_label": args.operator_label,
+            "target_scope": {
+                "cidrs": args.cidr,
+                "hosts_file": args.hosts,
+            },
+            "auth": {
+                "mode": "local" if args.local_auth else "domain",
+                "domain": args.domain or None,
+                "username": args.username,
+                "method": "kerberos" if args.kerberos else "ntlm",
+            },
+        }
+    )
+
+    host_failures = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+        futures = [executor.submit(scan_host, host, args, run_id, writer, stats, lock) for host in targets]
+        for future in concurrent.futures.as_completed(futures):
+            if not future.result():
+                host_failures += 1
+
+    writer.emit(
+        {
+            "type": "run_end",
+            "run_id": run_id,
+            "finished_at": datetime.now(tz=UTC).isoformat(),
+            "stats": {
+                "endpoints": stats.endpoints,
+                "resources": stats.resources,
+                "items": stats.items,
+                "errors": stats.errors,
+            },
+        }
+    )
+    writer.close()
+
+    try:
+        if args.upload and output_path is not None:
+            upload_artifact(args, run_id, output_path)
+    finally:
+        if temp_artifact and os.path.exists(temp_artifact):
+            os.unlink(temp_artifact)
+
+    if stats.endpoints == 0 and stats.resources == 0 and stats.items == 0 and stats.errors == 0:
+        return 3
+    if host_failures > 0:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
