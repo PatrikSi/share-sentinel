@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.middleware import RequestContextMiddleware
-from app.routers import audit, auth, projects, runs, users
+from app.routers import audit, auth, inventory, projects, runs, users
 
 settings = get_settings()
 
@@ -33,6 +33,7 @@ app.add_middleware(RequestContextMiddleware)
 app.include_router(auth.router)
 app.include_router(projects.router)
 app.include_router(runs.router)
+app.include_router(inventory.router)
 app.include_router(audit.router)
 app.include_router(users.router)
 

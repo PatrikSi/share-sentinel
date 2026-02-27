@@ -237,6 +237,16 @@ export function ProjectsPage() {
           <p className="text-sm text-slate-600 dark:text-slate-300">
             Choose project, create run, upload artifact, and monitor ingestion.
           </p>
+          {selectedProject ? (
+            <div className="mt-3">
+              <Link
+                className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                to={`/projects/${selectedProject}/inventory`}
+              >
+                Open Project Inventory
+              </Link>
+            </div>
+          ) : null}
         </div>
         <div className="space-y-2">
           <label className="block text-sm font-semibold">Current project</label>
@@ -416,7 +426,7 @@ export function ProjectsPage() {
                       className="rounded-lg border border-slate-300 px-3 py-1 text-xs font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
                       to={`/projects/${selectedProject}/runs/${run.id}`}
                     >
-                      Open
+                      Run View
                     </Link>
                     {canDeleteRuns ? (
                       <button

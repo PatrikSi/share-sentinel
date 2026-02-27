@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 
 import { apiFetch } from "@/lib/api";
 
@@ -227,6 +227,16 @@ export function RunDetailPage() {
             <h1 className="text-2xl font-bold">{run?.name || "Run Explorer"}</h1>
             <p className="text-sm text-slate-600 dark:text-slate-300">Run ID: {runId}</p>
             {run?.description ? <p className="mt-1 text-xs text-slate-500">{run.description}</p> : null}
+            {projectId ? (
+              <div className="mt-2">
+                <Link
+                  className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                  to={`/projects/${projectId}/inventory`}
+                >
+                  Open Project Inventory
+                </Link>
+              </div>
+            ) : null}
           </div>
           {run ? (
             <div className="text-right text-xs">

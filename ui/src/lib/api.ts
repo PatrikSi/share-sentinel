@@ -21,6 +21,18 @@ function toErrorMessage(body: string, status: number): string {
   return body;
 }
 
+function parseResponseBody(response: Response, body: string) {
+  if (!body) return null;
+  const contentType = (response.headers.get("content-type") || "").toLowerCase();
+  if (contentType.includes("application/json")) {
+    return JSON.parse(body);
+  }
+  if (body.trimStart().startsWith("<")) {
+    throw new Error("API returned HTML instead of JSON. Check API routing and service health.");
+  }
+  throw new Error(`Unexpected API response type (${contentType || "unknown"}).`);
+}
+
 async function refreshAccessToken(): Promise<string | null> {
   const refreshToken = getRefreshToken();
   if (!refreshToken) return null;
@@ -75,5 +87,5 @@ export async function apiFetch(path: string, init: RequestInit = {}, allowRefres
   }
 
   const body = await response.text();
-  return body ? JSON.parse(body) : null;
+  return parseResponseBody(response, body);
 }
