@@ -48,13 +48,7 @@ export function ProjectsPage() {
 
   const [runName, setRunName] = useState("");
   const [runDescription, setRunDescription] = useState("");
-  const [runIdOverride, setRunIdOverride] = useState("");
-  const [targetScopeJson, setTargetScopeJson] = useState('{"cidrs":[],"hosts":[]}');
   const [artifactFile, setArtifactFile] = useState<File | null>(null);
-  const [uploadMode, setUploadMode] = useState<"multipart" | "stream">("multipart");
-  const [contentTypeOverride, setContentTypeOverride] = useState<"auto" | "application/gzip" | "application/x-ndjson">(
-    "auto",
-  );
   const [importing, setImporting] = useState(false);
 
   const [error, setError] = useState<string | null>(null);
@@ -177,6 +171,10 @@ export function ProjectsPage() {
       setError("Run name is required.");
       return;
     }
+    if (!artifactFile) {
+      setError("Artifact file is required.");
+      return;
+    }
 
     setImporting(true);
     setError(null);
@@ -184,58 +182,26 @@ export function ProjectsPage() {
     setCreatedRunId(null);
 
     try {
-      let parsedScope: Record<string, unknown> = {};
-      if (targetScopeJson.trim()) {
-        parsedScope = JSON.parse(targetScopeJson) as Record<string, unknown>;
-      }
-
-      const runPayload: Record<string, unknown> = {
+      const runPayload = {
         name: runName.trim(),
         description: runDescription.trim() || null,
-        target_scope: parsedScope,
       };
-      if (runIdOverride.trim()) {
-        runPayload.run_id = runIdOverride.trim();
-      }
 
       const run = (await apiFetch(`/projects/${selectedProject}/runs`, {
         method: "POST",
         body: JSON.stringify(runPayload),
       })) as Run;
       setCreatedRunId(run.id);
-      setInfo(`Run ${run.id} created.`);
-
-      if (artifactFile) {
-        if (uploadMode === "multipart") {
-          const formData = new FormData();
-          const fileForUpload =
-            contentTypeOverride === "auto"
-              ? artifactFile
-              : new File([artifactFile], artifactFile.name, { type: contentTypeOverride });
-          formData.append("file", fileForUpload);
-          await apiFetch(`/projects/${selectedProject}/runs/${run.id}/artifact`, {
-            method: "POST",
-            body: formData,
-          });
-        } else {
-          const headers: Record<string, string> = {};
-          if (contentTypeOverride !== "auto") {
-            headers["Content-Type"] = contentTypeOverride;
-          }
-          await apiFetch(`/projects/${selectedProject}/runs/${run.id}/artifact`, {
-            method: "POST",
-            body: artifactFile,
-            headers,
-          });
-        }
-        setInfo(`Artifact uploaded for run ${run.id}. Ingestion queued.`);
-      } else {
-        setInfo(`Run ${run.id} created without artifact.`);
-      }
+      const formData = new FormData();
+      formData.append("file", artifactFile);
+      await apiFetch(`/projects/${selectedProject}/runs/${run.id}/artifact`, {
+        method: "POST",
+        body: formData,
+      });
+      setInfo(`Artifact uploaded for run ${run.id}. Ingestion queued.`);
 
       setRunName("");
       setRunDescription("");
-      setRunIdOverride("");
       setArtifactFile(null);
       await loadRuns(selectedProject, cursor);
     } catch (err) {
@@ -324,16 +290,6 @@ export function ProjectsPage() {
             />
           </label>
 
-          <label className="text-sm">
-            Optional run ID (UUID)
-            <input
-              className="mt-1 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
-              value={runIdOverride}
-              onChange={(event) => setRunIdOverride(event.target.value)}
-              placeholder="leave empty for auto"
-            />
-          </label>
-
           <label className="md:col-span-2 text-sm">
             Description
             <input
@@ -345,49 +301,15 @@ export function ProjectsPage() {
           </label>
 
           <label className="md:col-span-2 text-sm">
-            Target scope JSON
-            <textarea
-              className="mt-1 h-24 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 font-mono text-xs dark:border-slate-700 dark:bg-slate-900"
-              value={targetScopeJson}
-              onChange={(event) => setTargetScopeJson(event.target.value)}
-            />
-          </label>
-
-          <label className="text-sm">
-            Upload mode
-            <select
-              className="mt-1 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
-              value={uploadMode}
-              onChange={(event) => setUploadMode(event.target.value as "multipart" | "stream")}
-            >
-              <option value="multipart">multipart/form-data</option>
-              <option value="stream">stream body</option>
-            </select>
-          </label>
-
-          <label className="text-sm">
-            Content type override
-            <select
-              className="mt-1 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
-              value={contentTypeOverride}
-              onChange={(event) =>
-                setContentTypeOverride(event.target.value as "auto" | "application/gzip" | "application/x-ndjson")
-              }
-            >
-              <option value="auto">auto-detect</option>
-              <option value="application/gzip">application/gzip</option>
-              <option value="application/x-ndjson">application/x-ndjson</option>
-            </select>
-          </label>
-
-          <label className="md:col-span-2 text-sm">
-            Artifact file (optional)
+            Scan file
             <input
               className="mt-1 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
               type="file"
-              accept=".ndjson,.gz,.ndjson.gz,application/gzip,application/x-ndjson"
+              accept=".json,.jsonl,.ndjson,.json.gz,.ndjson.gz,.gz,application/json,application/x-ndjson,application/gzip"
               onChange={(event) => setArtifactFile(event.target.files?.[0] || null)}
+              required
             />
+            <p className="mt-1 text-xs text-slate-500">Accepted: .json, .jsonl, .ndjson, and .gz variants.</p>
           </label>
 
           <div className="md:col-span-2">

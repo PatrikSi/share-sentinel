@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 import time
 import uuid
 from datetime import UTC, datetime
@@ -127,6 +128,15 @@ async def _upload_artifact_stream(
     except Exception:
         await run_in_threadpool(abort_multipart_upload, key, upload_id)
         raise
+
+
+def _artifact_suffix(content_type: str | None, filename: str | None) -> str:
+    lowered_content_type = (content_type or "").lower()
+    lowered_filename = (filename or "").lower()
+    extension = os.path.splitext(lowered_filename)[1]
+    if "gzip" in lowered_content_type or extension == ".gz":
+        return ".ndjson.gz"
+    return ".ndjson"
 
 
 def _write_read_audit(
@@ -300,7 +310,7 @@ async def upload_artifact(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run state does not accept upload")
 
     content_type = file.content_type if file else request.headers.get("content-type", "application/octet-stream")
-    suffix = ".ndjson.gz" if "gzip" in (content_type or "") else ".ndjson"
+    suffix = _artifact_suffix(content_type, file.filename if file else None)
     key = f"projects/{project_id}/runs/{run_id}/artifact{suffix}"
 
     started = time.perf_counter()
