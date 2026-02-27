@@ -45,6 +45,7 @@ export function ProjectsPage() {
 
   const [newProjectName, setNewProjectName] = useState("");
   const [creatingProject, setCreatingProject] = useState(false);
+  const [showCreateProjectForm, setShowCreateProjectForm] = useState(false);
 
   const [runName, setRunName] = useState("");
   const [runDescription, setRunDescription] = useState("");
@@ -125,6 +126,7 @@ export function ProjectsPage() {
       return statusOk && searchOk;
     });
   }, [runs, runSearch, statusFilter]);
+  const latestRun = runs.length > 0 ? runs[0] : null;
 
   function moveNext() {
     if (!nextCursor) return;
@@ -150,12 +152,14 @@ export function ProjectsPage() {
     setInfo(null);
 
     try {
-      await apiFetch("/projects", {
+      const created = (await apiFetch("/projects", {
         method: "POST",
         body: JSON.stringify({ name: newProjectName.trim() }),
-      });
+      })) as Project;
       setNewProjectName("");
-      setInfo("Project created.");
+      setSelectedProject(created.id);
+      setShowCreateProjectForm(false);
+      setInfo(`Project created: ${created.name}`);
       await loadProjects();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Project creation failed");
@@ -231,25 +235,50 @@ export function ProjectsPage() {
 
   return (
     <section className="workspace">
-      <div className="workspace-header md:grid-cols-2">
+      <div className="workspace-header md:grid-cols-[2fr_1fr]">
         <div>
-          <h1 className="text-2xl font-bold">Projects & Ingestion</h1>
+          <h1 className="text-2xl font-bold">Projects</h1>
           <p className="text-sm text-slate-600 dark:text-slate-300">
-            Choose project, create run, upload artifact, and monitor ingestion.
+            Choose a project workspace, open inventory, and import scan artifacts.
           </p>
           {selectedProject ? (
-            <div className="mt-3">
+            <div className="mt-4 flex flex-wrap items-center gap-2">
               <Link
-                className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-white hover:bg-emerald-500"
                 to={`/projects/${selectedProject}/inventory`}
               >
                 Open Project Inventory
               </Link>
+              <a
+                className="rounded-xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                href="#import-scan"
+              >
+                Import Scan
+              </a>
+              {latestRun ? (
+                <Link
+                  className="rounded-xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                  to={`/projects/${selectedProject}/runs/${latestRun.id}`}
+                >
+                  Open Latest Run
+                </Link>
+              ) : null}
             </div>
           ) : null}
         </div>
-        <div className="space-y-2">
-          <label className="block text-sm font-semibold">Current project</label>
+        <div className="space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <label className="block text-sm font-semibold">Current project</label>
+            {canCreateProject ? (
+              <button
+                className="rounded-lg border border-slate-300 px-3 py-1 text-xs font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                onClick={() => setShowCreateProjectForm((prev) => !prev)}
+                type="button"
+              >
+                {showCreateProjectForm ? "Close" : "New Project"}
+              </button>
+            ) : null}
+          </div>
           <select
             className="w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
             value={selectedProject}
@@ -265,9 +294,9 @@ export function ProjectsPage() {
         </div>
       </div>
 
-      {canCreateProject ? (
+      {canCreateProject && showCreateProjectForm ? (
         <div className="workspace-section">
-          <h2 className="mb-3 text-lg font-semibold">Create Project</h2>
+          <h2 className="mb-3 text-lg font-semibold">Create New Project</h2>
           <form className="flex flex-wrap items-end gap-3" onSubmit={onCreateProject}>
             <label className="flex-1 text-sm">
               Project name
@@ -275,7 +304,7 @@ export function ProjectsPage() {
                 className="mt-1 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
                 value={newProjectName}
                 onChange={(event) => setNewProjectName(event.target.value)}
-                placeholder="Client East - Q1"
+                placeholder="Client East - Q1 Shares"
                 required
               />
             </label>
@@ -286,7 +315,7 @@ export function ProjectsPage() {
         </div>
       ) : null}
 
-      <div className="workspace-section">
+      <div className="workspace-section" id="import-scan">
         <h2 className="mb-3 text-lg font-semibold">Import Scan Artifact</h2>
         <form className="grid gap-3 md:grid-cols-2" onSubmit={onImportRun}>
           <label className="text-sm">

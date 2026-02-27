@@ -113,6 +113,9 @@ export function ProjectInventoryPage() {
   const [itemColumns, setItemColumns] = useState<ItemColumnKey[]>(["path", "name", "resource_name", "hostname", "run_name", "is_dir"]);
   const [resourceColumns, setResourceColumns] = useState<ResourceColumnKey[]>(["name", "access_level", "hostname", "item_count", "run_name", "remark"]);
   const [endpointColumns, setEndpointColumns] = useState<EndpointColumnKey[]>(["endpoint_key", "hostname", "domain", "resource_count", "item_count", "run_name"]);
+  const [dragItemColumn, setDragItemColumn] = useState<ItemColumnKey | null>(null);
+  const [dragResourceColumn, setDragResourceColumn] = useState<ResourceColumnKey | null>(null);
+  const [dragEndpointColumn, setDragEndpointColumn] = useState<EndpointColumnKey | null>(null);
 
   const runIdsParam = useMemo(() => selectedRunIds.join(","), [selectedRunIds]);
   const endpointQuery = useMemo(() => [query.trim(), endpointFilter.trim()].filter(Boolean).join(" "), [query, endpointFilter]);
@@ -212,6 +215,31 @@ export function ProjectInventoryPage() {
       }
       return [...prev, column];
     });
+  }
+
+  function moveInArray<T>(rows: T[], from: T, to: T): T[] {
+    const sourceIndex = rows.indexOf(from);
+    const targetIndex = rows.indexOf(to);
+    if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return rows;
+    const next = [...rows];
+    next.splice(sourceIndex, 1);
+    next.splice(targetIndex, 0, from);
+    return next;
+  }
+
+  function reorderItemColumns(target: ItemColumnKey) {
+    if (!dragItemColumn || dragItemColumn === target) return;
+    setItemColumns((prev) => moveInArray(prev, dragItemColumn, target));
+  }
+
+  function reorderResourceColumns(target: ResourceColumnKey) {
+    if (!dragResourceColumn || dragResourceColumn === target) return;
+    setResourceColumns((prev) => moveInArray(prev, dragResourceColumn, target));
+  }
+
+  function reorderEndpointColumns(target: EndpointColumnKey) {
+    if (!dragEndpointColumn || dragEndpointColumn === target) return;
+    setEndpointColumns((prev) => moveInArray(prev, dragEndpointColumn, target));
   }
 
   function toggleResourceColumn(column: ResourceColumnKey) {
@@ -399,43 +427,107 @@ export function ProjectInventoryPage() {
               <summary className="list-none cursor-pointer rounded border border-slate-300 px-3 py-1 text-xs font-semibold uppercase dark:border-slate-700">
                 Columns
               </summary>
-              <div className="absolute right-0 z-10 mt-1 w-56 rounded-lg border border-slate-300 bg-white p-2 shadow-lg dark:border-slate-700 dark:bg-slate-900">
-                {activeTab === "items"
-                  ? ITEM_COLUMN_OPTIONS.map((column) => (
-                      <label className="mb-1 flex items-center gap-2 text-xs" key={column.key}>
-                        <input
-                          type="checkbox"
-                          checked={itemColumns.includes(column.key)}
-                          onChange={() => toggleItemColumn(column.key)}
-                        />
-                        <span>{column.label}</span>
-                      </label>
-                    ))
-                  : null}
-                {activeTab === "resources"
-                  ? RESOURCE_COLUMN_OPTIONS.map((column) => (
-                      <label className="mb-1 flex items-center gap-2 text-xs" key={column.key}>
-                        <input
-                          type="checkbox"
-                          checked={resourceColumns.includes(column.key)}
-                          onChange={() => toggleResourceColumn(column.key)}
-                        />
-                        <span>{column.label}</span>
-                      </label>
-                    ))
-                  : null}
-                {activeTab === "endpoints"
-                  ? ENDPOINT_COLUMN_OPTIONS.map((column) => (
-                      <label className="mb-1 flex items-center gap-2 text-xs" key={column.key}>
-                        <input
-                          type="checkbox"
-                          checked={endpointColumns.includes(column.key)}
-                          onChange={() => toggleEndpointColumn(column.key)}
-                        />
-                        <span>{column.label}</span>
-                      </label>
-                    ))
-                  : null}
+              <div className="absolute right-0 z-10 mt-1 w-72 rounded-lg border border-slate-300 bg-white p-2 shadow-lg dark:border-slate-700 dark:bg-slate-900">
+                <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-slate-500">Drag to reorder visible columns</p>
+
+                {activeTab === "items" ? (
+                  <>
+                    <div className="mb-2 space-y-1">
+                      {itemColumns.map((column) => (
+                        <div
+                          key={`selected-${column}`}
+                          className="flex cursor-grab items-center justify-between rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
+                          draggable
+                          onDragStart={() => setDragItemColumn(column)}
+                          onDragOver={(event) => event.preventDefault()}
+                          onDrop={() => reorderItemColumns(column)}
+                          onDragEnd={() => setDragItemColumn(null)}
+                        >
+                          <span>{ITEM_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column}</span>
+                          <span className="text-slate-400">::</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="max-h-44 overflow-auto border-t border-slate-200 pt-2 dark:border-slate-700">
+                      {ITEM_COLUMN_OPTIONS.map((column) => (
+                        <label className="mb-1 flex items-center gap-2 text-xs" key={column.key}>
+                          <input
+                            type="checkbox"
+                            checked={itemColumns.includes(column.key)}
+                            onChange={() => toggleItemColumn(column.key)}
+                          />
+                          <span>{column.label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </>
+                ) : null}
+
+                {activeTab === "resources" ? (
+                  <>
+                    <div className="mb-2 space-y-1">
+                      {resourceColumns.map((column) => (
+                        <div
+                          key={`selected-${column}`}
+                          className="flex cursor-grab items-center justify-between rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
+                          draggable
+                          onDragStart={() => setDragResourceColumn(column)}
+                          onDragOver={(event) => event.preventDefault()}
+                          onDrop={() => reorderResourceColumns(column)}
+                          onDragEnd={() => setDragResourceColumn(null)}
+                        >
+                          <span>{RESOURCE_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column}</span>
+                          <span className="text-slate-400">::</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="max-h-44 overflow-auto border-t border-slate-200 pt-2 dark:border-slate-700">
+                      {RESOURCE_COLUMN_OPTIONS.map((column) => (
+                        <label className="mb-1 flex items-center gap-2 text-xs" key={column.key}>
+                          <input
+                            type="checkbox"
+                            checked={resourceColumns.includes(column.key)}
+                            onChange={() => toggleResourceColumn(column.key)}
+                          />
+                          <span>{column.label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </>
+                ) : null}
+
+                {activeTab === "endpoints" ? (
+                  <>
+                    <div className="mb-2 space-y-1">
+                      {endpointColumns.map((column) => (
+                        <div
+                          key={`selected-${column}`}
+                          className="flex cursor-grab items-center justify-between rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
+                          draggable
+                          onDragStart={() => setDragEndpointColumn(column)}
+                          onDragOver={(event) => event.preventDefault()}
+                          onDrop={() => reorderEndpointColumns(column)}
+                          onDragEnd={() => setDragEndpointColumn(null)}
+                        >
+                          <span>{ENDPOINT_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column}</span>
+                          <span className="text-slate-400">::</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="max-h-44 overflow-auto border-t border-slate-200 pt-2 dark:border-slate-700">
+                      {ENDPOINT_COLUMN_OPTIONS.map((column) => (
+                        <label className="mb-1 flex items-center gap-2 text-xs" key={column.key}>
+                          <input
+                            type="checkbox"
+                            checked={endpointColumns.includes(column.key)}
+                            onChange={() => toggleEndpointColumn(column.key)}
+                          />
+                          <span>{column.label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </>
+                ) : null}
               </div>
             </details>
             <button
