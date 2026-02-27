@@ -5,6 +5,7 @@ import { TopNav } from "@/components/top-nav";
 import { getAccessToken } from "@/lib/auth";
 import { AdminPage } from "@/pages/admin-page";
 import { LoginPage } from "@/pages/login-page";
+import { ProjectImportPage } from "@/pages/project-import-page";
 import { ProjectInventoryPage } from "@/pages/project-inventory-page";
 import { ProjectsPage } from "@/pages/projects-page";
 import { RunDetailPage } from "@/pages/run-detail-page";
@@ -62,6 +63,14 @@ export function App() {
               element={
                 <RequireAuth>
                   <ProjectInventoryPage />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/projects/:projectId/import"
+              element={
+                <RequireAuth>
+                  <ProjectImportPage />
                 </RequireAuth>
               }
             />

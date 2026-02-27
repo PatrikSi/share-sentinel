@@ -57,6 +57,95 @@ def _audit_read(
     )
 
 
+@router.get("/stats")
+def inventory_stats(
+    project_id: uuid.UUID,
+    request: Request,
+    run_ids: str | None = Query(default=None, description="comma-separated run UUIDs"),
+    db: Session = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    run_id_list = _parse_run_ids(run_ids)
+
+    scope_runs_stmt = select(ScanRun.id).where(*_base_project_filters(project_id))
+    if run_id_list:
+        scope_runs_stmt = scope_runs_stmt.where(ScanRun.id.in_(run_id_list))
+
+    scope_runs = scope_runs_stmt.subquery()
+    scope_run_ids = select(scope_runs.c.id)
+
+    runs_total = int(db.execute(select(func.count(ScanRun.id)).where(ScanRun.project_id == project_id)).scalar() or 0)
+    runs_complete = int(
+        db.execute(select(func.count(ScanRun.id)).where(ScanRun.project_id == project_id, ScanRun.status == RunStatus.COMPLETE)).scalar() or 0
+    )
+    runs_ingesting = int(
+        db.execute(select(func.count(ScanRun.id)).where(ScanRun.project_id == project_id, ScanRun.status == RunStatus.INGESTING)).scalar() or 0
+    )
+    latest_run_at = db.execute(select(func.max(ScanRun.created_at)).where(ScanRun.project_id == project_id)).scalar()
+
+    endpoint_count = int(db.execute(select(func.count(Endpoint.id)).where(Endpoint.run_id.in_(scope_run_ids))).scalar() or 0)
+    resource_count = int(db.execute(select(func.count(Resource.id)).where(Resource.run_id.in_(scope_run_ids))).scalar() or 0)
+
+    item_totals = db.execute(
+        select(
+            func.count(Item.id),
+            func.count(Item.id).filter(Item.is_dir.is_(False)),
+            func.count(Item.id).filter(Item.is_dir.is_(True)),
+        ).where(Item.run_id.in_(scope_run_ids))
+    ).one()
+    items_total = int(item_totals[0] or 0)
+    files_total = int(item_totals[1] or 0)
+    directories_total = int(item_totals[2] or 0)
+
+    ext_expr = func.lower(func.substring(Item.name, r"\.[^.]+$"))
+    file_types_count = int(
+        db.execute(
+            select(func.count(func.distinct(ext_expr))).where(
+                Item.run_id.in_(scope_run_ids),
+                Item.is_dir.is_(False),
+                ext_expr.is_not(None),
+            )
+        ).scalar()
+        or 0
+    )
+
+    unique_hosts = int(
+        db.execute(
+            select(func.count(func.distinct(func.coalesce(Endpoint.hostname, Endpoint.ip, Endpoint.endpoint_key)))).where(
+                Endpoint.run_id.in_(scope_run_ids)
+            )
+        ).scalar()
+        or 0
+    )
+
+    project_run_count_in_scope = int(db.execute(select(func.count()).select_from(scope_runs)).scalar() or 0)
+    _audit_read(
+        db,
+        request,
+        auth,
+        project_id,
+        action="PROJECT_INVENTORY_STATS_VIEWED",
+        metadata={"run_ids": run_ids, "scope_runs": project_run_count_in_scope},
+    )
+    db.commit()
+
+    return {
+        "runs_total": runs_total,
+        "runs_complete": runs_complete,
+        "runs_ingesting": runs_ingesting,
+        "scope_runs": project_run_count_in_scope,
+        "endpoints": endpoint_count,
+        "shares": resource_count,
+        "items": items_total,
+        "files": files_total,
+        "directories": directories_total,
+        "file_types": file_types_count,
+        "unique_hosts": unique_hosts,
+        "latest_run_at": latest_run_at.isoformat() if latest_run_at else None,
+    }
+
+
 @router.get("/extensions")
 def inventory_extensions(
     project_id: uuid.UUID,
