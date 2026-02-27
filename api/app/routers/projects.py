@@ -1,14 +1,14 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, get_current_user, require_project_role, require_sysadmin, request_meta
 from app.enums import ProjectRole
 from app.models import Project, ProjectMember, User
-from app.schemas import MemberAddIn, ProjectCreateIn, ProjectOut
+from app.schemas import MemberAddByEmailIn, MemberAddIn, ProjectCreateIn, ProjectOut
 from app.services.audit import write_audit_event
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -113,6 +113,16 @@ def get_project(
     return ProjectOut(id=project.id, name=project.name, created_at=project.created_at)
 
 
+@router.get("/{project_id}/my-role")
+def get_my_role(
+    project_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    role = require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    return {"role": role.value}
+
+
 @router.post("/{project_id}/members")
 def add_member(
     project_id: uuid.UUID,
@@ -146,6 +156,42 @@ def add_member(
     )
     db.commit()
     return {"ok": True}
+
+
+@router.post("/{project_id}/members/by-email")
+def add_member_by_email(
+    project_id: uuid.UUID,
+    payload: MemberAddByEmailIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.ADMIN, auth, db)
+
+    stmt = select(User).where(func.lower(User.email) == payload.email.lower())
+    user = db.execute(stmt).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+
+    existing = db.get(ProjectMember, {"project_id": project_id, "user_id": user.id})
+    if existing:
+        existing.role = payload.role
+        db.add(existing)
+    else:
+        db.add(ProjectMember(project_id=project_id, user_id=user.id, role=payload.role))
+
+    write_audit_event(
+        db,
+        action="PROJECT_MEMBER_UPSERT",
+        object_type="project_member",
+        object_id=f"{project_id}:{user.id}",
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata={**request_meta(request), "role": payload.role.value, "email": payload.email.lower()},
+    )
+    db.commit()
+    return {"ok": True, "user_id": str(user.id), "email": user.email}
 
 
 @router.get("/{project_id}/members")

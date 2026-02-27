@@ -1,19 +1,46 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
 
 import { apiFetch } from "@/lib/api";
 
-type Endpoint = { id: number; endpoint_key: string };
-type Resource = { id: number; name: string; access_level: string };
+type RunInfo = {
+  id: string;
+  name: string;
+  description: string | null;
+  status: string;
+  created_at: string;
+  target_scope: Record<string, unknown>;
+  summary: { endpoints?: number; resources?: number; items?: number; errors?: number };
+};
+
+type Endpoint = {
+  id: number;
+  endpoint_key: string;
+  ip: string | null;
+  hostname: string | null;
+  smb_signing: string | null;
+};
+type Resource = { id: number; name: string; access_level: string; remark: string | null };
 type Item = { id: number; path: string; is_dir: boolean; resource_id?: number; name?: string };
+type SavedQuery = { id: string; label: string; q: string; ext: string };
+
+const RUN_STATUS_COLORS: Record<string, string> = {
+  PENDING_UPLOAD: "bg-slate-200 text-slate-900 dark:bg-slate-800 dark:text-slate-200",
+  UPLOADED: "bg-amber-200 text-amber-900 dark:bg-amber-900/40 dark:text-amber-200",
+  INGESTING: "bg-sky-200 text-sky-900 dark:bg-sky-900/40 dark:text-sky-200",
+  COMPLETE: "bg-emerald-200 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-200",
+  FAILED: "bg-rose-200 text-rose-900 dark:bg-rose-900/40 dark:text-rose-200",
+};
 
 export function RunDetailPage() {
   const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
 
+  const [run, setRun] = useState<RunInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [endpointSearch, setEndpointSearch] = useState("");
   const [itemSearch, setItemSearch] = useState("");
+  const [pathPrefix, setPathPrefix] = useState("");
   const [globalQuery, setGlobalQuery] = useState("");
   const [globalExt, setGlobalExt] = useState("");
 
@@ -36,6 +63,47 @@ export function RunDetailPage() {
   const [globalCursor, setGlobalCursor] = useState<string | null>(null);
   const [globalHistory, setGlobalHistory] = useState<Array<string | null>>([]);
   const [globalNext, setGlobalNext] = useState<string | null>(null);
+
+  const savedQueriesKey = useMemo(() => `share_sentinel_saved_queries_${runId || "default"}`, [runId]);
+  const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
+  const [savedQueryLabel, setSavedQueryLabel] = useState("");
+
+  useEffect(() => {
+    if (!runId) return;
+    const raw = localStorage.getItem(savedQueriesKey);
+    if (!raw) {
+      setSavedQueries([]);
+      return;
+    }
+    try {
+      setSavedQueries(JSON.parse(raw) as SavedQuery[]);
+    } catch {
+      setSavedQueries([]);
+    }
+  }, [runId, savedQueriesKey]);
+
+  function persistSavedQueries(next: SavedQuery[]) {
+    setSavedQueries(next);
+    localStorage.setItem(savedQueriesKey, JSON.stringify(next));
+  }
+
+  useEffect(() => {
+    if (!projectId || !runId) return;
+    apiFetch(`/projects/${projectId}/runs/${runId}`)
+      .then((data) => setRun(data as RunInfo))
+      .catch((err) => setError(err.message));
+  }, [projectId, runId]);
+
+  useEffect(() => {
+    if (!projectId || !runId || !run) return;
+    if (run.status !== "UPLOADED" && run.status !== "INGESTING") return;
+    const timer = window.setInterval(() => {
+      apiFetch(`/projects/${projectId}/runs/${runId}`)
+        .then((data) => setRun(data as RunInfo))
+        .catch(() => undefined);
+    }, 8000);
+    return () => window.clearInterval(timer);
+  }, [projectId, runId, run]);
 
   useEffect(() => {
     setEndpointCursor(null);
@@ -73,11 +141,12 @@ export function RunDetailPage() {
   useEffect(() => {
     setItemCursor(null);
     setItemHistory([]);
-  }, [selectedResource, itemSearch, projectId, runId]);
+  }, [selectedResource, itemSearch, pathPrefix, projectId, runId]);
 
   useEffect(() => {
     if (!projectId || !runId || !selectedResource) return;
     const query = new URLSearchParams({ limit: "200", search: itemSearch });
+    if (pathPrefix.trim()) query.set("path_prefix", pathPrefix.trim());
     if (itemCursor) query.set("cursor", itemCursor);
 
     apiFetch(`/projects/${projectId}/runs/${runId}/resources/${selectedResource}/items?${query.toString()}`)
@@ -86,7 +155,7 @@ export function RunDetailPage() {
         setItemNext((data?.next_cursor as string | null) || null);
       })
       .catch((err) => setError(err.message));
-  }, [projectId, runId, selectedResource, itemSearch, itemCursor]);
+  }, [projectId, runId, selectedResource, itemSearch, pathPrefix, itemCursor]);
 
   useEffect(() => {
     setGlobalCursor(null);
@@ -131,11 +200,47 @@ export function RunDetailPage() {
     });
   }
 
+  function saveCurrentQuery() {
+    if (!savedQueryLabel.trim()) return;
+    const next: SavedQuery[] = [
+      ...savedQueries,
+      {
+        id: crypto.randomUUID(),
+        label: savedQueryLabel.trim(),
+        q: globalQuery,
+        ext: globalExt,
+      },
+    ];
+    persistSavedQueries(next);
+    setSavedQueryLabel("");
+  }
+
+  function removeSavedQuery(id: string) {
+    persistSavedQueries(savedQueries.filter((query) => query.id !== id));
+  }
+
   return (
     <section className="space-y-6">
       <div className="panel">
-        <h1 className="text-2xl font-bold">Run Explorer</h1>
-        <p className="text-sm text-slate-600 dark:text-slate-300">Run: {runId}</p>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h1 className="text-2xl font-bold">{run?.name || "Run Explorer"}</h1>
+            <p className="text-sm text-slate-600 dark:text-slate-300">Run ID: {runId}</p>
+            {run?.description ? <p className="mt-1 text-xs text-slate-500">{run.description}</p> : null}
+          </div>
+          {run ? (
+            <div className="text-right text-xs">
+              <span className={`rounded-full px-2 py-1 font-semibold ${RUN_STATUS_COLORS[run.status] || "bg-slate-200 text-slate-900"}`}>
+                {run.status}
+              </span>
+              <p className="mt-2 text-slate-500">Created {new Date(run.created_at).toLocaleString()}</p>
+              <p className="text-slate-500">
+                e:{run.summary?.endpoints || 0} r:{run.summary?.resources || 0} i:{run.summary?.items || 0} err:
+                {run.summary?.errors || 0}
+              </p>
+            </div>
+          ) : null}
+        </div>
         {error ? <p className="mt-2 text-sm text-red-600">{error}</p> : null}
       </div>
 
@@ -144,8 +249,8 @@ export function RunDetailPage() {
           <div className="mb-3 flex items-center justify-between gap-2">
             <h2 className="text-lg font-semibold">Endpoints</h2>
             <input
-              className="w-40 rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
-              placeholder="Search"
+              className="w-44 rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+              placeholder="Search endpoint"
               value={endpointSearch}
               onChange={(event) => setEndpointSearch(event.target.value)}
             />
@@ -177,7 +282,10 @@ export function RunDetailPage() {
                   }`}
                   onClick={() => setSelectedEndpoint(endpoint.id)}
                 >
-                  {endpoint.endpoint_key}
+                  <div className="font-semibold">{endpoint.endpoint_key}</div>
+                  <div className="text-slate-500">
+                    {(endpoint.hostname || endpoint.ip || "-") + (endpoint.smb_signing ? ` | signing:${endpoint.smb_signing}` : "")}
+                  </div>
                 </button>
               </li>
             ))}
@@ -199,6 +307,7 @@ export function RunDetailPage() {
                 >
                   <span className="block font-semibold">{resource.name}</span>
                   <span className="text-slate-500">{resource.access_level}</span>
+                  {resource.remark ? <span className="block text-slate-500">{resource.remark}</span> : null}
                 </button>
               </li>
             ))}
@@ -206,13 +315,19 @@ export function RunDetailPage() {
         </div>
 
         <div className="panel">
-          <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="mb-3 grid gap-2">
             <h2 className="text-lg font-semibold">Items</h2>
             <input
-              className="w-40 rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
-              placeholder="Search"
+              className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+              placeholder="Search name"
               value={itemSearch}
               onChange={(event) => setItemSearch(event.target.value)}
+            />
+            <input
+              className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+              placeholder="Path prefix (e.g. \\HR\\)"
+              value={pathPrefix}
+              onChange={(event) => setPathPrefix(event.target.value)}
             />
           </div>
           <div className="mb-2 flex items-center gap-2">
@@ -243,23 +358,59 @@ export function RunDetailPage() {
       </div>
 
       <div className="panel">
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="mb-3 flex flex-wrap items-end justify-between gap-3">
           <h2 className="text-lg font-semibold">Run-Scoped Search</h2>
-          <div className="flex items-center gap-2">
-            <input
-              className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
-              placeholder="Query"
-              value={globalQuery}
-              onChange={(event) => setGlobalQuery(event.target.value)}
-            />
-            <input
-              className="w-20 rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
-              placeholder=".ext"
-              value={globalExt}
-              onChange={(event) => setGlobalExt(event.target.value)}
-            />
+          <div className="flex flex-wrap items-end gap-2">
+            <div>
+              <input
+                className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+                placeholder="Query"
+                value={globalQuery}
+                onChange={(event) => setGlobalQuery(event.target.value)}
+              />
+            </div>
+            <div>
+              <input
+                className="w-24 rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+                placeholder=".ext"
+                value={globalExt}
+                onChange={(event) => setGlobalExt(event.target.value)}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                className="w-32 rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+                placeholder="Save as..."
+                value={savedQueryLabel}
+                onChange={(event) => setSavedQueryLabel(event.target.value)}
+              />
+              <button className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700" onClick={saveCurrentQuery}>
+                Save
+              </button>
+            </div>
           </div>
         </div>
+
+        {savedQueries.length > 0 ? (
+          <div className="mb-3 flex flex-wrap gap-2">
+            {savedQueries.map((saved) => (
+              <div key={saved.id} className="flex items-center gap-1 rounded-full bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800">
+                <button
+                  className="font-semibold"
+                  onClick={() => {
+                    setGlobalQuery(saved.q);
+                    setGlobalExt(saved.ext);
+                  }}
+                >
+                  {saved.label}
+                </button>
+                <button className="text-slate-500" onClick={() => removeSavedQuery(saved.id)}>
+                  x
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
 
         <div className="mb-2 flex items-center gap-2">
           <button

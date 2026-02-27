@@ -66,6 +66,11 @@ class MemberAddIn(BaseModel):
     role: ProjectRole
 
 
+class MemberAddByEmailIn(BaseModel):
+    email: EmailStr
+    role: ProjectRole
+
+
 class RunCreateIn(BaseModel):
     run_id: uuid.UUID | None = None
     name: str = Field(min_length=1, max_length=255)
