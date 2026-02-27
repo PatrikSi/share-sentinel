@@ -37,6 +37,7 @@ BATCH_SIZE = int(os.getenv("INGEST_BATCH_SIZE", "5000"))
 PROGRESS_EVERY_LINES = int(os.getenv("INGEST_PROGRESS_EVERY_LINES", "2000"))
 RECOVERY_SCAN_SECONDS = int(os.getenv("INGEST_RECOVERY_SCAN_SECONDS", "8"))
 PENDING_IDLE_MS = int(os.getenv("INGEST_PENDING_IDLE_MS", "60000"))
+JSON_COMPAT_MAX_BYTES = int(os.getenv("INGEST_JSON_COMPAT_MAX_BYTES", str(50 * 1024 * 1024)))
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -220,6 +221,142 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
     return True, None
 
 
+def _normalize_windows_path(value: Any) -> str:
+    path = str(value or "\\").replace("/", "\\").strip()
+    if not path:
+        return "\\"
+    if not path.startswith("\\"):
+        path = f"\\{path}"
+    return path
+
+
+def _join_windows_path(parent: Any, name: Any) -> str:
+    base = _normalize_windows_path(parent)
+    leaf = str(name or "").strip().strip("\\/")
+    if not leaf:
+        return base
+    if base == "\\":
+        return f"\\{leaf}"
+    return base.rstrip("\\") + "\\" + leaf
+
+
+def _iter_items_from_entries(
+    run_id: str,
+    endpoint_key: str,
+    resource_name: str,
+    entries: list[Any],
+    parent_path: str = "\\",
+):
+    for raw_entry in entries:
+        if not isinstance(raw_entry, dict):
+            continue
+
+        name = str(raw_entry.get("name") or "").strip()
+        is_dir = bool(raw_entry.get("is_dir", False))
+        full_path = _join_windows_path(raw_entry.get("path") or parent_path, name)
+        if not name:
+            name = PurePosixPath(full_path.replace("\\", "/")).name or full_path
+
+        yield {
+            "type": "item",
+            "run_id": run_id,
+            "endpoint_key": endpoint_key,
+            "resource_type": "smb_share",
+            "resource_name": resource_name,
+            "path": full_path,
+            "name": name,
+            "is_dir": is_dir,
+        }
+
+        children = raw_entry.get("children")
+        if is_dir and isinstance(children, list):
+            yield from _iter_items_from_entries(run_id, endpoint_key, resource_name, children, full_path)
+
+
+def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
+    endpoints_raw = doc.get("endpoints")
+    if not isinstance(endpoints_raw, list):
+        return []
+
+    records: list[dict[str, Any]] = []
+    for raw_endpoint in endpoints_raw:
+        if not isinstance(raw_endpoint, dict):
+            continue
+
+        endpoint_key = str(raw_endpoint.get("endpoint_key") or "").strip()
+        if not endpoint_key:
+            ip = str(raw_endpoint.get("ip") or "").strip()
+            hostname = str(raw_endpoint.get("hostname") or "").strip()
+            endpoint_key = f"{ip}:445" if ip else (f"{hostname}:445" if hostname else "unknown:445")
+
+        records.append(
+            {
+                "type": "endpoint",
+                "run_id": run_id,
+                "endpoint_key": endpoint_key,
+                "ip": raw_endpoint.get("ip"),
+                "hostname": raw_endpoint.get("hostname"),
+                "domain": raw_endpoint.get("domain"),
+            }
+        )
+
+        raw_shares = raw_endpoint.get("shares")
+        if not isinstance(raw_shares, list):
+            continue
+
+        for raw_share in raw_shares:
+            if not isinstance(raw_share, dict):
+                continue
+
+            share_name = str(raw_share.get("name") or "").strip()
+            if not share_name:
+                continue
+
+            records.append(
+                {
+                    "type": "resource",
+                    "run_id": run_id,
+                    "endpoint_key": endpoint_key,
+                    "resource_type": "smb_share",
+                    "name": share_name,
+                    "remark": raw_share.get("remark"),
+                    "access_level": raw_share.get("access_level", "no_access"),
+                }
+            )
+
+            raw_entries = raw_share.get("entries")
+            if isinstance(raw_entries, list):
+                records.extend(_iter_items_from_entries(run_id, endpoint_key, share_name, raw_entries))
+
+    return records
+
+
+def records_from_json_document(doc: Any, run_id: str) -> list[dict[str, Any]]:
+    if isinstance(doc, list):
+        records = []
+        for row in doc:
+            if not isinstance(row, dict):
+                continue
+            rec = dict(row)
+            rec.setdefault("run_id", run_id)
+            records.append(rec)
+        if records:
+            return records
+        raise ValueError("json array contains no object records")
+
+    if isinstance(doc, dict) and isinstance(doc.get("type"), str):
+        rec = dict(doc)
+        rec.setdefault("run_id", run_id)
+        return [rec]
+
+    if isinstance(doc, dict):
+        nested = _records_from_nested_json(doc, run_id)
+        if nested:
+            return nested
+
+    raise ValueError("unsupported JSON artifact format")
+
+
 def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
     with psycopg.connect(DATABASE_URL) as conn:
         rows = conn.execute(
@@ -263,7 +400,7 @@ def process_job(fields: dict[str, str]) -> None:
         try:
             row = conn.execute(
                 """
-                SELECT project_id::text, artifact_key, status::text, summary, ingest_progress
+                SELECT project_id::text, artifact_key, status::text, summary, ingest_progress, artifact_content_type, artifact_size
                 FROM scan_runs
                 WHERE id = %s
                 """,
@@ -273,7 +410,7 @@ def process_job(fields: dict[str, str]) -> None:
                 logger.warning("run not found run_id=%s", run_id)
                 return
 
-            db_project_id, db_artifact_key, status, summary_raw, progress_raw = row
+            db_project_id, db_artifact_key, status, summary_raw, progress_raw, artifact_content_type, artifact_size = row
             project_id = project_id or db_project_id
             artifact_key = artifact_key or db_artifact_key
             if not artifact_key:
@@ -306,30 +443,8 @@ def process_job(fields: dict[str, str]) -> None:
 
             obj = s3.get_object(Bucket=S3_BUCKET, Key=artifact_key)
             body = obj["Body"]
-            reader = gzip.GzipFile(fileobj=body) if artifact_key.endswith(".gz") else body.iter_lines()
-
-            current_line = 0
-            for raw_line in reader:
-                current_line += 1
-                if current_line <= line_offset:
-                    continue
-
-                line_offset = current_line
-                if isinstance(raw_line, bytes):
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                else:
-                    line = str(raw_line).strip()
-                if not line:
-                    continue
-
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    error_batch.append((run_id, "error", "JSON_DECODE_ERROR", str(exc), None, None, None))
-                    counts["errors"] += 1
-                    if len(error_batch) >= BATCH_SIZE:
-                        flush_error_batch(conn, error_batch)
-                    continue
+            def process_record(rec: dict[str, Any]) -> None:
+                nonlocal counts
 
                 valid, reason = validate_record(rec)
                 if not valid:
@@ -347,12 +462,12 @@ def process_job(fields: dict[str, str]) -> None:
                     counts["errors"] += 1
                     if len(error_batch) >= BATCH_SIZE:
                         flush_error_batch(conn, error_batch)
-                    continue
+                    return
 
                 rec_type = rec.get("type")
                 rec_run_id = rec.get("run_id")
-                if rec_run_id and rec_run_id != run_id:
-                    continue
+                if rec_run_id and str(rec_run_id) != run_id:
+                    return
 
                 if rec_type == "endpoint":
                     endpoint_id = upsert_endpoint(conn, run_id, rec)
@@ -425,13 +540,71 @@ def process_job(fields: dict[str, str]) -> None:
                         "errors": int(incoming.get("errors", counts["errors"])),
                     }
 
-                if line_offset % PROGRESS_EVERY_LINES == 0:
-                    flush_item_batch(conn, item_batch)
-                    flush_error_batch(conn, error_batch)
-                    update_run_status(conn, run_id, "INGESTING", line_offset, counts)
-                    conn.commit()
-                    last_line_offset = line_offset
-                    last_counts = counts.copy()
+            raw_bytes: bytes | None = None
+            json_records: list[dict[str, Any]] | None = None
+            content_type = str(artifact_content_type or "").lower()
+            size_value = int(artifact_size or 0)
+
+            if artifact_key.endswith(".gz"):
+                reader = gzip.GzipFile(fileobj=body)
+            elif "json" in content_type and "ndjson" not in content_type and size_value <= JSON_COMPAT_MAX_BYTES:
+                raw_bytes = body.read()
+                try:
+                    json_doc = json.loads(raw_bytes.decode("utf-8", errors="replace"))
+                    json_records = records_from_json_document(json_doc, run_id)
+                except Exception:
+                    json_records = None
+                    reader = raw_bytes.splitlines()
+            else:
+                reader = body.iter_lines()
+
+            current_line = 0
+            if json_records is not None:
+                for rec in json_records:
+                    current_line += 1
+                    if current_line <= line_offset:
+                        continue
+                    line_offset = current_line
+                    process_record(rec)
+
+                    if line_offset % PROGRESS_EVERY_LINES == 0:
+                        flush_item_batch(conn, item_batch)
+                        flush_error_batch(conn, error_batch)
+                        update_run_status(conn, run_id, "INGESTING", line_offset, counts)
+                        conn.commit()
+                        last_line_offset = line_offset
+                        last_counts = counts.copy()
+            else:
+                for raw_line in reader:
+                    current_line += 1
+                    if current_line <= line_offset:
+                        continue
+
+                    line_offset = current_line
+                    if isinstance(raw_line, bytes):
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                    else:
+                        line = str(raw_line).strip()
+                    if not line:
+                        continue
+
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        error_batch.append((run_id, "error", "JSON_DECODE_ERROR", str(exc), None, None, None))
+                        counts["errors"] += 1
+                        if len(error_batch) >= BATCH_SIZE:
+                            flush_error_batch(conn, error_batch)
+                        continue
+
+                    process_record(rec)
+                    if line_offset % PROGRESS_EVERY_LINES == 0:
+                        flush_item_batch(conn, item_batch)
+                        flush_error_batch(conn, error_batch)
+                        update_run_status(conn, run_id, "INGESTING", line_offset, counts)
+                        conn.commit()
+                        last_line_offset = line_offset
+                        last_counts = counts.copy()
 
             flush_item_batch(conn, item_batch)
             flush_error_batch(conn, error_batch)
