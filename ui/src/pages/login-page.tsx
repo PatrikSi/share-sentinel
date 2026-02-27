@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 
 import { setTokens } from "@/lib/auth";
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "http://localhost:8000";
+const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "/api";
 
 export function LoginPage() {
   const navigate = useNavigate();

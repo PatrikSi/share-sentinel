@@ -14,7 +14,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-app = FastAPI(title="Share Sentinel API", version="0.1.0")
+app = FastAPI(
+    title="Share Sentinel API",
+    version="0.1.0",
+    root_path=settings.api_root_path,
+)
 
 origins = [item.strip() for item in settings.cors_origins.split(",") if item.strip()]
 app.add_middleware(

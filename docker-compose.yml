@@ -8,10 +8,8 @@ services:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--entrypoints.web.address=:80"
-      - "--entrypoints.websecure.address=:443"
     ports:
       - "80:80"
-      - "443:443"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
     depends_on:
@@ -84,7 +82,8 @@ services:
       JWT_SECRET: ${JWT_SECRET:-change-me-super-long-random-string}
       JWT_ISSUER: smbguard
       TOKEN_PEPPER: ${TOKEN_PEPPER:-change-me-long-random-string}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://ui.localhost,http://localhost:3000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+      API_ROOT_PATH: /api
       LOG_LEVEL: INFO
     depends_on:
       db:
@@ -102,11 +101,11 @@ services:
       retries: 10
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.api-http.rule=Host(`api.localhost`)"
-      - "traefik.http.routers.api-http.entrypoints=web"
-      - "traefik.http.routers.api-https.rule=Host(`api.localhost`)"
-      - "traefik.http.routers.api-https.entrypoints=websecure"
-      - "traefik.http.routers.api-https.tls=true"
+      - "traefik.http.routers.api.rule=Host(`localhost`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.api.entrypoints=web"
+      - "traefik.http.routers.api.priority=100"
+      - "traefik.http.routers.api.middlewares=api-strip-prefix"
+      - "traefik.http.middlewares.api-strip-prefix.stripprefix.prefixes=/api"
       - "traefik.http.services.api.loadbalancer.server.port=8000"
 
   worker:
@@ -146,7 +145,7 @@ services:
     build:
       context: ./ui
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://api.localhost}
+        VITE_API_BASE_URL: /api
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/ || exit 1"]
       interval: 15s
@@ -154,11 +153,9 @@ services:
       retries: 10
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.ui-http.rule=Host(`ui.localhost`) || Host(`localhost`)"
-      - "traefik.http.routers.ui-http.entrypoints=web"
-      - "traefik.http.routers.ui-https.rule=Host(`ui.localhost`) || Host(`localhost`)"
-      - "traefik.http.routers.ui-https.entrypoints=websecure"
-      - "traefik.http.routers.ui-https.tls=true"
+      - "traefik.http.routers.ui.rule=Host(`localhost`)"
+      - "traefik.http.routers.ui.entrypoints=web"
+      - "traefik.http.routers.ui.priority=1"
       - "traefik.http.services.ui.loadbalancer.server.port=3000"
 
 volumes:

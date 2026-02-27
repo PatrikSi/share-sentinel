@@ -8,6 +8,7 @@ class Settings(BaseSettings):
 
     app_name: str = "share-sentinel-api"
     log_level: str = "INFO"
+    api_root_path: str = ""
 
     database_url: str = "postgresql+psycopg://smbguard:smbguard@db:5432/smbguard"
     redis_url: str = "redis://redis:6379/0"
@@ -24,7 +25,7 @@ class Settings(BaseSettings):
     token_pepper: str = "dev-pepper"
     require_user_for_api_token_create: bool = True
 
-    cors_origins: str = "http://ui.localhost,http://localhost:3000"
+    cors_origins: str = "http://localhost"
 
     upload_max_bytes: int = 10 * 1024 * 1024 * 1024
     upload_chunk_bytes: int = 8 * 1024 * 1024

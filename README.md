@@ -24,8 +24,8 @@ docker compose up --build
 
 3. Open UI and API:
 
-- `http://ui.localhost`
-- `http://api.localhost/docs`
+- `http://localhost`
+- `http://localhost/api/docs`
 
 4. Default seeded admin credentials come from `.env`:
 
