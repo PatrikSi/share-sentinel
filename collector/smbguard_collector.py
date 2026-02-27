@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import concurrent.futures
 import gzip
 import ipaddress
@@ -12,12 +13,10 @@ import socket
 import sys
 import tempfile
 import threading
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable
 
 import requests
 
@@ -121,6 +120,17 @@ def parse_targets(cidrs: list[str], hosts_file: str | None) -> list[str]:
     return sorted(targets)
 
 
+def parse_hosts_file(hosts_file: str | None) -> list[str]:
+    if not hosts_file:
+        return []
+    hosts: list[str] = []
+    for line in Path(hosts_file).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            hosts.append(line)
+    return hosts
+
+
 def normalize_path(base: str, child: str) -> str:
     base = base.replace("/", "\\")
     child = child.replace("/", "\\")
@@ -141,11 +151,11 @@ def list_share_entries(
     exclude_path_regex: re.Pattern[str] | None,
     extensions: set[str] | None,
 ):
-    queue: list[tuple[str, int]] = [("", 0)]
+    queue = collections.deque([("", 0)])
     emitted = 0
 
     while queue and emitted < max_entries:
-        rel_path, depth = queue.pop(0)
+        rel_path, depth = queue.popleft()
         wildcard = f"{rel_path}\\*" if rel_path else "*"
 
         try:
@@ -179,6 +189,24 @@ def list_share_entries(
                 break
             if is_dir and depth + 1 < max_depth:
                 queue.append((full_path.strip("\\"), depth + 1))
+
+
+def _dialect_label(raw: str) -> str:
+    mapping = {
+        "528": "2.0.2",
+        "770": "2.1",
+        "768": "3.0",
+        "785": "3.1.1",
+    }
+    return mapping.get(str(raw), str(raw))
+
+
+def _signing_label(conn: SMBConnection) -> str:
+    try:
+        required = bool(conn.isSigningRequired())
+        return "required" if required else "enabled"
+    except Exception:  # noqa: BLE001
+        return "enabled"
 
 
 def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
@@ -231,8 +259,8 @@ def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWr
             "hostname": host if not _is_ip(host) else None,
             "domain": args.domain or None,
             "smb": {
-                "dialect": str(conn.getDialect()),
-                "signing": "enabled",
+                "dialect": _dialect_label(str(conn.getDialect())),
+                "signing": _signing_label(conn),
             },
             "auth": {
                 "method": auth_method,
@@ -359,7 +387,7 @@ def _is_ip(value: str) -> bool:
         return False
 
 
-def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str) -> None:
+def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str, hosts: list[str]) -> None:
     if not args.upload:
         return
 
@@ -377,7 +405,7 @@ def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str) -
         "description": "collector upload",
         "target_scope": {
             "cidrs": args.cidr,
-            "hosts_file": bool(args.hosts),
+            "hosts": hosts,
         },
     }
     create_url = f"{base}/projects/{args.project_id}/runs"
@@ -402,6 +430,7 @@ def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str) -
 def main() -> int:
     args = parse_args()
     targets = parse_targets(args.cidr, args.hosts)
+    host_inputs = parse_hosts_file(args.hosts)
     run_id = str(uuid.uuid4())
     started_at = datetime.now(tz=UTC)
 
@@ -429,7 +458,7 @@ def main() -> int:
             "operator_label": args.operator_label,
             "target_scope": {
                 "cidrs": args.cidr,
-                "hosts_file": args.hosts,
+                "hosts": host_inputs,
             },
             "auth": {
                 "mode": "local" if args.local_auth else "domain",
@@ -465,7 +494,7 @@ def main() -> int:
 
     try:
         if args.upload and output_path is not None:
-            upload_artifact(args, run_id, output_path)
+            upload_artifact(args, run_id, output_path, host_inputs)
     finally:
         if temp_artifact and os.path.exists(temp_artifact):
             os.unlink(temp_artifact)

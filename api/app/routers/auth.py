@@ -2,7 +2,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -35,9 +35,16 @@ rate_limiter = RateLimiter()
 
 @router.post("/login", response_model=TokenPairOut)
 def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
-    rate_limiter.check(request, "auth_login", limit=20, window_seconds=60)
+    rate_limiter.check(
+        request,
+        "auth_login",
+        limit=20,
+        window_seconds=60,
+        actor_key=f"login:{payload.email.lower()}",
+        fail_open=False,
+    )
 
-    stmt = select(User).where(User.email == payload.email)
+    stmt = select(User).where(func.lower(User.email) == payload.email.lower())
     user = db.execute(stmt).scalar_one_or_none()
     if user is None or not verify_password(payload.password, user.password_hash):
         write_audit_event(
@@ -90,13 +97,36 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
 
 @router.post("/refresh")
 def refresh(payload: RefreshIn, request: Request, db: Session = Depends(get_db)):
-    rate_limiter.check(request, "auth_refresh", limit=60, window_seconds=60)
-
     token_hash = hash_external_token(payload.refresh_token)
+    rate_limiter.check(
+        request,
+        "auth_refresh",
+        limit=60,
+        window_seconds=60,
+        actor_key=f"refresh:{token_hash}",
+        fail_open=False,
+    )
+
     stmt = select(RefreshToken).where(RefreshToken.token_hash == token_hash, RefreshToken.revoked_at.is_(None))
     refresh_token = db.execute(stmt).scalar_one_or_none()
     if refresh_token is None or refresh_token.expires_at < datetime.now(tz=UTC):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid refresh token")
+
+    user = db.get(User, refresh_token.user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid refresh token")
+
+    # Rotate refresh tokens to reduce replay window.
+    refresh_token.revoked_at = datetime.now(tz=UTC)
+    new_refresh_raw = random_token(48)
+    new_refresh_hash = hash_external_token(new_refresh_raw)
+    settings = get_settings()
+    replacement = RefreshToken(
+        user_id=refresh_token.user_id,
+        token_hash=new_refresh_hash,
+        expires_at=datetime.now(tz=UTC) + timedelta(days=settings.refresh_token_days),
+    )
+    db.add(replacement)
 
     access_token = make_access_token(str(refresh_token.user_id))
     write_audit_event(
@@ -107,8 +137,9 @@ def refresh(payload: RefreshIn, request: Request, db: Session = Depends(get_db))
         actor_user_id=refresh_token.user_id,
         metadata=request_meta(request),
     )
+    db.add(refresh_token)
     db.commit()
-    return {"access_token": access_token}
+    return {"access_token": access_token, "refresh_token": new_refresh_raw}
 
 
 @router.post("/logout")
@@ -164,12 +195,23 @@ def create_api_token(
     db: Session = Depends(get_db),
     auth: AuthContext = Depends(get_auth_context),
 ):
+    settings = get_settings()
     if auth.user_id is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user login required")
+    if settings.require_user_for_api_token_create and auth.token_id is not None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user login required")
 
     role = get_project_role(db, auth, payload.project_id)
     if role != ProjectRole.ADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="project admin required")
+    rate_limiter.check(
+        request,
+        "api_token_create",
+        limit=30,
+        window_seconds=300,
+        actor_key=f"user:{auth.user_id}",
+        fail_open=False,
+    )
 
     token_raw = random_token(48)
     token_hash = hash_external_token(token_raw)

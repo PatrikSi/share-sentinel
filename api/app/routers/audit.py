@@ -1,14 +1,15 @@
 import uuid
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.deps import AuthContext, get_auth_context, require_project_role
+from app.deps import AuthContext, get_auth_context, request_meta, require_project_role
 from app.enums import ProjectRole
 from app.models import AuditEvent
 from app.pagination import next_cursor, parse_cursor
+from app.services.audit import write_audit_event
 
 router = APIRouter(prefix="/projects/{project_id}/audit", tags=["audit"])
 
@@ -16,6 +17,7 @@ router = APIRouter(prefix="/projects/{project_id}/audit", tags=["audit"])
 @router.get("")
 def list_audit_events(
     project_id: uuid.UUID,
+    request: Request,
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -32,6 +34,17 @@ def list_audit_events(
         .limit(limit)
     )
     events = db.execute(stmt).scalars().all()
+    write_audit_event(
+        db,
+        action="AUDIT_VIEWED",
+        object_type="project",
+        object_id=str(project_id),
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata={**request_meta(request), "limit": limit, "cursor": cursor, "result_count": len(events)},
+    )
+    db.commit()
     return {
         "items": [
             {

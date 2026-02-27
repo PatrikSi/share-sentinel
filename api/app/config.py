@@ -22,10 +22,14 @@ class Settings(BaseSettings):
     access_token_minutes: int = 15
     refresh_token_days: int = 14
     token_pepper: str = "dev-pepper"
+    require_user_for_api_token_create: bool = True
 
-    cors_origins: str = "http://localhost:3000"
+    cors_origins: str = "http://ui.localhost,http://localhost:3000"
 
     upload_max_bytes: int = 10 * 1024 * 1024 * 1024
+    upload_chunk_bytes: int = 8 * 1024 * 1024
+    rate_limit_fail_open: bool = False
+    redis_stream_retries: int = 3
     seed_admin_email: str | None = None
     seed_admin_password: str | None = None
 

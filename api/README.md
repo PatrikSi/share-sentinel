@@ -7,6 +7,7 @@ FastAPI service for auth, project management, run lifecycle, artifact upload, an
 - JWT access + refresh tokens
 - Hashed API tokens (project scoped)
 - Project-scoped RBAC (admin/operator/viewer)
+- Sysadmin user management endpoints (`/users`)
 - Request IDs and request logging
 - Redis-backed fixed-window rate limits (auth + upload)
 - Async ingestion queueing via Redis Streams

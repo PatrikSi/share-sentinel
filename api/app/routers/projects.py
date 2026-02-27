@@ -45,11 +45,24 @@ def create_project(
 
 @router.get("", response_model=list[ProjectOut])
 def list_projects(
+    request: Request,
     db: Session = Depends(get_db),
     auth: AuthContext = Depends(get_auth_context),
 ):
     if auth.token_id:
         project = db.get(Project, auth.token_project_id)
+        if project:
+            write_audit_event(
+                db,
+                action="PROJECTS_LISTED",
+                object_type="user",
+                object_id=str(auth.user_id or auth.token_id),
+                actor_user_id=auth.user_id,
+                actor_token_id=auth.token_id,
+                project_id=project.id,
+                metadata=request_meta(request),
+            )
+            db.commit()
         return [ProjectOut(id=project.id, name=project.name, created_at=project.created_at)] if project else []
 
     if auth.user_id is None:
@@ -62,12 +75,23 @@ def list_projects(
         .order_by(Project.created_at.desc())
     )
     projects = db.execute(stmt).scalars().all()
+    write_audit_event(
+        db,
+        action="PROJECTS_LISTED",
+        object_type="user",
+        object_id=str(auth.user_id),
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        metadata={**request_meta(request), "result_count": len(projects)},
+    )
+    db.commit()
     return [ProjectOut(id=p.id, name=p.name, created_at=p.created_at) for p in projects]
 
 
 @router.get("/{project_id}", response_model=ProjectOut)
 def get_project(
     project_id: uuid.UUID,
+    request: Request,
     db: Session = Depends(get_db),
     auth: AuthContext = Depends(get_auth_context),
 ):
@@ -75,6 +99,17 @@ def get_project(
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+    write_audit_event(
+        db,
+        action="PROJECT_VIEWED",
+        object_type="project",
+        object_id=str(project_id),
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata=request_meta(request),
+    )
+    db.commit()
     return ProjectOut(id=project.id, name=project.name, created_at=project.created_at)
 
 
@@ -116,6 +151,7 @@ def add_member(
 @router.get("/{project_id}/members")
 def list_members(
     project_id: uuid.UUID,
+    request: Request,
     db: Session = Depends(get_db),
     auth: AuthContext = Depends(get_auth_context),
 ):
@@ -128,6 +164,17 @@ def list_members(
         .order_by(User.email.asc())
     )
     rows = db.execute(stmt).all()
+    write_audit_event(
+        db,
+        action="PROJECT_MEMBERS_VIEWED",
+        object_type="project",
+        object_id=str(project_id),
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata={**request_meta(request), "result_count": len(rows)},
+    )
+    db.commit()
     return {
         "items": [
             {

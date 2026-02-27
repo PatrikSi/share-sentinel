@@ -44,7 +44,7 @@ class ApiToken(Base):
     id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     project_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
-    token_hash: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    token_hash: Mapped[str] = mapped_column(sa.String(128), nullable=False, unique=True, index=True)
     name: Mapped[str] = mapped_column(sa.String(120), nullable=False)
     role: Mapped[ProjectRole] = mapped_column(sa.Enum(ProjectRole, name="token_role"), nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
@@ -165,3 +165,5 @@ class AuditEvent(Base):
 
 
 Index("ix_scan_runs_project_created", ScanRun.project_id, ScanRun.created_at)
+Index("ix_scan_runs_status_created", ScanRun.status, ScanRun.created_at)
+Index("ix_refresh_tokens_user_revoked", RefreshToken.user_id, RefreshToken.revoked_at)

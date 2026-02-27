@@ -32,6 +32,7 @@ def upgrade() -> None:
     resource_type.create(bind, checkfirst=True)
     access_level.create(bind, checkfirst=True)
     error_severity.create(bind, checkfirst=True)
+    op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
 
     op.create_table(
         "users",
@@ -78,7 +79,9 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["project_id"], ["projects.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("token_hash"),
     )
+    op.create_index("ix_api_tokens_token_hash", "api_tokens", ["token_hash"], unique=False)
 
     op.create_table(
         "refresh_tokens",
@@ -92,6 +95,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("token_hash"),
     )
+    op.create_index("ix_refresh_tokens_user_revoked", "refresh_tokens", ["user_id", "revoked_at"], unique=False)
 
     op.create_table(
         "scan_runs",
@@ -116,6 +120,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_scan_runs_project_created", "scan_runs", ["project_id", "created_at"], unique=False)
+    op.create_index("ix_scan_runs_status_created", "scan_runs", ["status", "created_at"], unique=False)
 
     op.create_table(
         "endpoints",
@@ -167,6 +172,8 @@ def upgrade() -> None:
     )
     op.create_index("ix_items_run_resource_path", "items", ["run_id", "resource_id", "path"], unique=False)
     op.create_index("ix_items_run_name", "items", ["run_id", "name"], unique=False)
+    op.execute("CREATE INDEX IF NOT EXISTS ix_items_name_trgm ON items USING GIN (name gin_trgm_ops)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_items_path_trgm ON items USING GIN (path gin_trgm_ops)")
 
     op.create_table(
         "ingest_errors",
@@ -203,6 +210,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute("DROP INDEX IF EXISTS ix_items_path_trgm")
+    op.execute("DROP INDEX IF EXISTS ix_items_name_trgm")
     op.drop_index("ix_audit_events_project_ts", table_name="audit_events")
     op.drop_table("audit_events")
     op.drop_table("ingest_errors")
@@ -213,9 +222,12 @@ def downgrade() -> None:
     op.drop_table("resources")
     op.drop_index("ix_endpoints_run_ip", table_name="endpoints")
     op.drop_table("endpoints")
+    op.drop_index("ix_scan_runs_status_created", table_name="scan_runs")
     op.drop_index("ix_scan_runs_project_created", table_name="scan_runs")
     op.drop_table("scan_runs")
+    op.drop_index("ix_refresh_tokens_user_revoked", table_name="refresh_tokens")
     op.drop_table("refresh_tokens")
+    op.drop_index("ix_api_tokens_token_hash", table_name="api_tokens")
     op.drop_table("api_tokens")
     op.drop_table("project_members")
     op.drop_table("projects")

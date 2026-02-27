@@ -18,6 +18,10 @@ export function ProjectsPage() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [error, setError] = useState<string | null>(null);
 
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [cursorHistory, setCursorHistory] = useState<Array<string | null>>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+
   useEffect(() => {
     apiFetch("/projects")
       .then((data) => {
@@ -31,16 +35,44 @@ export function ProjectsPage() {
   }, []);
 
   useEffect(() => {
-    if (!selectedProject) return;
-    apiFetch(`/projects/${selectedProject}/runs?limit=50`)
-      .then((data) => setRuns((data?.items || []) as Run[]))
-      .catch((err) => setError(err.message));
+    setCursor(null);
+    setCursorHistory([]);
   }, [selectedProject]);
+
+  useEffect(() => {
+    if (!selectedProject) return;
+    const query = new URLSearchParams({ limit: "50" });
+    if (cursor) {
+      query.set("cursor", cursor);
+    }
+    apiFetch(`/projects/${selectedProject}/runs?${query.toString()}`)
+      .then((data) => {
+        setRuns((data?.items || []) as Run[]);
+        setNextCursor((data?.next_cursor as string | null) || null);
+      })
+      .catch((err) => setError(err.message));
+  }, [selectedProject, cursor]);
 
   const selectedProjectName = useMemo(
     () => projects.find((project) => project.id === selectedProject)?.name || "",
     [projects, selectedProject],
   );
+
+  function moveNext() {
+    if (!nextCursor) return;
+    setCursorHistory((prev) => [...prev, cursor]);
+    setCursor(nextCursor);
+  }
+
+  function movePrev() {
+    setCursorHistory((prev) => {
+      if (prev.length === 0) return prev;
+      const copy = [...prev];
+      const previousCursor = copy.pop() ?? null;
+      setCursor(previousCursor);
+      return copy;
+    });
+  }
 
   return (
     <section className="space-y-6">
@@ -65,7 +97,25 @@ export function ProjectsPage() {
       {error ? <p className="text-sm text-red-600">{error}</p> : null}
 
       <div className="panel overflow-x-auto">
-        <h2 className="mb-4 text-lg font-semibold">Runs in {selectedProjectName || "selected project"}</h2>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h2 className="text-lg font-semibold">Runs in {selectedProjectName || "selected project"}</h2>
+          <div className="flex items-center gap-2">
+            <button
+              className="rounded-lg border border-slate-300 px-3 py-1 text-xs font-semibold uppercase hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800"
+              onClick={movePrev}
+              disabled={cursorHistory.length === 0}
+            >
+              Prev
+            </button>
+            <button
+              className="rounded-lg border border-slate-300 px-3 py-1 text-xs font-semibold uppercase hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800"
+              onClick={moveNext}
+              disabled={!nextCursor}
+            >
+              Next
+            </button>
+          </div>
+        </div>
         <table className="data-table">
           <thead>
             <tr>

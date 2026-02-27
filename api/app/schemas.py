@@ -87,3 +87,10 @@ class RunOut(BaseModel):
 
 class ThemeUpdateIn(BaseModel):
     ui_theme: UITheme
+
+
+class UserCreateIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=12, max_length=256)
+    is_active: bool = True
+    is_sysadmin: bool = False

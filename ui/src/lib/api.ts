@@ -1,4 +1,4 @@
-import { getAccessToken } from "@/lib/auth";
+import { clearTokens, getAccessToken } from "@/lib/auth";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "http://localhost:8000";
 
@@ -15,6 +15,10 @@ export async function apiFetch(path: string, init: RequestInit = {}) {
 
   const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
   if (response.status === 401) {
+    clearTokens();
+    if (window.location.pathname !== "/") {
+      window.location.href = "/";
+    }
     throw new Error("Unauthorized");
   }
   if (!response.ok) {

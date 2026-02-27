@@ -13,8 +13,11 @@ def main() -> None:
 
     if not email or not password:
         return
+    if len(password) < 12:
+        raise RuntimeError("SEED_ADMIN_PASSWORD must be at least 12 characters")
 
     with SessionLocal() as db:
+        email = email.lower()
         existing = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
         if existing:
             return

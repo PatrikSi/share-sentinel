@@ -71,7 +71,7 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       JWT_ISSUER: smbguard
       TOKEN_PEPPER: ${TOKEN_PEPPER}
-      CORS_ORIGINS: ${CORS_ORIGINS}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://ui.localhost,http://localhost:3000}
       LOG_LEVEL: INFO
     depends_on:
       db:
@@ -122,9 +122,10 @@ services:
     restart: "no"
 
   ui:
-    build: ./ui
-    environment:
-      VITE_API_BASE_URL: http://api.localhost
+    build:
+      context: ./ui
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://api.localhost}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.ui.rule=Host(`ui.localhost`)"

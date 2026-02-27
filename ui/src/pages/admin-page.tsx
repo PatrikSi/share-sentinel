@@ -13,6 +13,7 @@ export function AdminPage() {
   const [members, setMembers] = useState<Member[]>([]);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
   const [tokens, setTokens] = useState<TokenMeta[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   const [newMemberUserId, setNewMemberUserId] = useState("");
   const [newMemberRole, setNewMemberRole] = useState("viewer");
@@ -20,35 +21,63 @@ export function AdminPage() {
   const [tokenRole, setTokenRole] = useState("operator");
   const [createdToken, setCreatedToken] = useState<string | null>(null);
 
+  const [auditCursor, setAuditCursor] = useState<string | null>(null);
+  const [auditHistory, setAuditHistory] = useState<Array<string | null>>([]);
+  const [auditNext, setAuditNext] = useState<string | null>(null);
+
   useEffect(() => {
-    apiFetch("/projects").then((data) => {
-      const rows = (data || []) as Project[];
-      setProjects(rows);
-      if (rows.length > 0) {
-        setProjectId(rows[0].id);
-      }
-    });
-    apiFetch("/auth/api-tokens").then((data) => setTokens((data || []) as TokenMeta[]));
+    apiFetch("/projects")
+      .then((data) => {
+        const rows = (data || []) as Project[];
+        setProjects(rows);
+        if (rows.length > 0) {
+          setProjectId(rows[0].id);
+        }
+      })
+      .catch((err) => setError(err.message));
+
+    apiFetch("/auth/api-tokens")
+      .then((data) => setTokens((data || []) as TokenMeta[]))
+      .catch((err) => setError(err.message));
   }, []);
 
   useEffect(() => {
-    if (!projectId) return;
-    apiFetch(`/projects/${projectId}/members`).then((data) => setMembers((data?.items || []) as Member[]));
-    apiFetch(`/projects/${projectId}/audit?limit=50`).then((data) => setAudit((data?.items || []) as AuditEvent[]));
+    setAuditCursor(null);
+    setAuditHistory([]);
   }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    apiFetch(`/projects/${projectId}/members`)
+      .then((data) => setMembers((data?.items || []) as Member[]))
+      .catch((err) => setError(err.message));
+
+    const query = new URLSearchParams({ limit: "50" });
+    if (auditCursor) query.set("cursor", auditCursor);
+
+    apiFetch(`/projects/${projectId}/audit?${query.toString()}`)
+      .then((data) => {
+        setAudit((data?.items || []) as AuditEvent[]);
+        setAuditNext((data?.next_cursor as string | null) || null);
+      })
+      .catch((err) => setError(err.message));
+  }, [projectId, auditCursor]);
 
   async function addMember(event: FormEvent) {
     event.preventDefault();
+    if (!projectId) return;
     await apiFetch(`/projects/${projectId}/members`, {
       method: "POST",
       body: JSON.stringify({ user_id: newMemberUserId, role: newMemberRole }),
     });
     const data = await apiFetch(`/projects/${projectId}/members`);
     setMembers((data?.items || []) as Member[]);
+    setNewMemberUserId("");
   }
 
   async function createToken(event: FormEvent) {
     event.preventDefault();
+    if (!projectId) return;
     const data = await apiFetch("/auth/api-tokens", {
       method: "POST",
       body: JSON.stringify({ project_id: projectId, name: tokenName, role: tokenRole }),
@@ -60,6 +89,22 @@ export function AdminPage() {
   async function revokeToken(tokenId: string) {
     await apiFetch(`/auth/api-tokens/${tokenId}`, { method: "DELETE" });
     setTokens((prev) => prev.map((token) => (token.id === tokenId ? { ...token, revoked_at: new Date().toISOString() } : token)));
+  }
+
+  function nextAuditPage() {
+    if (!auditNext) return;
+    setAuditHistory((prev) => [...prev, auditCursor]);
+    setAuditCursor(auditNext);
+  }
+
+  function prevAuditPage() {
+    setAuditHistory((prev) => {
+      if (prev.length === 0) return prev;
+      const copy = [...prev];
+      const previous = copy.pop() ?? null;
+      setAuditCursor(previous);
+      return copy;
+    });
   }
 
   return (
@@ -78,6 +123,8 @@ export function AdminPage() {
           ))}
         </select>
       </div>
+
+      {error ? <p className="text-sm text-red-600">{error}</p> : null}
 
       <div className="grid gap-4 md:grid-cols-2">
         <div className="panel space-y-4">
@@ -99,7 +146,7 @@ export function AdminPage() {
               <option value="operator">operator</option>
               <option value="viewer">viewer</option>
             </select>
-            <button className="rounded-lg bg-pine px-3 py-1 text-sm font-semibold text-white" type="submit">
+            <button className="rounded-lg bg-pine px-3 py-1 text-sm font-semibold text-white" type="submit" disabled={!projectId}>
               Add
             </button>
           </form>
@@ -132,7 +179,7 @@ export function AdminPage() {
               <option value="operator">operator</option>
               <option value="viewer">viewer</option>
             </select>
-            <button className="rounded-lg bg-ember px-3 py-1 text-sm font-semibold text-white" type="submit">
+            <button className="rounded-lg bg-ember px-3 py-1 text-sm font-semibold text-white" type="submit" disabled={!projectId}>
               Create
             </button>
           </form>
@@ -162,7 +209,26 @@ export function AdminPage() {
       </div>
 
       <div className="panel">
-        <h2 className="mb-3 text-lg font-semibold">Audit</h2>
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-lg font-semibold">Audit</h2>
+          <div className="flex items-center gap-2">
+            <button
+              className="rounded border border-slate-300 px-2 py-1 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
+              onClick={prevAuditPage}
+              disabled={auditHistory.length === 0}
+            >
+              Prev
+            </button>
+            <button
+              className="rounded border border-slate-300 px-2 py-1 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
+              onClick={nextAuditPage}
+              disabled={!auditNext}
+            >
+              Next
+            </button>
+          </div>
+        </div>
+
         <table className="data-table">
           <thead>
             <tr>

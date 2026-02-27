@@ -1,13 +1,14 @@
+import asyncio
 import hashlib
-import json
-import os
-import tempfile
+import time
 import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
-from sqlalchemy import and_, cast, delete, func, or_, select, String
+from sqlalchemy import String, cast, delete, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
 from app.db import get_db
@@ -19,7 +20,12 @@ from app.rate_limit import RateLimiter
 from app.schemas import RunCreateIn, RunOut
 from app.services.audit import write_audit_event
 from app.services.queue import enqueue_ingest_job
-from app.services.storage import upload_fileobj
+from app.services.storage import (
+    abort_multipart_upload,
+    complete_multipart_upload,
+    create_multipart_upload,
+    upload_part,
+)
 
 router = APIRouter(prefix="/projects/{project_id}/runs", tags=["runs"])
 rate_limiter = RateLimiter()
@@ -47,6 +53,104 @@ def _to_run_out(run: ScanRun) -> RunOut:
     )
 
 
+async def _enqueue_with_retries(payload: dict, retries: int) -> bool:
+    for attempt in range(retries):
+        try:
+            enqueue_ingest_job(payload)
+            return True
+        except Exception:  # noqa: BLE001
+            if attempt + 1 >= retries:
+                return False
+            await asyncio.sleep(min(2**attempt, 4))
+    return False
+
+
+async def _upload_artifact_stream(
+    request: Request,
+    file: UploadFile | None,
+    key: str,
+    content_type: str | None,
+) -> tuple[int, str]:
+    settings = get_settings()
+    chunk_bytes = max(5 * 1024 * 1024, settings.upload_chunk_bytes)
+
+    upload_id = await run_in_threadpool(create_multipart_upload, key, content_type)
+    sha256 = hashlib.sha256()
+    size = 0
+    part_number = 1
+    parts: list[dict] = []
+    buffer = bytearray()
+
+    async def flush_parts(force: bool = False) -> None:
+        nonlocal part_number
+        while len(buffer) >= chunk_bytes or (force and buffer):
+            if len(buffer) >= chunk_bytes:
+                payload = bytes(buffer[:chunk_bytes])
+                del buffer[:chunk_bytes]
+            else:
+                payload = bytes(buffer)
+                buffer.clear()
+
+            etag = await run_in_threadpool(upload_part, key, upload_id, part_number, payload)
+            parts.append({"ETag": etag, "PartNumber": part_number})
+            part_number += 1
+
+    try:
+        if file:
+            while True:
+                chunk = await run_in_threadpool(file.file.read, chunk_bytes)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > settings.upload_max_bytes:
+                    raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="upload too large")
+                sha256.update(chunk)
+                buffer.extend(chunk)
+                await flush_parts()
+        else:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > settings.upload_max_bytes:
+                    raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="upload too large")
+                sha256.update(chunk)
+                buffer.extend(chunk)
+                await flush_parts()
+
+        if size == 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="empty upload")
+
+        await flush_parts(force=True)
+        await run_in_threadpool(complete_multipart_upload, key, upload_id, parts)
+        return size, sha256.hexdigest()
+    except Exception:
+        await run_in_threadpool(abort_multipart_upload, key, upload_id)
+        raise
+
+
+def _write_read_audit(
+    db: Session,
+    request: Request,
+    auth: AuthContext,
+    project_id: uuid.UUID,
+    action: str,
+    object_type: str,
+    object_id: str,
+    metadata: dict | None = None,
+) -> None:
+    write_audit_event(
+        db,
+        action=action,
+        object_type=object_type,
+        object_id=object_id,
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata={**request_meta(request), **(metadata or {})},
+    )
+
+
 @router.post("", response_model=RunOut)
 def create_run(
     project_id: uuid.UUID,
@@ -68,6 +172,7 @@ def create_run(
         status=RunStatus.PENDING_UPLOAD,
     )
     db.add(run)
+
     write_audit_event(
         db,
         action="RUN_CREATED",
@@ -78,7 +183,12 @@ def create_run(
         project_id=project_id,
         metadata=request_meta(request),
     )
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run already exists") from exc
+
     db.refresh(run)
     return _to_run_out(run)
 
@@ -86,6 +196,7 @@ def create_run(
 @router.get("", response_model=dict)
 def list_runs(
     project_id: uuid.UUID,
+    request: Request,
     limit: int = Query(default=50, ge=1, le=200),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -102,6 +213,19 @@ def list_runs(
         .limit(limit)
     )
     runs = db.execute(stmt).scalars().all()
+
+    _write_read_audit(
+        db,
+        request,
+        auth,
+        project_id,
+        action="RUNS_LISTED",
+        object_type="project",
+        object_id=str(project_id),
+        metadata={"limit": limit, "cursor": cursor, "result_count": len(runs)},
+    )
+    db.commit()
+
     return {
         "items": [_to_run_out(r).model_dump(mode="json") for r in runs],
         "next_cursor": next_cursor(offset, limit, len(runs)),
@@ -112,11 +236,23 @@ def list_runs(
 def get_run(
     project_id: uuid.UUID,
     run_id: uuid.UUID,
+    request: Request,
     db: Session = Depends(get_db),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     run = _get_run(db, project_id, run_id)
+
+    _write_read_audit(
+        db,
+        request,
+        auth,
+        project_id,
+        action="RUN_VIEWED",
+        object_type="scan_run",
+        object_id=str(run_id),
+    )
+    db.commit()
     return _to_run_out(run)
 
 
@@ -155,7 +291,8 @@ async def upload_artifact(
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
-    rate_limiter.check(request, "artifact_upload", limit=30, window_seconds=60)
+    actor_key = str(auth.token_id or auth.user_id or "anon")
+    rate_limiter.check(request, "artifact_upload", limit=30, window_seconds=60, actor_key=f"upload:{actor_key}", fail_open=False)
 
     settings = get_settings()
     run = _get_run(db, project_id, run_id)
@@ -166,60 +303,16 @@ async def upload_artifact(
     suffix = ".ndjson.gz" if "gzip" in (content_type or "") else ".ndjson"
     key = f"projects/{project_id}/runs/{run_id}/artifact{suffix}"
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        temp_path = tmp.name
-
-    sha256 = hashlib.sha256()
-    size = 0
-
-    try:
-        with open(temp_path, "wb") as out:
-            if file:
-                while True:
-                    chunk = file.file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if size > settings.upload_max_bytes:
-                        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="upload too large")
-                    sha256.update(chunk)
-                    out.write(chunk)
-            else:
-                async for chunk in request.stream():
-                    if not chunk:
-                        continue
-                    size += len(chunk)
-                    if size > settings.upload_max_bytes:
-                        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="upload too large")
-                    sha256.update(chunk)
-                    out.write(chunk)
-
-        if size == 0:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="empty upload")
-
-        with open(temp_path, "rb") as up:
-            upload_fileobj(up, key=key, content_type=content_type)
-
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
+    started = time.perf_counter()
+    size, digest = await _upload_artifact_stream(request, file, key, content_type)
 
     run.artifact_key = key
     run.artifact_size = size
-    run.artifact_sha256 = sha256.hexdigest()
+    run.artifact_sha256 = digest
     run.artifact_content_type = content_type
     run.status = RunStatus.UPLOADED
     run.ingest_progress = {"line_offset": 0}
-
-    enqueue_ingest_job(
-        {
-            "run_id": str(run.id),
-            "project_id": str(project_id),
-            "artifact_key": key,
-            "schema_version": 1,
-            "uploaded_at": datetime.now(tz=UTC).isoformat(),
-        }
-    )
+    db.add(run)
 
     write_audit_event(
         db,
@@ -229,18 +322,60 @@ async def upload_artifact(
         actor_user_id=auth.user_id,
         actor_token_id=auth.token_id,
         project_id=project_id,
-        metadata={**request_meta(request), "size": size, "content_type": content_type},
+        metadata={
+            **request_meta(request),
+            "size": size,
+            "content_type": content_type,
+            "upload_ms": int((time.perf_counter() - started) * 1000),
+        },
     )
-
-    db.add(run)
     db.commit()
-    return {"ok": True, "run_id": str(run.id), "artifact_key": key}
+
+    payload = {
+        "run_id": str(run.id),
+        "project_id": str(project_id),
+        "artifact_key": key,
+        "schema_version": 1,
+        "uploaded_at": datetime.now(tz=UTC).isoformat(),
+    }
+    queued = await _enqueue_with_retries(payload, settings.redis_stream_retries)
+    if queued:
+        write_audit_event(
+            db,
+            action="INGEST_QUEUED",
+            object_type="scan_run",
+            object_id=str(run.id),
+            actor_user_id=auth.user_id,
+            actor_token_id=auth.token_id,
+            project_id=project_id,
+            metadata=request_meta(request),
+        )
+    else:
+        write_audit_event(
+            db,
+            action="INGEST_QUEUE_FALLBACK",
+            object_type="scan_run",
+            object_id=str(run.id),
+            actor_user_id=auth.user_id,
+            actor_token_id=auth.token_id,
+            project_id=project_id,
+            metadata={**request_meta(request), "reason": "redis enqueue failed"},
+        )
+    db.commit()
+
+    return {
+        "ok": True,
+        "run_id": str(run.id),
+        "artifact_key": key,
+        "queued": queued,
+    }
 
 
 @router.get("/{run_id}/endpoints")
 def list_endpoints(
     project_id: uuid.UUID,
     run_id: uuid.UUID,
+    request: Request,
     search: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
@@ -266,6 +401,19 @@ def list_endpoints(
 
     stmt = stmt.order_by(Endpoint.id.asc()).offset(offset).limit(limit)
     rows = db.execute(stmt).scalars().all()
+
+    _write_read_audit(
+        db,
+        request,
+        auth,
+        project_id,
+        action="ENDPOINTS_LISTED",
+        object_type="scan_run",
+        object_id=str(run_id),
+        metadata={"search": search, "limit": limit, "cursor": cursor, "result_count": len(rows)},
+    )
+    db.commit()
+
     return {
         "items": [
             {
@@ -289,6 +437,7 @@ def endpoint_resources(
     project_id: uuid.UUID,
     run_id: uuid.UUID,
     endpoint_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     auth: AuthContext = Depends(get_auth_context),
 ):
@@ -301,6 +450,19 @@ def endpoint_resources(
         .order_by(Resource.id.asc())
     )
     resources = db.execute(stmt).scalars().all()
+
+    _write_read_audit(
+        db,
+        request,
+        auth,
+        project_id,
+        action="RESOURCES_LISTED",
+        object_type="endpoint",
+        object_id=str(endpoint_id),
+        metadata={"run_id": str(run_id), "result_count": len(resources)},
+    )
+    db.commit()
+
     return {
         "items": [
             {
@@ -320,6 +482,7 @@ def resource_items(
     project_id: uuid.UUID,
     run_id: uuid.UUID,
     resource_id: int,
+    request: Request,
     search: str | None = None,
     path_prefix: str | None = None,
     limit: int = Query(default=200, ge=1, le=1000),
@@ -340,6 +503,26 @@ def resource_items(
 
     stmt = stmt.order_by(Item.id.asc()).offset(offset).limit(limit)
     items = db.execute(stmt).scalars().all()
+
+    _write_read_audit(
+        db,
+        request,
+        auth,
+        project_id,
+        action="ITEMS_LISTED",
+        object_type="resource",
+        object_id=str(resource_id),
+        metadata={
+            "run_id": str(run_id),
+            "search": search,
+            "path_prefix": path_prefix,
+            "limit": limit,
+            "cursor": cursor,
+            "result_count": len(items),
+        },
+    )
+    db.commit()
+
     return {
         "items": [
             {
@@ -360,6 +543,7 @@ def resource_items(
 def search_items(
     project_id: uuid.UUID,
     run_id: uuid.UUID,
+    request: Request,
     q: str | None = None,
     ext: str | None = None,
     limit: int = Query(default=200, ge=1, le=1000),
@@ -381,6 +565,19 @@ def search_items(
 
     stmt = stmt.order_by(Item.id.asc()).offset(offset).limit(limit)
     items = db.execute(stmt).scalars().all()
+
+    _write_read_audit(
+        db,
+        request,
+        auth,
+        project_id,
+        action="ITEMS_SEARCHED",
+        object_type="scan_run",
+        object_id=str(run_id),
+        metadata={"q": q, "ext": ext, "limit": limit, "cursor": cursor, "result_count": len(items)},
+    )
+    db.commit()
+
     return {
         "items": [
             {

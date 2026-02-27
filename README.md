@@ -42,5 +42,6 @@ docker compose up --build
 ## Notes
 
 - v1 ingestion is async and idempotent via unique DB constraints.
+- Worker performs resume-aware ingestion (`line_offset`) and reconciliation for runs left in `UPLOADED`.
 - API attaches `X-Request-ID` to every response.
 - Upload and auth endpoints have Redis-backed fixed-window rate limiting.

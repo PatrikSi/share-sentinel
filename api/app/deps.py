@@ -49,17 +49,18 @@ def get_auth_context(
     if token.count(".") == 2:
         try:
             payload = decode_access_token(token)
-        except JWTError as exc:
-            raise _unauthorized("invalid access token") from exc
-        try:
-            user_id = uuid.UUID(payload["sub"])
-        except Exception as exc:  # noqa: BLE001
-            raise _unauthorized("invalid access token subject") from exc
+            try:
+                user_id = uuid.UUID(payload["sub"])
+            except Exception as exc:  # noqa: BLE001
+                raise _unauthorized("invalid access token subject") from exc
 
-        user = db.get(User, user_id)
-        if not user or not user.is_active:
-            raise _unauthorized("user not active")
-        return AuthContext(user_id=user_id, token_id=None, token_project_id=None, token_role=None)
+            user = db.get(User, user_id)
+            if not user or not user.is_active:
+                raise _unauthorized("user not active")
+            return AuthContext(user_id=user_id, token_id=None, token_project_id=None, token_role=None)
+        except JWTError:
+            # Fallback to API token lookup for token strings that resemble JWTs.
+            pass
 
     token_hash = hash_external_token(token)
     stmt = select(ApiToken).where(ApiToken.token_hash == token_hash, ApiToken.revoked_at.is_(None))
