@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { apiFetch } from "@/lib/api";
@@ -47,6 +47,43 @@ type InventoryEndpoint = {
 };
 
 type Tab = "items" | "resources" | "endpoints";
+type ItemColumnKey = "path" | "name" | "resource_name" | "access_level" | "endpoint_key" | "hostname" | "ip" | "run_name" | "run_id" | "is_dir";
+type ResourceColumnKey = "name" | "access_level" | "endpoint_key" | "hostname" | "item_count" | "run_name" | "run_id" | "remark";
+type EndpointColumnKey = "endpoint_key" | "hostname" | "ip" | "domain" | "smb_signing" | "resource_count" | "item_count" | "run_name" | "run_id";
+
+const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
+  { key: "path", label: "Path" },
+  { key: "name", label: "Name" },
+  { key: "resource_name", label: "Share" },
+  { key: "access_level", label: "Share Access" },
+  { key: "endpoint_key", label: "Endpoint Key" },
+  { key: "hostname", label: "Hostname" },
+  { key: "ip", label: "IP" },
+  { key: "run_name", label: "Run Name" },
+  { key: "run_id", label: "Run ID" },
+  { key: "is_dir", label: "Type" },
+];
+const RESOURCE_COLUMN_OPTIONS: Array<{ key: ResourceColumnKey; label: string }> = [
+  { key: "name", label: "Share" },
+  { key: "access_level", label: "Access" },
+  { key: "endpoint_key", label: "Endpoint Key" },
+  { key: "hostname", label: "Hostname" },
+  { key: "item_count", label: "Items" },
+  { key: "run_name", label: "Run Name" },
+  { key: "run_id", label: "Run ID" },
+  { key: "remark", label: "Remark" },
+];
+const ENDPOINT_COLUMN_OPTIONS: Array<{ key: EndpointColumnKey; label: string }> = [
+  { key: "endpoint_key", label: "Endpoint Key" },
+  { key: "hostname", label: "Hostname" },
+  { key: "ip", label: "IP" },
+  { key: "domain", label: "Domain" },
+  { key: "smb_signing", label: "Signing" },
+  { key: "resource_count", label: "Shares" },
+  { key: "item_count", label: "Items" },
+  { key: "run_name", label: "Run Name" },
+  { key: "run_id", label: "Run ID" },
+];
 
 export function ProjectInventoryPage() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -73,6 +110,9 @@ export function ProjectInventoryPage() {
   const [nextCursor, setNextCursor] = useState<string | null>(null);
 
   const [error, setError] = useState<string | null>(null);
+  const [itemColumns, setItemColumns] = useState<ItemColumnKey[]>(["path", "name", "resource_name", "hostname", "run_name", "is_dir"]);
+  const [resourceColumns, setResourceColumns] = useState<ResourceColumnKey[]>(["name", "access_level", "hostname", "item_count", "run_name", "remark"]);
+  const [endpointColumns, setEndpointColumns] = useState<EndpointColumnKey[]>(["endpoint_key", "hostname", "domain", "resource_count", "item_count", "run_name"]);
 
   const runIdsParam = useMemo(() => selectedRunIds.join(","), [selectedRunIds]);
   const endpointQuery = useMemo(() => [query.trim(), endpointFilter.trim()].filter(Boolean).join(" "), [query, endpointFilter]);
@@ -162,6 +202,72 @@ export function ProjectInventoryPage() {
       setCursor(previous);
       return copy;
     });
+  }
+
+  function toggleItemColumn(column: ItemColumnKey) {
+    setItemColumns((prev) => {
+      if (prev.includes(column)) {
+        if (prev.length === 1) return prev;
+        return prev.filter((key) => key !== column);
+      }
+      return [...prev, column];
+    });
+  }
+
+  function toggleResourceColumn(column: ResourceColumnKey) {
+    setResourceColumns((prev) => {
+      if (prev.includes(column)) {
+        if (prev.length === 1) return prev;
+        return prev.filter((key) => key !== column);
+      }
+      return [...prev, column];
+    });
+  }
+
+  function toggleEndpointColumn(column: EndpointColumnKey) {
+    setEndpointColumns((prev) => {
+      if (prev.includes(column)) {
+        if (prev.length === 1) return prev;
+        return prev.filter((key) => key !== column);
+      }
+      return [...prev, column];
+    });
+  }
+
+  function itemCell(row: InventoryItem, column: ItemColumnKey): ReactNode {
+    if (column === "path") return <span className="font-mono text-xs">{row.path}</span>;
+    if (column === "name") return row.name;
+    if (column === "resource_name") return row.resource_name;
+    if (column === "access_level") return row.access_level;
+    if (column === "endpoint_key") return row.endpoint_key;
+    if (column === "hostname") return row.hostname || "-";
+    if (column === "ip") return row.ip || "-";
+    if (column === "run_name") return row.run_name;
+    if (column === "run_id") return <span className="font-mono text-xs">{row.run_id}</span>;
+    return row.is_dir ? "directory" : "file";
+  }
+
+  function resourceCell(row: InventoryResource, column: ResourceColumnKey): ReactNode {
+    if (column === "name") return row.name;
+    if (column === "access_level") return row.access_level;
+    if (column === "endpoint_key") return row.endpoint_key;
+    if (column === "hostname") return row.hostname || "-";
+    if (column === "item_count") return row.item_count;
+    if (column === "run_name") return row.run_name;
+    if (column === "run_id") return <span className="font-mono text-xs">{row.run_id}</span>;
+    return row.remark || "-";
+  }
+
+  function endpointCell(row: InventoryEndpoint, column: EndpointColumnKey): ReactNode {
+    if (column === "endpoint_key") return row.endpoint_key;
+    if (column === "hostname") return row.hostname || "-";
+    if (column === "ip") return row.ip || "-";
+    if (column === "domain") return row.domain || "-";
+    if (column === "smb_signing") return row.smb_signing || "-";
+    if (column === "resource_count") return row.resource_count;
+    if (column === "item_count") return row.item_count;
+    if (column === "run_name") return row.run_name;
+    return <span className="font-mono text-xs">{row.run_id}</span>;
   }
 
   return (
@@ -289,6 +395,49 @@ export function ProjectInventoryPage() {
           </div>
 
           <div className="flex items-center justify-end gap-2">
+            <details className="relative">
+              <summary className="list-none cursor-pointer rounded border border-slate-300 px-3 py-1 text-xs font-semibold uppercase dark:border-slate-700">
+                Columns
+              </summary>
+              <div className="absolute right-0 z-10 mt-1 w-56 rounded-lg border border-slate-300 bg-white p-2 shadow-lg dark:border-slate-700 dark:bg-slate-900">
+                {activeTab === "items"
+                  ? ITEM_COLUMN_OPTIONS.map((column) => (
+                      <label className="mb-1 flex items-center gap-2 text-xs" key={column.key}>
+                        <input
+                          type="checkbox"
+                          checked={itemColumns.includes(column.key)}
+                          onChange={() => toggleItemColumn(column.key)}
+                        />
+                        <span>{column.label}</span>
+                      </label>
+                    ))
+                  : null}
+                {activeTab === "resources"
+                  ? RESOURCE_COLUMN_OPTIONS.map((column) => (
+                      <label className="mb-1 flex items-center gap-2 text-xs" key={column.key}>
+                        <input
+                          type="checkbox"
+                          checked={resourceColumns.includes(column.key)}
+                          onChange={() => toggleResourceColumn(column.key)}
+                        />
+                        <span>{column.label}</span>
+                      </label>
+                    ))
+                  : null}
+                {activeTab === "endpoints"
+                  ? ENDPOINT_COLUMN_OPTIONS.map((column) => (
+                      <label className="mb-1 flex items-center gap-2 text-xs" key={column.key}>
+                        <input
+                          type="checkbox"
+                          checked={endpointColumns.includes(column.key)}
+                          onChange={() => toggleEndpointColumn(column.key)}
+                        />
+                        <span>{column.label}</span>
+                      </label>
+                    ))
+                  : null}
+              </div>
+            </details>
             <button
               className="rounded border border-slate-300 px-3 py-1 text-xs font-semibold uppercase disabled:opacity-50 dark:border-slate-700"
               disabled={cursorHistory.length === 0}
@@ -345,26 +494,17 @@ export function ProjectInventoryPage() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>Path</th>
-                <th>Name</th>
-                <th>Share</th>
-                <th>Endpoint</th>
-                <th>Run</th>
-                <th>Type</th>
+                {itemColumns.map((column) => (
+                  <th key={column}>{ITEM_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column}</th>
+                ))}
               </tr>
             </thead>
             <tbody>
               {items.map((row) => (
                 <tr key={row.id}>
-                  <td className="font-mono text-xs">{row.path}</td>
-                  <td>{row.name}</td>
-                  <td>{row.resource_name}</td>
-                  <td>{row.hostname || row.endpoint_key || row.ip || "-"}</td>
-                  <td className="text-xs">
-                    <div>{row.run_name}</div>
-                    <div className="font-mono text-slate-500">{row.run_id}</div>
-                  </td>
-                  <td>{row.is_dir ? "directory" : "file"}</td>
+                  {itemColumns.map((column) => (
+                    <td key={`${row.id}-${column}`}>{itemCell(row, column)}</td>
+                  ))}
                 </tr>
               ))}
             </tbody>
@@ -375,26 +515,17 @@ export function ProjectInventoryPage() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>Share</th>
-                <th>Access</th>
-                <th>Endpoint</th>
-                <th>Items</th>
-                <th>Run</th>
-                <th>Remark</th>
+                {resourceColumns.map((column) => (
+                  <th key={column}>{RESOURCE_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column}</th>
+                ))}
               </tr>
             </thead>
             <tbody>
               {resources.map((row) => (
                 <tr key={row.id}>
-                  <td>{row.name}</td>
-                  <td>{row.access_level}</td>
-                  <td>{row.hostname || row.endpoint_key}</td>
-                  <td>{row.item_count}</td>
-                  <td className="text-xs">
-                    <div>{row.run_name}</div>
-                    <div className="font-mono text-slate-500">{row.run_id}</div>
-                  </td>
-                  <td>{row.remark || "-"}</td>
+                  {resourceColumns.map((column) => (
+                    <td key={`${row.id}-${column}`}>{resourceCell(row, column)}</td>
+                  ))}
                 </tr>
               ))}
             </tbody>
@@ -405,28 +536,17 @@ export function ProjectInventoryPage() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>Endpoint</th>
-                <th>Host/IP</th>
-                <th>Domain</th>
-                <th>Signing</th>
-                <th>Shares</th>
-                <th>Items</th>
-                <th>Run</th>
+                {endpointColumns.map((column) => (
+                  <th key={column}>{ENDPOINT_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column}</th>
+                ))}
               </tr>
             </thead>
             <tbody>
               {endpoints.map((row) => (
                 <tr key={row.id}>
-                  <td>{row.endpoint_key}</td>
-                  <td>{row.hostname || row.ip || "-"}</td>
-                  <td>{row.domain || "-"}</td>
-                  <td>{row.smb_signing || "-"}</td>
-                  <td>{row.resource_count}</td>
-                  <td>{row.item_count}</td>
-                  <td className="text-xs">
-                    <div>{row.run_name}</div>
-                    <div className="font-mono text-slate-500">{row.run_id}</div>
-                  </td>
+                  {endpointColumns.map((column) => (
+                    <td key={`${row.id}-${column}`}>{endpointCell(row, column)}</td>
+                  ))}
                 </tr>
               ))}
             </tbody>
