@@ -1,18 +1,16 @@
-"use client";
-
 import { FormEvent, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useNavigate } from "react-router-dom";
 
 import { setTokens } from "@/lib/auth";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "http://localhost:8000";
 
-export default function LoginPage() {
-  const router = useRouter();
+export function LoginPage() {
+  const navigate = useNavigate();
   const [email, setEmail] = useState("admin@example.com");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -20,18 +18,18 @@ export default function LoginPage() {
     setError(null);
 
     try {
-      const res = await fetch(`${API_BASE}/auth/login`, {
+      const response = await fetch(`${API_BASE}/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
       });
-      if (!res.ok) {
-        throw new Error(await res.text());
+      if (!response.ok) {
+        throw new Error(await response.text());
       }
-      const data = await res.json();
+      const data = await response.json();
       setTokens(data.access_token, data.refresh_token);
       localStorage.setItem("share_sentinel_theme", data.user.ui_theme);
-      router.push("/projects");
+      navigate("/projects");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
@@ -50,7 +48,7 @@ export default function LoginPage() {
             className="mt-1 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
             type="email"
             value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            onChange={(event) => setEmail(event.target.value)}
             required
           />
         </label>
@@ -60,7 +58,7 @@ export default function LoginPage() {
             className="mt-1 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
             type="password"
             value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            onChange={(event) => setPassword(event.target.value)}
             required
           />
         </label>

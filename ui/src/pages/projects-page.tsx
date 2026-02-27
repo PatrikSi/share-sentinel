@@ -1,7 +1,5 @@
-"use client";
-
-import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { apiFetch } from "@/lib/api";
 
@@ -14,18 +12,19 @@ type Run = {
   summary: { endpoints?: number; resources?: number; items?: number; errors?: number };
 };
 
-export default function ProjectsPage() {
+export function ProjectsPage() {
   const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProject, setSelectedProject] = useState<string>("");
+  const [selectedProject, setSelectedProject] = useState("");
   const [runs, setRuns] = useState<Run[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     apiFetch("/projects")
       .then((data) => {
-        setProjects(data);
-        if (data.length) {
-          setSelectedProject(data[0].id);
+        const projectRows = (data || []) as Project[];
+        setProjects(projectRows);
+        if (projectRows.length > 0) {
+          setSelectedProject(projectRows[0].id);
         }
       })
       .catch((err) => setError(err.message));
@@ -34,12 +33,12 @@ export default function ProjectsPage() {
   useEffect(() => {
     if (!selectedProject) return;
     apiFetch(`/projects/${selectedProject}/runs?limit=50`)
-      .then((data) => setRuns(data.items || []))
+      .then((data) => setRuns((data?.items || []) as Run[]))
       .catch((err) => setError(err.message));
   }, [selectedProject]);
 
   const selectedProjectName = useMemo(
-    () => projects.find((p) => p.id === selectedProject)?.name || "",
+    () => projects.find((project) => project.id === selectedProject)?.name || "",
     [projects, selectedProject],
   );
 
@@ -53,7 +52,7 @@ export default function ProjectsPage() {
         <select
           className="rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
           value={selectedProject}
-          onChange={(e) => setSelectedProject(e.target.value)}
+          onChange={(event) => setSelectedProject(event.target.value)}
         >
           {projects.map((project) => (
             <option key={project.id} value={project.id}>
@@ -89,7 +88,7 @@ export default function ProjectsPage() {
                 <td>
                   <Link
                     className="rounded-lg border border-slate-300 px-3 py-1 text-xs font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                    href={`/projects/${selectedProject}/runs/${run.id}`}
+                    to={`/projects/${selectedProject}/runs/${run.id}`}
                   >
                     Open
                   </Link>

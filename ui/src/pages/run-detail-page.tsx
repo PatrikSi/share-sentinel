@@ -1,15 +1,14 @@
-"use client";
-
 import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
 
 import { apiFetch } from "@/lib/api";
 
-type Endpoint = { id: number; endpoint_key: string; ip?: string; hostname?: string };
+type Endpoint = { id: number; endpoint_key: string };
 type Resource = { id: number; name: string; access_level: string };
-type Item = { id: number; path: string; name: string; is_dir: boolean };
+type Item = { id: number; path: string; is_dir: boolean };
 
-export default function RunDetailPage({ params }: { params: { projectId: string; runId: string } }) {
-  const { projectId, runId } = params;
+export function RunDetailPage() {
+  const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
 
   const [endpointSearch, setEndpointSearch] = useState("");
   const [itemSearch, setItemSearch] = useState("");
@@ -20,27 +19,34 @@ export default function RunDetailPage({ params }: { params: { projectId: string;
   const [selectedResource, setSelectedResource] = useState<number | null>(null);
 
   useEffect(() => {
-    apiFetch(`/projects/${projectId}/runs/${runId}/endpoints?search=${encodeURIComponent(endpointSearch)}&limit=100`).then((d) => {
-      const list = d.items || [];
-      setEndpoints(list);
-      if (!selectedEndpoint && list.length) setSelectedEndpoint(list[0].id);
-    });
+    if (!projectId || !runId) return;
+    apiFetch(`/projects/${projectId}/runs/${runId}/endpoints?search=${encodeURIComponent(endpointSearch)}&limit=100`).then(
+      (data) => {
+        const rows = (data?.items || []) as Endpoint[];
+        setEndpoints(rows);
+        if (!selectedEndpoint && rows.length > 0) {
+          setSelectedEndpoint(rows[0].id);
+        }
+      },
+    );
   }, [projectId, runId, endpointSearch, selectedEndpoint]);
 
   useEffect(() => {
-    if (!selectedEndpoint) return;
-    apiFetch(`/projects/${projectId}/runs/${runId}/endpoints/${selectedEndpoint}/resources`).then((d) => {
-      const list = d.items || [];
-      setResources(list);
-      if (list.length) setSelectedResource(list[0].id);
+    if (!projectId || !runId || !selectedEndpoint) return;
+    apiFetch(`/projects/${projectId}/runs/${runId}/endpoints/${selectedEndpoint}/resources`).then((data) => {
+      const rows = (data?.items || []) as Resource[];
+      setResources(rows);
+      if (rows.length > 0) {
+        setSelectedResource(rows[0].id);
+      }
     });
   }, [projectId, runId, selectedEndpoint]);
 
   useEffect(() => {
-    if (!selectedResource) return;
+    if (!projectId || !runId || !selectedResource) return;
     apiFetch(
       `/projects/${projectId}/runs/${runId}/resources/${selectedResource}/items?search=${encodeURIComponent(itemSearch)}&limit=200`,
-    ).then((d) => setItems(d.items || []));
+    ).then((data) => setItems((data?.items || []) as Item[]));
   }, [projectId, runId, selectedResource, itemSearch]);
 
   return (
@@ -58,7 +64,7 @@ export default function RunDetailPage({ params }: { params: { projectId: string;
               className="w-40 rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
               placeholder="Search"
               value={endpointSearch}
-              onChange={(e) => setEndpointSearch(e.target.value)}
+              onChange={(event) => setEndpointSearch(event.target.value)}
             />
           </div>
           <ul className="space-y-2">
@@ -107,7 +113,7 @@ export default function RunDetailPage({ params }: { params: { projectId: string;
               className="w-40 rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
               placeholder="Search"
               value={itemSearch}
-              onChange={(e) => setItemSearch(e.target.value)}
+              onChange={(event) => setItemSearch(event.target.value)}
             />
           </div>
           <ul className="max-h-[420px] space-y-2 overflow-auto">

@@ -1,18 +1,15 @@
-"use client";
-
-import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import { clearTokens } from "@/lib/auth";
-import { ThemeToggle } from "./theme-toggle";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 export function TopNav() {
-  const pathname = usePathname();
-  const router = useRouter();
+  const location = useLocation();
+  const navigate = useNavigate();
 
   function logout() {
     clearTokens();
-    router.push("/");
+    navigate("/");
   }
 
   return (
@@ -20,10 +17,10 @@ export function TopNav() {
       <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
         <div className="flex items-center gap-4 text-sm font-semibold uppercase tracking-[0.2em] text-slate-700 dark:text-slate-200">
           <span>Share Sentinel</span>
-          <Link className={pathname.startsWith("/projects") ? "text-ember" : ""} href="/projects">
+          <Link className={location.pathname.startsWith("/projects") ? "text-ember" : ""} to="/projects">
             Projects
           </Link>
-          <Link className={pathname.startsWith("/admin") ? "text-ember" : ""} href="/admin">
+          <Link className={location.pathname.startsWith("/admin") ? "text-ember" : ""} to="/admin">
             Admin
           </Link>
         </div>

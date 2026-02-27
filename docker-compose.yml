@@ -124,7 +124,7 @@ services:
   ui:
     build: ./ui
     environment:
-      NEXT_PUBLIC_API_BASE_URL: http://api.localhost
+      VITE_API_BASE_URL: http://api.localhost
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.ui.rule=Host(`ui.localhost`)"
