@@ -2,6 +2,14 @@ import { clearTokens, getAccessToken, getRefreshToken, setTokens } from "@/lib/a
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "/api";
 
+function loginRedirectPath(): string {
+  const next = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (!next || next === "/") {
+    return "/";
+  }
+  return `/?next=${encodeURIComponent(next)}`;
+}
+
 function toErrorMessage(body: string, status: number): string {
   if (!body) return `Request failed (${status})`;
   try {
@@ -58,9 +66,7 @@ export async function apiFetch(path: string, init: RequestInit = {}, allowRefres
       }
     }
     clearTokens();
-    if (window.location.pathname !== "/") {
-      window.location.href = "/";
-    }
+    window.location.href = loginRedirectPath();
     throw new Error("Unauthorized");
   }
   if (!response.ok) {

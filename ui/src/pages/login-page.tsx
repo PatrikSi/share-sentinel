@@ -1,16 +1,31 @@
 import { FormEvent, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Navigate, useLocation, useNavigate } from "react-router-dom";
 
-import { setTokens } from "@/lib/auth";
+import { getAccessToken, setTokens } from "@/lib/auth";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "/api";
 
+function resolveNextPath(raw: string | null): string {
+  if (!raw || !raw.startsWith("/") || raw.startsWith("//")) {
+    return "/projects";
+  }
+  return raw === "/" ? "/projects" : raw;
+}
+
 export function LoginPage() {
+  const location = useLocation();
   const navigate = useNavigate();
+  const authenticated = !!getAccessToken();
+  const next = new URLSearchParams(location.search).get("next");
+  const nextPath = resolveNextPath(next);
   const [email, setEmail] = useState("admin@example.com");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  if (authenticated) {
+    return <Navigate to={nextPath} replace />;
+  }
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -29,7 +44,7 @@ export function LoginPage() {
       const data = await response.json();
       setTokens(data.access_token, data.refresh_token);
       localStorage.setItem("share_sentinel_theme", data.user.ui_theme);
-      navigate("/projects");
+      navigate(nextPath, { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
