@@ -1,0 +1,139 @@
+version: "3.9"
+
+services:
+  gateway:
+    image: traefik:v3.0
+    command:
+      - "--api.dashboard=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    depends_on:
+      - api
+      - ui
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: smbguard
+      POSTGRES_USER: smbguard
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smbguard -d smbguard"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+
+  minio:
+    image: minio/minio:RELEASE.2025-01-20T00-00-00Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniadata:/data
+
+  create-bucket:
+    image: minio/mc:RELEASE.2025-01-17T23-25-50Z
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb -p local/smbguard-artifacts || true
+      "
+    restart: "no"
+
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql+psycopg://smbguard:${POSTGRES_PASSWORD}@db:5432/smbguard
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: smbguard-artifacts
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ISSUER: smbguard
+      TOKEN_PEPPER: ${TOKEN_PEPPER}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      LOG_LEVEL: INFO
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      create-bucket:
+        condition: service_completed_successfully
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`api.localhost`)"
+      - "traefik.http.routers.api.entrypoints=web"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
+
+  worker:
+    build: ./worker
+    environment:
+      DATABASE_URL: postgresql+psycopg://smbguard:${POSTGRES_PASSWORD}@db:5432/smbguard
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: smbguard-artifacts
+      LOG_LEVEL: INFO
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      create-bucket:
+        condition: service_completed_successfully
+
+  migrations:
+    build: ./api
+    command: ["bash", "-lc", "alembic upgrade head && python -m app.seed"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://smbguard:${POSTGRES_PASSWORD}@db:5432/smbguard
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD}
+      TOKEN_PEPPER: ${TOKEN_PEPPER}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  ui:
+    build: ./ui
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://api.localhost
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ui.rule=Host(`ui.localhost`)"
+      - "traefik.http.routers.ui.entrypoints=web"
+      - "traefik.http.services.ui.loadbalancer.server.port=3000"
+
+volumes:
+  pgdata:
+  redisdata:
+  miniadata:
