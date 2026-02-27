@@ -39,15 +39,15 @@ export function ThemeToggle() {
   }
 
   return (
-    <div className="flex items-center gap-2 rounded-full border border-slate-300 bg-white/70 p-1 text-xs dark:border-slate-700 dark:bg-slate-900/70">
+    <div className="flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-900 p-1 text-xs">
       {THEMES.map((entry) => (
         <button
           key={entry}
           onClick={() => updateTheme(entry)}
-          className={`rounded-full px-3 py-1 uppercase tracking-wide transition ${
+          className={`rounded-md px-2 py-1 uppercase tracking-wide transition ${
             theme === entry
-              ? "bg-ember text-white"
-              : "text-slate-700 hover:bg-slate-200 dark:text-slate-200 dark:hover:bg-slate-700"
+              ? "bg-emerald-600 text-white"
+              : "text-slate-300 hover:bg-slate-700"
           }`}
         >
           {entry}

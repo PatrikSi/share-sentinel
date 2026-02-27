@@ -5,13 +5,25 @@
 @tailwind utilities;
 
 :root {
-  --bg-start: #f8fafc;
-  --bg-end: #e2e8f0;
+  --app-bg: #f1f5f9;
+  --app-panel: #ffffff;
+  --app-border: #d6dee8;
+  --app-sidebar-bg: #0f172a;
+  --app-sidebar-border: #1f2937;
+  --app-sidebar-text: #cbd5e1;
+  --app-sidebar-active-bg: #1e293b;
+  --app-sidebar-active-text: #f8fafc;
 }
 
 .dark {
-  --bg-start: #020617;
-  --bg-end: #0f172a;
+  --app-bg: #020617;
+  --app-panel: #0b1220;
+  --app-border: #1e293b;
+  --app-sidebar-bg: #020617;
+  --app-sidebar-border: #1e293b;
+  --app-sidebar-text: #94a3b8;
+  --app-sidebar-active-bg: #111827;
+  --app-sidebar-active-text: #f8fafc;
 }
 
 html,
@@ -22,14 +34,14 @@ body,
 
 body {
   @apply m-0 font-sans text-slate-900 dark:text-slate-100;
-  background:
-    radial-gradient(circle at 15% 20%, rgba(234, 88, 12, 0.18), transparent 30%),
-    radial-gradient(circle at 80% 0%, rgba(20, 83, 45, 0.2), transparent 30%),
-    linear-gradient(145deg, var(--bg-start), var(--bg-end));
+  background: var(--app-bg);
 }
 
 .panel {
-  @apply rounded-2xl border border-slate-200/70 bg-white/80 p-4 shadow-panel backdrop-blur dark:border-slate-800 dark:bg-slate-950/70;
+  @apply rounded-xl p-4;
+  background: var(--app-panel);
+  border: 1px solid var(--app-border);
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.04);
 }
 
 .data-table {
@@ -42,4 +54,85 @@ body {
 
 .data-table td {
   @apply border-b border-slate-100 px-3 py-2 dark:border-slate-800;
+}
+
+.app-shell {
+  @apply flex min-h-screen;
+}
+
+.app-sidebar {
+  @apply hidden w-64 shrink-0 flex-col border-r px-4 py-5 lg:flex;
+  background: var(--app-sidebar-bg);
+  border-color: var(--app-sidebar-border);
+}
+
+.app-sidebar-brand {
+  @apply mb-6 border-b border-slate-800/60 pb-4;
+}
+
+.app-sidebar-eyebrow {
+  @apply text-[11px] font-semibold uppercase tracking-widest text-slate-400;
+}
+
+.app-sidebar-title {
+  @apply m-0 text-lg font-semibold lowercase tracking-wide text-slate-100;
+}
+
+.app-sidebar-nav {
+  @apply flex flex-1 flex-col gap-1;
+}
+
+.app-sidebar-link {
+  @apply rounded-lg px-3 py-2 text-sm font-medium transition;
+  color: var(--app-sidebar-text);
+}
+
+.app-sidebar-link:hover {
+  background: rgba(30, 41, 59, 0.55);
+  color: #f8fafc;
+}
+
+.app-sidebar-link.is-active {
+  background: var(--app-sidebar-active-bg);
+  color: var(--app-sidebar-active-text);
+}
+
+.app-sidebar-footer {
+  @apply border-t border-slate-800/60 pt-4;
+}
+
+.app-logout-btn {
+  @apply w-full rounded-lg border px-3 py-2 text-xs font-semibold uppercase tracking-wider transition;
+  border-color: #334155;
+  color: #e2e8f0;
+}
+
+.app-logout-btn:hover {
+  background: #111827;
+}
+
+.app-main {
+  @apply flex min-h-screen flex-1 flex-col;
+}
+
+.app-topbar {
+  @apply border-b px-5 py-4 lg:px-8;
+  background: var(--app-panel);
+  border-color: var(--app-border);
+}
+
+.app-topbar-title {
+  @apply m-0 text-lg font-semibold;
+}
+
+.app-topbar-subtitle {
+  @apply mt-1 text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400;
+}
+
+.app-content {
+  @apply flex-1 space-y-5 px-5 py-5 lg:px-8;
+}
+
+.app-login-main {
+  @apply mx-auto max-w-7xl px-4 pb-8;
 }

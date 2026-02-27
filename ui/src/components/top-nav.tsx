@@ -12,28 +12,41 @@ export function TopNav() {
     navigate("/");
   }
 
+  const navItems = [
+    { to: "/projects", label: "Operations", match: "/projects" },
+    { to: "/admin", label: "Administration", match: "/admin" },
+  ];
+
   return (
-    <header className="sticky top-0 z-10 mb-6 border-b border-slate-200/70 bg-white/80 backdrop-blur dark:border-slate-800 dark:bg-slate-950/80">
-      <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
-        <div className="flex items-center gap-4 text-sm font-semibold uppercase tracking-[0.2em] text-slate-700 dark:text-slate-200">
-          <span>Share Sentinel</span>
-          <Link className={location.pathname.startsWith("/projects") ? "text-ember" : ""} to="/projects">
-            Projects
-          </Link>
-          <Link className={location.pathname.startsWith("/admin") ? "text-ember" : ""} to="/admin">
-            Admin
-          </Link>
-        </div>
-        <div className="flex items-center gap-3">
-          <ThemeToggle />
-          <button
-            className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-widest hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-            onClick={logout}
-          >
-            Logout
-          </button>
-        </div>
+    <aside className="app-sidebar">
+      <div className="app-sidebar-brand">
+        <p className="app-sidebar-eyebrow">Platform</p>
+        <h1 className="app-sidebar-title">share-sentinel</h1>
       </div>
-    </header>
+
+      <nav className="app-sidebar-nav">
+        {navItems.map((item) => (
+          <Link
+            className={`app-sidebar-link ${location.pathname.startsWith(item.match) ? "is-active" : ""}`}
+            key={item.to}
+            to={item.to}
+          >
+            {item.label}
+          </Link>
+        ))}
+      </nav>
+
+      <div className="app-sidebar-footer">
+        <div className="mb-3">
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+            Theme
+          </p>
+          <ThemeToggle />
+        </div>
+        <button className="app-logout-btn" onClick={logout}>
+          Logout
+        </button>
+      </div>
+    </aside>
   );
 }

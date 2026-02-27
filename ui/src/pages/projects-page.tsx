@@ -269,7 +269,7 @@ export function ProjectsPage() {
         <div>
           <h1 className="text-2xl font-bold">Projects & Ingestion</h1>
           <p className="text-sm text-slate-600 dark:text-slate-300">
-            BloodHound-style workflow: choose project, create run, upload artifact, and monitor ingestion.
+            Choose project, create run, upload artifact, and monitor ingestion.
           </p>
         </div>
         <div className="space-y-2">
