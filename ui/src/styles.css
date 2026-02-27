@@ -5,25 +5,15 @@
 @tailwind utilities;
 
 :root {
-  --app-bg: #f1f5f9;
+  --app-bg: #edf2f7;
   --app-panel: #ffffff;
-  --app-border: #d6dee8;
-  --app-sidebar-bg: #0f172a;
-  --app-sidebar-border: #1f2937;
-  --app-sidebar-text: #cbd5e1;
-  --app-sidebar-active-bg: #1e293b;
-  --app-sidebar-active-text: #f8fafc;
+  --app-border: #d2dbe7;
 }
 
 .dark {
   --app-bg: #020617;
-  --app-panel: #0b1220;
+  --app-panel: #0b1422;
   --app-border: #1e293b;
-  --app-sidebar-bg: #020617;
-  --app-sidebar-border: #1e293b;
-  --app-sidebar-text: #94a3b8;
-  --app-sidebar-active-bg: #111827;
-  --app-sidebar-active-text: #f8fafc;
 }
 
 html,
@@ -44,24 +34,40 @@ body {
 }
 
 .workspace {
-  @apply overflow-hidden rounded-xl border;
-  background: var(--app-panel);
-  border-color: var(--app-border);
+  @apply grid gap-0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
 }
 
 .workspace-header {
-  @apply grid gap-4 px-4 py-4 md:px-5;
+  @apply grid gap-4 pb-4;
+  border-bottom: 1px solid var(--app-border);
 }
 
 .workspace-section {
-  @apply border-t px-4 py-4 md:px-5;
-  border-color: var(--app-border);
+  @apply py-4;
+  border-bottom: 1px solid var(--app-border);
+}
+
+.workspace-section:last-child {
+  border-bottom: 0;
+}
+
+.workspace > .workspace-header + .workspace-section {
+  @apply pt-5;
+}
+
+.workspace > .workspace-header,
+.workspace > .workspace-section {
+  @apply px-0;
 }
 
 .workspace-card {
-  @apply rounded-lg border p-3;
-  background: var(--app-panel);
+  @apply border p-3;
   border-color: var(--app-border);
+  border-radius: 0;
+  background: transparent;
 }
 
 .data-table {
@@ -77,80 +83,71 @@ body {
 }
 
 .app-shell {
-  @apply flex min-h-screen;
+  @apply flex min-h-screen flex-col;
 }
 
-.app-sidebar {
-  @apply hidden w-64 shrink-0 flex-col border-r px-4 py-5 lg:flex;
-  background: var(--app-sidebar-bg);
-  border-color: var(--app-sidebar-border);
-}
-
-.app-sidebar-brand {
-  @apply mb-6 border-b border-slate-800/60 pb-4;
-}
-
-.app-sidebar-eyebrow {
-  @apply text-[11px] font-semibold uppercase tracking-widest text-slate-400;
-}
-
-.app-sidebar-title {
-  @apply m-0 text-lg font-semibold lowercase tracking-wide text-slate-100;
-}
-
-.app-sidebar-nav {
-  @apply flex flex-1 flex-col gap-1;
-}
-
-.app-sidebar-link {
-  @apply rounded-lg px-3 py-2 text-sm font-medium transition;
-  color: var(--app-sidebar-text);
-}
-
-.app-sidebar-link:hover {
-  background: rgba(30, 41, 59, 0.55);
-  color: #f8fafc;
-}
-
-.app-sidebar-link.is-active {
-  background: var(--app-sidebar-active-bg);
-  color: var(--app-sidebar-active-text);
-}
-
-.app-sidebar-footer {
-  @apply border-t border-slate-800/60 pt-4;
-}
-
-.app-logout-btn {
-  @apply w-full rounded-lg border px-3 py-2 text-xs font-semibold uppercase tracking-wider transition;
-  border-color: #334155;
-  color: #e2e8f0;
-}
-
-.app-logout-btn:hover {
-  background: #111827;
-}
-
-.app-main {
-  @apply flex min-h-screen flex-1 flex-col;
-}
-
-.app-topbar {
-  @apply border-b px-5 py-4 lg:px-8;
+.app-nav {
+  @apply border-b;
   background: var(--app-panel);
   border-color: var(--app-border);
 }
 
-.app-topbar-title {
-  @apply m-0 text-lg font-semibold;
+.app-nav-inner {
+  @apply mx-auto flex w-full max-w-[1700px] flex-wrap items-center gap-3 px-4 py-3 lg:px-6;
 }
 
-.app-topbar-subtitle {
-  @apply mt-1 text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400;
+.app-nav-brand {
+  @apply mr-4 flex min-w-fit items-center gap-2;
+}
+
+.app-nav-title {
+  @apply text-lg font-semibold lowercase tracking-wide text-slate-900 dark:text-slate-100;
+}
+
+.app-nav-subtitle {
+  @apply text-xs uppercase tracking-widest text-slate-500 dark:text-slate-400;
+}
+
+.app-nav-links {
+  @apply flex flex-1 flex-wrap items-center gap-1;
+}
+
+.app-nav-link {
+  @apply border-b-2 border-transparent px-3 py-2 text-sm font-semibold text-slate-600 transition hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100;
+}
+
+.app-nav-link.is-active {
+  @apply border-emerald-600 text-slate-900 dark:text-slate-100;
+}
+
+.app-nav-actions {
+  @apply ml-auto flex items-center gap-2;
+}
+
+.app-logout-btn {
+  @apply rounded-md border px-3 py-2 text-xs font-semibold uppercase tracking-wider transition;
+  border-color: var(--app-border);
+  color: #334155;
+}
+
+.app-logout-btn:hover {
+  background: #e2e8f0;
+}
+
+.dark .app-logout-btn {
+  color: #e2e8f0;
+}
+
+.dark .app-logout-btn:hover {
+  background: #111827;
+}
+
+.app-main {
+  @apply flex flex-1 flex-col;
 }
 
 .app-content {
-  @apply flex-1 space-y-5 px-5 py-5 lg:px-8;
+  @apply mx-auto w-full max-w-[1700px] flex-1 space-y-4 px-4 py-4 lg:px-6;
 }
 
 .app-login-main {

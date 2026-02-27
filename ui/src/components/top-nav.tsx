@@ -18,35 +18,32 @@ export function TopNav() {
   ];
 
   return (
-    <aside className="app-sidebar">
-      <div className="app-sidebar-brand">
-        <p className="app-sidebar-eyebrow">Platform</p>
-        <h1 className="app-sidebar-title">share-sentinel</h1>
-      </div>
-
-      <nav className="app-sidebar-nav">
-        {navItems.map((item) => (
-          <Link
-            className={`app-sidebar-link ${location.pathname.startsWith(item.match) ? "is-active" : ""}`}
-            key={item.to}
-            to={item.to}
-          >
-            {item.label}
-          </Link>
-        ))}
-      </nav>
-
-      <div className="app-sidebar-footer">
-        <div className="mb-3">
-          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-            Theme
-          </p>
-          <ThemeToggle />
+    <header className="app-nav">
+      <div className="app-nav-inner">
+        <div className="app-nav-brand">
+          <span className="app-nav-title">share-sentinel</span>
+          <span className="app-nav-subtitle">Platform</span>
         </div>
-        <button className="app-logout-btn" onClick={logout}>
-          Logout
-        </button>
+
+        <nav className="app-nav-links">
+          {navItems.map((item) => (
+            <Link
+              className={`app-nav-link ${location.pathname.startsWith(item.match) ? "is-active" : ""}`}
+              key={item.to}
+              to={item.to}
+            >
+              {item.label}
+            </Link>
+          ))}
+        </nav>
+
+        <div className="app-nav-actions">
+          <ThemeToggle />
+          <button className="app-logout-btn" onClick={logout}>
+            Logout
+          </button>
+        </div>
       </div>
-    </aside>
+    </header>
   );
 }

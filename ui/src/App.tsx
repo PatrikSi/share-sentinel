@@ -10,11 +10,6 @@ import { RunDetailPage } from "@/pages/run-detail-page";
 export function App() {
   const location = useLocation();
   const showNav = location.pathname !== "/";
-  const pageTitle = location.pathname.startsWith("/admin")
-    ? "Administration"
-    : location.pathname.startsWith("/projects/")
-      ? "Run Explorer"
-      : "Operations";
 
   useEffect(() => {
     const saved = localStorage.getItem("share_sentinel_theme") || "system";
@@ -31,20 +26,14 @@ export function App() {
     <div className={showNav ? "app-shell" : ""}>
       {showNav ? <TopNav /> : null}
       <main className={showNav ? "app-main" : "app-login-main"}>
-        {showNav ? (
-          <header className="app-topbar">
-            <h2 className="app-topbar-title">{pageTitle}</h2>
-            <p className="app-topbar-subtitle">Share Sentinel Platform</p>
-          </header>
-        ) : null}
         <section className={showNav ? "app-content" : ""}>
-        <Routes>
-          <Route path="/" element={<LoginPage />} />
-          <Route path="/projects" element={<ProjectsPage />} />
-          <Route path="/projects/:projectId/runs/:runId" element={<RunDetailPage />} />
-          <Route path="/admin" element={<AdminPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+          <Routes>
+            <Route path="/" element={<LoginPage />} />
+            <Route path="/projects" element={<ProjectsPage />} />
+            <Route path="/projects/:projectId/runs/:runId" element={<RunDetailPage />} />
+            <Route path="/admin" element={<AdminPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
         </section>
       </main>
     </div>
