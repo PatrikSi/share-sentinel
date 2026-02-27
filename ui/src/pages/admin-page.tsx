@@ -227,8 +227,8 @@ export function AdminPage() {
   const canProjectAdmin = projectRole === "admin";
 
   return (
-    <section className="space-y-6">
-      <div className="panel flex flex-wrap items-center justify-between gap-3">
+    <section className="workspace">
+      <div className="workspace-header flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold">Administration</h1>
           <p className="text-sm text-slate-600 dark:text-slate-300">Manage members, tokens, users, and audit history.</p>
@@ -249,11 +249,15 @@ export function AdminPage() {
         </div>
       </div>
 
-      {error ? <p className="rounded-xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{error}</p> : null}
-      {info ? <p className="rounded-xl bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">{info}</p> : null}
+      {error || info ? (
+        <div className="workspace-section space-y-2">
+          {error ? <p className="rounded-xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{error}</p> : null}
+          {info ? <p className="rounded-xl bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">{info}</p> : null}
+        </div>
+      ) : null}
 
-      <div className="grid gap-4 md:grid-cols-2">
-        <div className="panel space-y-4">
+      <div className="workspace-section grid gap-4 md:grid-cols-2">
+        <div className="workspace-card space-y-4">
           <h2 className="text-lg font-semibold">Project Members</h2>
           <form className="flex flex-wrap gap-2" onSubmit={addMember}>
             <input
@@ -299,7 +303,7 @@ export function AdminPage() {
           </ul>
         </div>
 
-        <div className="panel space-y-4">
+        <div className="workspace-card space-y-4">
           <h2 className="text-lg font-semibold">API Tokens</h2>
           <form className="flex flex-wrap gap-2" onSubmit={createToken}>
             <input
@@ -353,8 +357,8 @@ export function AdminPage() {
       </div>
 
       {me?.is_sysadmin ? (
-        <div className="grid gap-4 md:grid-cols-2">
-          <div className="panel space-y-4">
+        <div className="workspace-section grid gap-4 md:grid-cols-2">
+          <div className="workspace-card space-y-4">
             <h2 className="text-lg font-semibold">Create User</h2>
             <form className="space-y-3" onSubmit={createUser}>
               <input
@@ -384,7 +388,7 @@ export function AdminPage() {
             </form>
           </div>
 
-          <div className="panel space-y-3">
+          <div className="workspace-card space-y-3">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold">User Directory</h2>
               <input
@@ -418,7 +422,7 @@ export function AdminPage() {
         </div>
       ) : null}
 
-      <div className="panel">
+      <div className="workspace-section">
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-lg font-semibold">Audit Events</h2>
           <div className="flex items-center gap-2">

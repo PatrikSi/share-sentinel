@@ -264,8 +264,8 @@ export function ProjectsPage() {
   const canDeleteRuns = projectRole === "admin";
 
   return (
-    <section className="space-y-6">
-      <div className="panel grid gap-4 md:grid-cols-2">
+    <section className="workspace">
+      <div className="workspace-header md:grid-cols-2">
         <div>
           <h1 className="text-2xl font-bold">Projects & Ingestion</h1>
           <p className="text-sm text-slate-600 dark:text-slate-300">
@@ -290,7 +290,7 @@ export function ProjectsPage() {
       </div>
 
       {canCreateProject ? (
-        <div className="panel">
+        <div className="workspace-section">
           <h2 className="mb-3 text-lg font-semibold">Create Project</h2>
           <form className="flex flex-wrap items-end gap-3" onSubmit={onCreateProject}>
             <label className="flex-1 text-sm">
@@ -310,7 +310,7 @@ export function ProjectsPage() {
         </div>
       ) : null}
 
-      <div className="panel">
+      <div className="workspace-section">
         <h2 className="mb-3 text-lg font-semibold">Import Scan Artifact</h2>
         <form className="grid gap-3 md:grid-cols-2" onSubmit={onImportRun}>
           <label className="text-sm">
@@ -403,18 +403,22 @@ export function ProjectsPage() {
         </form>
       </div>
 
-      {error ? <p className="rounded-xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{error}</p> : null}
-      {info ? <p className="rounded-xl bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">{info}</p> : null}
-      {createdRunId ? (
-        <p className="text-sm">
-          Open created run:{" "}
-          <Link className="font-semibold text-ember underline" to={`/projects/${selectedProject}/runs/${createdRunId}`}>
-            {createdRunId}
-          </Link>
-        </p>
+      {error || info || createdRunId ? (
+        <div className="workspace-section space-y-2">
+          {error ? <p className="rounded-xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{error}</p> : null}
+          {info ? <p className="rounded-xl bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">{info}</p> : null}
+          {createdRunId ? (
+            <p className="text-sm">
+              Open created run:{" "}
+              <Link className="font-semibold text-ember underline" to={`/projects/${selectedProject}/runs/${createdRunId}`}>
+                {createdRunId}
+              </Link>
+            </p>
+          ) : null}
+        </div>
       ) : null}
 
-      <div className="panel overflow-x-auto">
+      <div className="workspace-section overflow-x-auto">
         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
           <div>
             <h2 className="text-lg font-semibold">Runs in {selectedProjectName || "selected project"}</h2>

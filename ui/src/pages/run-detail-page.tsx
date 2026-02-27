@@ -220,8 +220,8 @@ export function RunDetailPage() {
   }
 
   return (
-    <section className="space-y-6">
-      <div className="panel">
+    <section className="workspace">
+      <div className="workspace-header">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h1 className="text-2xl font-bold">{run?.name || "Run Explorer"}</h1>
@@ -244,8 +244,8 @@ export function RunDetailPage() {
         {error ? <p className="mt-2 text-sm text-red-600">{error}</p> : null}
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3">
-        <div className="panel">
+      <div className="workspace-section grid gap-4 md:grid-cols-3">
+        <div className="workspace-card">
           <div className="mb-3 flex items-center justify-between gap-2">
             <h2 className="text-lg font-semibold">Endpoints</h2>
             <input
@@ -292,7 +292,7 @@ export function RunDetailPage() {
           </ul>
         </div>
 
-        <div className="panel">
+        <div className="workspace-card">
           <h2 className="mb-3 text-lg font-semibold">Shares</h2>
           <ul className="space-y-2">
             {resources.map((resource) => (
@@ -314,7 +314,7 @@ export function RunDetailPage() {
           </ul>
         </div>
 
-        <div className="panel">
+        <div className="workspace-card">
           <div className="mb-3 grid gap-2">
             <h2 className="text-lg font-semibold">Items</h2>
             <input
@@ -357,7 +357,7 @@ export function RunDetailPage() {
         </div>
       </div>
 
-      <div className="panel">
+      <div className="workspace-section">
         <div className="mb-3 flex flex-wrap items-end justify-between gap-3">
           <h2 className="text-lg font-semibold">Run-Scoped Search</h2>
           <div className="flex flex-wrap items-end gap-2">
