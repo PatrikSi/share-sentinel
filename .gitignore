@@ -15,6 +15,7 @@ node_modules/
 *.ndjson.gz
 *.log
 .env
+dummy-scan-data.json
 
 # OS / editor
 .DS_Store
