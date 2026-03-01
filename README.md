@@ -23,6 +23,12 @@ cp .env.example .env
 docker compose up --build
 ```
 
+If you want a fast post-start verification (routing + API wiring):
+
+```bash
+./scripts/smoke-routes.sh
+```
+
 3. Open UI and API:
 
 - `http://localhost`
