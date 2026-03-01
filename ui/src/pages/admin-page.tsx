@@ -7,7 +7,7 @@ type Project = { id: string; name: string };
 type TokenMeta = { id: string; name: string; role: string; revoked_at: string | null; created_at: string };
 type AuditEvent = { id: number; ts: string; action: string; object_type: string; object_id: string };
 type Member = { user_id: string; email: string; role: string };
-type UserRow = { id: string; email: string; is_active: boolean; is_sysadmin: boolean; created_at: string };
+type UserRow = { id: string; email: string; is_active: boolean; is_sysadmin: boolean; is_approved: boolean; created_at: string };
 
 export function AdminPage() {
   const [me, setMe] = useState<UserMe | null>(null);
@@ -199,6 +199,21 @@ export function AdminPage() {
       setInfo(`User ${isActive ? "enabled" : "disabled"}.`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to update user status");
+    }
+  }
+
+  async function setUserApproval(userId: string, isApproved: boolean) {
+    setError(null);
+    setInfo(null);
+    try {
+      await apiFetch(`/users/${userId}/approval`, {
+        method: "PATCH",
+        body: JSON.stringify({ is_approved: isApproved }),
+      });
+      setUsers((prev) => prev.map((user) => (user.id === userId ? { ...user, is_approved: isApproved } : user)));
+      setInfo(isApproved ? "User approved." : "User moved back to pending.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update approval");
     }
   }
 
@@ -405,15 +420,24 @@ export function AdminPage() {
                     <div>
                       <div className="font-semibold">{user.email}</div>
                       <div className="text-xs text-slate-500">
-                        {user.is_sysadmin ? "sysadmin" : "user"} | {user.is_active ? "active" : "disabled"}
+                        {user.is_sysadmin ? "sysadmin" : "user"} | {user.is_active ? "active" : "disabled"} |{" "}
+                        {user.is_approved ? "approved" : "pending approval"}
                       </div>
                     </div>
-                    <button
-                      className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
-                      onClick={() => setUserActive(user.id, !user.is_active)}
-                    >
-                      {user.is_active ? "Disable" : "Enable"}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
+                        onClick={() => setUserActive(user.id, !user.is_active)}
+                      >
+                        {user.is_active ? "Disable" : "Enable"}
+                      </button>
+                      <button
+                        className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
+                        onClick={() => setUserApproval(user.id, !user.is_approved)}
+                      >
+                        {user.is_approved ? "Unapprove" : "Approve"}
+                      </button>
+                    </div>
                   </div>
                 </li>
               ))}

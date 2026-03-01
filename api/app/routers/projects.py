@@ -5,11 +5,20 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.deps import AuthContext, get_auth_context, get_current_user, require_project_role, require_sysadmin, request_meta
+from app.deps import (
+    AuthContext,
+    get_auth_context,
+    get_current_user,
+    require_project_role,
+    require_sysadmin,
+    request_meta,
+    require_token_scopes,
+)
 from app.enums import ProjectRole
 from app.models import Project, ProjectMember, User
 from app.schemas import MemberAddByEmailIn, MemberAddIn, ProjectCreateIn, ProjectOut
 from app.services.audit import write_audit_event
+from app.token_scopes import SCOPE_READ_MEMBERS, SCOPE_READ_PROJECTS, SCOPE_WRITE_MEMBERS, SCOPE_WRITE_PROJECTS
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -19,6 +28,7 @@ def create_project(
     payload: ProjectCreateIn,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_PROJECTS)),
     admin: User = Depends(require_sysadmin),
 ):
     project = Project(name=payload.name)
@@ -47,6 +57,7 @@ def create_project(
 def list_projects(
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_PROJECTS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     if auth.token_id:
@@ -93,6 +104,7 @@ def get_project(
     project_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_PROJECTS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -117,6 +129,7 @@ def get_project(
 def get_my_role(
     project_id: uuid.UUID,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_PROJECTS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     role = require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -129,6 +142,7 @@ def add_member(
     payload: MemberAddIn,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_MEMBERS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
@@ -164,6 +178,7 @@ def add_member_by_email(
     payload: MemberAddByEmailIn,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_MEMBERS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
@@ -199,6 +214,7 @@ def list_members(
     project_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_MEMBERS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
@@ -239,6 +255,7 @@ def remove_member(
     user_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_MEMBERS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)

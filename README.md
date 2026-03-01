@@ -4,6 +4,7 @@ Share Sentinel is a v1 SMB artifact ingestion platform with:
 
 - Python collector that emits NDJSON / NDJSON.GZ
 - FastAPI control plane with JWT + API token auth and project-scoped RBAC
+- Enterprise auth controls: account approval workflow, optional self-registration, API token scopes/expiry, login lockout
 - Async ingestion workers reading jobs from Redis Streams
 - Postgres normalized schema + MinIO raw artifact storage
 - React (Vite) UI for runs/endpoints/resources/items exploration

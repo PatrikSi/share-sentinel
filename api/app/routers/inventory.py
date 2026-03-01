@@ -5,11 +5,12 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.deps import AuthContext, get_auth_context, require_project_role, request_meta
+from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_token_scopes
 from app.enums import ProjectRole, RunStatus
 from app.models import Endpoint, Item, Resource, ScanRun
 from app.pagination import next_cursor, parse_cursor
 from app.services.audit import write_audit_event
+from app.token_scopes import SCOPE_READ_INVENTORY
 
 router = APIRouter(prefix="/projects/{project_id}/inventory", tags=["inventory"])
 
@@ -63,6 +64,7 @@ def inventory_stats(
     request: Request,
     run_ids: str | None = Query(default=None, description="comma-separated run UUIDs"),
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -153,6 +155,7 @@ def inventory_extensions(
     run_ids: str | None = Query(default=None, description="comma-separated run UUIDs"),
     limit: int = Query(default=50, ge=1, le=500),
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -200,6 +203,7 @@ def inventory_items(
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -298,6 +302,7 @@ def inventory_resources(
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -384,6 +389,7 @@ def inventory_endpoints(
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)

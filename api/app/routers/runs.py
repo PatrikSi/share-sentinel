@@ -13,7 +13,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
 from app.db import get_db
-from app.deps import AuthContext, get_auth_context, require_project_role, request_meta
+from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_token_scopes
 from app.enums import ProjectRole, RunStatus
 from app.models import Endpoint, Item, Resource, ScanRun
 from app.pagination import next_cursor, parse_cursor
@@ -27,6 +27,7 @@ from app.services.storage import (
     create_multipart_upload,
     upload_part,
 )
+from app.token_scopes import SCOPE_READ_RUNS, SCOPE_WRITE_RUNS
 
 router = APIRouter(prefix="/projects/{project_id}/runs", tags=["runs"])
 rate_limiter = RateLimiter()
@@ -167,6 +168,7 @@ def create_run(
     payload: RunCreateIn,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
@@ -210,6 +212,7 @@ def list_runs(
     limit: int = Query(default=50, ge=1, le=200),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -248,6 +251,7 @@ def get_run(
     run_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -272,6 +276,7 @@ def delete_run(
     run_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
@@ -298,6 +303,7 @@ async def upload_artifact(
     request: Request,
     file: UploadFile | None = File(default=None),
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
@@ -390,6 +396,7 @@ def list_endpoints(
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -449,6 +456,7 @@ def endpoint_resources(
     endpoint_id: int,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -498,6 +506,7 @@ def resource_items(
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -559,6 +568,7 @@ def search_items(
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
