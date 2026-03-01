@@ -153,6 +153,12 @@ def add_member(
 
     existing = db.get(ProjectMember, {"project_id": project_id, "user_id": payload.user_id})
     if existing:
+        if existing.role == ProjectRole.ADMIN and payload.role != ProjectRole.ADMIN:
+            if _count_project_admins(db, project_id, exclude_user_id=payload.user_id) < 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="at least one project admin must remain",
+                )
         existing.role = payload.role
         db.add(existing)
     else:
@@ -190,6 +196,12 @@ def add_member_by_email(
 
     existing = db.get(ProjectMember, {"project_id": project_id, "user_id": user.id})
     if existing:
+        if existing.role == ProjectRole.ADMIN and payload.role != ProjectRole.ADMIN:
+            if _count_project_admins(db, project_id, exclude_user_id=user.id) < 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="at least one project admin must remain",
+                )
         existing.role = payload.role
         db.add(existing)
     else:
@@ -263,6 +275,9 @@ def remove_member(
     membership = db.get(ProjectMember, {"project_id": project_id, "user_id": user_id})
     if membership is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="member not found")
+    if membership.role == ProjectRole.ADMIN:
+        if _count_project_admins(db, project_id, exclude_user_id=user_id) < 1:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="at least one project admin must remain")
 
     db.delete(membership)
     write_audit_event(
@@ -277,3 +292,13 @@ def remove_member(
     )
     db.commit()
     return {"ok": True}
+
+
+def _count_project_admins(db: Session, project_id: uuid.UUID, exclude_user_id: uuid.UUID | None = None) -> int:
+    stmt = select(func.count(ProjectMember.user_id)).where(
+        ProjectMember.project_id == project_id,
+        ProjectMember.role == ProjectRole.ADMIN,
+    )
+    if exclude_user_id is not None:
+        stmt = stmt.where(ProjectMember.user_id != exclude_user_id)
+    return int(db.execute(stmt).scalar() or 0)
