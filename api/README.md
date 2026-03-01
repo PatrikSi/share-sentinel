@@ -15,6 +15,7 @@ FastAPI service for auth, project management, run lifecycle, artifact upload, an
 - Optional cookie session support with CSRF protection for unsafe methods
 - Request IDs and request logging
 - Redis-backed fixed-window rate limits (auth + upload)
+- Deep health endpoint for database and Redis readiness (`/healthz/deep`)
 - Async ingestion queueing via Redis Streams
 
 ## Local run (without Docker)

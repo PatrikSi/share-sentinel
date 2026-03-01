@@ -46,3 +46,4 @@ docker compose up --build
 - Worker performs resume-aware ingestion (`line_offset`) and reconciliation for runs left in `UPLOADED`.
 - API attaches `X-Request-ID` to every response.
 - Upload and auth endpoints have Redis-backed fixed-window rate limiting.
+- `/healthz/deep` provides dependency readiness checks for Postgres and Redis.
