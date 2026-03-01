@@ -225,6 +225,15 @@ def login(payload: LoginIn, request: Request, response: Response, db: Session = 
 @router.post("/refresh")
 def refresh(payload: RefreshIn, request: Request, response: Response, db: Session = Depends(get_db)):
     token_hash = hash_external_token(payload.refresh_token)
+    # Apply both per-client and per-token throttles. Per-token alone is bypassable with random tokens.
+    rate_limiter.check(
+        request,
+        "auth_refresh",
+        limit=120,
+        window_seconds=60,
+        actor_key="refresh",
+        fail_open=False,
+    )
     rate_limiter.check(
         request,
         "auth_refresh",

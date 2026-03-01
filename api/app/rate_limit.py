@@ -6,6 +6,7 @@ import redis
 from fastapi import HTTPException, Request, status
 
 from app.config import get_settings
+from app.deps import resolve_client_ip
 
 logger = logging.getLogger("share_sentinel.ratelimit")
 
@@ -30,7 +31,7 @@ class RateLimiter:
         actor_key: str | None = None,
         fail_open: bool | None = None,
     ) -> None:
-        client_ip = request.client.host if request.client else "unknown"
+        client_ip = _resolve_rate_limit_ip(request)
         actor = actor_key or "anon"
         identity_hash = self._hash_identity(f"{client_ip}:{actor}")
         bucket = int(time.time() // window_seconds)
@@ -49,3 +50,10 @@ class RateLimiter:
 
         if count > limit:
             raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="rate limit exceeded")
+
+
+def _resolve_rate_limit_ip(request: Request) -> str:
+    try:
+        return resolve_client_ip(request)
+    except Exception:  # noqa: BLE001
+        return request.client.host if request.client else "unknown"

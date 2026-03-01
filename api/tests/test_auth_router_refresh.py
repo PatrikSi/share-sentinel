@@ -76,7 +76,20 @@ def test_refresh_allows_single_use_and_rejects_replay(monkeypatch) -> None:
         used = True
         return consumed
 
-    monkeypatch.setattr(auth_router.rate_limiter, "check", lambda *_args, **_kwargs: None)
+    rate_limit_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        auth_router.rate_limiter,
+        "check",
+        lambda _request, scope, limit, window_seconds, actor_key, fail_open: rate_limit_calls.append(
+            {
+                "scope": scope,
+                "limit": limit,
+                "window_seconds": window_seconds,
+                "actor_key": actor_key,
+                "fail_open": fail_open,
+            }
+        ),
+    )
     monkeypatch.setattr(auth_router, "_consume_refresh_token", _consume_once)
     monkeypatch.setattr(auth_router, "hash_external_token", lambda value: f"hash:{value}")
     monkeypatch.setattr(auth_router, "random_token", lambda *_args, **_kwargs: "new-refresh")
@@ -99,3 +112,5 @@ def test_refresh_allows_single_use_and_rejects_replay(monkeypatch) -> None:
         auth_router.refresh(payload, _request(), Response(), fake_db)
     assert exc.value.status_code == 401
     assert fake_db.commit_count == 1
+    assert any(call["actor_key"] == "refresh" for call in rate_limit_calls)
+    assert any(call["actor_key"] == "refresh:hash:old-refresh" for call in rate_limit_calls)
