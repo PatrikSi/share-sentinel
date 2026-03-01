@@ -2,7 +2,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -219,17 +219,15 @@ def refresh(payload: RefreshIn, request: Request, response: Response, db: Sessio
         fail_open=False,
     )
 
-    stmt = select(RefreshToken).where(RefreshToken.token_hash == token_hash, RefreshToken.revoked_at.is_(None))
-    refresh_token = db.execute(stmt).scalar_one_or_none()
-    if refresh_token is None or refresh_token.expires_at < datetime.now(tz=UTC):
+    now = datetime.now(tz=UTC)
+    refresh_token = _consume_refresh_token(db, token_hash, now)
+    if refresh_token is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid refresh token")
 
     user = db.get(User, refresh_token.user_id)
     if user is None or not user.is_active or not user.is_approved:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid refresh token")
 
-    # Rotate refresh tokens to reduce replay window.
-    refresh_token.revoked_at = datetime.now(tz=UTC)
     new_refresh_raw = random_token(48)
     new_refresh_hash = hash_external_token(new_refresh_raw)
     settings = get_settings()
@@ -251,7 +249,6 @@ def refresh(payload: RefreshIn, request: Request, response: Response, db: Sessio
         actor_user_id=refresh_token.user_id,
         metadata=request_meta(request),
     )
-    db.add(refresh_token)
     db.commit()
     return {"access_token": access_token, "refresh_token": new_refresh_raw, "csrf_token": csrf_token}
 
@@ -511,3 +508,19 @@ def _enforce_scope_policy_for_owner(owner: User, role: ProjectRole, scopes: list
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"non-sysadmin token scopes must match role defaults: {', '.join(disallowed)}",
         )
+
+
+def _consume_refresh_token(db: Session, token_hash: str, now: datetime) -> RefreshToken | None:
+    row = db.execute(
+        update(RefreshToken)
+        .where(
+            RefreshToken.token_hash == token_hash,
+            RefreshToken.revoked_at.is_(None),
+            RefreshToken.expires_at >= now,
+        )
+        .values(revoked_at=now)
+        .returning(RefreshToken)
+    ).first()
+    if row is None:
+        return None
+    return row[0]
