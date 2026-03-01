@@ -146,6 +146,9 @@ services:
       context: ./ui
       args:
         VITE_API_BASE_URL: /api
+    depends_on:
+      api:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/ || exit 1"]
       interval: 15s
