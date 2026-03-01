@@ -60,7 +60,8 @@ class NDJSONWriter:
             if self._closed:
                 return
             self._fp.write(line + "\n")
-            self._fp.flush()
+            if self._path is None:
+                self._fp.flush()
 
     def close(self) -> None:
         with self._lock:
