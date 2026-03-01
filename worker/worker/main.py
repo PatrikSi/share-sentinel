@@ -436,7 +436,7 @@ def process_job(fields: dict[str, str]) -> None:
                 update_run_status(conn, run_id, "FAILED", parse_offset(progress_raw), parse_summary(summary_raw), "missing artifact key")
                 conn.commit()
                 return
-            if status == "COMPLETE":
+            if status in {"COMPLETE", "FAILED"}:
                 return
 
             counts = parse_summary(summary_raw)
