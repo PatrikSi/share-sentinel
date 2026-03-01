@@ -7,6 +7,7 @@ type UserMe = { id: string; email: string; is_sysadmin: boolean };
 type SettingsOutletContext = { me: UserMe };
 
 const SETTINGS_TABS = [
+  { to: "overview", label: "Overview" },
   { to: "users", label: "Users" },
   { to: "rbac", label: "RBAC" },
   { to: "api-tokens", label: "API Tokens" },

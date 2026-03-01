@@ -8,6 +8,7 @@ Share Sentinel is a v1 SMB artifact ingestion platform with:
 - Async ingestion workers reading jobs from Redis Streams
 - Postgres normalized schema + MinIO raw artifact storage
 - React (Vite) UI for runs/endpoints/resources/items exploration
+- Enterprise settings section split into overview, users, RBAC, API token management, and audit logs
 
 ## Quick start
 
@@ -45,6 +46,11 @@ If you want a fast post-start verification (routing + API wiring):
 - `worker/`: Redis Streams ingestion worker
 - `collector/`: one-off SMB collector CLI
 - `ui/`: React SPA for operations
+- `docs/`: product and reference documentation
+
+## Documentation
+
+- `docs/README.md`
 
 ## Notes
 

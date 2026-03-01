@@ -12,6 +12,7 @@ import { RunDetailPage } from "@/pages/run-detail-page";
 import { SettingsApiTokensPage } from "@/pages/settings-api-tokens-page";
 import { SettingsAuditLogsPage } from "@/pages/settings-audit-logs-page";
 import { SettingsLayout } from "@/pages/settings-layout";
+import { SettingsOverviewPage } from "@/pages/settings-overview-page";
 import { SettingsRbacPage } from "@/pages/settings-rbac-page";
 import { SettingsUsersPage } from "@/pages/settings-users-page";
 
@@ -83,7 +84,7 @@ export function App() {
               path="/admin"
               element={
                 <RequireAuth>
-                  <Navigate to="/settings/users" replace />
+                  <Navigate to="/settings/overview" replace />
                 </RequireAuth>
               }
             />
@@ -95,7 +96,8 @@ export function App() {
                 </RequireAuth>
               }
             >
-              <Route index element={<Navigate to="/settings/users" replace />} />
+              <Route index element={<Navigate to="/settings/overview" replace />} />
+              <Route path="overview" element={<SettingsOverviewPage />} />
               <Route path="users" element={<SettingsUsersPage />} />
               <Route path="rbac" element={<SettingsRbacPage />} />
               <Route path="api-tokens" element={<SettingsApiTokensPage />} />
