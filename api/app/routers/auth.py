@@ -65,6 +65,12 @@ def security_settings(user: User = Depends(get_current_user)):
         auth_login_window_seconds=settings.auth_login_window_seconds,
         auth_login_lockout_seconds=settings.auth_login_lockout_seconds,
         default_api_token_expiry_days=settings.default_api_token_expiry_days,
+        rbac_enabled=True,
+        mfa_enabled=False,
+        sso_enabled=False,
+        scim_enabled=False,
+        password_history_enforced=False,
+        session_idle_timeout_minutes=None,
     )
 
 

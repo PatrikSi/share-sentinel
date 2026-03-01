@@ -42,6 +42,12 @@ class SecuritySettingsOut(BaseModel):
     auth_login_window_seconds: int
     auth_login_lockout_seconds: int
     default_api_token_expiry_days: int
+    rbac_enabled: bool
+    mfa_enabled: bool
+    sso_enabled: bool
+    scim_enabled: bool
+    password_history_enforced: bool
+    session_idle_timeout_minutes: int | None
 
 
 class ChangePasswordIn(BaseModel):
@@ -155,3 +161,46 @@ class UserUpdateIn(BaseModel):
 
 class UserApprovalIn(BaseModel):
     is_approved: bool
+
+
+class ApiTokenAdminOut(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    user_email: str
+    project_id: uuid.UUID
+    project_name: str
+    name: str
+    role: ProjectRole
+    scopes: list[str]
+    last_used_at: datetime | None
+    expires_at: datetime | None
+    created_at: datetime
+    revoked_at: datetime | None
+
+
+class AuditEventOut(BaseModel):
+    id: int
+    ts: datetime
+    actor_user_id: uuid.UUID | None
+    actor_email: str | None
+    actor_token_id: uuid.UUID | None
+    project_id: uuid.UUID | None
+    project_name: str | None
+    action: str
+    object_type: str
+    object_id: str
+    metadata: dict[str, Any]
+
+
+class ProjectMembershipOut(BaseModel):
+    project_id: uuid.UUID
+    project_name: str
+    user_id: uuid.UUID
+    user_email: str
+    role: ProjectRole
+
+
+class ProjectMembershipUpsertIn(BaseModel):
+    project_id: uuid.UUID
+    user_id: uuid.UUID
+    role: ProjectRole

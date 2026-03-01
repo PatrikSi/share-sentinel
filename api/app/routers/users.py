@@ -2,7 +2,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -131,6 +131,11 @@ def update_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
 
+    next_is_active = user.is_active if payload.is_active is None else payload.is_active
+    next_is_approved = user.is_approved if payload.is_approved is None else payload.is_approved
+    next_is_sysadmin = user.is_sysadmin if payload.is_sysadmin is None else payload.is_sysadmin
+    _enforce_admin_safety(db, auth.user_id, user, next_is_active, next_is_approved, next_is_sysadmin)
+
     if payload.email is not None:
         user.email = payload.email.lower()
 
@@ -197,6 +202,8 @@ def update_user_status(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
 
+    _enforce_admin_safety(db, auth.user_id, user, is_active, user.is_approved, user.is_sysadmin)
+
     user.is_active = is_active
     db.add(user)
     write_audit_event(
@@ -226,6 +233,8 @@ def update_user_approval(
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+
+    _enforce_admin_safety(db, auth.user_id, user, user.is_active, payload.is_approved, user.is_sysadmin)
 
     user.is_approved = payload.is_approved
     if payload.is_approved:
@@ -260,3 +269,42 @@ def _to_user_out(user: User) -> UserOut:
         approved_by_user_id=user.approved_by_user_id,
         ui_theme=user.ui_theme,
     )
+
+
+def _enforce_admin_safety(
+    db: Session,
+    actor_user_id: uuid.UUID | None,
+    target_user: User,
+    next_is_active: bool,
+    next_is_approved: bool,
+    next_is_sysadmin: bool,
+) -> None:
+    is_self_update = actor_user_id is not None and actor_user_id == target_user.id
+    if is_self_update:
+        if not next_is_active:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="you cannot disable your own account")
+        if not next_is_approved:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="you cannot unapprove your own account")
+        if not next_is_sysadmin:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="you cannot remove your own sysadmin access")
+
+    target_is_active_admin = target_user.is_sysadmin and target_user.is_active and target_user.is_approved
+    target_will_remain_active_admin = next_is_sysadmin and next_is_active and next_is_approved
+    if target_is_active_admin and not target_will_remain_active_admin:
+        remaining = _count_active_approved_sysadmins(db, exclude_user_id=target_user.id)
+        if remaining < 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="at least one active approved sysadmin must remain",
+            )
+
+
+def _count_active_approved_sysadmins(db: Session, exclude_user_id: uuid.UUID | None = None) -> int:
+    stmt = select(func.count(User.id)).where(
+        User.is_sysadmin.is_(True),
+        User.is_active.is_(True),
+        User.is_approved.is_(True),
+    )
+    if exclude_user_id is not None:
+        stmt = stmt.where(User.id != exclude_user_id)
+    return int(db.execute(stmt).scalar() or 0)

@@ -5,22 +5,22 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.middleware import RequestContextMiddleware
-from app.routers import audit, auth, health, inventory, projects, runs, users
+from app.routers import audit, auth, health, inventory, projects, runs, settings, users
 
-settings = get_settings()
+app_settings = get_settings()
 
 logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    level=getattr(logging, app_settings.log_level.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
 app = FastAPI(
     title="Share Sentinel API",
     version="0.1.0",
-    root_path=settings.api_root_path,
+    root_path=app_settings.api_root_path,
 )
 
-origins = [item.strip() for item in settings.cors_origins.split(",") if item.strip()]
+origins = [item.strip() for item in app_settings.cors_origins.split(",") if item.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -36,4 +36,5 @@ app.include_router(runs.router)
 app.include_router(inventory.router)
 app.include_router(audit.router)
 app.include_router(users.router)
+app.include_router(settings.router)
 app.include_router(health.router)
