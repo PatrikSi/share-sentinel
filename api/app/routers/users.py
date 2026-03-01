@@ -9,11 +9,12 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
-from app.models import User
-from app.schemas import UserApprovalIn, UserCreateIn, UserOut, UserUpdateIn
+from app.enums import ProjectRole
+from app.models import Project, ProjectMember, User
+from app.schemas import UserApprovalIn, UserAssignAllProjectsIn, UserCreateIn, UserOut, UserUpdateIn
 from app.security import hash_password, validate_password_strength
 from app.services.audit import write_audit_event
-from app.token_scopes import SCOPE_READ_USERS, SCOPE_WRITE_USERS
+from app.token_scopes import SCOPE_READ_USERS, SCOPE_WRITE_MEMBERS, SCOPE_WRITE_USERS, has_required_scope
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -52,6 +53,11 @@ def create_user(
         db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="email already exists") from exc
 
+    assigned_projects = 0
+    if payload.add_to_all_projects:
+        _require_member_write_scope_if_token(auth)
+        assigned_projects = _assign_user_to_all_projects(db, user.id, payload.all_projects_role, overwrite_existing=False)
+
     write_audit_event(
         db,
         action="USER_CREATED",
@@ -64,6 +70,9 @@ def create_user(
             "is_active": user.is_active,
             "is_sysadmin": user.is_sysadmin,
             "is_approved": user.is_approved,
+            "add_to_all_projects": payload.add_to_all_projects,
+            "all_projects_role": payload.all_projects_role.value if payload.add_to_all_projects else None,
+            "assigned_projects": assigned_projects,
         },
     )
     db.commit()
@@ -75,6 +84,9 @@ def create_user(
 def list_users(
     search: str | None = None,
     include_pending_only: bool = False,
+    is_active: bool | None = Query(default=None),
+    is_approved: bool | None = Query(default=None),
+    is_sysadmin: bool | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -94,6 +106,12 @@ def list_users(
         stmt = stmt.where(User.email.ilike(f"%{search}%"))
     if include_pending_only:
         stmt = stmt.where(User.is_approved.is_(False))
+    if is_active is not None:
+        stmt = stmt.where(User.is_active.is_(is_active))
+    if is_approved is not None:
+        stmt = stmt.where(User.is_approved.is_(is_approved))
+    if is_sysadmin is not None:
+        stmt = stmt.where(User.is_sysadmin.is_(is_sysadmin))
 
     stmt = stmt.order_by(User.created_at.desc()).offset(offset).limit(limit)
     users = db.execute(stmt).scalars().all()
@@ -258,6 +276,40 @@ def update_user_approval(
     return _to_user_out(user)
 
 
+@router.post("/{user_id}/assign-all-projects")
+def assign_user_to_all_projects(
+    user_id: uuid.UUID,
+    payload: UserAssignAllProjectsIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_USERS)),
+    __: User = Depends(require_sysadmin),
+):
+    _ = __
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+
+    _require_member_write_scope_if_token(auth)
+    assigned = _assign_user_to_all_projects(db, user_id, payload.role, overwrite_existing=payload.overwrite_existing)
+    write_audit_event(
+        db,
+        action="USER_ASSIGNED_TO_ALL_PROJECTS",
+        object_type="user",
+        object_id=str(user_id),
+        actor_user_id=auth.user_id,
+        metadata={
+            **request_meta(request),
+            "role": payload.role.value,
+            "overwrite_existing": payload.overwrite_existing,
+            "assigned_projects": assigned,
+        },
+    )
+    db.commit()
+    return {"ok": True, "assigned_projects": assigned}
+
+
 def _to_user_out(user: User) -> UserOut:
     return UserOut(
         id=user.id,
@@ -308,3 +360,28 @@ def _count_active_approved_sysadmins(db: Session, exclude_user_id: uuid.UUID | N
     if exclude_user_id is not None:
         stmt = stmt.where(User.id != exclude_user_id)
     return int(db.execute(stmt).scalar() or 0)
+
+
+def _require_member_write_scope_if_token(auth: AuthContext) -> None:
+    if auth.token_id is None:
+        return
+    granted = set(auth.token_scopes or [])
+    if not has_required_scope(granted, SCOPE_WRITE_MEMBERS):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient token scope")
+
+
+def _assign_user_to_all_projects(db: Session, user_id: uuid.UUID, role: ProjectRole, overwrite_existing: bool) -> int:
+    projects = db.execute(select(Project.id)).all()
+    assigned = 0
+    for row in projects:
+        project_id = row.id
+        membership = db.get(ProjectMember, {"project_id": project_id, "user_id": user_id})
+        if membership:
+            if overwrite_existing and membership.role != role:
+                membership.role = role
+                db.add(membership)
+                assigned += 1
+            continue
+        db.add(ProjectMember(project_id=project_id, user_id=user_id, role=role))
+        assigned += 1
+    return assigned

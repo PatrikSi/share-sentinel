@@ -13,7 +13,6 @@ import { SettingsApiTokensPage } from "@/pages/settings-api-tokens-page";
 import { SettingsAuditLogsPage } from "@/pages/settings-audit-logs-page";
 import { SettingsLayout } from "@/pages/settings-layout";
 import { SettingsRbacPage } from "@/pages/settings-rbac-page";
-import { SettingsSecurityPage } from "@/pages/settings-security-page";
 import { SettingsUsersPage } from "@/pages/settings-users-page";
 
 function RequireAuth({ children }: { children: JSX.Element }) {
@@ -101,7 +100,6 @@ export function App() {
               <Route path="rbac" element={<SettingsRbacPage />} />
               <Route path="api-tokens" element={<SettingsApiTokensPage />} />
               <Route path="audit-logs" element={<SettingsAuditLogsPage />} />
-              <Route path="security" element={<SettingsSecurityPage />} />
             </Route>
             <Route
               path="/account"

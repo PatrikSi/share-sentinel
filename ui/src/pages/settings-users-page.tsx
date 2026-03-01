@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useOutletContext } from "react-router-dom";
 
 import { apiFetch } from "@/lib/api";
@@ -13,30 +13,56 @@ type UserRow = {
   created_at: string;
 };
 
+const PROJECT_ROLES = ["viewer", "operator", "admin"];
+
 export function SettingsUsersPage() {
   const { me } = useOutletContext<SettingsOutletContext>();
 
   const [users, setUsers] = useState<UserRow[]>([]);
   const [search, setSearch] = useState("");
   const [pendingOnly, setPendingOnly] = useState(false);
+  const [isActiveFilter, setIsActiveFilter] = useState("all");
+  const [isApprovedFilter, setIsApprovedFilter] = useState("all");
+  const [isSysadminFilter, setIsSysadminFilter] = useState("all");
   const [loading, setLoading] = useState(false);
 
   const [newUserEmail, setNewUserEmail] = useState("");
   const [newUserPassword, setNewUserPassword] = useState("");
   const [newUserSysadmin, setNewUserSysadmin] = useState(false);
   const [newUserApproved, setNewUserApproved] = useState(true);
+  const [newUserAllProjects, setNewUserAllProjects] = useState(false);
+  const [newUserAllProjectsRole, setNewUserAllProjectsRole] = useState("viewer");
+
+  const [assignUserId, setAssignUserId] = useState("");
+  const [assignRole, setAssignRole] = useState("viewer");
+  const [assignOverwrite, setAssignOverwrite] = useState(false);
 
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
+  const counts = useMemo(() => {
+    const total = users.length;
+    const active = users.filter((user) => user.is_active).length;
+    const pending = users.filter((user) => !user.is_approved).length;
+    const admins = users.filter((user) => user.is_sysadmin).length;
+    return { total, active, pending, admins };
+  }, [users]);
+
   async function loadUsers() {
     setLoading(true);
-    const query = new URLSearchParams({ limit: "200" });
+    const query = new URLSearchParams({ limit: "500" });
     if (search.trim()) query.set("search", search.trim());
     if (pendingOnly) query.set("include_pending_only", "true");
+    if (isActiveFilter !== "all") query.set("is_active", isActiveFilter);
+    if (isApprovedFilter !== "all") query.set("is_approved", isApprovedFilter);
+    if (isSysadminFilter !== "all") query.set("is_sysadmin", isSysadminFilter);
     try {
       const data = await apiFetch(`/users?${query.toString()}`);
-      setUsers((data?.items || []) as UserRow[]);
+      const rows = (data?.items || []) as UserRow[];
+      setUsers(rows);
+      if (!assignUserId && rows.length > 0) {
+        setAssignUserId(rows[0].id);
+      }
     } finally {
       setLoading(false);
     }
@@ -45,7 +71,7 @@ export function SettingsUsersPage() {
   useEffect(() => {
     loadUsers().catch((err) => setError(err instanceof Error ? err.message : "Failed to load users"));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, pendingOnly]);
+  }, [search, pendingOnly, isActiveFilter, isApprovedFilter, isSysadminFilter]);
 
   async function createUser(event: FormEvent) {
     event.preventDefault();
@@ -60,6 +86,8 @@ export function SettingsUsersPage() {
           is_active: true,
           is_sysadmin: newUserSysadmin,
           is_approved: newUserApproved,
+          add_to_all_projects: newUserAllProjects,
+          all_projects_role: newUserAllProjectsRole,
         }),
       });
       setInfo("User created.");
@@ -67,6 +95,8 @@ export function SettingsUsersPage() {
       setNewUserPassword("");
       setNewUserSysadmin(false);
       setNewUserApproved(true);
+      setNewUserAllProjects(false);
+      setNewUserAllProjectsRole("viewer");
       await loadUsers();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create user");
@@ -85,6 +115,31 @@ export function SettingsUsersPage() {
     }
   }
 
+  async function assignToAllProjects(userId: string, role: string, overwriteExisting: boolean) {
+    setError(null);
+    setInfo(null);
+    try {
+      const data = await apiFetch(`/users/${userId}/assign-all-projects`, {
+        method: "POST",
+        body: JSON.stringify({ role, overwrite_existing: overwriteExisting }),
+      });
+      const assigned = typeof data?.assigned_projects === "number" ? data.assigned_projects : 0;
+      setInfo(`Assigned user to ${assigned} project memberships.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to assign memberships");
+    }
+  }
+
+  async function resetPassword(user: UserRow) {
+    const nextPassword = window.prompt(`Set temporary password for ${user.email} (minimum 12 characters):`);
+    if (!nextPassword) return;
+    if (nextPassword.length < 12) {
+      setError("Temporary password must be at least 12 characters.");
+      return;
+    }
+    await patchUser(user.id, { password: nextPassword }, "Password updated.");
+  }
+
   return (
     <>
       {error || info ? (
@@ -94,8 +149,8 @@ export function SettingsUsersPage() {
         </div>
       ) : null}
 
-      <div className="workspace-section grid gap-4 md:grid-cols-2">
-        <div className="workspace-card space-y-3">
+      <div className="workspace-section grid gap-4 xl:grid-cols-3">
+        <div className="workspace-card space-y-3 xl:col-span-1">
           <h2 className="text-lg font-semibold">Create User</h2>
           <form className="space-y-3" onSubmit={createUser}>
             <input
@@ -123,30 +178,129 @@ export function SettingsUsersPage() {
               <input checked={newUserApproved} onChange={(event) => setNewUserApproved(event.target.checked)} type="checkbox" />
               Mark approved
             </label>
+            <label className="flex items-center gap-2 text-sm">
+              <input checked={newUserAllProjects} onChange={(event) => setNewUserAllProjects(event.target.checked)} type="checkbox" />
+              Add to all projects on create
+            </label>
+            {newUserAllProjects ? (
+              <label className="block text-sm">
+                All-project role
+                <select
+                  className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  value={newUserAllProjectsRole}
+                  onChange={(event) => setNewUserAllProjectsRole(event.target.value)}
+                >
+                  {PROJECT_ROLES.map((role) => (
+                    <option key={role} value={role}>
+                      {role}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
             <button className="rounded-lg bg-pine px-3 py-1 text-sm font-semibold text-white" type="submit">
               Create user
             </button>
           </form>
         </div>
 
-        <div className="workspace-card space-y-3">
+        <div className="workspace-card space-y-3 xl:col-span-2">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-lg font-semibold">User Directory</h2>
-            <div className="flex items-center gap-2">
-              <input
-                className="rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
-                placeholder="Search email"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-              />
-              <label className="flex items-center gap-1 text-xs">
-                <input checked={pendingOnly} onChange={(event) => setPendingOnly(event.target.checked)} type="checkbox" />
-                Pending only
-              </label>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+              <span>Total: {counts.total}</span>
+              <span>Active: {counts.active}</span>
+              <span>Pending: {counts.pending}</span>
+              <span>Sysadmin: {counts.admins}</span>
             </div>
           </div>
+
+          <div className="grid gap-2 lg:grid-cols-5">
+            <input
+              className="rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+              placeholder="Search email"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+            />
+            <select
+              className="rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+              value={isActiveFilter}
+              onChange={(event) => setIsActiveFilter(event.target.value)}
+            >
+              <option value="all">All activity</option>
+              <option value="true">Active only</option>
+              <option value="false">Disabled only</option>
+            </select>
+            <select
+              className="rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+              value={isApprovedFilter}
+              onChange={(event) => setIsApprovedFilter(event.target.value)}
+            >
+              <option value="all">All approvals</option>
+              <option value="true">Approved only</option>
+              <option value="false">Pending only</option>
+            </select>
+            <select
+              className="rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+              value={isSysadminFilter}
+              onChange={(event) => setIsSysadminFilter(event.target.value)}
+            >
+              <option value="all">All roles</option>
+              <option value="true">Sysadmin only</option>
+              <option value="false">Non-sysadmin</option>
+            </select>
+            <label className="flex items-center gap-1 rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700">
+              <input checked={pendingOnly} onChange={(event) => setPendingOnly(event.target.checked)} type="checkbox" />
+              Pending only quick filter
+            </label>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 p-2 dark:border-slate-700">
+            <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Assign Existing User To All Projects</p>
+            <div className="grid gap-2 md:grid-cols-4">
+              <select
+                className="rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+                value={assignUserId}
+                onChange={(event) => setAssignUserId(event.target.value)}
+              >
+                {users.map((user) => (
+                  <option key={user.id} value={user.id}>
+                    {user.email}
+                  </option>
+                ))}
+              </select>
+              <select
+                className="rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+                value={assignRole}
+                onChange={(event) => setAssignRole(event.target.value)}
+              >
+                {PROJECT_ROLES.map((role) => (
+                  <option key={role} value={role}>
+                    {role}
+                  </option>
+                ))}
+              </select>
+              <label className="flex items-center gap-1 rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700">
+                <input checked={assignOverwrite} onChange={(event) => setAssignOverwrite(event.target.checked)} type="checkbox" />
+                Overwrite existing memberships
+              </label>
+              <button
+                className="rounded-lg bg-pine px-3 py-1 text-xs font-semibold text-white"
+                type="button"
+                onClick={() => {
+                  if (!assignUserId) return;
+                  assignToAllProjects(assignUserId, assignRole, assignOverwrite).catch((err) =>
+                    setError(err instanceof Error ? err.message : "Failed to assign memberships"),
+                  );
+                }}
+              >
+                Assign now
+              </button>
+            </div>
+          </div>
+
           {loading ? <p className="text-sm text-slate-500">Loading users…</p> : null}
-          <ul className="max-h-[420px] space-y-2 overflow-auto text-sm">
+          <ul className="max-h-[520px] space-y-2 overflow-auto text-sm">
             {users.map((user) => (
               <li className="rounded-lg border border-slate-300 p-2 dark:border-slate-700" key={user.id}>
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -191,6 +345,19 @@ export function SettingsUsersPage() {
                       }
                     >
                       {user.is_sysadmin ? "Demote" : "Promote"}
+                    </button>
+                    <button
+                      className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
+                      onClick={() => {
+                        assignToAllProjects(user.id, "viewer", false).catch((err) =>
+                          setError(err instanceof Error ? err.message : "Failed to assign memberships"),
+                        );
+                      }}
+                    >
+                      Add To All Projects
+                    </button>
+                    <button className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700" onClick={() => resetPassword(user)}>
+                      Reset Password
                     </button>
                   </div>
                 </div>

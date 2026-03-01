@@ -149,6 +149,8 @@ class UserCreateIn(BaseModel):
     is_active: bool = True
     is_sysadmin: bool = False
     is_approved: bool = True
+    add_to_all_projects: bool = False
+    all_projects_role: ProjectRole = ProjectRole.VIEWER
 
 
 class UserUpdateIn(BaseModel):
@@ -161,6 +163,11 @@ class UserUpdateIn(BaseModel):
 
 class UserApprovalIn(BaseModel):
     is_approved: bool
+
+
+class UserAssignAllProjectsIn(BaseModel):
+    role: ProjectRole = ProjectRole.VIEWER
+    overwrite_existing: bool = False
 
 
 class ApiTokenAdminOut(BaseModel):
@@ -176,6 +183,48 @@ class ApiTokenAdminOut(BaseModel):
     expires_at: datetime | None
     created_at: datetime
     revoked_at: datetime | None
+
+
+class ApiTokenAdminCreateIn(BaseModel):
+    user_id: uuid.UUID
+    project_id: uuid.UUID
+    name: str = Field(min_length=1, max_length=120)
+    role: ProjectRole
+    expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+    scopes: list[str] = Field(default_factory=list)
+
+    @field_validator("scopes")
+    @classmethod
+    def validate_scopes(cls, value: list[str]) -> list[str]:
+        normalized = normalize_token_scopes(value)
+        invalid = [scope for scope in normalized if not is_scope_allowed(scope)]
+        if invalid:
+            raise ValueError(f"unsupported scopes: {', '.join(invalid)}")
+        return normalized
+
+
+class ApiTokenAdminUpdateIn(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    role: ProjectRole | None = None
+    scopes: list[str] | None = None
+    expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+    never_expires: bool = False
+
+    @field_validator("scopes")
+    @classmethod
+    def validate_scopes(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        normalized = normalize_token_scopes(value)
+        invalid = [scope for scope in normalized if not is_scope_allowed(scope)]
+        if invalid:
+            raise ValueError(f"unsupported scopes: {', '.join(invalid)}")
+        return normalized
+
+
+class ApiTokenAdminCreateOut(BaseModel):
+    token: str
+    token_meta: ApiTokenAdminOut
 
 
 class AuditEventOut(BaseModel):

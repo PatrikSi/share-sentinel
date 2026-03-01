@@ -362,6 +362,10 @@ def create_api_token(
     role = get_project_role(db, auth, payload.project_id)
     if role != ProjectRole.ADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="project admin required")
+
+    owner = db.get(User, auth.user_id)
+    if owner is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user login required")
     rate_limiter.check(
         request,
         "api_token_create",
@@ -382,6 +386,7 @@ def create_api_token(
     scopes = normalize_token_scopes(payload.scopes)
     if not scopes:
         scopes = default_scopes_for_project_role(payload.role)
+    _enforce_scope_policy_for_owner(owner, payload.role, scopes)
 
     token = ApiToken(
         user_id=auth.user_id,
@@ -487,3 +492,15 @@ def _to_user_out(user: User) -> UserOut:
         approved_by_user_id=user.approved_by_user_id,
         ui_theme=user.ui_theme,
     )
+
+
+def _enforce_scope_policy_for_owner(owner: User, role: ProjectRole, scopes: list[str]) -> None:
+    if owner.is_sysadmin:
+        return
+    allowed_scopes = set(default_scopes_for_project_role(role))
+    disallowed = sorted(scope for scope in scopes if scope not in allowed_scopes)
+    if disallowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"non-sysadmin token scopes must match role defaults: {', '.join(disallowed)}",
+        )

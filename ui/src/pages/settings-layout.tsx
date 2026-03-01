@@ -11,7 +11,6 @@ const SETTINGS_TABS = [
   { to: "rbac", label: "RBAC" },
   { to: "api-tokens", label: "API Tokens" },
   { to: "audit-logs", label: "Audit Logs" },
-  { to: "security", label: "Security" },
 ];
 
 export function SettingsLayout() {

@@ -23,6 +23,11 @@ class _ExecuteResult:
     def scalars(self):
         return self
 
+    def scalar(self):
+        if not self._rows:
+            return None
+        return self._rows[0]
+
 
 @dataclass
 class _FakeDb:
@@ -48,6 +53,22 @@ class _FakeDb:
 
     def commit(self):
         self.commit_count += 1
+
+    def flush(self):
+        for obj in self.added:
+            if getattr(obj, "id", None) is None:
+                try:
+                    obj.id = uuid.uuid4()
+                except Exception:  # noqa: BLE001
+                    pass
+            if getattr(obj, "created_at", None) is None:
+                try:
+                    obj.created_at = datetime.now(tz=UTC)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def refresh(self, _obj):
+        return None
 
 
 def _normalize_key(key):
@@ -169,6 +190,7 @@ def test_settings_rbac_upsert_and_remove_membership() -> None:
     fake_db.get_map[(Project, project_id)] = SimpleNamespace(id=project_id, name="Core")
     fake_db.get_map[(User, user_id)] = SimpleNamespace(id=user_id, email="analyst@example.com")
     fake_db.get_map[(ProjectMember, _normalize_key({"project_id": project_id, "user_id": user_id}))] = existing_membership
+    fake_db.execute_queue.append(_ExecuteResult([1]))
 
     client = _client_for_db(fake_db)
     try:
@@ -215,3 +237,71 @@ def test_settings_rbac_lists_memberships() -> None:
     assert payload["items"][0]["project_id"] == str(project_id)
     assert payload["items"][0]["user_email"] == "viewer@example.com"
     assert payload["items"][0]["role"] == "viewer"
+
+
+def test_settings_api_token_catalog_and_create_and_rotate() -> None:
+    fake_db = _FakeDb()
+    actor_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    target_user = SimpleNamespace(id=user_id, email="owner@example.com", is_sysadmin=False, is_active=True, is_approved=True)
+    target_project = SimpleNamespace(id=project_id, name="Core")
+    target_membership = SimpleNamespace(project_id=project_id, user_id=user_id, role=ProjectRole.ADMIN)
+    fake_db.get_map[(User, user_id)] = target_user
+    fake_db.get_map[(Project, project_id)] = target_project
+    fake_db.get_map[(ProjectMember, _normalize_key({"project_id": project_id, "user_id": user_id}))] = target_membership
+
+    client = _client_for_db(fake_db, actor_user_id=actor_id)
+    try:
+        catalog_response = client.get("/settings/api-token-scopes")
+        create_response = client.post(
+            "/settings/api-tokens",
+            json={
+                "user_id": str(user_id),
+                "project_id": str(project_id),
+                "name": "global-agent",
+                "role": "admin",
+                "scopes": [],
+                "expires_in_days": 30,
+            },
+        )
+        created_id = create_response.json()["token_meta"]["id"]
+        created_token = next(obj for obj in fake_db.added if isinstance(obj, ApiToken))
+        fake_db.get_map[(ApiToken, uuid.UUID(created_id))] = created_token
+        rotate_response = client.post(f"/settings/api-tokens/{created_id}/rotate")
+    finally:
+        _clear_overrides()
+
+    assert catalog_response.status_code == 200
+    catalog_payload = catalog_response.json()
+    assert "allowed_scopes" in catalog_payload
+    assert "defaults_by_role" in catalog_payload
+
+    assert create_response.status_code == 200
+    create_payload = create_response.json()
+    assert create_payload["token"]
+    assert create_payload["token_meta"]["user_email"] == "owner@example.com"
+    assert create_payload["token_meta"]["project_name"] == "Core"
+
+    assert rotate_response.status_code == 200
+    rotate_payload = rotate_response.json()
+    assert rotate_payload["token"]
+    assert rotate_payload["token_meta"]["id"] == created_id
+
+
+def test_settings_rejects_removing_last_project_admin() -> None:
+    fake_db = _FakeDb()
+    project_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    membership = SimpleNamespace(project_id=project_id, user_id=user_id, role=ProjectRole.ADMIN)
+    fake_db.get_map[(ProjectMember, _normalize_key({"project_id": project_id, "user_id": user_id}))] = membership
+    fake_db.execute_queue.append(_ExecuteResult([0]))
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.delete(f"/settings/rbac/project-memberships/{project_id}/{user_id}")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 400
+    assert "at least one project admin must remain" in response.json()["detail"]
