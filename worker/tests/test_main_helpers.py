@@ -81,3 +81,61 @@ def test_validate_record_requires_numeric_schema_version_for_run_meta() -> None:
     )
     assert unsupported is False
     assert unsupported_reason == "unsupported schema_version"
+
+
+def test_validate_record_normalizes_share_type_and_resource_type() -> None:
+    resource_record = {
+        "type": "resource",
+        "run_id": "run-1",
+        "endpoint_key": "host:2049",
+        "name": "/srv/public",
+        "share_type": "NFS",
+    }
+    resource_ok, resource_reason = main.validate_record(resource_record)
+    assert resource_ok is True
+    assert resource_reason is None
+    assert resource_record["share_type"] == "nfs"
+    assert resource_record["resource_type"] == "nfs_share"
+
+    item_record = {
+        "type": "item",
+        "run_id": "run-1",
+        "endpoint_key": "host:2049",
+        "resource_name": "/srv/public",
+        "path": "/srv/public/file.txt",
+        "resource_type": "nfs_share",
+    }
+    item_ok, item_reason = main.validate_record(item_record)
+    assert item_ok is True
+    assert item_reason is None
+    assert item_record["share_type"] == "nfs"
+    assert item_record["resource_type"] == "nfs_share"
+
+
+def test_records_from_nested_json_preserves_share_type() -> None:
+    run_id = str(uuid.uuid4())
+    records = main.records_from_json_document(
+        {
+            "endpoints": [
+                {
+                    "endpoint_key": "host:2049",
+                    "shares": [
+                        {
+                            "name": "/srv/public",
+                            "share_type": "nfs",
+                            "entries": [{"name": "docs", "is_dir": True, "children": [{"name": "file.txt", "is_dir": False}]}],
+                        }
+                    ],
+                }
+            ]
+        },
+        run_id,
+    )
+
+    resource = next(record for record in records if record.get("type") == "resource")
+    item = next(record for record in records if record.get("type") == "item")
+
+    assert resource["share_type"] == "nfs"
+    assert resource["resource_type"] == "nfs_share"
+    assert item["share_type"] == "nfs"
+    assert item["resource_type"] == "nfs_share"

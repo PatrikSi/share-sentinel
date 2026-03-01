@@ -9,6 +9,7 @@ from app.deps import AuthContext, get_auth_context, require_project_role, reques
 from app.enums import ProjectRole, RunStatus
 from app.models import Endpoint, Item, Resource, ScanRun
 from app.pagination import next_cursor, parse_cursor
+from app.share_types import share_type_from_resource_type
 from app.services.audit import write_audit_event
 from app.token_scopes import SCOPE_READ_INVENTORY
 
@@ -220,6 +221,7 @@ def inventory_items(
             Endpoint.ip,
             Resource.name.label("resource_name"),
             Resource.access_level,
+            Resource.resource_type,
             Item.path,
             Item.name,
             Item.is_dir,
@@ -272,6 +274,7 @@ def inventory_items(
             "ip": row.ip,
             "resource_name": row.resource_name,
             "access_level": row.access_level.value if hasattr(row.access_level, "value") else row.access_level,
+            "share_type": share_type_from_resource_type(row.resource_type),
             "path": row.path,
             "name": row.name,
             "is_dir": bool(row.is_dir),
@@ -319,6 +322,7 @@ def inventory_resources(
             Resource.name,
             Resource.remark,
             Resource.access_level,
+            Resource.resource_type,
             func.count(Item.id).label("item_count"),
         )
         .select_from(Resource)
@@ -335,6 +339,7 @@ def inventory_resources(
             Resource.name,
             Resource.remark,
             Resource.access_level,
+            Resource.resource_type,
         )
     )
 
@@ -363,6 +368,7 @@ def inventory_resources(
             "name": row.name,
             "remark": row.remark,
             "access_level": row.access_level.value if hasattr(row.access_level, "value") else row.access_level,
+            "share_type": share_type_from_resource_type(row.resource_type),
             "item_count": int(row.item_count or 0),
         }
         for row in rows

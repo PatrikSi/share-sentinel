@@ -16,6 +16,7 @@ type InventoryItem = {
   ip: string | null;
   resource_name: string;
   access_level: string;
+  share_type: string;
   path: string;
   name: string;
   is_dir: boolean;
@@ -30,6 +31,7 @@ type InventoryResource = {
   name: string;
   remark: string | null;
   access_level: string;
+  share_type: string;
   item_count: number;
 };
 
@@ -47,14 +49,26 @@ type InventoryEndpoint = {
 };
 
 type Tab = "items" | "resources" | "endpoints";
-type ItemColumnKey = "path" | "name" | "resource_name" | "access_level" | "endpoint_key" | "hostname" | "ip" | "run_name" | "run_id" | "is_dir";
-type ResourceColumnKey = "name" | "access_level" | "endpoint_key" | "hostname" | "item_count" | "run_name" | "run_id" | "remark";
+type ItemColumnKey =
+  | "path"
+  | "name"
+  | "resource_name"
+  | "share_type"
+  | "access_level"
+  | "endpoint_key"
+  | "hostname"
+  | "ip"
+  | "run_name"
+  | "run_id"
+  | "is_dir";
+type ResourceColumnKey = "name" | "share_type" | "access_level" | "endpoint_key" | "hostname" | "item_count" | "run_name" | "run_id" | "remark";
 type EndpointColumnKey = "endpoint_key" | "hostname" | "ip" | "domain" | "smb_signing" | "resource_count" | "item_count" | "run_name" | "run_id";
 
 const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
   { key: "path", label: "Path" },
   { key: "name", label: "Name" },
   { key: "resource_name", label: "Share" },
+  { key: "share_type", label: "Share Type" },
   { key: "access_level", label: "Share Access" },
   { key: "endpoint_key", label: "Endpoint Key" },
   { key: "hostname", label: "Hostname" },
@@ -65,6 +79,7 @@ const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
 ];
 const RESOURCE_COLUMN_OPTIONS: Array<{ key: ResourceColumnKey; label: string }> = [
   { key: "name", label: "Share" },
+  { key: "share_type", label: "Share Type" },
   { key: "access_level", label: "Access" },
   { key: "endpoint_key", label: "Endpoint Key" },
   { key: "hostname", label: "Hostname" },
@@ -110,8 +125,16 @@ export function ProjectInventoryPage() {
   const [nextCursor, setNextCursor] = useState<string | null>(null);
 
   const [error, setError] = useState<string | null>(null);
-  const [itemColumns, setItemColumns] = useState<ItemColumnKey[]>(["path", "name", "resource_name", "hostname", "run_name", "is_dir"]);
-  const [resourceColumns, setResourceColumns] = useState<ResourceColumnKey[]>(["name", "access_level", "hostname", "item_count", "run_name", "remark"]);
+  const [itemColumns, setItemColumns] = useState<ItemColumnKey[]>(["path", "name", "resource_name", "share_type", "hostname", "run_name", "is_dir"]);
+  const [resourceColumns, setResourceColumns] = useState<ResourceColumnKey[]>([
+    "name",
+    "share_type",
+    "access_level",
+    "hostname",
+    "item_count",
+    "run_name",
+    "remark",
+  ]);
   const [endpointColumns, setEndpointColumns] = useState<EndpointColumnKey[]>(["endpoint_key", "hostname", "domain", "resource_count", "item_count", "run_name"]);
   const [dragItemColumn, setDragItemColumn] = useState<ItemColumnKey | null>(null);
   const [dragResourceColumn, setDragResourceColumn] = useState<ResourceColumnKey | null>(null);
@@ -266,6 +289,7 @@ export function ProjectInventoryPage() {
     if (column === "path") return <span className="font-mono text-xs">{row.path}</span>;
     if (column === "name") return row.name;
     if (column === "resource_name") return row.resource_name;
+    if (column === "share_type") return row.share_type.toUpperCase();
     if (column === "access_level") return row.access_level;
     if (column === "endpoint_key") return row.endpoint_key;
     if (column === "hostname") return row.hostname || "-";
@@ -277,6 +301,7 @@ export function ProjectInventoryPage() {
 
   function resourceCell(row: InventoryResource, column: ResourceColumnKey): ReactNode {
     if (column === "name") return row.name;
+    if (column === "share_type") return row.share_type.toUpperCase();
     if (column === "access_level") return row.access_level;
     if (column === "endpoint_key") return row.endpoint_key;
     if (column === "hostname") return row.hostname || "-";

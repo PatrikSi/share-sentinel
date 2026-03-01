@@ -20,6 +20,7 @@ from app.models import Endpoint, Item, Resource, ScanRun
 from app.pagination import next_cursor, parse_cursor
 from app.rate_limit import RateLimiter
 from app.schemas import RunCreateIn, RunOut
+from app.share_types import share_type_from_resource_type
 from app.services.audit import write_audit_event
 from app.services.queue import enqueue_ingest_job
 from app.services.storage import (
@@ -490,10 +491,11 @@ def endpoint_resources(
         "items": [
             {
                 "id": r.id,
-                "resource_type": r.resource_type,
+                "resource_type": r.resource_type.value if hasattr(r.resource_type, "value") else r.resource_type,
+                "share_type": share_type_from_resource_type(r.resource_type),
                 "name": r.name,
                 "remark": r.remark,
-                "access_level": r.access_level,
+                "access_level": r.access_level.value if hasattr(r.access_level, "value") else r.access_level,
             }
             for r in resources
         ]

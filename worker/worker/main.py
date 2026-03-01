@@ -74,6 +74,11 @@ INGEST_OPERATION_EXCEPTIONS = (
     TypeError,
 )
 STREAM_MESSAGE_RETRYABLE_EXCEPTIONS = INGEST_OPERATION_EXCEPTIONS + (redis.RedisError,)
+SHARE_TYPE_TO_RESOURCE_TYPE = {
+    "smb": "smb_share",
+    "nfs": "nfs_share",
+}
+RESOURCE_TYPE_TO_SHARE_TYPE = {value: key for key, value in SHARE_TYPE_TO_RESOURCE_TYPE.items()}
 
 
 def _safe_run_id(fields: dict[str, str] | None) -> str | None:
@@ -238,6 +243,25 @@ def parse_offset(raw: Any) -> int:
         return 0
 
 
+def _normalize_share_type(raw_share_type: Any, raw_resource_type: Any = None) -> str:
+    if isinstance(raw_share_type, str):
+        normalized = raw_share_type.strip().lower()
+        if normalized in SHARE_TYPE_TO_RESOURCE_TYPE:
+            return normalized
+
+    if isinstance(raw_resource_type, str):
+        normalized_resource_type = raw_resource_type.strip().lower()
+        share_type = RESOURCE_TYPE_TO_SHARE_TYPE.get(normalized_resource_type)
+        if share_type:
+            return share_type
+
+    return "smb"
+
+
+def _resource_type_from_share_type(share_type: str) -> str:
+    return SHARE_TYPE_TO_RESOURCE_TYPE.get(share_type, "smb_share")
+
+
 def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
     rec_type = rec.get("type")
     if rec_type not in {"run_meta", "endpoint", "resource", "item", "error", "run_end"}:
@@ -246,8 +270,8 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
     required: dict[str, tuple[str, ...]] = {
         "run_meta": ("schema_version", "tool", "tool_version", "run_id", "started_at"),
         "endpoint": ("run_id", "endpoint_key"),
-        "resource": ("run_id", "endpoint_key", "resource_type", "name"),
-        "item": ("run_id", "endpoint_key", "resource_type", "resource_name", "path"),
+        "resource": ("run_id", "endpoint_key", "name"),
+        "item": ("run_id", "endpoint_key", "resource_name", "path"),
         "error": ("run_id", "severity", "code", "message"),
         "run_end": ("run_id", "finished_at"),
     }
@@ -264,6 +288,11 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
 
     if rec_type == "item" and not rec.get("name"):
         rec["name"] = PurePosixPath(str(rec.get("path", ""))).name or ""
+
+    if rec_type in {"resource", "item"}:
+        share_type = _normalize_share_type(rec.get("share_type"), rec.get("resource_type"))
+        rec["share_type"] = share_type
+        rec["resource_type"] = _resource_type_from_share_type(share_type)
     return True, None
 
 
@@ -291,8 +320,10 @@ def _iter_items_from_entries(
     endpoint_key: str,
     resource_name: str,
     entries: list[Any],
+    share_type: str = "smb",
     parent_path: str = "\\",
 ):
+    resource_type = _resource_type_from_share_type(share_type)
     for raw_entry in entries:
         if not isinstance(raw_entry, dict):
             continue
@@ -307,7 +338,8 @@ def _iter_items_from_entries(
             "type": "item",
             "run_id": run_id,
             "endpoint_key": endpoint_key,
-            "resource_type": "smb_share",
+            "resource_type": resource_type,
+            "share_type": share_type,
             "resource_name": resource_name,
             "path": full_path,
             "name": name,
@@ -316,7 +348,7 @@ def _iter_items_from_entries(
 
         children = raw_entry.get("children")
         if is_dir and isinstance(children, list):
-            yield from _iter_items_from_entries(run_id, endpoint_key, resource_name, children, full_path)
+            yield from _iter_items_from_entries(run_id, endpoint_key, resource_name, children, share_type, full_path)
 
 
 def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
@@ -357,13 +389,15 @@ def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str
             share_name = str(raw_share.get("name") or "").strip()
             if not share_name:
                 continue
+            share_type = _normalize_share_type(raw_share.get("share_type"), raw_share.get("resource_type"))
 
             records.append(
                 {
                     "type": "resource",
                     "run_id": run_id,
                     "endpoint_key": endpoint_key,
-                    "resource_type": "smb_share",
+                    "resource_type": _resource_type_from_share_type(share_type),
+                    "share_type": share_type,
                     "name": share_name,
                     "remark": raw_share.get("remark"),
                     "access_level": raw_share.get("access_level", "no_access"),
@@ -372,7 +406,7 @@ def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str
 
             raw_entries = raw_share.get("entries")
             if isinstance(raw_entries, list):
-                records.extend(_iter_items_from_entries(run_id, endpoint_key, share_name, raw_entries))
+                records.extend(_iter_items_from_entries(run_id, endpoint_key, share_name, raw_entries, share_type=share_type))
 
     return records
 
@@ -483,7 +517,7 @@ def process_job(fields: dict[str, str]) -> None:
             conn.commit()
 
             endpoint_cache: dict[str, int] = {}
-            resource_cache: dict[tuple[str, str], int] = {}
+            resource_cache: dict[tuple[str, str, str], int] = {}
             item_batch: list[tuple] = []
             error_batch: list[tuple] = []
 
@@ -521,17 +555,20 @@ def process_job(fields: dict[str, str]) -> None:
                     counts["endpoints"] += 1
                 elif rec_type == "resource":
                     endpoint_key = rec.get("endpoint_key", "")
+                    resource_type = str(rec.get("resource_type") or "smb_share")
+                    resource_name = rec.get("name", "")
                     endpoint_id = endpoint_cache.get(endpoint_key)
                     if endpoint_id is None:
                         endpoint_id = upsert_endpoint(conn, run_id, {"endpoint_key": endpoint_key})
                         endpoint_cache[endpoint_key] = endpoint_id
                     resource_id = upsert_resource(conn, run_id, endpoint_id, rec)
-                    resource_cache[(endpoint_key, rec.get("name", ""))] = resource_id
+                    resource_cache[(endpoint_key, resource_name, resource_type)] = resource_id
                     counts["resources"] += 1
                 elif rec_type == "item":
                     endpoint_key = rec.get("endpoint_key", "")
                     resource_name = rec.get("resource_name", "")
-                    key = (endpoint_key, resource_name)
+                    resource_type = str(rec.get("resource_type") or "smb_share")
+                    key = (endpoint_key, resource_name, resource_type)
                     resource_id = resource_cache.get(key)
                     if resource_id is None:
                         endpoint_id = endpoint_cache.get(endpoint_key)
@@ -543,7 +580,7 @@ def process_job(fields: dict[str, str]) -> None:
                             run_id,
                             endpoint_id,
                             {
-                                "resource_type": rec.get("resource_type", "smb_share"),
+                                "resource_type": resource_type,
                                 "name": resource_name,
                                 "remark": None,
                                 "access_level": "no_access",

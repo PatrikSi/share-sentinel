@@ -10,6 +10,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -75,17 +76,18 @@ class NDJSONWriter:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="SMB one-off enumerator for Share Sentinel")
+    parser = argparse.ArgumentParser(description="Network share enumerator for Share Sentinel")
     parser.add_argument("--cidr", action="append", default=[])
     parser.add_argument("--hosts", type=str)
 
     parser.add_argument("--domain", type=str, default="")
-    parser.add_argument("--username", type=str, required=True)
+    parser.add_argument("--username", type=str, default="")
     parser.add_argument("--password", type=str, default="")
     parser.add_argument("--hashes", type=str)
     parser.add_argument("--local-auth", action="store_true")
     parser.add_argument("--kerberos", action="store_true")
     parser.add_argument("--ccache", type=str)
+    parser.add_argument("--share-types", choices=["smb", "nfs", "both"], default="smb")
 
     parser.add_argument("--workers", type=int, default=100)
     parser.add_argument("--timeout", type=float, default=3.0)
@@ -104,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-base", type=str)
     parser.add_argument("--project-id", type=str)
     parser.add_argument("--api-token", type=str)
-    parser.add_argument("--run-name", type=str, default="SMB Collector Run")
+    parser.add_argument("--run-name", type=str, default="Share Collector Run")
     return parser.parse_args()
 
 
@@ -213,7 +215,57 @@ def _signing_label(conn: SMBConnection) -> str:
         return "enabled"
 
 
-def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
+def _selected_share_types(raw_value: str) -> set[str]:
+    normalized = (raw_value or "smb").strip().lower()
+    if normalized == "both":
+        return {"smb", "nfs"}
+    if normalized in {"smb", "nfs"}:
+        return {normalized}
+    return {"smb"}
+
+
+def _parse_showmount_exports(output: str) -> list[str]:
+    exports: list[str] = []
+    seen: set[str] = set()
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.lower().startswith("exports list"):
+            continue
+        if not line.startswith("/"):
+            continue
+        export_path = line.split()[0]
+        if export_path in seen:
+            continue
+        seen.add(export_path)
+        exports.append(export_path)
+    return exports
+
+
+def _discover_nfs_exports(host: str, timeout_seconds: float) -> tuple[list[str], str | None]:
+    timeout = max(1.0, timeout_seconds * 4)
+    try:
+        completed = subprocess.run(
+            ["showmount", "-e", host],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return [], "showmount is not available"
+    except subprocess.TimeoutExpired:
+        return [], "showmount timed out"
+    except OSError as exc:
+        return [], str(exc)
+
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or f"showmount exit code {completed.returncode}"
+        return [], detail
+
+    return _parse_showmount_exports(completed.stdout), None
+
+
+def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
     endpoint_key = f"{host}:445"
     if SMBConnection is None:
         writer.emit(
@@ -292,6 +344,7 @@ def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWr
                 "type": "resource",
                 "run_id": run_id,
                 "endpoint_key": endpoint_key,
+                "share_type": "smb",
                 "resource_type": "smb_share",
                 "name": share_name,
                 "remark": remark,
@@ -315,6 +368,7 @@ def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWr
                             "type": "item",
                             "run_id": run_id,
                             "endpoint_key": endpoint_key,
+                            "share_type": "smb",
                             "resource_type": "smb_share",
                             "resource_name": share_name,
                             **entry,
@@ -422,6 +476,105 @@ def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWr
     with lock:
         stats.errors += 1
     return False
+
+
+def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
+    endpoint_key = f"{host}:2049"
+
+    try:
+        with socket.create_connection((host, 2049), timeout=args.timeout):
+            pass
+    except (socket.timeout, TimeoutError):
+        writer.emit(
+            {
+                "type": "error",
+                "run_id": run_id,
+                "severity": "error",
+                "code": "NFS_TIMEOUT",
+                "message": "connection timeout",
+                "endpoint_key": endpoint_key,
+            }
+        )
+        with lock:
+            stats.errors += 1
+        return False
+    except OSError as exc:
+        writer.emit(
+            {
+                "type": "error",
+                "run_id": run_id,
+                "severity": "error",
+                "code": "NFS_CONNECT_FAILED",
+                "message": str(exc),
+                "endpoint_key": endpoint_key,
+            }
+        )
+        with lock:
+            stats.errors += 1
+        return False
+
+    writer.emit(
+        {
+            "type": "endpoint",
+            "run_id": run_id,
+            "endpoint_key": endpoint_key,
+            "ip": host if _is_ip(host) else None,
+            "hostname": host if not _is_ip(host) else None,
+            "domain": args.domain or None,
+            "nfs": {
+                "port": 2049,
+            },
+            "auth": {
+                "method": "none",
+                "success": True,
+            },
+        }
+    )
+    with lock:
+        stats.endpoints += 1
+
+    exports, export_error = _discover_nfs_exports(host, args.timeout)
+    if export_error:
+        writer.emit(
+            {
+                "type": "error",
+                "run_id": run_id,
+                "severity": "warn",
+                "code": "NFS_EXPORT_ENUM_FAILED",
+                "message": export_error,
+                "endpoint_key": endpoint_key,
+            }
+        )
+        with lock:
+            stats.errors += 1
+
+    for export_path in exports:
+        writer.emit(
+            {
+                "type": "resource",
+                "run_id": run_id,
+                "endpoint_key": endpoint_key,
+                "share_type": "nfs",
+                "resource_type": "nfs_share",
+                "name": export_path,
+                "remark": "",
+                "access_level": "list_only",
+            }
+        )
+        with lock:
+            stats.resources += 1
+    return True
+
+
+def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
+    selected_share_types = _selected_share_types(args.share_types)
+    succeeded = False
+
+    if "smb" in selected_share_types:
+        succeeded = scan_host_smb(host, args, run_id, writer, stats, lock) or succeeded
+    if "nfs" in selected_share_types:
+        succeeded = scan_host_nfs(host, args, run_id, writer, stats, lock) or succeeded
+    return succeeded
 
 
 def _is_ip(value: str) -> bool:
@@ -570,6 +723,10 @@ def _scan_thread_error_code(exc: BaseException) -> str:
 
 def main() -> int:
     args = parse_args()
+    selected_share_types = sorted(_selected_share_types(args.share_types))
+    if "smb" in selected_share_types and not args.username:
+        raise SystemExit("--username is required when --share-types includes smb")
+
     targets = parse_targets(args.cidr, args.hosts)
     host_inputs = parse_hosts_file(args.hosts)
     run_id = str(uuid.uuid4())
@@ -600,12 +757,13 @@ def main() -> int:
             "target_scope": {
                 "cidrs": args.cidr,
                 "hosts": host_inputs,
+                "share_types": selected_share_types,
             },
             "auth": {
-                "mode": "local" if args.local_auth else "domain",
-                "domain": args.domain or None,
-                "username": args.username,
-                "method": "kerberos" if args.kerberos else "ntlm",
+                "mode": ("local" if args.local_auth else "domain") if "smb" in selected_share_types else "none",
+                "domain": (args.domain or None) if "smb" in selected_share_types else None,
+                "username": args.username or None,
+                "method": ("kerberos" if args.kerberos else "ntlm") if "smb" in selected_share_types else "none",
             },
         }
     )

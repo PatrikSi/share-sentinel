@@ -20,7 +20,7 @@ type Endpoint = {
   hostname: string | null;
   smb_signing: string | null;
 };
-type Resource = { id: number; name: string; access_level: string; remark: string | null };
+type Resource = { id: number; name: string; access_level: string; remark: string | null; share_type: string };
 type Item = { id: number; path: string; is_dir: boolean; resource_id?: number; name?: string };
 type SavedQuery = { id: string; label: string; q: string; ext: string };
 
@@ -316,7 +316,9 @@ export function RunDetailPage() {
                   onClick={() => setSelectedResource(resource.id)}
                 >
                   <span className="block font-semibold">{resource.name}</span>
-                  <span className="text-slate-500">{resource.access_level}</span>
+                  <span className="text-slate-500">
+                    {resource.share_type.toUpperCase()} | {resource.access_level}
+                  </span>
                   {resource.remark ? <span className="block text-slate-500">{resource.remark}</span> : null}
                 </button>
               </li>
