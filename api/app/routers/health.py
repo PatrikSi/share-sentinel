@@ -1,11 +1,12 @@
 from fastapi import APIRouter, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 import redis
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
+from app import metrics as metrics_module
 
 router = APIRouter(tags=["health"])
 settings = get_settings()
@@ -36,3 +37,11 @@ def healthz_deep(db: Session = Depends(get_db)):
     ok = all(value == "ok" for value in checks.values())
     status_code = 200 if ok else 503
     return JSONResponse(status_code=status_code, content={"ok": ok, "checks": checks})
+
+
+@router.get("/metrics", include_in_schema=False)
+def metrics():
+    return PlainTextResponse(
+        metrics_module.render_prometheus(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
