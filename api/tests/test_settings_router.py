@@ -305,3 +305,75 @@ def test_settings_rejects_removing_last_project_admin() -> None:
 
     assert response.status_code == 400
     assert "at least one project admin must remain" in response.json()["detail"]
+
+
+def test_settings_rejects_demoting_last_project_admin() -> None:
+    fake_db = _FakeDb()
+    project_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    fake_db.get_map[(Project, project_id)] = SimpleNamespace(id=project_id, name="Core")
+    fake_db.get_map[(User, user_id)] = SimpleNamespace(id=user_id, email="admin@example.com")
+    membership = SimpleNamespace(project_id=project_id, user_id=user_id, role=ProjectRole.ADMIN)
+    fake_db.get_map[(ProjectMember, _normalize_key({"project_id": project_id, "user_id": user_id}))] = membership
+    fake_db.execute_queue.append(_ExecuteResult([0]))
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.post(
+            "/settings/rbac/project-memberships",
+            json={"project_id": str(project_id), "user_id": str(user_id), "role": "viewer"},
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 400
+    assert "at least one project admin must remain" in response.json()["detail"]
+
+
+def test_settings_assign_user_all_projects_endpoint() -> None:
+    fake_db = _FakeDb()
+    user_id = uuid.uuid4()
+    project_a = uuid.uuid4()
+    project_b = uuid.uuid4()
+    fake_db.get_map[(User, user_id)] = SimpleNamespace(id=user_id, email="user@example.com")
+    fake_db.execute_queue.append(_ExecuteResult([SimpleNamespace(id=project_a), SimpleNamespace(id=project_b)]))
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.post(
+            f"/settings/rbac/users/{user_id}/assign-all-projects",
+            json={"role": "operator", "overwrite_existing": False},
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["assigned_projects"] == 2
+
+
+def test_settings_token_create_rejects_non_member_target_user() -> None:
+    fake_db = _FakeDb()
+    user_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    fake_db.get_map[(User, user_id)] = SimpleNamespace(id=user_id, email="owner@example.com", is_sysadmin=False, is_active=True, is_approved=True)
+    fake_db.get_map[(Project, project_id)] = SimpleNamespace(id=project_id, name="Core")
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.post(
+            "/settings/api-tokens",
+            json={
+                "user_id": str(user_id),
+                "project_id": str(project_id),
+                "name": "collector",
+                "role": "viewer",
+                "scopes": [],
+            },
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 400
+    assert "user must be a project member" in response.json()["detail"]
