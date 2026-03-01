@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from starlette.requests import Request
 
 from app.enums import UITheme
@@ -24,8 +25,10 @@ class _ExecuteResult:
 @dataclass
 class _FakeDb:
     execute_row: Any | None = None
+    flush_error: Exception | None = None
     added: list[Any] = field(default_factory=list)
     commit_count: int = 0
+    rollback_count: int = 0
 
     def execute(self, _statement):
         return _ExecuteResult(self.execute_row)
@@ -34,6 +37,8 @@ class _FakeDb:
         self.added.append(obj)
 
     def flush(self):
+        if self.flush_error is not None:
+            raise self.flush_error
         for obj in self.added:
             if getattr(obj, "id", None) is None:
                 obj.id = uuid.uuid4()
@@ -47,6 +52,9 @@ class _FakeDb:
 
     def refresh(self, _obj):
         return None
+
+    def rollback(self):
+        self.rollback_count += 1
 
 
 def _request() -> Request:
@@ -130,3 +138,26 @@ def test_register_returns_throttle_error_when_rate_limited(monkeypatch) -> None:
     assert exc.value.status_code == 429
     assert fake_db.commit_count == 0
     assert fake_db.added == []
+
+
+def test_register_handles_integrity_error_as_conflict(monkeypatch) -> None:
+    fake_db = _FakeDb(execute_row=None, flush_error=IntegrityError("insert", {}, Exception("duplicate")))
+
+    monkeypatch.setattr(
+        auth_router,
+        "get_settings",
+        lambda: SimpleNamespace(allow_self_registration=True, password_min_length=12),
+    )
+    monkeypatch.setattr(auth_router, "validate_password_strength", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router, "hash_password", lambda *_args, **_kwargs: "hashed")
+    monkeypatch.setattr(auth_router, "write_audit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router.rate_limiter, "check", lambda *_args, **_kwargs: None)
+
+    payload = RegisterIn(email="user@example.com", password="StrongPassword12345")
+    with pytest.raises(HTTPException) as exc:
+        auth_router.register(payload, _request(), fake_db)
+
+    assert exc.value.status_code == 409
+    assert "email already exists" in exc.value.detail
+    assert fake_db.rollback_count == 1
+    assert fake_db.commit_count == 0
