@@ -427,6 +427,39 @@ def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str, h
     print(f"api_run_url={base}/projects/{args.project_id}/runs/{run_id}")
 
 
+def _collect_scan_results(
+    futures_by_host: dict[concurrent.futures.Future, str],
+    run_id: str,
+    writer: NDJSONWriter,
+    stats: Stats,
+    lock: threading.Lock,
+) -> int:
+    host_failures = 0
+    for future in concurrent.futures.as_completed(futures_by_host):
+        host = futures_by_host[future]
+        try:
+            ok = bool(future.result())
+        except Exception as exc:  # noqa: BLE001
+            writer.emit(
+                {
+                    "type": "error",
+                    "run_id": run_id,
+                    "severity": "error",
+                    "code": "SCAN_THREAD_FAILED",
+                    "message": str(exc),
+                    "endpoint_key": f"{host}:445",
+                }
+            )
+            with lock:
+                stats.errors += 1
+            host_failures += 1
+            continue
+
+        if not ok:
+            host_failures += 1
+    return host_failures
+
+
 def main() -> int:
     args = parse_args()
     targets = parse_targets(args.cidr, args.hosts)
@@ -472,10 +505,8 @@ def main() -> int:
     host_failures = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures = [executor.submit(scan_host, host, args, run_id, writer, stats, lock) for host in targets]
-        for future in concurrent.futures.as_completed(futures):
-            if not future.result():
-                host_failures += 1
+        futures_by_host = {executor.submit(scan_host, host, args, run_id, writer, stats, lock): host for host in targets}
+        host_failures = _collect_scan_results(futures_by_host, run_id, writer, stats, lock)
 
     writer.emit(
         {
