@@ -79,19 +79,29 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     settings = get_settings()
     if not settings.allow_self_registration:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="self-registration is disabled")
+    email = payload.email.lower()
+    client_ip = resolve_client_ip(request)
+    rate_limiter.check(
+        request,
+        "auth_register",
+        limit=10,
+        window_seconds=300,
+        actor_key=f"register:{email}:{client_ip}",
+        fail_open=False,
+    )
 
     try:
         validate_password_strength(payload.password, settings.password_min_length)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    stmt = select(User).where(func.lower(User.email) == payload.email.lower())
+    stmt = select(User).where(func.lower(User.email) == email)
     existing = db.execute(stmt).scalar_one_or_none()
     if existing is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="email already exists")
 
     user = User(
-        email=payload.email.lower(),
+        email=email,
         password_hash=hash_password(payload.password),
         is_active=True,
         is_sysadmin=False,
