@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import sys
 from pathlib import Path
 
@@ -14,46 +15,42 @@ def _load_collector_module():
     return module
 
 
-class _FakeStream:
-    def __init__(self) -> None:
-        self.buffer: list[str] = []
-        self.flush_count = 0
-        self.close_count = 0
-
-    def write(self, value: str):
-        self.buffer.append(value)
-
-    def flush(self):
-        self.flush_count += 1
-
-    def close(self):
-        self.close_count += 1
-
-
-def test_ndjson_writer_flushes_stdout_emits() -> None:
+def test_ndjson_writer_writes_stdout_on_close(monkeypatch) -> None:
     collector = _load_collector_module()
-    fake_stdout = _FakeStream()
-    collector.sys.stdout = fake_stdout
+    fake_stdout = io.StringIO()
+    monkeypatch.setattr(collector.sys, "stdout", fake_stdout)
 
     writer = collector.NDJSONWriter(path=None, gzip_output=False)
     writer.emit({"type": "run_meta", "run_id": "abc"})
+
+    assert fake_stdout.getvalue() == ""
+
     writer.close()
 
-    assert fake_stdout.flush_count == 1
-    assert fake_stdout.close_count == 0
-    assert fake_stdout.buffer
+    output = fake_stdout.getvalue()
+    assert '"type": "run_meta"' in output
+    assert '"run_id": "abc"' in output
 
 
-def test_ndjson_writer_buffers_file_output_without_per_line_flush() -> None:
+def test_ndjson_writer_discards_file_output_when_not_kept(tmp_path) -> None:
     collector = _load_collector_module()
-    fake_file = _FakeStream()
+    output_path = tmp_path / "collector.ndjson"
 
-    collector.open = lambda *_args, **_kwargs: fake_file
-
-    writer = collector.NDJSONWriter(path="/tmp/collector.ndjson", gzip_output=False)
+    writer = collector.NDJSONWriter(path=str(output_path), gzip_output=False)
     writer.emit({"type": "endpoint", "run_id": "abc"})
-    writer.close()
+    writer.close(keep_output=False)
 
-    assert fake_file.flush_count == 0
-    assert fake_file.close_count == 1
-    assert fake_file.buffer
+    assert not output_path.exists()
+
+
+def test_ndjson_writer_writes_file_output_when_kept(tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "collector.ndjson"
+
+    writer = collector.NDJSONWriter(path=str(output_path), gzip_output=False)
+    writer.emit({"type": "endpoint", "run_id": "abc"})
+    writer.close(keep_output=True)
+
+    assert output_path.exists()
+    payload = output_path.read_text(encoding="utf-8")
+    assert '"type": "endpoint"' in payload

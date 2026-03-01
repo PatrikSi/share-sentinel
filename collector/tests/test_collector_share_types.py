@@ -172,3 +172,53 @@ def test_help_text_contains_common_and_examples_sections() -> None:
     assert "Common Options" in help_text
     assert "SMB Authentication" in help_text
     assert "Examples:" in help_text
+
+
+def test_scan_host_smb_auth_failure_includes_actionable_hint(monkeypatch) -> None:
+    collector = _load_collector_module()
+    fake_session_error = type("FakeSessionError", (Exception,), {})
+    monkeypatch.setattr(collector, "SessionError", fake_session_error)
+
+    class _Conn:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def login(self, *_args, **_kwargs):
+            raise fake_session_error("STATUS_LOGON_FAILURE")
+
+    monkeypatch.setattr(collector, "SMBConnection", _Conn)
+
+    class _Writer:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=False,
+        username="svc-scan",
+        password="bad-pass",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=1,
+    )
+    writer = _Writer()
+    stats = collector.Stats()
+
+    ok = collector.scan_host_smb("10.0.0.6", args, "run-1", writer, stats, threading.Lock())
+
+    assert ok is False
+    assert stats.errors == 1
+    error_record = writer.records[0]
+    assert error_record["code"] == "SMB_AUTH_FAILED"
+    assert "check smb username/password" in error_record["hint"].lower()

@@ -9,13 +9,14 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 import time
@@ -37,25 +38,20 @@ class Stats:
     resources: int = 0
     items: int = 0
     errors: int = 0
+    error_codes: collections.Counter[str] = field(default_factory=collections.Counter)
+    error_samples: dict[str, str] = field(default_factory=dict)
 
 
 class NDJSONWriter:
     def __init__(self, path: str | None, gzip_output: bool):
         self._lock = threading.Lock()
         self._path = path
-        self._gzip = gzip_output
+        self._gzip = bool(gzip_output and path is not None)
         self._closed = False
-
-        if path is None:
-            self._fp = sys.stdout
-            self._is_binary = False
-        else:
-            if gzip_output:
-                self._fp = gzip.open(path, "wt", encoding="utf-8")
-                self._is_binary = False
-            else:
-                self._fp = open(path, "w", encoding="utf-8")
-                self._is_binary = False
+        fd, buffer_path = tempfile.mkstemp(prefix="smbguard-buffer-", suffix=".ndjson")
+        os.close(fd)
+        self._buffer_path = buffer_path
+        self._fp = open(self._buffer_path, "w", encoding="utf-8")
 
     def emit(self, record: dict) -> None:
         line = json.dumps(record, ensure_ascii=True)
@@ -63,16 +59,32 @@ class NDJSONWriter:
             if self._closed:
                 return
             self._fp.write(line + "\n")
-            if self._path is None:
-                self._fp.flush()
 
-    def close(self) -> None:
+    def close(self, keep_output: bool = True) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            if self._path is not None:
-                self._fp.close()
+            self._fp.close()
+
+        try:
+            if not keep_output:
+                return
+            if self._path is None:
+                with open(self._buffer_path, "r", encoding="utf-8") as buffer_fp:
+                    shutil.copyfileobj(buffer_fp, sys.stdout)
+                sys.stdout.flush()
+                return
+            if self._gzip:
+                with open(self._buffer_path, "rb") as source_fp:
+                    with gzip.open(self._path, "wb") as target_fp:
+                        shutil.copyfileobj(source_fp, target_fp)
+                return
+            os.replace(self._buffer_path, self._path)
+            self._buffer_path = ""
+        finally:
+            if self._buffer_path and os.path.exists(self._buffer_path):
+                os.unlink(self._buffer_path)
 
 
 class _CollectorHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
@@ -104,7 +116,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "      * NTLM: set --username (and password or hashes)\n"
             "      * Kerberos: add --kerberos and --username\n"
             "      * Anonymous: set --smb-anonymous or omit SMB credentials\n"
-            "  - NFS export enumeration uses `showmount -e`; if unavailable, host reachability is still recorded."
+            "  - NFS export enumeration uses `showmount -e`; if unavailable, host reachability is still recorded.\n"
+            "  - When no endpoint/resource/item data is collected, output files are not written."
         ),
         formatter_class=_CollectorHelpFormatter,
     )
@@ -118,7 +131,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default="smb",
         help="Share protocols to scan.",
     )
-    common.add_argument("--output", type=str, help="Write NDJSON output to this file. Defaults to stdout unless --upload needs a temp file.")
+    common.add_argument(
+        "--output",
+        type=str,
+        help="Write NDJSON output to this file. Output is only committed when scan data is collected.",
+    )
     common.add_argument("--gzip", action="store_true", help="Gzip-compress output when writing to a file.")
     common.add_argument("--workers", type=int, default=100, help="Concurrent host workers.")
     common.add_argument("--timeout", type=float, default=3.0, help="Per-network-operation timeout in seconds.")
@@ -280,23 +297,53 @@ def _resolve_smb_auth_method(args: argparse.Namespace) -> str:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    selected_share_types = _selected_share_types(args.share_types)
-    if not args.cidr and not args.hosts:
+    selected_share_types = _selected_share_types(getattr(args, "share_types", "smb"))
+    cidr = getattr(args, "cidr", [])
+    hosts = getattr(args, "hosts", None)
+    kerberos = bool(getattr(args, "kerberos", False))
+    smb_anonymous = bool(getattr(args, "smb_anonymous", False))
+    username = str(getattr(args, "username", "") or "")
+    password = str(getattr(args, "password", "") or "")
+    hashes = getattr(args, "hashes", None)
+    upload = bool(getattr(args, "upload", False))
+    api_base = getattr(args, "api_base", None)
+    project_id = getattr(args, "project_id", None)
+    api_token = getattr(args, "api_token", None)
+    workers = int(getattr(args, "workers", 1))
+    timeout = float(getattr(args, "timeout", 1.0))
+    max_depth = int(getattr(args, "max_depth", 1))
+    max_entries_per_share = int(getattr(args, "max_entries_per_share", 1))
+    exclude_path_regex = getattr(args, "exclude_path_regex", None)
+
+    if not cidr and not hosts:
         raise SystemExit("at least one target source is required: --hosts and/or --cidr")
 
-    if args.kerberos and args.smb_anonymous:
+    if kerberos and smb_anonymous:
         raise SystemExit("--kerberos cannot be combined with --smb-anonymous")
 
     if "smb" in selected_share_types:
-        if args.kerberos and not args.username:
+        if kerberos and not username:
             raise SystemExit("--kerberos requires --username")
-        if args.hashes and not args.username and not args.smb_anonymous:
+        if hashes and not username and not smb_anonymous:
             raise SystemExit("--hashes requires --username unless --smb-anonymous is set")
-        if args.password and not args.username and not args.smb_anonymous:
+        if password and not username and not smb_anonymous:
             raise SystemExit("--password requires --username unless --smb-anonymous is set")
 
-    if args.upload and (not args.api_base or not args.project_id or not args.api_token):
+    if upload and (not api_base or not project_id or not api_token):
         raise SystemExit("--upload requires --api-base, --project-id, and --api-token")
+    if workers <= 0:
+        raise SystemExit("--workers must be greater than zero")
+    if timeout <= 0:
+        raise SystemExit("--timeout must be greater than zero")
+    if max_depth <= 0:
+        raise SystemExit("--max-depth must be greater than zero")
+    if max_entries_per_share <= 0:
+        raise SystemExit("--max-entries-per-share must be greater than zero")
+    if exclude_path_regex:
+        try:
+            re.compile(exclude_path_regex)
+        except re.error as exc:
+            raise SystemExit(f"--exclude-path-regex is invalid: {exc}") from exc
 
 
 def _parse_showmount_exports(output: str) -> list[str]:
@@ -340,22 +387,128 @@ def _discover_nfs_exports(host: str, timeout_seconds: float) -> tuple[list[str],
     return _parse_showmount_exports(completed.stdout), None
 
 
+def _error_detail(exc: BaseException) -> str:
+    detail = str(exc).strip()
+    return detail if detail else type(exc).__name__
+
+
+def _record_error(stats: Stats, lock: threading.Lock, code: str, message: str) -> None:
+    with lock:
+        stats.errors += 1
+        stats.error_codes[code] += 1
+        if code not in stats.error_samples:
+            stats.error_samples[code] = message
+
+
+def _emit_error(
+    writer: NDJSONWriter,
+    run_id: str,
+    *,
+    severity: str,
+    code: str,
+    message: str,
+    endpoint_key: str | None = None,
+    resource_name: str | None = None,
+    path: str | None = None,
+    hint: str | None = None,
+) -> None:
+    record: dict[str, object] = {
+        "type": "error",
+        "run_id": run_id,
+        "severity": severity,
+        "code": code,
+        "message": message,
+    }
+    if endpoint_key is not None:
+        record["endpoint_key"] = endpoint_key
+    if resource_name is not None:
+        record["resource_name"] = resource_name
+    if path is not None:
+        record["path"] = path
+    if hint is not None:
+        record["hint"] = hint
+    writer.emit(record)
+
+
+def _session_error_hint(raw_error: str, auth_method: str) -> str | None:
+    upper = raw_error.upper()
+    if "STATUS_LOGON_FAILURE" in upper:
+        return "Check SMB username/password or hash values and confirm domain/local auth mode."
+    if "STATUS_ACCESS_DENIED" in upper:
+        return "Credentials are valid but not authorized for this share or path."
+    if "STATUS_ACCOUNT_DISABLED" in upper:
+        return "Enable the account or use a different service account."
+    if "STATUS_PASSWORD_EXPIRED" in upper:
+        return "Rotate password for the scanning account and retry."
+    if "STATUS_ACCOUNT_LOCKED_OUT" in upper:
+        return "Wait for lockout reset or use an unlocked account."
+    if "STATUS_MORE_PROCESSING_REQUIRED" in upper:
+        return "Kerberos/NTLM negotiation failed; verify auth flags and credential type."
+    if auth_method == "anonymous":
+        return "Target blocks anonymous SMB sessions; rerun with authenticated credentials."
+    return None
+
+
+def _is_successful_run(stats: Stats) -> bool:
+    return stats.endpoints > 0 or stats.resources > 0 or stats.items > 0
+
+
+def _print_scan_failure_summary(
+    stats: Stats,
+    host_failures: int,
+    *,
+    reason: str,
+    output_path: str | None,
+) -> None:
+    print(reason, file=sys.stderr)
+    if output_path:
+        print(f"output not written: {output_path}", file=sys.stderr)
+    if host_failures > 0:
+        print(f"failed hosts: {host_failures}", file=sys.stderr)
+    if stats.error_codes:
+        print("error summary:", file=sys.stderr)
+        for code, count in stats.error_codes.most_common(10):
+            sample = stats.error_samples.get(code, "")
+            if sample:
+                print(f"  - {code} ({count}): {sample}", file=sys.stderr)
+            else:
+                print(f"  - {code}: {count}", file=sys.stderr)
+
+
+def _validate_runtime_dependencies(selected_share_types: set[str]) -> tuple[set[str], list[str], list[str]]:
+    disabled: set[str] = set()
+    warnings: list[str] = []
+    fatals: list[str] = []
+
+    if "smb" in selected_share_types and SMBConnection is None:
+        message = (
+            "SMB scanning requires the optional dependency `impacket`. "
+            "Install with `pip install impacket`."
+        )
+        if selected_share_types == {"smb"}:
+            fatals.append(message)
+        else:
+            disabled.add("smb")
+            warnings.append(f"{message} SMB scanning will be skipped.")
+
+    return disabled, warnings, fatals
+
+
 def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
     endpoint_key = f"{host}:445"
     attempted_auth = _resolve_smb_auth_method(args)
     if SMBConnection is None:
-        writer.emit(
-            {
-                "type": "error",
-                "run_id": run_id,
-                "severity": "error",
-                "code": "IMPACKET_NOT_AVAILABLE",
-                "message": "impacket is not installed; install it with `pip install impacket` to scan SMB shares",
-                "endpoint_key": endpoint_key,
-            }
+        message = "SMB scanner unavailable because impacket is not installed."
+        _emit_error(
+            writer,
+            run_id,
+            severity="error",
+            code="SMB_SCANNER_UNAVAILABLE",
+            message=message,
+            endpoint_key=endpoint_key,
+            hint="Install impacket with `pip install impacket` and rerun.",
         )
-        with lock:
-            stats.errors += 1
+        _record_error(stats, lock, "SMB_SCANNER_UNAVAILABLE", message)
         return False
 
     try:
@@ -404,7 +557,9 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             stats.endpoints += 1
 
         excluded_shares = {s.upper() for s in args.exclude_share}
-        exclude_path_regex = re.compile(args.exclude_path_regex) if args.exclude_path_regex else None
+        exclude_path_regex = getattr(args, "exclude_path_pattern", None)
+        if exclude_path_regex is None and args.exclude_path_regex:
+            exclude_path_regex = re.compile(args.exclude_path_regex)
         extensions = None
         if args.extensions_only:
             extensions = {e.strip().lower() for e in args.extensions_only.split(",") if e.strip()}
@@ -453,50 +608,49 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                     with lock:
                         stats.items += 1
             except SessionError as exc:
-                writer.emit(
-                    {
-                        "type": "error",
-                        "run_id": run_id,
-                        "severity": "warn",
-                        "code": "LIST_SESSION_ERROR",
-                        "message": f"failed listing SMB share {share_name}: {exc}",
-                        "endpoint_key": endpoint_key,
-                        "resource_name": share_name,
-                        "path": "\\",
-                    }
+                detail = _error_detail(exc)
+                message = f"SMB share listing failed for {share_name}: {detail}"
+                _emit_error(
+                    writer,
+                    run_id,
+                    severity="warn",
+                    code="LIST_SESSION_ERROR",
+                    message=message,
+                    endpoint_key=endpoint_key,
+                    resource_name=share_name,
+                    path="\\",
+                    hint=_session_error_hint(detail, attempted_auth),
                 )
-                with lock:
-                    stats.errors += 1
+                _record_error(stats, lock, "LIST_SESSION_ERROR", message)
             except (socket.timeout, TimeoutError):
-                writer.emit(
-                    {
-                        "type": "error",
-                        "run_id": run_id,
-                        "severity": "warn",
-                        "code": "LIST_TIMEOUT",
-                        "message": f"listing SMB share {share_name} timed out",
-                        "endpoint_key": endpoint_key,
-                        "resource_name": share_name,
-                        "path": "\\",
-                    }
+                message = f"SMB share listing timed out for {share_name}."
+                _emit_error(
+                    writer,
+                    run_id,
+                    severity="warn",
+                    code="LIST_TIMEOUT",
+                    message=message,
+                    endpoint_key=endpoint_key,
+                    resource_name=share_name,
+                    path="\\",
+                    hint="Increase --timeout or reduce --workers for congested networks.",
                 )
-                with lock:
-                    stats.errors += 1
+                _record_error(stats, lock, "LIST_TIMEOUT", message)
             except OSError as exc:
-                writer.emit(
-                    {
-                        "type": "error",
-                        "run_id": run_id,
-                        "severity": "warn",
-                        "code": "LIST_IO_ERROR",
-                        "message": f"io error listing SMB share {share_name}: {exc}",
-                        "endpoint_key": endpoint_key,
-                        "resource_name": share_name,
-                        "path": "\\",
-                    }
+                detail = _error_detail(exc)
+                message = f"SMB share listing IO failure for {share_name}: {detail}"
+                _emit_error(
+                    writer,
+                    run_id,
+                    severity="warn",
+                    code="LIST_IO_ERROR",
+                    message=message,
+                    endpoint_key=endpoint_key,
+                    resource_name=share_name,
+                    path="\\",
+                    hint="Check share permissions and target SMB server health.",
                 )
-                with lock:
-                    stats.errors += 1
+                _record_error(stats, lock, "LIST_IO_ERROR", message)
 
         try:
             conn.logoff()
@@ -504,53 +658,51 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             pass
         return True
 
+    except socket.gaierror as exc:
+        detail = _error_detail(exc)
+        code = "SMB_DNS_FAILED"
+        message = f"SMB target name resolution failed: {detail}"
+        hint = "Use an IP address or fix DNS records for the host."
+    except ConnectionRefusedError as exc:
+        detail = _error_detail(exc)
+        code = "SMB_PORT_CLOSED"
+        message = f"SMB tcp/445 refused connection: {detail}"
+        hint = "Ensure SMB service is listening and firewall rules allow tcp/445."
+    except ConnectionResetError as exc:
+        detail = _error_detail(exc)
+        code = "SMB_CONNECTION_RESET"
+        message = f"SMB connection reset by peer: {detail}"
+        hint = "Target reset the session; retry and verify network middleboxes."
     except (socket.timeout, TimeoutError):
-        writer.emit(
-            {
-                "type": "error",
-                "run_id": run_id,
-                "severity": "error",
-                "code": "SMB_TIMEOUT",
-                "message": "SMB connection to tcp/445 timed out",
-                "endpoint_key": endpoint_key,
-            }
-        )
+        code = "SMB_TIMEOUT"
+        message = f"SMB connection to {host}:445 timed out."
+        hint = "Host may be down or filtered; increase --timeout for slow networks."
     except SessionError as exc:
-        writer.emit(
-            {
-                "type": "error",
-                "run_id": run_id,
-                "severity": "error",
-                "code": "SMB_AUTH_FAILED",
-                "message": f"SMB {attempted_auth} session failed: {exc}",
-                "endpoint_key": endpoint_key,
-            }
-        )
+        detail = _error_detail(exc)
+        code = "SMB_AUTH_FAILED"
+        message = f"SMB {attempted_auth} session failed: {detail}"
+        hint = _session_error_hint(detail, attempted_auth)
     except (OSError, ConnectionError) as exc:
-        writer.emit(
-            {
-                "type": "error",
-                "run_id": run_id,
-                "severity": "error",
-                "code": "SMB_NETWORK_FAILED",
-                "message": f"SMB network failure: {exc}",
-                "endpoint_key": endpoint_key,
-            }
-        )
+        detail = _error_detail(exc)
+        code = "SMB_NETWORK_FAILED"
+        message = f"SMB network failure: {detail}"
+        hint = "Verify route, firewall rules, and SMB service availability."
     except (TypeError, ValueError) as exc:
-        writer.emit(
-            {
-                "type": "error",
-                "run_id": run_id,
-                "severity": "error",
-                "code": "SMB_INPUT_INVALID",
-                "message": f"SMB scan input is invalid: {exc}",
-                "endpoint_key": endpoint_key,
-            }
-        )
+        detail = _error_detail(exc)
+        code = "SMB_INPUT_INVALID"
+        message = f"SMB scan input is invalid: {detail}"
+        hint = "Verify CLI arguments for credentials and filters."
 
-    with lock:
-        stats.errors += 1
+    _emit_error(
+        writer,
+        run_id,
+        severity="error",
+        code=code,
+        message=message,
+        endpoint_key=endpoint_key,
+        hint=hint,
+    )
+    _record_error(stats, lock, code, message)
     return False
 
 
@@ -560,33 +712,60 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
     try:
         with socket.create_connection((host, 2049), timeout=args.timeout):
             pass
-    except (socket.timeout, TimeoutError):
-        writer.emit(
-            {
-                "type": "error",
-                "run_id": run_id,
-                "severity": "error",
-                "code": "NFS_TIMEOUT",
-                "message": "NFS connection to tcp/2049 timed out",
-                "endpoint_key": endpoint_key,
-            }
+    except socket.gaierror as exc:
+        detail = _error_detail(exc)
+        message = f"NFS target name resolution failed: {detail}"
+        _emit_error(
+            writer,
+            run_id,
+            severity="error",
+            code="NFS_DNS_FAILED",
+            message=message,
+            endpoint_key=endpoint_key,
+            hint="Use an IP address or fix DNS for this host.",
         )
-        with lock:
-            stats.errors += 1
+        _record_error(stats, lock, "NFS_DNS_FAILED", message)
+        return False
+    except (socket.timeout, TimeoutError):
+        message = f"NFS connection to {host}:2049 timed out."
+        _emit_error(
+            writer,
+            run_id,
+            severity="error",
+            code="NFS_TIMEOUT",
+            message=message,
+            endpoint_key=endpoint_key,
+            hint="Host may be down or filtered; increase --timeout for slow links.",
+        )
+        _record_error(stats, lock, "NFS_TIMEOUT", message)
+        return False
+    except ConnectionRefusedError as exc:
+        detail = _error_detail(exc)
+        message = f"NFS tcp/2049 refused connection: {detail}"
+        _emit_error(
+            writer,
+            run_id,
+            severity="error",
+            code="NFS_PORT_CLOSED",
+            message=message,
+            endpoint_key=endpoint_key,
+            hint="Ensure NFS service is enabled and firewall allows tcp/2049.",
+        )
+        _record_error(stats, lock, "NFS_PORT_CLOSED", message)
         return False
     except OSError as exc:
-        writer.emit(
-            {
-                "type": "error",
-                "run_id": run_id,
-                "severity": "error",
-                "code": "NFS_CONNECT_FAILED",
-                "message": f"NFS connectivity failure: {exc}",
-                "endpoint_key": endpoint_key,
-            }
+        detail = _error_detail(exc)
+        message = f"NFS connectivity failure: {detail}"
+        _emit_error(
+            writer,
+            run_id,
+            severity="error",
+            code="NFS_CONNECT_FAILED",
+            message=message,
+            endpoint_key=endpoint_key,
+            hint="Verify network path and NFS daemon availability.",
         )
-        with lock:
-            stats.errors += 1
+        _record_error(stats, lock, "NFS_CONNECT_FAILED", message)
         return False
 
     writer.emit(
@@ -611,18 +790,17 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
 
     exports, export_error = _discover_nfs_exports(host, args.timeout)
     if export_error:
-        writer.emit(
-            {
-                "type": "error",
-                "run_id": run_id,
-                "severity": "warn",
-                "code": "NFS_EXPORT_ENUM_FAILED",
-                "message": f"failed to enumerate NFS exports on {host}: {export_error}",
-                "endpoint_key": endpoint_key,
-            }
+        message = f"Failed to enumerate NFS exports on {host}: {export_error}"
+        _emit_error(
+            writer,
+            run_id,
+            severity="warn",
+            code="NFS_EXPORT_ENUM_FAILED",
+            message=message,
+            endpoint_key=endpoint_key,
+            hint="Install and verify `showmount`, and ensure rpcbind/mountd access from this host.",
         )
-        with lock:
-            stats.errors += 1
+        _record_error(stats, lock, "NFS_EXPORT_ENUM_FAILED", message)
 
     for export_path in exports:
         writer.emit(
@@ -644,11 +822,12 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
 
 def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
     selected_share_types = _selected_share_types(args.share_types)
+    disabled_share_types = getattr(args, "disabled_share_types", set())
     succeeded = False
 
-    if "smb" in selected_share_types:
+    if "smb" in selected_share_types and "smb" not in disabled_share_types:
         succeeded = scan_host_smb(host, args, run_id, writer, stats, lock) or succeeded
-    if "nfs" in selected_share_types:
+    if "nfs" in selected_share_types and "nfs" not in disabled_share_types:
         succeeded = scan_host_nfs(host, args, run_id, writer, stats, lock) or succeeded
     return succeeded
 
@@ -761,19 +940,18 @@ def _collect_scan_results(
             exc = cancelled_error
 
         if exc is not None:
-            message = str(exc) or type(exc).__name__
-            writer.emit(
-                {
-                    "type": "error",
-                    "run_id": run_id,
-                    "severity": "error",
-                    "code": _scan_thread_error_code(exc),
-                    "message": message,
-                    "endpoint_key": f"{host}:445",
-                }
+            message = _error_detail(exc)
+            code = _scan_thread_error_code(exc)
+            _emit_error(
+                writer,
+                run_id,
+                severity="error",
+                code=code,
+                message=message,
+                endpoint_key=f"{host}:445",
+                hint="Unhandled worker exception; inspect traceback/logs for root cause.",
             )
-            with lock:
-                stats.errors += 1
+            _record_error(stats, lock, code, message)
             host_failures += 1
             continue
 
@@ -800,11 +978,29 @@ def _scan_thread_error_code(exc: BaseException) -> str:
 def main() -> int:
     args = parse_args()
     _validate_args(args)
+    args.exclude_path_pattern = re.compile(args.exclude_path_regex) if args.exclude_path_regex else None
     selected_share_types = sorted(_selected_share_types(args.share_types))
+    disabled_share_types, dependency_warnings, dependency_fatals = _validate_runtime_dependencies(set(selected_share_types))
+    args.disabled_share_types = disabled_share_types
     smb_auth_method = _resolve_smb_auth_method(args) if "smb" in selected_share_types else "none"
 
-    targets = parse_targets(args.cidr, args.hosts)
-    host_inputs = parse_hosts_file(args.hosts)
+    if dependency_fatals:
+        for message in dependency_fatals:
+            print(f"configuration error: {message}", file=sys.stderr)
+        return 2
+
+    try:
+        targets = parse_targets(args.cidr, args.hosts)
+        host_inputs = parse_hosts_file(args.hosts)
+    except (OSError, ValueError) as exc:
+        print(f"input error: {_error_detail(exc)}", file=sys.stderr)
+        print("fix target inputs and retry (--hosts file and/or --cidr values).", file=sys.stderr)
+        return 2
+
+    if not targets:
+        print("input error: no targets resolved from --hosts/--cidr.", file=sys.stderr)
+        return 2
+
     run_id = str(uuid.uuid4())
     started_at = datetime.now(tz=UTC)
 
@@ -834,6 +1030,7 @@ def main() -> int:
                 "cidrs": args.cidr,
                 "hosts": host_inputs,
                 "share_types": selected_share_types,
+                "disabled_share_types": sorted(disabled_share_types),
             },
             "auth": {
                 "mode": (
@@ -847,6 +1044,17 @@ def main() -> int:
             },
         }
     )
+
+    for warning in dependency_warnings:
+        _emit_error(
+            writer,
+            run_id,
+            severity="warn",
+            code="SCAN_DEPENDENCY_WARNING",
+            message=warning,
+            hint="Install the missing dependency to enable all requested share types.",
+        )
+        _record_error(stats, lock, "SCAN_DEPENDENCY_WARNING", warning)
 
     host_failures = 0
 
@@ -867,17 +1075,26 @@ def main() -> int:
             },
         }
     )
-    writer.close()
+
+    run_has_data = _is_successful_run(stats)
+    keep_output = run_has_data
+    writer.close(keep_output=keep_output)
 
     try:
-        if args.upload and output_path is not None:
+        if args.upload and keep_output and output_path is not None:
             upload_artifact(args, run_id, output_path, host_inputs)
     finally:
         if temp_artifact and os.path.exists(temp_artifact):
             os.unlink(temp_artifact)
 
-    if stats.endpoints == 0 and stats.resources == 0 and stats.items == 0 and stats.errors == 0:
-        return 3
+    if not keep_output:
+        _print_scan_failure_summary(
+            stats,
+            host_failures,
+            reason="scan did not collect any endpoint/resource/item records.",
+            output_path=args.output,
+        )
+        return 2
     if host_failures > 0:
         return 2
     return 0
