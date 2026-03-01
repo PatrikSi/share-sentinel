@@ -52,10 +52,16 @@ s3 = boto3.client(
 def _safe_run_id(fields: dict[str, str] | None) -> str | None:
     if not isinstance(fields, dict):
         return None
-    run_id = fields.get("run_id")
-    if run_id is None:
+    return _normalize_uuid_str(fields.get("run_id"))
+
+
+def _normalize_uuid_str(value: Any) -> str | None:
+    if value is None:
         return None
-    return str(run_id)
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def _should_log_redis_error(last_logged_at: float, now: float, interval_seconds: float = 30.0) -> bool:
@@ -393,14 +399,14 @@ def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
 
 
 def process_job(fields: dict[str, str]) -> None:
-    run_id = fields.get("run_id")
-    project_id = fields.get("project_id")
+    run_id = _normalize_uuid_str(fields.get("run_id"))
+    project_id = _normalize_uuid_str(fields.get("project_id"))
     artifact_key = fields.get("artifact_key")
     last_line_offset = 0
     last_counts = {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
 
     if not run_id:
-        logger.error("invalid job payload missing run_id: %s", fields)
+        logger.error("invalid job payload missing or invalid run_id: %s", fields)
         return
 
     with psycopg.connect(DATABASE_URL) as conn:
