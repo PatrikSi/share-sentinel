@@ -20,6 +20,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("share_sentinel.worker")
 
+
+def _read_int_env(name: str, default: int, min_value: int = 1) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("invalid integer value for %s=%r; using default=%s", name, raw, default)
+        return default
+
+    if value < min_value:
+        logger.warning("value for %s=%s is below min=%s; using min", name, value, min_value)
+        return min_value
+    return value
+
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://smbguard:smbguard@db:5432/smbguard").replace(
     "postgresql+psycopg://", "postgresql://"
@@ -33,11 +48,11 @@ STREAM_NAME = "ingest_jobs"
 GROUP_NAME = "ingest_workers"
 CONSUMER_NAME = f"{socket.gethostname()}-{os.getpid()}"
 
-BATCH_SIZE = int(os.getenv("INGEST_BATCH_SIZE", "5000"))
-PROGRESS_EVERY_LINES = int(os.getenv("INGEST_PROGRESS_EVERY_LINES", "2000"))
-RECOVERY_SCAN_SECONDS = int(os.getenv("INGEST_RECOVERY_SCAN_SECONDS", "8"))
-PENDING_IDLE_MS = int(os.getenv("INGEST_PENDING_IDLE_MS", "60000"))
-JSON_COMPAT_MAX_BYTES = int(os.getenv("INGEST_JSON_COMPAT_MAX_BYTES", str(50 * 1024 * 1024)))
+BATCH_SIZE = _read_int_env("INGEST_BATCH_SIZE", 5000, min_value=1)
+PROGRESS_EVERY_LINES = _read_int_env("INGEST_PROGRESS_EVERY_LINES", 2000, min_value=1)
+RECOVERY_SCAN_SECONDS = _read_int_env("INGEST_RECOVERY_SCAN_SECONDS", 8, min_value=1)
+PENDING_IDLE_MS = _read_int_env("INGEST_PENDING_IDLE_MS", 60000, min_value=1)
+JSON_COMPAT_MAX_BYTES = _read_int_env("INGEST_JSON_COMPAT_MAX_BYTES", 50 * 1024 * 1024, min_value=1024)
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
