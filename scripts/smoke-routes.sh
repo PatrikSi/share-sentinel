@@ -53,9 +53,9 @@ ui_body=$(cat /tmp/share_sentinel_ui.out 2>/dev/null || true)
 assert_contains "$ui_status" "200" "UI /projects should return 200"
 assert_contains "$ui_body" "<!doctype html>" "UI should return app shell"
 
-settings_ui_status=$(request_with_retries "$base_url/settings/users" "GET" "" "" "200" /tmp/share_sentinel_settings_ui.out)
+settings_ui_status=$(request_with_retries "$base_url/settings/iam" "GET" "" "" "200" /tmp/share_sentinel_settings_ui.out)
 settings_ui_body=$(cat /tmp/share_sentinel_settings_ui.out 2>/dev/null || true)
-assert_contains "$settings_ui_status" "200" "UI /settings/users should return 200"
+assert_contains "$settings_ui_status" "200" "UI /settings/iam should return 200"
 assert_contains "$settings_ui_body" "<!doctype html>" "Settings route should return app shell"
 
 api_health_status=$(request_with_retries "$base_url/api/healthz" "GET" "" "" "200" /tmp/share_sentinel_health.out)

@@ -19,7 +19,7 @@ export function SettingsOverviewPage() {
           <li>All privileged settings routes require sysadmin access</li>
           <li>API tokens respect scope checks and token role</li>
           <li>User self-lockout actions are blocked</li>
-          <li>Settings UI split into users, RBAC, tokens, and audit logs</li>
+          <li>Settings UI aligned to IAM + tokens + audit governance sections</li>
           <li>Route smoke tests cover UI and API settings paths</li>
         </ul>
       </section>

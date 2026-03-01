@@ -8,8 +8,7 @@ type SettingsOutletContext = { me: UserMe };
 
 const SETTINGS_TABS = [
   { to: "overview", label: "Overview" },
-  { to: "users", label: "Users" },
-  { to: "rbac", label: "RBAC" },
+  { to: "iam", label: "IAM" },
   { to: "api-tokens", label: "API Tokens" },
   { to: "audit-logs", label: "Audit Logs" },
 ];

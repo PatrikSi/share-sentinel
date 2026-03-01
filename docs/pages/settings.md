@@ -2,13 +2,12 @@
 
 ## Purpose
 
-Centralized enterprise administration for users, RBAC, API tokens, and global audit visibility.
+Centralized enterprise administration for IAM, API tokens, and global audit governance.
 
 ## Navigation Items
 
 - Overview
-- Users
-- RBAC
+- IAM
 - API Tokens
 - Audit Logs
 
@@ -16,38 +15,51 @@ Centralized enterprise administration for users, RBAC, API tokens, and global au
 
 Provides a quick controls matrix:
 
-- Implemented controls
-- Operational defaults
-- Enterprise gaps still to plan
+- implemented controls
+- operational defaults
+- enterprise gaps still to plan
 
-## Users
+## IAM
+
+IAM consolidates identity lifecycle and project access control in one place.
+
+### Identity Management
 
 Primary workflows:
 
-- Create user with:
+- create identity with:
   - approval state
-  - sysadmin state
+  - system role (`System Admin` or `Standard User`)
   - optional add-to-all-projects assignment
-- Search and filter user directory by:
+- search and filter identity directory by:
   - email
   - active flag
   - approval flag
-  - sysadmin flag
-- Lifecycle operations:
+  - system role flag
+- lifecycle operations:
   - enable / disable
   - approve / unapprove
-  - promote / demote sysadmin
+  - promote / demote system admin
   - reset password
-- Bulk onboarding:
-  - assign existing user to all projects
-  - optional overwrite of existing memberships
 
 Safety controls:
 
-- User cannot disable self
-- User cannot unapprove self
-- User cannot remove own sysadmin role
-- Last active approved sysadmin cannot be removed
+- identity cannot disable self
+- identity cannot unapprove self
+- identity cannot remove own sysadmin role
+- last active approved sysadmin cannot be removed
+
+### Access Management
+
+Project membership operations:
+
+- upsert one membership (project, user, role)
+- remove one membership
+- apply all-project role policy for one identity
+
+Project-safety controls:
+
+- prevent demotion/removal of the last admin in a project
 
 API calls:
 
@@ -55,21 +67,6 @@ API calls:
 - `POST /users`
 - `PATCH /users/{id}`
 - `POST /users/{id}/assign-all-projects`
-
-## RBAC
-
-Project membership operations:
-
-- Upsert one membership (project, user, role)
-- Remove one membership
-- Assign user role across all projects
-
-Safety controls:
-
-- Prevent demotion/removal of the last admin in a project
-
-API calls:
-
 - `GET /settings/projects`
 - `GET /settings/rbac/project-memberships`
 - `POST /settings/rbac/project-memberships`
@@ -80,21 +77,21 @@ API calls:
 
 Enterprise token administration:
 
-- Global search and pagination
-- Create token for any eligible project member
-- One-time secret display on create and rotate
-- Update token metadata:
+- global search and pagination
+- create token for any eligible project member
+- one-time secret display on create and rotate
+- update token metadata:
   - name
   - role
   - scopes
   - expiry
-- Rotate token secret
-- Revoke token
+- rotate token secret
+- revoke token
 
 Scope controls:
 
-- Scope catalog endpoint for allowed scopes and per-role defaults
-- Non-sysadmin token scopes are constrained to role defaults
+- scope catalog endpoint for allowed scopes and per-role defaults
+- non-sysadmin token scopes are constrained to role defaults
 
 API calls:
 
@@ -109,9 +106,9 @@ API calls:
 
 Global audit workflow:
 
-- Search by action/object/actor/project
-- Cursor pagination
-- System-wide event timeline
+- search by action/object/actor/project
+- cursor pagination
+- system-wide event timeline
 
 API calls:
 
