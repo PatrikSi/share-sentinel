@@ -2,7 +2,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -10,7 +10,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
 from app.enums import ProjectRole
-from app.models import Project, ProjectMember, User
+from app.models import Project, ProjectMember, RefreshToken, User
 from app.schemas import UserApprovalIn, UserAssignAllProjectsIn, UserCreateIn, UserOut, UserUpdateIn
 from app.security import hash_password, validate_password_strength
 from app.services.audit import write_audit_event
@@ -148,6 +148,8 @@ def update_user(
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+    prev_is_active = user.is_active
+    prev_is_approved = user.is_approved
 
     next_is_active = user.is_active if payload.is_active is None else payload.is_active
     next_is_approved = user.is_approved if payload.is_approved is None else payload.is_approved
@@ -186,6 +188,9 @@ def update_user(
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="email already exists") from exc
+    revoked_sessions = 0
+    if (prev_is_active and not user.is_active) or (prev_is_approved and not user.is_approved):
+        revoked_sessions = _revoke_active_refresh_tokens(db, user.id)
 
     write_audit_event(
         db,
@@ -198,6 +203,7 @@ def update_user(
             "is_active": user.is_active,
             "is_sysadmin": user.is_sysadmin,
             "is_approved": user.is_approved,
+            "revoked_sessions": revoked_sessions,
         },
     )
     db.commit()
@@ -220,17 +226,19 @@ def update_user_status(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
 
+    was_active = user.is_active
     _enforce_admin_safety(db, auth.user_id, user, is_active, user.is_approved, user.is_sysadmin)
 
     user.is_active = is_active
     db.add(user)
+    revoked_sessions = _revoke_active_refresh_tokens(db, user.id) if was_active and not is_active else 0
     write_audit_event(
         db,
         action="USER_STATUS_UPDATED",
         object_type="user",
         object_id=str(user.id),
         actor_user_id=auth.user_id,
-        metadata={**request_meta(request), "is_active": is_active},
+        metadata={**request_meta(request), "is_active": is_active, "revoked_sessions": revoked_sessions},
     )
     db.commit()
     db.refresh(user)
@@ -252,6 +260,7 @@ def update_user_approval(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
 
+    was_approved = user.is_approved
     _enforce_admin_safety(db, auth.user_id, user, user.is_active, payload.is_approved, user.is_sysadmin)
 
     user.is_approved = payload.is_approved
@@ -263,13 +272,14 @@ def update_user_approval(
         user.approved_by_user_id = None
 
     db.add(user)
+    revoked_sessions = _revoke_active_refresh_tokens(db, user.id) if was_approved and not user.is_approved else 0
     write_audit_event(
         db,
         action="USER_APPROVAL_UPDATED",
         object_type="user",
         object_id=str(user.id),
         actor_user_id=auth.user_id,
-        metadata={**request_meta(request), "is_approved": user.is_approved},
+        metadata={**request_meta(request), "is_approved": user.is_approved, "revoked_sessions": revoked_sessions},
     )
     db.commit()
     db.refresh(user)
@@ -398,3 +408,12 @@ def _count_project_admins(db: Session, project_id: uuid.UUID, exclude_user_id: u
     if exclude_user_id is not None:
         stmt = stmt.where(ProjectMember.user_id != exclude_user_id)
     return int(db.execute(stmt).scalar() or 0)
+
+
+def _revoke_active_refresh_tokens(db: Session, user_id: uuid.UUID) -> int:
+    result = db.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=datetime.now(tz=UTC))
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
