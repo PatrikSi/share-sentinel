@@ -21,6 +21,26 @@ type Run = {
   summary: { endpoints?: number; resources?: number; items?: number; errors?: number };
 };
 
+type ProjectStats = {
+  runs_total: number;
+  runs_complete: number;
+  runs_ingesting: number;
+  scope_runs: number;
+  endpoints: number;
+  shares: number;
+  items: number;
+  files: number;
+  directories: number;
+  file_types: number;
+  unique_hosts: number;
+  latest_run_at: string | null;
+};
+
+type ExtensionStat = {
+  ext: string;
+  count: number;
+};
+
 const RUN_STATUS_COLORS: Record<string, string> = {
   PENDING_UPLOAD: "bg-slate-200 text-slate-900 dark:bg-slate-800 dark:text-slate-200",
   UPLOADED: "bg-amber-200 text-amber-900 dark:bg-amber-900/40 dark:text-amber-200",
@@ -45,15 +65,14 @@ export function ProjectsPage() {
 
   const [newProjectName, setNewProjectName] = useState("");
   const [creatingProject, setCreatingProject] = useState(false);
+  const [showCreateProjectForm, setShowCreateProjectForm] = useState(false);
 
-  const [runName, setRunName] = useState("");
-  const [runDescription, setRunDescription] = useState("");
-  const [artifactFile, setArtifactFile] = useState<File | null>(null);
-  const [importing, setImporting] = useState(false);
+  const [projectStats, setProjectStats] = useState<ProjectStats | null>(null);
+  const [topExtensions, setTopExtensions] = useState<ExtensionStat[]>([]);
+  const [loadingStats, setLoadingStats] = useState(false);
 
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
-  const [createdRunId, setCreatedRunId] = useState<string | null>(null);
 
   async function loadProjects() {
     const data = (await apiFetch("/projects")) as Project[];
@@ -71,6 +90,20 @@ export function ProjectsPage() {
     setNextCursor((data?.next_cursor as string | null) || null);
   }
 
+  async function loadProjectInsights(projectId: string) {
+    setLoadingStats(true);
+    try {
+      const [statsData, extData] = await Promise.all([
+        apiFetch(`/projects/${projectId}/inventory/stats`),
+        apiFetch(`/projects/${projectId}/inventory/extensions?limit=8`),
+      ]);
+      setProjectStats((statsData || null) as ProjectStats | null);
+      setTopExtensions(((extData?.items as ExtensionStat[]) || []).filter((entry) => !!entry.ext));
+    } finally {
+      setLoadingStats(false);
+    }
+  }
+
   useEffect(() => {
     apiFetch("/auth/me")
       .then((data) => setMe(data as UserMe))
@@ -83,12 +116,14 @@ export function ProjectsPage() {
     setCursor(null);
     setCursorHistory([]);
     setInfo(null);
-    setCreatedRunId(null);
+    setProjectStats(null);
+    setTopExtensions([]);
   }, [selectedProject]);
 
   useEffect(() => {
     if (!selectedProject) return;
     loadRuns(selectedProject, cursor).catch((err) => setError(err.message));
+    loadProjectInsights(selectedProject).catch((err) => setError(err.message));
   }, [selectedProject, cursor]);
 
   useEffect(() => {
@@ -105,6 +140,7 @@ export function ProjectsPage() {
 
     const timer = window.setInterval(() => {
       loadRuns(selectedProject, cursor).catch(() => undefined);
+      loadProjectInsights(selectedProject).catch(() => undefined);
     }, 8000);
     return () => window.clearInterval(timer);
   }, [selectedProject, runs, cursor]);
@@ -125,6 +161,7 @@ export function ProjectsPage() {
       return statusOk && searchOk;
     });
   }, [runs, runSearch, statusFilter]);
+  const latestRun = runs.length > 0 ? runs[0] : null;
 
   function moveNext() {
     if (!nextCursor) return;
@@ -150,64 +187,19 @@ export function ProjectsPage() {
     setInfo(null);
 
     try {
-      await apiFetch("/projects", {
+      const created = (await apiFetch("/projects", {
         method: "POST",
         body: JSON.stringify({ name: newProjectName.trim() }),
-      });
+      })) as Project;
       setNewProjectName("");
-      setInfo("Project created.");
+      setSelectedProject(created.id);
+      setShowCreateProjectForm(false);
+      setInfo(`Project created: ${created.name}`);
       await loadProjects();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Project creation failed");
     } finally {
       setCreatingProject(false);
-    }
-  }
-
-  async function onImportRun(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!selectedProject) return;
-    if (!runName.trim()) {
-      setError("Run name is required.");
-      return;
-    }
-    if (!artifactFile) {
-      setError("Artifact file is required.");
-      return;
-    }
-
-    setImporting(true);
-    setError(null);
-    setInfo(null);
-    setCreatedRunId(null);
-
-    try {
-      const runPayload = {
-        name: runName.trim(),
-        description: runDescription.trim() || null,
-      };
-
-      const run = (await apiFetch(`/projects/${selectedProject}/runs`, {
-        method: "POST",
-        body: JSON.stringify(runPayload),
-      })) as Run;
-      setCreatedRunId(run.id);
-      const formData = new FormData();
-      formData.append("file", artifactFile);
-      await apiFetch(`/projects/${selectedProject}/runs/${run.id}/artifact`, {
-        method: "POST",
-        body: formData,
-      });
-      setInfo(`Artifact uploaded for run ${run.id}. Ingestion queued.`);
-
-      setRunName("");
-      setRunDescription("");
-      setArtifactFile(null);
-      await loadRuns(selectedProject, cursor);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Import failed");
-    } finally {
-      setImporting(false);
     }
   }
 
@@ -228,18 +220,65 @@ export function ProjectsPage() {
   const canCreateProject = !!me?.is_sysadmin;
   const canImport = projectRole === "operator" || projectRole === "admin";
   const canDeleteRuns = projectRole === "admin";
+  const latestRunAtText = projectStats?.latest_run_at ? new Date(projectStats.latest_run_at).toLocaleString() : "N/A";
+
+  function formatCount(value: number | null | undefined): string {
+    if (value === null || value === undefined) return loadingStats ? "..." : "0";
+    return value.toLocaleString();
+  }
 
   return (
     <section className="workspace">
-      <div className="workspace-header md:grid-cols-2">
+      <div className="workspace-header md:grid-cols-[2fr_1fr]">
         <div>
-          <h1 className="text-2xl font-bold">Projects & Ingestion</h1>
+          <h1 className="text-2xl font-bold">{selectedProjectName || "Projects"}</h1>
           <p className="text-sm text-slate-600 dark:text-slate-300">
-            Choose project, create run, upload artifact, and monitor ingestion.
+            Choose a project workspace, browse shares, and manage imported scan runs.
           </p>
+          {selectedProject ? (
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              <Link
+                className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-white hover:bg-emerald-500"
+                to={`/projects/${selectedProject}/inventory`}
+              >
+                Browse Shares
+              </Link>
+              {canImport ? (
+                <Link
+                  className="rounded-xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                  to={`/projects/${selectedProject}/import`}
+                >
+                  Import Scan
+                </Link>
+              ) : (
+                <span className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-semibold uppercase text-slate-500 dark:border-slate-800 dark:text-slate-400">
+                  Import Scan (Operator/Admin)
+                </span>
+              )}
+              {latestRun ? (
+                <Link
+                  className="rounded-xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                  to={`/projects/${selectedProject}/runs/${latestRun.id}`}
+                >
+                  Open Latest Run
+                </Link>
+              ) : null}
+            </div>
+          ) : null}
         </div>
-        <div className="space-y-2">
-          <label className="block text-sm font-semibold">Current project</label>
+        <div className="space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <label className="block text-sm font-semibold">Current project</label>
+            {canCreateProject ? (
+              <button
+                className="rounded-lg border border-slate-300 px-3 py-1 text-xs font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                onClick={() => setShowCreateProjectForm((prev) => !prev)}
+                type="button"
+              >
+                {showCreateProjectForm ? "Close" : "New Project"}
+              </button>
+            ) : null}
+          </div>
           <select
             className="w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
             value={selectedProject}
@@ -255,9 +294,57 @@ export function ProjectsPage() {
         </div>
       </div>
 
-      {canCreateProject ? (
+      {selectedProject ? (
         <div className="workspace-section">
-          <h2 className="mb-3 text-lg font-semibold">Create Project</h2>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-lg font-semibold">Project Stats</h2>
+            <p className="text-xs text-slate-500">Live view across complete and ingesting runs. Latest run: {latestRunAtText}</p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-900">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Runs</p>
+              <p className="text-lg font-semibold">{formatCount(projectStats?.runs_total)}</p>
+              <p className="text-xs text-slate-500">Scope: {formatCount(projectStats?.scope_runs)}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-900">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Endpoints</p>
+              <p className="text-lg font-semibold">{formatCount(projectStats?.endpoints)}</p>
+              <p className="text-xs text-slate-500">Unique hosts: {formatCount(projectStats?.unique_hosts)}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-900">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Shares</p>
+              <p className="text-lg font-semibold">{formatCount(projectStats?.shares)}</p>
+              <p className="text-xs text-slate-500">Files: {formatCount(projectStats?.files)}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-900">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Paths</p>
+              <p className="text-lg font-semibold">{formatCount(projectStats?.items)}</p>
+              <p className="text-xs text-slate-500">
+                Directories: {formatCount(projectStats?.directories)} • Types: {formatCount(projectStats?.file_types)}
+              </p>
+            </div>
+          </div>
+          {topExtensions.length > 0 ? (
+            <div className="mt-3">
+              <p className="mb-2 text-xs uppercase tracking-wide text-slate-500">Top file types</p>
+              <div className="flex flex-wrap gap-2">
+                {topExtensions.map((entry) => (
+                  <span
+                    key={entry.ext}
+                    className="rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+                  >
+                    {entry.ext} ({entry.count.toLocaleString()})
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {canCreateProject && showCreateProjectForm ? (
+        <div className="workspace-section">
+          <h2 className="mb-3 text-lg font-semibold">Create New Project</h2>
           <form className="flex flex-wrap items-end gap-3" onSubmit={onCreateProject}>
             <label className="flex-1 text-sm">
               Project name
@@ -265,7 +352,7 @@ export function ProjectsPage() {
                 className="mt-1 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
                 value={newProjectName}
                 onChange={(event) => setNewProjectName(event.target.value)}
-                placeholder="Client East - Q1"
+                placeholder="Client East - Q1 Shares"
                 required
               />
             </label>
@@ -276,67 +363,10 @@ export function ProjectsPage() {
         </div>
       ) : null}
 
-      <div className="workspace-section">
-        <h2 className="mb-3 text-lg font-semibold">Import Scan Artifact</h2>
-        <form className="grid gap-3 md:grid-cols-2" onSubmit={onImportRun}>
-          <label className="text-sm">
-            Run name
-            <input
-              className="mt-1 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
-              value={runName}
-              onChange={(event) => setRunName(event.target.value)}
-              placeholder="Feb 27 corp share sweep"
-              required
-            />
-          </label>
-
-          <label className="md:col-span-2 text-sm">
-            Description
-            <input
-              className="mt-1 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
-              value={runDescription}
-              onChange={(event) => setRunDescription(event.target.value)}
-              placeholder="Operator notes, credential set, scope details"
-            />
-          </label>
-
-          <label className="md:col-span-2 text-sm">
-            Scan file
-            <input
-              className="mt-1 w-full rounded-xl border border-slate-300 bg-white/90 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-              type="file"
-              accept=".json,.jsonl,.ndjson,.json.gz,.ndjson.gz,.gz,application/json,application/x-ndjson,application/gzip"
-              onChange={(event) => setArtifactFile(event.target.files?.[0] || null)}
-              required
-            />
-            <p className="mt-1 text-xs text-slate-500">Accepted: .json, .jsonl, .ndjson, and .gz variants.</p>
-          </label>
-
-          <div className="md:col-span-2">
-            <button
-              className="rounded-xl bg-ember px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
-              type="submit"
-              disabled={!selectedProject || !canImport || importing}
-            >
-              {importing ? "Importing..." : "Create Run + Upload"}
-            </button>
-            {!canImport ? <p className="mt-2 text-xs text-amber-700">Operator/Admin role required for ingestion.</p> : null}
-          </div>
-        </form>
-      </div>
-
-      {error || info || createdRunId ? (
+      {error || info ? (
         <div className="workspace-section space-y-2">
           {error ? <p className="rounded-xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{error}</p> : null}
           {info ? <p className="rounded-xl bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">{info}</p> : null}
-          {createdRunId ? (
-            <p className="text-sm">
-              Open created run:{" "}
-              <Link className="font-semibold text-ember underline" to={`/projects/${selectedProject}/runs/${createdRunId}`}>
-                {createdRunId}
-              </Link>
-            </p>
-          ) : null}
         </div>
       ) : null}
 
@@ -416,7 +446,7 @@ export function ProjectsPage() {
                       className="rounded-lg border border-slate-300 px-3 py-1 text-xs font-semibold uppercase hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
                       to={`/projects/${selectedProject}/runs/${run.id}`}
                     >
-                      Open
+                      Run View
                     </Link>
                     {canDeleteRuns ? (
                       <button

@@ -1,9 +1,14 @@
+import logging
+from datetime import UTC, datetime
+
 from sqlalchemy import select
 
 from app.config import get_settings
 from app.db import SessionLocal
 from app.models import User
-from app.security import hash_password
+from app.security import hash_password, validate_password_strength
+
+logger = logging.getLogger("share_sentinel.seed")
 
 
 def main() -> None:
@@ -13,8 +18,11 @@ def main() -> None:
 
     if not email or not password:
         return
-    if len(password) < 12:
-        raise RuntimeError("SEED_ADMIN_PASSWORD must be at least 12 characters")
+    try:
+        validate_password_strength(password, settings.password_min_length)
+    except ValueError as exc:
+        logger.warning("SEED_ADMIN_PASSWORD does not meet password policy, skipping admin seed: %s", exc)
+        return
 
     with SessionLocal() as db:
         email = email.lower()
@@ -27,6 +35,9 @@ def main() -> None:
             password_hash=hash_password(password),
             is_active=True,
             is_sysadmin=True,
+            is_approved=True,
+            approved_at=datetime.now(tz=UTC),
+            approved_by_user_id=None,
         )
         db.add(user)
         db.commit()

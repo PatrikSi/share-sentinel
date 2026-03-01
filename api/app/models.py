@@ -28,6 +28,9 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.true())
     is_sysadmin: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
+    is_approved: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.true())
+    approved_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     ui_theme: Mapped[UITheme] = mapped_column(value_enum(UITheme, name="ui_theme"), nullable=False, server_default=UITheme.SYSTEM.value)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
@@ -57,7 +60,9 @@ class ApiToken(Base):
     token_hash: Mapped[str] = mapped_column(sa.String(128), nullable=False, unique=True, index=True)
     name: Mapped[str] = mapped_column(sa.String(120), nullable=False)
     role: Mapped[ProjectRole] = mapped_column(value_enum(ProjectRole, name="token_role"), nullable=False)
+    scopes: Mapped[list[str]] = mapped_column(JSONB, nullable=False, server_default=sa.text("'[]'::jsonb"))
     last_used_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
     revoked_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
 
@@ -185,3 +190,4 @@ class AuditEvent(Base):
 Index("ix_scan_runs_project_created", ScanRun.project_id, ScanRun.created_at)
 Index("ix_scan_runs_status_created", ScanRun.status, ScanRun.created_at)
 Index("ix_refresh_tokens_user_revoked", RefreshToken.user_id, RefreshToken.revoked_at)
+Index("ix_users_approval_status", User.is_approved, User.created_at)

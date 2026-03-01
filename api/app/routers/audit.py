@@ -5,11 +5,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.deps import AuthContext, get_auth_context, request_meta, require_project_role
+from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
 from app.enums import ProjectRole
 from app.models import AuditEvent
 from app.pagination import next_cursor, parse_cursor
 from app.services.audit import write_audit_event
+from app.token_scopes import SCOPE_READ_AUDIT
 
 router = APIRouter(prefix="/projects/{project_id}/audit", tags=["audit"])
 
@@ -21,6 +22,7 @@ def list_audit_events(
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_AUDIT)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)

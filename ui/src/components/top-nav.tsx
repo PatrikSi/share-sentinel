@@ -1,20 +1,35 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
-import { clearTokens } from "@/lib/auth";
+import { clearTokens, getRefreshToken } from "@/lib/auth";
 import { ThemeToggle } from "@/components/theme-toggle";
 
 export function TopNav() {
   const location = useLocation();
   const navigate = useNavigate();
+  const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "/api";
 
-  function logout() {
+  async function logout() {
+    const refreshToken = getRefreshToken();
+    if (refreshToken) {
+      try {
+        await fetch(`${API_BASE}/auth/logout`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token: refreshToken }),
+        });
+      } catch {
+        // Local cleanup still proceeds.
+      }
+    }
     clearTokens();
     navigate("/");
   }
 
   const navItems = [
     { to: "/projects", label: "Operations", match: "/projects" },
-    { to: "/admin", label: "Administration", match: "/admin" },
+    { to: "/account", label: "Account", match: "/account" },
+    { to: "/settings/users", label: "Setings", match: "/settings" },
   ];
 
   return (

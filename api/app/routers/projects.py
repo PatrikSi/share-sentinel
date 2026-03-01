@@ -5,11 +5,20 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.deps import AuthContext, get_auth_context, get_current_user, require_project_role, require_sysadmin, request_meta
+from app.deps import (
+    AuthContext,
+    get_auth_context,
+    get_current_user,
+    require_project_role,
+    require_sysadmin,
+    request_meta,
+    require_token_scopes,
+)
 from app.enums import ProjectRole
 from app.models import Project, ProjectMember, User
 from app.schemas import MemberAddByEmailIn, MemberAddIn, ProjectCreateIn, ProjectOut
 from app.services.audit import write_audit_event
+from app.token_scopes import SCOPE_READ_MEMBERS, SCOPE_READ_PROJECTS, SCOPE_WRITE_MEMBERS, SCOPE_WRITE_PROJECTS
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -19,6 +28,7 @@ def create_project(
     payload: ProjectCreateIn,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_PROJECTS)),
     admin: User = Depends(require_sysadmin),
 ):
     project = Project(name=payload.name)
@@ -47,6 +57,7 @@ def create_project(
 def list_projects(
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_PROJECTS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     if auth.token_id:
@@ -93,6 +104,7 @@ def get_project(
     project_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_PROJECTS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -117,6 +129,7 @@ def get_project(
 def get_my_role(
     project_id: uuid.UUID,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_PROJECTS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     role = require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -129,6 +142,7 @@ def add_member(
     payload: MemberAddIn,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_MEMBERS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
@@ -139,6 +153,12 @@ def add_member(
 
     existing = db.get(ProjectMember, {"project_id": project_id, "user_id": payload.user_id})
     if existing:
+        if existing.role == ProjectRole.ADMIN and payload.role != ProjectRole.ADMIN:
+            if _count_project_admins(db, project_id, exclude_user_id=payload.user_id) < 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="at least one project admin must remain",
+                )
         existing.role = payload.role
         db.add(existing)
     else:
@@ -164,6 +184,7 @@ def add_member_by_email(
     payload: MemberAddByEmailIn,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_MEMBERS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
@@ -175,6 +196,12 @@ def add_member_by_email(
 
     existing = db.get(ProjectMember, {"project_id": project_id, "user_id": user.id})
     if existing:
+        if existing.role == ProjectRole.ADMIN and payload.role != ProjectRole.ADMIN:
+            if _count_project_admins(db, project_id, exclude_user_id=user.id) < 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="at least one project admin must remain",
+                )
         existing.role = payload.role
         db.add(existing)
     else:
@@ -199,6 +226,7 @@ def list_members(
     project_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_MEMBERS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
@@ -239,6 +267,7 @@ def remove_member(
     user_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_MEMBERS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
@@ -246,6 +275,9 @@ def remove_member(
     membership = db.get(ProjectMember, {"project_id": project_id, "user_id": user_id})
     if membership is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="member not found")
+    if membership.role == ProjectRole.ADMIN:
+        if _count_project_admins(db, project_id, exclude_user_id=user_id) < 1:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="at least one project admin must remain")
 
     db.delete(membership)
     write_audit_event(
@@ -260,3 +292,13 @@ def remove_member(
     )
     db.commit()
     return {"ok": True}
+
+
+def _count_project_admins(db: Session, project_id: uuid.UUID, exclude_user_id: uuid.UUID | None = None) -> int:
+    stmt = select(func.count(ProjectMember.user_id)).where(
+        ProjectMember.project_id == project_id,
+        ProjectMember.role == ProjectRole.ADMIN,
+    )
+    if exclude_user_id is not None:
+        stmt = stmt.where(ProjectMember.user_id != exclude_user_id)
+    return int(db.execute(stmt).scalar() or 0)

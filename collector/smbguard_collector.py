@@ -17,14 +17,17 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+import time
 
 import requests
 
 try:
     from impacket.smbconnection import SMBConnection, SessionError
-except Exception:  # noqa: BLE001
+except ImportError:
     SMBConnection = None
-    SessionError = Exception
+
+    class SessionError(Exception):
+        """Fallback error type used when impacket is unavailable."""
 
 
 @dataclass
@@ -59,7 +62,8 @@ class NDJSONWriter:
             if self._closed:
                 return
             self._fp.write(line + "\n")
-            self._fp.flush()
+            if self._path is None:
+                self._fp.flush()
 
     def close(self) -> None:
         with self._lock:
@@ -205,7 +209,7 @@ def _signing_label(conn: SMBConnection) -> str:
     try:
         required = bool(conn.isSigningRequired())
         return "required" if required else "enabled"
-    except Exception:  # noqa: BLE001
+    except (AttributeError, OSError, SessionError, TypeError, ValueError):
         return "enabled"
 
 
@@ -318,13 +322,43 @@ def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWr
                     )
                     with lock:
                         stats.items += 1
-            except Exception as exc:  # noqa: BLE001
+            except SessionError as exc:
                 writer.emit(
                     {
                         "type": "error",
                         "run_id": run_id,
                         "severity": "warn",
-                        "code": "LIST_FAILED",
+                        "code": "LIST_SESSION_ERROR",
+                        "message": str(exc),
+                        "endpoint_key": endpoint_key,
+                        "resource_name": share_name,
+                        "path": "\\",
+                    }
+                )
+                with lock:
+                    stats.errors += 1
+            except (socket.timeout, TimeoutError):
+                writer.emit(
+                    {
+                        "type": "error",
+                        "run_id": run_id,
+                        "severity": "warn",
+                        "code": "LIST_TIMEOUT",
+                        "message": "share listing timeout",
+                        "endpoint_key": endpoint_key,
+                        "resource_name": share_name,
+                        "path": "\\",
+                    }
+                )
+                with lock:
+                    stats.errors += 1
+            except OSError as exc:
+                writer.emit(
+                    {
+                        "type": "error",
+                        "run_id": run_id,
+                        "severity": "warn",
+                        "code": "LIST_IO_ERROR",
                         "message": str(exc),
                         "endpoint_key": endpoint_key,
                         "resource_name": share_name,
@@ -336,7 +370,7 @@ def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWr
 
         try:
             conn.logoff()
-        except Exception:  # noqa: BLE001
+        except (SessionError, OSError):
             pass
         return True
 
@@ -362,13 +396,24 @@ def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWr
                 "endpoint_key": endpoint_key,
             }
         )
-    except Exception as exc:  # noqa: BLE001
+    except (OSError, ConnectionError) as exc:
         writer.emit(
             {
                 "type": "error",
                 "run_id": run_id,
                 "severity": "error",
-                "code": "SMB_SCAN_FAILED",
+                "code": "SMB_NETWORK_FAILED",
+                "message": str(exc),
+                "endpoint_key": endpoint_key,
+            }
+        )
+    except (TypeError, ValueError) as exc:
+        writer.emit(
+            {
+                "type": "error",
+                "run_id": run_id,
+                "severity": "error",
+                "code": "SMB_INPUT_INVALID",
                 "message": str(exc),
                 "endpoint_key": endpoint_key,
             }
@@ -409,22 +454,118 @@ def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str, h
         },
     }
     create_url = f"{base}/projects/{args.project_id}/runs"
-    create_resp = requests.post(create_url, json=create_payload, headers=headers, timeout=30)
-    create_resp.raise_for_status()
+    create_resp = _post_with_retries(
+        lambda: requests.post(create_url, json=create_payload, headers=headers, timeout=30),
+    )
+    create_detail = _response_detail(create_resp)
+    if create_resp.status_code != 409 or create_detail != "run already exists":
+        create_resp.raise_for_status()
 
     upload_url = f"{base}/projects/{args.project_id}/runs/{run_id}/artifact"
     content_type = "application/gzip" if artifact_path.endswith(".gz") else "application/x-ndjson"
+    upload_resp = _post_with_retries(
+        lambda: _upload_artifact_once(upload_url, headers, content_type, artifact_path),
+    )
+    upload_detail = _response_detail(upload_resp)
+    if upload_resp.status_code != 409 or upload_detail != "run state does not accept upload":
+        upload_resp.raise_for_status()
+
+    print(f"run_id={run_id}")
+    print(f"api_run_url={base}/projects/{args.project_id}/runs/{run_id}")
+
+
+def _upload_artifact_once(url: str, headers: dict[str, str], content_type: str, artifact_path: str) -> requests.Response:
     with open(artifact_path, "rb") as fp:
-        upload_resp = requests.post(
-            upload_url,
+        return requests.post(
+            url,
             data=fp,
             headers={**headers, "Content-Type": content_type},
             timeout=3600,
         )
-    upload_resp.raise_for_status()
 
-    print(f"run_id={run_id}")
-    print(f"api_run_url={base}/projects/{args.project_id}/runs/{run_id}")
+
+def _response_detail(response: requests.Response) -> str | None:
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    detail = body.get("detail")
+    return str(detail) if detail is not None else None
+
+
+def _post_with_retries(
+    request_fn,
+    max_attempts: int = 3,
+    initial_backoff_seconds: float = 0.5,
+) -> requests.Response:
+    retriable_statuses = {429, 500, 502, 503, 504}
+    for attempt in range(max_attempts):
+        try:
+            response = request_fn()
+        except requests.RequestException:
+            if attempt + 1 >= max_attempts:
+                raise
+        else:
+            if response.status_code not in retriable_statuses or attempt + 1 >= max_attempts:
+                return response
+
+        sleep_seconds = min(initial_backoff_seconds * (2**attempt), 4.0)
+        time.sleep(sleep_seconds)
+    raise RuntimeError("post retry loop failed unexpectedly")
+
+
+def _collect_scan_results(
+    futures_by_host: dict[concurrent.futures.Future, str],
+    run_id: str,
+    writer: NDJSONWriter,
+    stats: Stats,
+    lock: threading.Lock,
+) -> int:
+    host_failures = 0
+    for future in concurrent.futures.as_completed(futures_by_host):
+        host = futures_by_host[future]
+        try:
+            exc = future.exception()
+        except concurrent.futures.CancelledError as cancelled_error:
+            exc = cancelled_error
+
+        if exc is not None:
+            message = str(exc) or type(exc).__name__
+            writer.emit(
+                {
+                    "type": "error",
+                    "run_id": run_id,
+                    "severity": "error",
+                    "code": _scan_thread_error_code(exc),
+                    "message": message,
+                    "endpoint_key": f"{host}:445",
+                }
+            )
+            with lock:
+                stats.errors += 1
+            host_failures += 1
+            continue
+
+        ok = bool(future.result())
+        if not ok:
+            host_failures += 1
+    return host_failures
+
+
+def _scan_thread_error_code(exc: BaseException) -> str:
+    if isinstance(exc, concurrent.futures.CancelledError):
+        return "SCAN_THREAD_CANCELLED"
+    if isinstance(exc, SessionError):
+        return "SCAN_SESSION_ERROR"
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "SCAN_TIMEOUT"
+    if isinstance(exc, OSError):
+        return "SCAN_IO_ERROR"
+    if isinstance(exc, (TypeError, ValueError)):
+        return "SCAN_INPUT_ERROR"
+    return "SCAN_THREAD_FAILED"
 
 
 def main() -> int:
@@ -472,10 +613,8 @@ def main() -> int:
     host_failures = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures = [executor.submit(scan_host, host, args, run_id, writer, stats, lock) for host in targets]
-        for future in concurrent.futures.as_completed(futures):
-            if not future.result():
-                host_failures += 1
+        futures_by_host = {executor.submit(scan_host, host, args, run_id, writer, stats, lock): host for host in targets}
+        host_failures = _collect_scan_results(futures_by_host, run_id, writer, stats, lock)
 
     writer.emit(
         {

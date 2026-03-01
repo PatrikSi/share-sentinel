@@ -4,10 +4,28 @@ import { apiFetch } from "@/lib/api";
 
 type UserMe = { id: string; is_sysadmin: boolean; email: string };
 type Project = { id: string; name: string };
-type TokenMeta = { id: string; name: string; role: string; revoked_at: string | null; created_at: string };
+type TokenMeta = {
+  id: string;
+  name: string;
+  role: string;
+  scopes: string[];
+  revoked_at: string | null;
+  expires_at: string | null;
+  created_at: string;
+};
 type AuditEvent = { id: number; ts: string; action: string; object_type: string; object_id: string };
 type Member = { user_id: string; email: string; role: string };
-type UserRow = { id: string; email: string; is_active: boolean; is_sysadmin: boolean; created_at: string };
+type UserRow = { id: string; email: string; is_active: boolean; is_sysadmin: boolean; is_approved: boolean; created_at: string };
+type SecuritySettings = {
+  allow_self_registration: boolean;
+  auth_require_csrf: boolean;
+  auth_cookie_secure: boolean;
+  password_min_length: number;
+  auth_login_max_attempts: number;
+  auth_login_window_seconds: number;
+  auth_login_lockout_seconds: number;
+  default_api_token_expiry_days: number;
+};
 
 export function AdminPage() {
   const [me, setMe] = useState<UserMe | null>(null);
@@ -28,12 +46,15 @@ export function AdminPage() {
 
   const [tokenName, setTokenName] = useState("collector-token");
   const [tokenRole, setTokenRole] = useState("operator");
+  const [tokenScopes, setTokenScopes] = useState("");
+  const [tokenExpiryDays, setTokenExpiryDays] = useState("90");
   const [createdToken, setCreatedToken] = useState<string | null>(null);
 
   const [newUserEmail, setNewUserEmail] = useState("");
   const [newUserPassword, setNewUserPassword] = useState("");
   const [newUserSysadmin, setNewUserSysadmin] = useState(false);
   const [userSearch, setUserSearch] = useState("");
+  const [securitySettings, setSecuritySettings] = useState<SecuritySettings | null>(null);
 
   const [auditCursor, setAuditCursor] = useState<string | null>(null);
   const [auditHistory, setAuditHistory] = useState<Array<string | null>>([]);
@@ -95,6 +116,9 @@ export function AdminPage() {
   useEffect(() => {
     if (!me?.is_sysadmin) return;
     loadUsers(userSearch).catch((err) => setError(err.message));
+    apiFetch("/auth/security-settings")
+      .then((data) => setSecuritySettings(data as SecuritySettings))
+      .catch((err) => setError(err.message));
   }, [me?.is_sysadmin, userSearch]);
 
   async function refreshMembers() {
@@ -142,9 +166,20 @@ export function AdminPage() {
     setInfo(null);
     setCreatedToken(null);
     try {
+      const scopes = tokenScopes
+        .split(",")
+        .map((scope) => scope.trim())
+        .filter(Boolean);
+      const parsedExpiry = tokenExpiryDays.trim() ? Number.parseInt(tokenExpiryDays.trim(), 10) : Number.NaN;
       const data = await apiFetch("/auth/api-tokens", {
         method: "POST",
-        body: JSON.stringify({ project_id: projectId, name: tokenName, role: tokenRole }),
+        body: JSON.stringify({
+          project_id: projectId,
+          name: tokenName,
+          role: tokenRole,
+          scopes,
+          expires_in_days: Number.isFinite(parsedExpiry) && parsedExpiry > 0 ? parsedExpiry : undefined,
+        }),
       });
       setCreatedToken(data.token as string);
       setTokens((prev) => [data.token_meta as TokenMeta, ...prev]);
@@ -199,6 +234,21 @@ export function AdminPage() {
       setInfo(`User ${isActive ? "enabled" : "disabled"}.`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to update user status");
+    }
+  }
+
+  async function setUserApproval(userId: string, isApproved: boolean) {
+    setError(null);
+    setInfo(null);
+    try {
+      await apiFetch(`/users/${userId}/approval`, {
+        method: "PATCH",
+        body: JSON.stringify({ is_approved: isApproved }),
+      });
+      setUsers((prev) => prev.map((user) => (user.id === userId ? { ...user, is_approved: isApproved } : user)));
+      setInfo(isApproved ? "User approved." : "User moved back to pending.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update approval");
     }
   }
 
@@ -323,6 +373,18 @@ export function AdminPage() {
             <button className="rounded-lg bg-ember px-3 py-1 text-sm font-semibold text-white" type="submit" disabled={!canProjectAdmin}>
               Create
             </button>
+            <input
+              className="w-full rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+              placeholder="Scopes (comma-separated, optional)"
+              value={tokenScopes}
+              onChange={(event) => setTokenScopes(event.target.value)}
+            />
+            <input
+              className="w-44 rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+              placeholder="Expiry days"
+              value={tokenExpiryDays}
+              onChange={(event) => setTokenExpiryDays(event.target.value)}
+            />
           </form>
 
           {createdToken ? (
@@ -341,6 +403,10 @@ export function AdminPage() {
                     <div className="font-semibold">{token.name}</div>
                     <div className="font-mono text-xs">{token.id}</div>
                     <div className="text-slate-500">role: {token.role}</div>
+                    <div className="text-slate-500">scopes: {(token.scopes || []).join(", ") || "none"}</div>
+                    <div className="text-slate-500">
+                      expires: {token.expires_at ? new Date(token.expires_at).toLocaleString() : "never"}
+                    </div>
                   </div>
                   <button
                     className="rounded border border-slate-300 px-2 py-1 text-xs disabled:opacity-40 dark:border-slate-700"
@@ -357,7 +423,7 @@ export function AdminPage() {
       </div>
 
       {me?.is_sysadmin ? (
-        <div className="workspace-section grid gap-4 md:grid-cols-2">
+        <div className="workspace-section grid gap-4 md:grid-cols-3">
           <div className="workspace-card space-y-4">
             <h2 className="text-lg font-semibold">Create User</h2>
             <form className="space-y-3" onSubmit={createUser}>
@@ -405,19 +471,47 @@ export function AdminPage() {
                     <div>
                       <div className="font-semibold">{user.email}</div>
                       <div className="text-xs text-slate-500">
-                        {user.is_sysadmin ? "sysadmin" : "user"} | {user.is_active ? "active" : "disabled"}
+                        {user.is_sysadmin ? "sysadmin" : "user"} | {user.is_active ? "active" : "disabled"} |{" "}
+                        {user.is_approved ? "approved" : "pending approval"}
                       </div>
                     </div>
-                    <button
-                      className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
-                      onClick={() => setUserActive(user.id, !user.is_active)}
-                    >
-                      {user.is_active ? "Disable" : "Enable"}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
+                        onClick={() => setUserActive(user.id, !user.is_active)}
+                      >
+                        {user.is_active ? "Disable" : "Enable"}
+                      </button>
+                      <button
+                        className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
+                        onClick={() => setUserApproval(user.id, !user.is_approved)}
+                      >
+                        {user.is_approved ? "Unapprove" : "Approve"}
+                      </button>
+                    </div>
                   </div>
                 </li>
               ))}
             </ul>
+          </div>
+
+          <div className="workspace-card space-y-3">
+            <h2 className="text-lg font-semibold">Security Policy</h2>
+            {securitySettings ? (
+              <ul className="space-y-1 text-sm">
+                <li>Self-registration: {securitySettings.allow_self_registration ? "enabled" : "disabled"}</li>
+                <li>CSRF required: {securitySettings.auth_require_csrf ? "yes" : "no"}</li>
+                <li>Secure auth cookie: {securitySettings.auth_cookie_secure ? "yes" : "no"}</li>
+                <li>Password minimum: {securitySettings.password_min_length}</li>
+                <li>
+                  Login lockout: {securitySettings.auth_login_max_attempts} attempts / {securitySettings.auth_login_window_seconds}s window /{" "}
+                  {securitySettings.auth_login_lockout_seconds}s lock
+                </li>
+                <li>Default token expiry: {securitySettings.default_api_token_expiry_days} days</li>
+              </ul>
+            ) : (
+              <p className="text-sm text-slate-500">Loading security settings…</p>
+            )}
           </div>
         </div>
       ) : null}

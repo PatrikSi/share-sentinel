@@ -3,10 +3,17 @@ import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 
 import { TopNav } from "@/components/top-nav";
 import { getAccessToken } from "@/lib/auth";
-import { AdminPage } from "@/pages/admin-page";
+import { AccountPage } from "@/pages/account-page";
 import { LoginPage } from "@/pages/login-page";
+import { ProjectImportPage } from "@/pages/project-import-page";
+import { ProjectInventoryPage } from "@/pages/project-inventory-page";
 import { ProjectsPage } from "@/pages/projects-page";
 import { RunDetailPage } from "@/pages/run-detail-page";
+import { SettingsApiTokensPage } from "@/pages/settings-api-tokens-page";
+import { SettingsAuditLogsPage } from "@/pages/settings-audit-logs-page";
+import { SettingsIamPage } from "@/pages/settings-iam-page";
+import { SettingsLayout } from "@/pages/settings-layout";
+import { SettingsOverviewPage } from "@/pages/settings-overview-page";
 
 function RequireAuth({ children }: { children: JSX.Element }) {
   const location = useLocation();
@@ -57,10 +64,50 @@ export function App() {
               }
             />
             <Route
+              path="/projects/:projectId/inventory"
+              element={
+                <RequireAuth>
+                  <ProjectInventoryPage />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/projects/:projectId/import"
+              element={
+                <RequireAuth>
+                  <ProjectImportPage />
+                </RequireAuth>
+              }
+            />
+            <Route
               path="/admin"
               element={
                 <RequireAuth>
-                  <AdminPage />
+                  <Navigate to="/settings/overview" replace />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/settings"
+              element={
+                <RequireAuth>
+                  <SettingsLayout />
+                </RequireAuth>
+              }
+            >
+              <Route index element={<Navigate to="/settings/overview" replace />} />
+              <Route path="overview" element={<SettingsOverviewPage />} />
+              <Route path="iam" element={<SettingsIamPage />} />
+              <Route path="users" element={<Navigate to="/settings/iam" replace />} />
+              <Route path="rbac" element={<Navigate to="/settings/iam" replace />} />
+              <Route path="api-tokens" element={<SettingsApiTokensPage />} />
+              <Route path="audit-logs" element={<SettingsAuditLogsPage />} />
+            </Route>
+            <Route
+              path="/account"
+              element={
+                <RequireAuth>
+                  <AccountPage />
                 </RequireAuth>
               }
             />

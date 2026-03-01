@@ -13,12 +13,28 @@ from typing import Any
 import boto3
 import psycopg
 import redis
+from botocore.exceptions import BotoCoreError, ClientError
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("share_sentinel.worker")
+
+
+def _read_int_env(name: str, default: int, min_value: int = 1) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("invalid integer value for %s=%r; using default=%s", name, raw, default)
+        return default
+
+    if value < min_value:
+        logger.warning("value for %s=%s is below min=%s; using min", name, value, min_value)
+        return min_value
+    return value
+
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://smbguard:smbguard@db:5432/smbguard").replace(
@@ -33,11 +49,11 @@ STREAM_NAME = "ingest_jobs"
 GROUP_NAME = "ingest_workers"
 CONSUMER_NAME = f"{socket.gethostname()}-{os.getpid()}"
 
-BATCH_SIZE = int(os.getenv("INGEST_BATCH_SIZE", "5000"))
-PROGRESS_EVERY_LINES = int(os.getenv("INGEST_PROGRESS_EVERY_LINES", "2000"))
-RECOVERY_SCAN_SECONDS = int(os.getenv("INGEST_RECOVERY_SCAN_SECONDS", "8"))
-PENDING_IDLE_MS = int(os.getenv("INGEST_PENDING_IDLE_MS", "60000"))
-JSON_COMPAT_MAX_BYTES = int(os.getenv("INGEST_JSON_COMPAT_MAX_BYTES", str(50 * 1024 * 1024)))
+BATCH_SIZE = _read_int_env("INGEST_BATCH_SIZE", 5000, min_value=1)
+PROGRESS_EVERY_LINES = _read_int_env("INGEST_PROGRESS_EVERY_LINES", 2000, min_value=1)
+RECOVERY_SCAN_SECONDS = _read_int_env("INGEST_RECOVERY_SCAN_SECONDS", 8, min_value=1)
+PENDING_IDLE_MS = _read_int_env("INGEST_PENDING_IDLE_MS", 60000, min_value=1)
+JSON_COMPAT_MAX_BYTES = _read_int_env("INGEST_JSON_COMPAT_MAX_BYTES", 50 * 1024 * 1024, min_value=1024)
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -47,6 +63,36 @@ s3 = boto3.client(
     aws_access_key_id=S3_ACCESS_KEY,
     aws_secret_access_key=S3_SECRET_KEY,
 )
+
+INGEST_OPERATION_EXCEPTIONS = (
+    psycopg.Error,
+    BotoCoreError,
+    ClientError,
+    OSError,
+    RuntimeError,
+    ValueError,
+    TypeError,
+)
+STREAM_MESSAGE_RETRYABLE_EXCEPTIONS = INGEST_OPERATION_EXCEPTIONS + (redis.RedisError,)
+
+
+def _safe_run_id(fields: dict[str, str] | None) -> str | None:
+    if not isinstance(fields, dict):
+        return None
+    return _normalize_uuid_str(fields.get("run_id"))
+
+
+def _normalize_uuid_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _should_log_redis_error(last_logged_at: float, now: float, interval_seconds: float = 30.0) -> bool:
+    return now - last_logged_at >= interval_seconds
 
 
 def now_iso() -> str:
@@ -188,7 +234,7 @@ def parse_offset(raw: Any) -> int:
     value = raw.get("line_offset", 0)
     try:
         return max(0, int(value))
-    except Exception:  # noqa: BLE001
+    except (TypeError, ValueError):
         return 0
 
 
@@ -213,7 +259,7 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
         try:
             if int(rec.get("schema_version")) != 1:
                 return False, "unsupported schema_version"
-        except Exception:  # noqa: BLE001
+        except (TypeError, ValueError):
             return False, "invalid schema_version"
 
     if rec_type == "item" and not rec.get("name"):
@@ -380,14 +426,14 @@ def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
 
 
 def process_job(fields: dict[str, str]) -> None:
-    run_id = fields.get("run_id")
-    project_id = fields.get("project_id")
+    run_id = _normalize_uuid_str(fields.get("run_id"))
+    project_id = _normalize_uuid_str(fields.get("project_id"))
     artifact_key = fields.get("artifact_key")
     last_line_offset = 0
     last_counts = {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
 
     if not run_id:
-        logger.error("invalid job payload missing run_id: %s", fields)
+        logger.error("invalid job payload missing or invalid run_id: %s", fields)
         return
 
     with psycopg.connect(DATABASE_URL) as conn:
@@ -417,7 +463,7 @@ def process_job(fields: dict[str, str]) -> None:
                 update_run_status(conn, run_id, "FAILED", parse_offset(progress_raw), parse_summary(summary_raw), "missing artifact key")
                 conn.commit()
                 return
-            if status == "COMPLETE":
+            if status in {"COMPLETE", "FAILED"}:
                 return
 
             counts = parse_summary(summary_raw)
@@ -552,7 +598,7 @@ def process_job(fields: dict[str, str]) -> None:
                 try:
                     json_doc = json.loads(raw_bytes.decode("utf-8", errors="replace"))
                     json_records = records_from_json_document(json_doc, run_id)
-                except Exception:
+                except (TypeError, ValueError):
                     json_records = None
                     reader = raw_bytes.splitlines()
             else:
@@ -621,7 +667,7 @@ def process_job(fields: dict[str, str]) -> None:
             conn.commit()
             last_line_offset = line_offset
             last_counts = counts.copy()
-        except Exception as exc:  # noqa: BLE001
+        except INGEST_OPERATION_EXCEPTIONS as exc:
             logger.exception("job failed run_id=%s", run_id)
             try:
                 update_run_status(conn, run_id, "FAILED", last_line_offset, last_counts, last_error=str(exc))
@@ -635,7 +681,7 @@ def process_job(fields: dict[str, str]) -> None:
                         {"worker": CONSUMER_NAME, "error": str(exc)},
                     )
                 conn.commit()
-            except Exception:  # noqa: BLE001
+            except psycopg.Error:
                 logger.exception("failed to persist ingest failure state run_id=%s", run_id)
             raise
         finally:
@@ -676,6 +722,7 @@ def main() -> int:
     logger.info("worker started consumer=%s", CONSUMER_NAME)
 
     last_recovery_scan = 0.0
+    last_redis_error_log = 0.0
 
     while True:
         messages = []
@@ -687,7 +734,11 @@ def main() -> int:
                 count=5,
                 block=3000,
             )
-        except redis.RedisError:
+        except redis.RedisError as exc:
+            now = time.time()
+            if _should_log_redis_error(last_redis_error_log, now):
+                logger.warning("redis stream read failed, retrying: %s", exc)
+                last_redis_error_log = now
             time.sleep(1)
 
         if messages:
@@ -696,7 +747,12 @@ def main() -> int:
                     try:
                         process_job(fields)
                         redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
-                    except Exception:
+                    except STREAM_MESSAGE_RETRYABLE_EXCEPTIONS:
+                        logger.exception(
+                            "failed processing stream message message_id=%s run_id=%s",
+                            message_id,
+                            _safe_run_id(fields),
+                        )
                         time.sleep(1)
 
         stale_jobs = claim_stale_messages()
@@ -704,14 +760,20 @@ def main() -> int:
             try:
                 process_job(fields)
                 redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
-            except Exception:
+            except STREAM_MESSAGE_RETRYABLE_EXCEPTIONS:
+                logger.exception(
+                    "failed processing claimed stream message message_id=%s run_id=%s",
+                    message_id,
+                    _safe_run_id(fields),
+                )
                 time.sleep(1)
 
         if time.time() - last_recovery_scan >= RECOVERY_SCAN_SECONDS:
             for recovered in discover_uploaded_runs(limit=5):
                 try:
                     process_job(recovered)
-                except Exception:
+                except STREAM_MESSAGE_RETRYABLE_EXCEPTIONS:
+                    logger.exception("failed processing recovered uploaded run run_id=%s", _safe_run_id(recovered))
                     time.sleep(1)
             last_recovery_scan = time.time()
 
