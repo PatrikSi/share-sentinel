@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import logging
 import os
 import time
 import uuid
@@ -31,6 +32,7 @@ from app.token_scopes import SCOPE_READ_RUNS, SCOPE_WRITE_RUNS
 
 router = APIRouter(prefix="/projects/{project_id}/runs", tags=["runs"])
 rate_limiter = RateLimiter()
+logger = logging.getLogger("share_sentinel.runs")
 
 
 def _get_run(db: Session, project_id: uuid.UUID, run_id: uuid.UUID) -> ScanRun:
@@ -127,7 +129,10 @@ async def _upload_artifact_stream(
         await run_in_threadpool(complete_multipart_upload, key, upload_id, parts)
         return size, sha256.hexdigest()
     except Exception:
-        await run_in_threadpool(abort_multipart_upload, key, upload_id)
+        try:
+            await run_in_threadpool(abort_multipart_upload, key, upload_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to abort multipart upload key=%s upload_id=%s", key, upload_id)
         raise
 
 
