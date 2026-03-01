@@ -49,6 +49,19 @@ s3 = boto3.client(
 )
 
 
+def _safe_run_id(fields: dict[str, str] | None) -> str | None:
+    if not isinstance(fields, dict):
+        return None
+    run_id = fields.get("run_id")
+    if run_id is None:
+        return None
+    return str(run_id)
+
+
+def _should_log_redis_error(last_logged_at: float, now: float, interval_seconds: float = 30.0) -> bool:
+    return now - last_logged_at >= interval_seconds
+
+
 def now_iso() -> str:
     return datetime.now(tz=UTC).isoformat()
 
@@ -676,6 +689,7 @@ def main() -> int:
     logger.info("worker started consumer=%s", CONSUMER_NAME)
 
     last_recovery_scan = 0.0
+    last_redis_error_log = 0.0
 
     while True:
         messages = []
@@ -687,7 +701,11 @@ def main() -> int:
                 count=5,
                 block=3000,
             )
-        except redis.RedisError:
+        except redis.RedisError as exc:
+            now = time.time()
+            if _should_log_redis_error(last_redis_error_log, now):
+                logger.warning("redis stream read failed, retrying: %s", exc)
+                last_redis_error_log = now
             time.sleep(1)
 
         if messages:
@@ -697,6 +715,11 @@ def main() -> int:
                         process_job(fields)
                         redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
                     except Exception:
+                        logger.exception(
+                            "failed processing stream message message_id=%s run_id=%s",
+                            message_id,
+                            _safe_run_id(fields),
+                        )
                         time.sleep(1)
 
         stale_jobs = claim_stale_messages()
@@ -705,6 +728,11 @@ def main() -> int:
                 process_job(fields)
                 redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
             except Exception:
+                logger.exception(
+                    "failed processing claimed stream message message_id=%s run_id=%s",
+                    message_id,
+                    _safe_run_id(fields),
+                )
                 time.sleep(1)
 
         if time.time() - last_recovery_scan >= RECOVERY_SCAN_SECONDS:
@@ -712,6 +740,7 @@ def main() -> int:
                 try:
                     process_job(recovered)
                 except Exception:
+                    logger.exception("failed processing recovered uploaded run run_id=%s", _safe_run_id(recovered))
                     time.sleep(1)
             last_recovery_scan = time.time()
 
