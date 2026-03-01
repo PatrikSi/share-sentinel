@@ -332,15 +332,22 @@ def change_password(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
+    now = datetime.now(tz=UTC)
     user.password_hash = hash_password(payload.new_password)
     db.add(user)
+    active_sessions = db.execute(
+        select(RefreshToken).where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
+    ).scalars().all()
+    for session in active_sessions:
+        session.revoked_at = now
+        db.add(session)
     write_audit_event(
         db,
         action="PASSWORD_CHANGED",
         object_type="user",
         object_id=str(user.id),
         actor_user_id=user.id,
-        metadata=request_meta(request),
+        metadata={**request_meta(request), "revoked_sessions": len(active_sessions)},
     )
     db.commit()
     return {"ok": True}
