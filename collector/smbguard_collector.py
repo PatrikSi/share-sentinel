@@ -414,7 +414,8 @@ def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str, h
     create_resp = _post_with_retries(
         lambda: requests.post(create_url, json=create_payload, headers=headers, timeout=30),
     )
-    if create_resp.status_code != 409:
+    create_detail = _response_detail(create_resp)
+    if create_resp.status_code != 409 or create_detail != "run already exists":
         create_resp.raise_for_status()
 
     upload_url = f"{base}/projects/{args.project_id}/runs/{run_id}/artifact"

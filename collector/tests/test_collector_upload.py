@@ -97,3 +97,30 @@ def test_upload_artifact_raises_for_non_idempotent_conflict(monkeypatch, tmp_pat
     except requests.HTTPError:
         return
     raise AssertionError("expected HTTPError for non-idempotent upload conflict")
+
+
+def test_upload_artifact_raises_for_non_idempotent_create_conflict(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    artifact = tmp_path / "artifact.ndjson"
+    artifact.write_text('{"type":"run_meta"}\n', encoding="utf-8")
+
+    args = SimpleNamespace(
+        upload=True,
+        api_base="http://api",
+        project_id="project-id",
+        api_token="token-value",
+        run_name="run-name",
+        cidr=[],
+    )
+
+    create_resp = _FakeResponse(409, {"detail": "project is locked"})
+    upload_resp = _FakeResponse(200, {})
+    responses = [create_resp, upload_resp]
+
+    monkeypatch.setattr(collector, "_post_with_retries", lambda request_fn, **_kwargs: responses.pop(0))
+
+    try:
+        collector.upload_artifact(args, "run-id", str(artifact), hosts=[])
+    except requests.HTTPError:
+        return
+    raise AssertionError("expected HTTPError for non-idempotent create conflict")
