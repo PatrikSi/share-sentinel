@@ -75,39 +75,84 @@ class NDJSONWriter:
                 self._fp.close()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Network share enumerator for Share Sentinel")
-    parser.add_argument("--cidr", action="append", default=[])
-    parser.add_argument("--hosts", type=str)
+class _CollectorHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    pass
 
-    parser.add_argument("--domain", type=str, default="")
-    parser.add_argument("--username", type=str, default="")
-    parser.add_argument("--password", type=str, default="")
-    parser.add_argument("--hashes", type=str)
-    parser.add_argument("--local-auth", action="store_true")
-    parser.add_argument("--kerberos", action="store_true")
-    parser.add_argument("--ccache", type=str)
-    parser.add_argument("--share-types", choices=["smb", "nfs", "both"], default="smb")
 
-    parser.add_argument("--workers", type=int, default=100)
-    parser.add_argument("--timeout", type=float, default=3.0)
-    parser.add_argument("--max-depth", type=int, default=1)
-    parser.add_argument("--max-entries-per-share", type=int, default=5000)
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Collect SMB and/or NFS share inventory and output NDJSON records.\n\n"
+            "Most common workflow:\n"
+            "  1) Pick targets with --hosts and/or --cidr\n"
+            "  2) Choose --share-types smb|nfs|both\n"
+            "  3) For SMB choose authenticated credentials or anonymous mode\n"
+            "  4) Save with --output and optionally upload with --upload"
+        ),
+        epilog=(
+            "Examples:\n"
+            "  Authenticated SMB scan:\n"
+            "    smbguard_collector.py --hosts hosts.txt --share-types smb --username corp\\\\svc_scan --password '***' --output run.ndjson.gz --gzip\n\n"
+            "  Anonymous SMB scan:\n"
+            "    smbguard_collector.py --cidr 10.20.0.0/24 --share-types smb --smb-anonymous --output anon.ndjson\n\n"
+            "  NFS + SMB combined scan:\n"
+            "    smbguard_collector.py --hosts hosts.txt --share-types both --username corp\\\\svc_scan --password '***' --output combined.ndjson.gz --gzip\n\n"
+            "  Upload after scan:\n"
+            "    smbguard_collector.py --hosts hosts.txt --share-types smb --username svc --password '***' --upload --api-base https://api.example --project-id <uuid> --api-token <token>\n\n"
+            "Notes:\n"
+            "  - SMB authentication modes:\n"
+            "      * NTLM: set --username (and password or hashes)\n"
+            "      * Kerberos: add --kerberos and --username\n"
+            "      * Anonymous: set --smb-anonymous or omit SMB credentials\n"
+            "  - NFS export enumeration uses `showmount -e`; if unavailable, host reachability is still recorded."
+        ),
+        formatter_class=_CollectorHelpFormatter,
+    )
 
-    parser.add_argument("--exclude-share", action="append", default=[])
-    parser.add_argument("--exclude-path-regex", type=str)
-    parser.add_argument("--extensions-only", type=str)
+    common = parser.add_argument_group("Common Options")
+    common.add_argument("--hosts", type=str, help="Path to newline-separated hosts (IPs or hostnames).")
+    common.add_argument("--cidr", action="append", default=[], help="Target CIDR range. Can be repeated.")
+    common.add_argument(
+        "--share-types",
+        choices=["smb", "nfs", "both"],
+        default="smb",
+        help="Share protocols to scan.",
+    )
+    common.add_argument("--output", type=str, help="Write NDJSON output to this file. Defaults to stdout unless --upload needs a temp file.")
+    common.add_argument("--gzip", action="store_true", help="Gzip-compress output when writing to a file.")
+    common.add_argument("--workers", type=int, default=100, help="Concurrent host workers.")
+    common.add_argument("--timeout", type=float, default=3.0, help="Per-network-operation timeout in seconds.")
+    common.add_argument("--operator-label", type=str, help="Optional operator label stored in run metadata.")
 
-    parser.add_argument("--output", type=str)
-    parser.add_argument("--gzip", action="store_true")
-    parser.add_argument("--operator-label", type=str)
+    smb_auth = parser.add_argument_group("SMB Authentication")
+    smb_auth.add_argument("--smb-anonymous", action="store_true", help="Force anonymous SMB session.")
+    smb_auth.add_argument("--username", type=str, default="", help="SMB username for NTLM/Kerberos.")
+    smb_auth.add_argument("--password", type=str, default="", help="SMB password for NTLM/Kerberos.")
+    smb_auth.add_argument("--hashes", type=str, help="LM:NT hash pair for NTLM auth.")
+    smb_auth.add_argument("--domain", type=str, default="", help="SMB domain for NTLM/Kerberos.")
+    smb_auth.add_argument("--local-auth", action="store_true", help="Use local SAM auth (empty domain) for NTLM.")
+    smb_auth.add_argument("--kerberos", action="store_true", help="Use Kerberos authentication for SMB.")
+    smb_auth.add_argument("--ccache", type=str, help="Use Kerberos credential cache.")
 
-    parser.add_argument("--upload", action="store_true")
-    parser.add_argument("--api-base", type=str)
-    parser.add_argument("--project-id", type=str)
-    parser.add_argument("--api-token", type=str)
-    parser.add_argument("--run-name", type=str, default="Share Collector Run")
-    return parser.parse_args()
+    tuning = parser.add_argument_group("Enumeration Tuning")
+    tuning.add_argument("--max-depth", type=int, default=1, help="Max directory traversal depth per share.")
+    tuning.add_argument("--max-entries-per-share", type=int, default=5000, help="Cap listed entries per share/export.")
+    tuning.add_argument("--exclude-share", action="append", default=[], help="SMB share name to skip. Can be repeated.")
+    tuning.add_argument("--exclude-path-regex", type=str, help="Regex for paths to exclude.")
+    tuning.add_argument("--extensions-only", type=str, help="Comma-separated file extensions filter, e.g. .docx,.pdf")
+
+    upload = parser.add_argument_group("Upload")
+    upload.add_argument("--upload", action="store_true", help="Upload artifact to Share Sentinel API after scan.")
+    upload.add_argument("--api-base", type=str, help="API base URL, e.g. https://api.example")
+    upload.add_argument("--project-id", type=str, help="Destination project UUID.")
+    upload.add_argument("--api-token", type=str, help="API token with run write scope.")
+    upload.add_argument("--run-name", type=str, default="Share Collector Run", help="Run name for uploaded scan.")
+
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return _build_parser().parse_args(argv)
 
 
 def parse_targets(cidrs: list[str], hosts_file: str | None) -> list[str]:
@@ -224,6 +269,36 @@ def _selected_share_types(raw_value: str) -> set[str]:
     return {"smb"}
 
 
+def _resolve_smb_auth_method(args: argparse.Namespace) -> str:
+    if args.smb_anonymous:
+        return "anonymous"
+    if args.kerberos:
+        return "kerberos"
+    if args.username:
+        return "ntlm"
+    return "anonymous"
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    selected_share_types = _selected_share_types(args.share_types)
+    if not args.cidr and not args.hosts:
+        raise SystemExit("at least one target source is required: --hosts and/or --cidr")
+
+    if args.kerberos and args.smb_anonymous:
+        raise SystemExit("--kerberos cannot be combined with --smb-anonymous")
+
+    if "smb" in selected_share_types:
+        if args.kerberos and not args.username:
+            raise SystemExit("--kerberos requires --username")
+        if args.hashes and not args.username and not args.smb_anonymous:
+            raise SystemExit("--hashes requires --username unless --smb-anonymous is set")
+        if args.password and not args.username and not args.smb_anonymous:
+            raise SystemExit("--password requires --username unless --smb-anonymous is set")
+
+    if args.upload and (not args.api_base or not args.project_id or not args.api_token):
+        raise SystemExit("--upload requires --api-base, --project-id, and --api-token")
+
+
 def _parse_showmount_exports(output: str) -> list[str]:
     exports: list[str] = []
     seen: set[str] = set()
@@ -267,6 +342,7 @@ def _discover_nfs_exports(host: str, timeout_seconds: float) -> tuple[list[str],
 
 def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
     endpoint_key = f"{host}:445"
+    attempted_auth = _resolve_smb_auth_method(args)
     if SMBConnection is None:
         writer.emit(
             {
@@ -274,7 +350,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "run_id": run_id,
                 "severity": "error",
                 "code": "IMPACKET_NOT_AVAILABLE",
-                "message": "impacket is not installed in this runtime",
+                "message": "impacket is not installed; install it with `pip install impacket` to scan SMB shares",
                 "endpoint_key": endpoint_key,
             }
         )
@@ -284,7 +360,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
 
     try:
         conn = SMBConnection(host, host, sess_port=445, timeout=args.timeout)
-        if args.kerberos:
+        if attempted_auth == "kerberos":
             conn.kerberosLogin(
                 args.username,
                 args.password,
@@ -297,15 +373,15 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 TGS=None,
                 useCache=bool(args.ccache),
             )
-            auth_method = "kerberos"
-        else:
+        elif attempted_auth == "ntlm":
             lmhash = ""
             nthash = ""
             if args.hashes and ":" in args.hashes:
                 lmhash, nthash = args.hashes.split(":", 1)
             domain = "" if args.local_auth else args.domain
             conn.login(args.username, args.password, domain=domain, lmhash=lmhash, nthash=nthash)
-            auth_method = "ntlm"
+        else:
+            conn.login("", "", domain="", lmhash="", nthash="")
 
         endpoint_record = {
             "type": "endpoint",
@@ -319,7 +395,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "signing": _signing_label(conn),
             },
             "auth": {
-                "method": auth_method,
+                "method": attempted_auth,
                 "success": True,
             },
         }
@@ -383,7 +459,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                         "run_id": run_id,
                         "severity": "warn",
                         "code": "LIST_SESSION_ERROR",
-                        "message": str(exc),
+                        "message": f"failed listing SMB share {share_name}: {exc}",
                         "endpoint_key": endpoint_key,
                         "resource_name": share_name,
                         "path": "\\",
@@ -398,7 +474,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                         "run_id": run_id,
                         "severity": "warn",
                         "code": "LIST_TIMEOUT",
-                        "message": "share listing timeout",
+                        "message": f"listing SMB share {share_name} timed out",
                         "endpoint_key": endpoint_key,
                         "resource_name": share_name,
                         "path": "\\",
@@ -413,7 +489,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                         "run_id": run_id,
                         "severity": "warn",
                         "code": "LIST_IO_ERROR",
-                        "message": str(exc),
+                        "message": f"io error listing SMB share {share_name}: {exc}",
                         "endpoint_key": endpoint_key,
                         "resource_name": share_name,
                         "path": "\\",
@@ -435,7 +511,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "run_id": run_id,
                 "severity": "error",
                 "code": "SMB_TIMEOUT",
-                "message": "connection timeout",
+                "message": "SMB connection to tcp/445 timed out",
                 "endpoint_key": endpoint_key,
             }
         )
@@ -446,7 +522,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "run_id": run_id,
                 "severity": "error",
                 "code": "SMB_AUTH_FAILED",
-                "message": str(exc),
+                "message": f"SMB {attempted_auth} session failed: {exc}",
                 "endpoint_key": endpoint_key,
             }
         )
@@ -457,7 +533,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "run_id": run_id,
                 "severity": "error",
                 "code": "SMB_NETWORK_FAILED",
-                "message": str(exc),
+                "message": f"SMB network failure: {exc}",
                 "endpoint_key": endpoint_key,
             }
         )
@@ -468,7 +544,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "run_id": run_id,
                 "severity": "error",
                 "code": "SMB_INPUT_INVALID",
-                "message": str(exc),
+                "message": f"SMB scan input is invalid: {exc}",
                 "endpoint_key": endpoint_key,
             }
         )
@@ -491,7 +567,7 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "run_id": run_id,
                 "severity": "error",
                 "code": "NFS_TIMEOUT",
-                "message": "connection timeout",
+                "message": "NFS connection to tcp/2049 timed out",
                 "endpoint_key": endpoint_key,
             }
         )
@@ -505,7 +581,7 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "run_id": run_id,
                 "severity": "error",
                 "code": "NFS_CONNECT_FAILED",
-                "message": str(exc),
+                "message": f"NFS connectivity failure: {exc}",
                 "endpoint_key": endpoint_key,
             }
         )
@@ -541,7 +617,7 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "run_id": run_id,
                 "severity": "warn",
                 "code": "NFS_EXPORT_ENUM_FAILED",
-                "message": export_error,
+                "message": f"failed to enumerate NFS exports on {host}: {export_error}",
                 "endpoint_key": endpoint_key,
             }
         )
@@ -723,9 +799,9 @@ def _scan_thread_error_code(exc: BaseException) -> str:
 
 def main() -> int:
     args = parse_args()
+    _validate_args(args)
     selected_share_types = sorted(_selected_share_types(args.share_types))
-    if "smb" in selected_share_types and not args.username:
-        raise SystemExit("--username is required when --share-types includes smb")
+    smb_auth_method = _resolve_smb_auth_method(args) if "smb" in selected_share_types else "none"
 
     targets = parse_targets(args.cidr, args.hosts)
     host_inputs = parse_hosts_file(args.hosts)
@@ -760,10 +836,14 @@ def main() -> int:
                 "share_types": selected_share_types,
             },
             "auth": {
-                "mode": ("local" if args.local_auth else "domain") if "smb" in selected_share_types else "none",
-                "domain": (args.domain or None) if "smb" in selected_share_types else None,
-                "username": args.username or None,
-                "method": ("kerberos" if args.kerberos else "ntlm") if "smb" in selected_share_types else "none",
+                "mode": (
+                    ("local" if args.local_auth else "domain")
+                    if smb_auth_method in {"ntlm", "kerberos"}
+                    else "none"
+                ),
+                "domain": (args.domain or None) if smb_auth_method in {"ntlm", "kerberos"} else None,
+                "username": (args.username or None) if smb_auth_method in {"ntlm", "kerberos"} else None,
+                "method": smb_auth_method,
             },
         }
     )
