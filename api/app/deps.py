@@ -95,6 +95,11 @@ def get_auth_context(
         raise _unauthorized("user not active")
     if not user.is_approved:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account pending approval")
+    membership = db.get(ProjectMember, {"project_id": api_token.project_id, "user_id": api_token.user_id})
+    if membership is None:
+        raise _unauthorized("invalid api token")
+    if ROLE_ORDER[membership.role] < ROLE_ORDER[api_token.role]:
+        raise _unauthorized("invalid api token")
 
     if _should_update_last_used(api_token.last_used_at, now):
         api_token.last_used_at = now
