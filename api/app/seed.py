@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime
 
 from sqlalchemy import select
@@ -6,6 +7,8 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.models import User
 from app.security import hash_password, validate_password_strength
+
+logger = logging.getLogger("share_sentinel.seed")
 
 
 def main() -> None:
@@ -18,7 +21,8 @@ def main() -> None:
     try:
         validate_password_strength(password, settings.password_min_length)
     except ValueError as exc:
-        raise RuntimeError("SEED_ADMIN_PASSWORD does not meet password policy") from exc
+        logger.warning("SEED_ADMIN_PASSWORD does not meet password policy, skipping admin seed: %s", exc)
+        return
 
     with SessionLocal() as db:
         email = email.lower()

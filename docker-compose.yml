@@ -134,7 +134,7 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://smbguard:${POSTGRES_PASSWORD:-change-me}@db:5432/smbguard
       SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@example.com}
-      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-change-me-please-12-plus}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-ChangeMe123456}
       TOKEN_PEPPER: ${TOKEN_PEPPER:-change-me-long-random-string}
     depends_on:
       db:
