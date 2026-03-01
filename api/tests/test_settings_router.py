@@ -353,6 +353,32 @@ def test_settings_assign_user_all_projects_endpoint() -> None:
     assert payload["assigned_projects"] == 2
 
 
+def test_users_assign_user_all_projects_preserves_last_project_admin() -> None:
+    fake_db = _FakeDb()
+    user_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    fake_db.get_map[(User, user_id)] = SimpleNamespace(id=user_id, email="admin@example.com")
+    existing = SimpleNamespace(project_id=project_id, user_id=user_id, role=ProjectRole.ADMIN)
+    fake_db.get_map[(ProjectMember, _normalize_key({"project_id": project_id, "user_id": user_id}))] = existing
+    fake_db.execute_queue.append(_ExecuteResult([SimpleNamespace(id=project_id)]))
+    fake_db.execute_queue.append(_ExecuteResult([0]))
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.post(
+            f"/users/{user_id}/assign-all-projects",
+            json={"role": "viewer", "overwrite_existing": True},
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["assigned_projects"] == 0
+    assert existing.role == ProjectRole.ADMIN
+
+
 def test_settings_token_create_rejects_non_member_target_user() -> None:
     fake_db = _FakeDb()
     user_id = uuid.uuid4()

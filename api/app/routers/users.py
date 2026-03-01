@@ -378,6 +378,9 @@ def _assign_user_to_all_projects(db: Session, user_id: uuid.UUID, role: ProjectR
         membership = db.get(ProjectMember, {"project_id": project_id, "user_id": user_id})
         if membership:
             if overwrite_existing and membership.role != role:
+                if membership.role == ProjectRole.ADMIN and role != ProjectRole.ADMIN:
+                    if _count_project_admins(db, project_id, exclude_user_id=user_id) < 1:
+                        continue
                 membership.role = role
                 db.add(membership)
                 assigned += 1
@@ -385,3 +388,13 @@ def _assign_user_to_all_projects(db: Session, user_id: uuid.UUID, role: ProjectR
         db.add(ProjectMember(project_id=project_id, user_id=user_id, role=role))
         assigned += 1
     return assigned
+
+
+def _count_project_admins(db: Session, project_id: uuid.UUID, exclude_user_id: uuid.UUID | None = None) -> int:
+    stmt = select(func.count(ProjectMember.user_id)).where(
+        ProjectMember.project_id == project_id,
+        ProjectMember.role == ProjectRole.ADMIN,
+    )
+    if exclude_user_id is not None:
+        stmt = stmt.where(ProjectMember.user_id != exclude_user_id)
+    return int(db.execute(stmt).scalar() or 0)

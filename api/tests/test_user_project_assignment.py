@@ -74,6 +74,32 @@ def test_assign_user_to_all_projects_without_overwrite_keeps_existing() -> None:
     assert existing.role == ProjectRole.OPERATOR
 
 
+def test_assign_user_to_all_projects_overwrite_keeps_last_project_admin(monkeypatch) -> None:
+    user_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    existing = ProjectMember(project_id=project_id, user_id=user_id, role=ProjectRole.ADMIN)
+    fake_db = _FakeDb(projects=[project_id], memberships={(project_id, user_id): existing})
+
+    monkeypatch.setattr(users_router, "_count_project_admins", lambda *_args, **_kwargs: 0)
+    assigned = users_router._assign_user_to_all_projects(fake_db, user_id, ProjectRole.VIEWER, overwrite_existing=True)
+
+    assert assigned == 0
+    assert existing.role == ProjectRole.ADMIN
+
+
+def test_assign_user_to_all_projects_overwrite_demotes_admin_when_other_admin_exists(monkeypatch) -> None:
+    user_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    existing = ProjectMember(project_id=project_id, user_id=user_id, role=ProjectRole.ADMIN)
+    fake_db = _FakeDb(projects=[project_id], memberships={(project_id, user_id): existing})
+
+    monkeypatch.setattr(users_router, "_count_project_admins", lambda *_args, **_kwargs: 1)
+    assigned = users_router._assign_user_to_all_projects(fake_db, user_id, ProjectRole.VIEWER, overwrite_existing=True)
+
+    assert assigned == 1
+    assert existing.role == ProjectRole.VIEWER
+
+
 def test_require_member_write_scope_if_token_rejects_missing_scope() -> None:
     with pytest.raises(HTTPException) as exc:
         users_router._require_member_write_scope_if_token(
