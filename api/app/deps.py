@@ -17,6 +17,7 @@ from app.security import decode_access_token, hash_external_token
 from app.token_scopes import has_required_scope, normalize_token_scopes
 
 bearer_scheme = HTTPBearer(auto_error=False)
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 ROLE_ORDER = {
@@ -44,10 +45,20 @@ def get_auth_context(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> AuthContext:
-    if credentials is None or credentials.scheme.lower() != "bearer":
+    request.state.token_scopes = None
+    token_source = "header"
+
+    token: str | None = None
+    if credentials is not None and credentials.scheme.lower() == "bearer":
+        token = credentials.credentials
+    else:
+        token = _resolve_cookie_token(request)
+        token_source = "cookie"
+    if not token:
         raise _unauthorized("missing bearer token")
 
-    token = credentials.credentials
+    if token_source == "cookie":
+        _enforce_csrf_if_needed(request)
 
     if token.count(".") == 2:
         try:
@@ -66,6 +77,8 @@ def get_auth_context(
         except JWTError:
             # Fallback to API token lookup for token strings that resemble JWTs.
             pass
+    elif token_source == "cookie":
+        raise _unauthorized("invalid session token")
 
     token_hash = hash_external_token(token)
     stmt = select(ApiToken).where(ApiToken.token_hash == token_hash, ApiToken.revoked_at.is_(None))
@@ -226,3 +239,21 @@ def _should_update_last_used(last_used_at: datetime | None, now: datetime) -> bo
         return True
     elapsed = (now - _coerce_utc(last_used_at)).total_seconds()
     return elapsed >= get_settings().api_token_last_used_update_interval_seconds
+
+
+def _resolve_cookie_token(request: Request) -> str | None:
+    settings = get_settings()
+    return request.cookies.get(settings.auth_cookie_name)
+
+
+def _enforce_csrf_if_needed(request: Request) -> None:
+    settings = get_settings()
+    if not settings.auth_require_csrf:
+        return
+    if request.method.upper() not in UNSAFE_METHODS:
+        return
+
+    csrf_cookie = request.cookies.get(settings.auth_csrf_cookie_name)
+    csrf_header = request.headers.get(settings.auth_csrf_header_name)
+    if not csrf_cookie or not csrf_header or csrf_cookie != csrf_header:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="missing or invalid CSRF token")

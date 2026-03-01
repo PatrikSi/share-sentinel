@@ -1,6 +1,9 @@
 import { clearTokens, getAccessToken, getRefreshToken, setTokens } from "@/lib/auth";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "/api";
+const CSRF_COOKIE_NAME = (import.meta.env.VITE_CSRF_COOKIE_NAME as string) || "share_sentinel_csrf";
+const CSRF_HEADER_NAME = ((import.meta.env.VITE_CSRF_HEADER_NAME as string) || "x-csrf-token").toLowerCase();
+const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 function loginRedirectPath(): string {
   const next = `${window.location.pathname}${window.location.search}${window.location.hash}`;
@@ -39,6 +42,7 @@ async function refreshAccessToken(): Promise<string | null> {
 
   const response = await fetch(`${API_BASE}/auth/refresh`, {
     method: "POST",
+    credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ refresh_token: refreshToken }),
   });
@@ -56,6 +60,7 @@ async function refreshAccessToken(): Promise<string | null> {
 export async function apiFetch(path: string, init: RequestInit = {}, allowRefresh = true) {
   const token = getAccessToken();
   const headers = new Headers(init.headers || {});
+  const method = (init.method || "GET").toUpperCase();
 
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
@@ -68,8 +73,14 @@ export async function apiFetch(path: string, init: RequestInit = {}, allowRefres
   if (shouldSetJsonContentType) {
     headers.set("Content-Type", "application/json");
   }
+  if (UNSAFE_METHODS.has(method) && !headers.has(CSRF_HEADER_NAME)) {
+    const csrfToken = getCookieValue(CSRF_COOKIE_NAME);
+    if (csrfToken) {
+      headers.set(CSRF_HEADER_NAME, csrfToken);
+    }
+  }
 
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  const response = await fetch(`${API_BASE}${path}`, { ...init, headers, credentials: "include" });
   if (response.status === 401) {
     if (allowRefresh) {
       const refreshed = await refreshAccessToken();
@@ -88,4 +99,17 @@ export async function apiFetch(path: string, init: RequestInit = {}, allowRefres
 
   const body = await response.text();
   return parseResponseBody(response, body);
+}
+
+function getCookieValue(name: string): string | null {
+  if (typeof document === "undefined") return null;
+  const prefix = `${name}=`;
+  const parts = document.cookie.split(";");
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (trimmed.startsWith(prefix)) {
+      return decodeURIComponent(trimmed.slice(prefix.length));
+    }
+  }
+  return null;
 }

@@ -1,7 +1,7 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -20,15 +20,19 @@ from app.schemas import (
     RefreshIn,
     RegisterIn,
     RegistrationSettingsOut,
+    SecuritySettingsOut,
     ThemeUpdateIn,
     TokenPairOut,
     UserOut,
 )
 from app.security import (
+    clear_auth_cookies,
+    generate_csrf_token,
     hash_external_token,
     hash_password,
     make_access_token,
     random_token,
+    set_auth_cookies,
     validate_password_strength,
     verify_password,
 )
@@ -44,6 +48,24 @@ rate_limiter = RateLimiter()
 def registration_settings():
     settings = get_settings()
     return RegistrationSettingsOut(allow_self_registration=settings.allow_self_registration)
+
+
+@router.get("/security-settings", response_model=SecuritySettingsOut)
+def security_settings(user: User = Depends(get_current_user)):
+    if not user.is_sysadmin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="sysadmin required")
+
+    settings = get_settings()
+    return SecuritySettingsOut(
+        allow_self_registration=settings.allow_self_registration,
+        auth_require_csrf=settings.auth_require_csrf,
+        auth_cookie_secure=settings.auth_cookie_secure,
+        password_min_length=settings.password_min_length,
+        auth_login_max_attempts=settings.auth_login_max_attempts,
+        auth_login_window_seconds=settings.auth_login_window_seconds,
+        auth_login_lockout_seconds=settings.auth_login_lockout_seconds,
+        default_api_token_expiry_days=settings.default_api_token_expiry_days,
+    )
 
 
 @router.post("/register", response_model=UserOut)
@@ -88,7 +110,7 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
 
 
 @router.post("/login", response_model=TokenPairOut)
-def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
+def login(payload: LoginIn, request: Request, response: Response, db: Session = Depends(get_db)):
     email = payload.email.lower()
     client_ip = resolve_client_ip(request)
 
@@ -148,6 +170,8 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
     clear_login_failures(email, client_ip)
 
     access_token = make_access_token(str(user.id))
+    csrf_token = generate_csrf_token()
+    set_auth_cookies(response, access_token, csrf_token)
     refresh_raw = random_token(48)
     refresh_hash = hash_external_token(refresh_raw)
     settings = get_settings()
@@ -172,12 +196,13 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
     return TokenPairOut(
         access_token=access_token,
         refresh_token=refresh_raw,
+        csrf_token=csrf_token,
         user=_to_user_out(user),
     )
 
 
 @router.post("/refresh")
-def refresh(payload: RefreshIn, request: Request, db: Session = Depends(get_db)):
+def refresh(payload: RefreshIn, request: Request, response: Response, db: Session = Depends(get_db)):
     token_hash = hash_external_token(payload.refresh_token)
     rate_limiter.check(
         request,
@@ -210,6 +235,8 @@ def refresh(payload: RefreshIn, request: Request, db: Session = Depends(get_db))
     db.add(replacement)
 
     access_token = make_access_token(str(refresh_token.user_id))
+    csrf_token = generate_csrf_token()
+    set_auth_cookies(response, access_token, csrf_token)
     write_audit_event(
         db,
         action="TOKEN_REFRESHED",
@@ -220,31 +247,33 @@ def refresh(payload: RefreshIn, request: Request, db: Session = Depends(get_db))
     )
     db.add(refresh_token)
     db.commit()
-    return {"access_token": access_token, "refresh_token": new_refresh_raw}
+    return {"access_token": access_token, "refresh_token": new_refresh_raw, "csrf_token": csrf_token}
 
 
 @router.post("/logout")
-def logout(payload: RefreshIn, request: Request, db: Session = Depends(get_db)):
-    token_hash = hash_external_token(payload.refresh_token)
-    stmt = select(RefreshToken).where(RefreshToken.token_hash == token_hash, RefreshToken.revoked_at.is_(None))
-    refresh_token = db.execute(stmt).scalar_one_or_none()
-    if refresh_token is not None:
-        refresh_token.revoked_at = datetime.now(tz=UTC)
-        write_audit_event(
-            db,
-            action="LOGOUT",
-            object_type="refresh_token",
-            object_id=str(refresh_token.id),
-            actor_user_id=refresh_token.user_id,
-            metadata=request_meta(request),
-        )
-        db.add(refresh_token)
-        db.commit()
+def logout(request: Request, response: Response, payload: RefreshIn | None = None, db: Session = Depends(get_db)):
+    if payload is not None:
+        token_hash = hash_external_token(payload.refresh_token)
+        stmt = select(RefreshToken).where(RefreshToken.token_hash == token_hash, RefreshToken.revoked_at.is_(None))
+        refresh_token = db.execute(stmt).scalar_one_or_none()
+        if refresh_token is not None:
+            refresh_token.revoked_at = datetime.now(tz=UTC)
+            write_audit_event(
+                db,
+                action="LOGOUT",
+                object_type="refresh_token",
+                object_id=str(refresh_token.id),
+                actor_user_id=refresh_token.user_id,
+                metadata=request_meta(request),
+            )
+            db.add(refresh_token)
+            db.commit()
+    clear_auth_cookies(response)
     return {"ok": True}
 
 
 @router.post("/logout-all")
-def logout_all(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def logout_all(request: Request, response: Response, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     stmt = select(RefreshToken).where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
     active_tokens = db.execute(stmt).scalars().all()
     revoked = 0
@@ -263,6 +292,7 @@ def logout_all(request: Request, db: Session = Depends(get_db), user: User = Dep
         metadata={**request_meta(request), "revoked_sessions": revoked},
     )
     db.commit()
+    clear_auth_cookies(response)
     return {"ok": True, "revoked_sessions": revoked}
 
 

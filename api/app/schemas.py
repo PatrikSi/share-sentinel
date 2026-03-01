@@ -33,6 +33,17 @@ class RegistrationSettingsOut(BaseModel):
     allow_self_registration: bool
 
 
+class SecuritySettingsOut(BaseModel):
+    allow_self_registration: bool
+    auth_require_csrf: bool
+    auth_cookie_secure: bool
+    password_min_length: int
+    auth_login_max_attempts: int
+    auth_login_window_seconds: int
+    auth_login_lockout_seconds: int
+    default_api_token_expiry_days: int
+
+
 class ChangePasswordIn(BaseModel):
     current_password: str
     new_password: str = Field(min_length=12, max_length=256)
@@ -41,6 +52,7 @@ class ChangePasswordIn(BaseModel):
 class TokenPairOut(BaseModel):
     access_token: str
     refresh_token: str
+    csrf_token: str | None = None
     user: UserOut
 
 

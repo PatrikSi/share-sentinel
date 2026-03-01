@@ -1,6 +1,15 @@
 import pytest
+from fastapi import Response
 
-from app.security import hash_external_token, hash_password, validate_password_strength, verify_password
+from app.security import (
+    clear_auth_cookies,
+    generate_csrf_token,
+    hash_external_token,
+    hash_password,
+    set_auth_cookies,
+    validate_password_strength,
+    verify_password,
+)
 
 
 def test_password_hash_roundtrip() -> None:
@@ -23,3 +32,18 @@ def test_password_strength_policy() -> None:
     validate_password_strength("VeryStrongPassword123", 12)
     with pytest.raises(ValueError):
         validate_password_strength("short1A", 12)
+
+
+def test_auth_cookie_helpers() -> None:
+    response = Response()
+    csrf_token = generate_csrf_token()
+    assert csrf_token
+
+    set_auth_cookies(response, "access-token", csrf_token)
+    raw_headers = [value.decode("latin-1") for key, value in response.raw_headers if key.lower() == b"set-cookie"]
+    assert any("share_sentinel_session=" in header for header in raw_headers)
+    assert any("share_sentinel_csrf=" in header for header in raw_headers)
+
+    clear_auth_cookies(response)
+    raw_headers = [value.decode("latin-1") for key, value in response.raw_headers if key.lower() == b"set-cookie"]
+    assert any("Max-Age=0" in header for header in raw_headers)

@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     allow_legacy_unscoped_tokens: bool = False
     default_api_token_expiry_days: int = 90
     api_token_last_used_update_interval_seconds: int = 300
+    auth_cookie_name: str = "share_sentinel_session"
+    auth_cookie_domain: str | None = None
+    auth_cookie_path: str = "/"
+    auth_cookie_secure: bool = False
+    auth_cookie_samesite: str = "lax"
+    auth_csrf_cookie_name: str = "share_sentinel_csrf"
+    auth_csrf_header_name: str = "x-csrf-token"
+    auth_require_csrf: bool = True
 
     cors_origins: str = "http://localhost"
     trusted_proxy_cidrs: str = ""
@@ -50,6 +58,19 @@ class Settings(BaseSettings):
     def _normalize_log_level(cls, value: str) -> str:
         return str(value).strip().upper() or "INFO"
 
+    @field_validator("auth_cookie_samesite", mode="before")
+    @classmethod
+    def _normalize_samesite(cls, value: str) -> str:
+        normalized = str(value).strip().lower()
+        if normalized not in {"lax", "strict", "none"}:
+            raise ValueError("auth_cookie_samesite must be one of: lax, strict, none")
+        return normalized
+
+    @field_validator("auth_csrf_header_name", mode="before")
+    @classmethod
+    def _normalize_csrf_header_name(cls, value: str) -> str:
+        return str(value).strip().lower()
+
     @model_validator(mode="after")
     def _validate_production_settings(self):
         if self.app_env.lower() in {"production", "prod"}:
@@ -59,6 +80,8 @@ class Settings(BaseSettings):
                 raise ValueError("token_pepper must be set and at least 32 characters in production")
             if self.seed_admin_password in {None, "change-me-please-12-plus"}:
                 raise ValueError("seed_admin_password must not use the default value in production")
+            if not self.auth_cookie_secure:
+                raise ValueError("auth_cookie_secure must be true in production")
         return self
 
 

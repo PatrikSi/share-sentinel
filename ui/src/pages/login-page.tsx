@@ -56,6 +56,7 @@ export function LoginPage() {
         }
         const response = await fetch(`${API_BASE}/auth/register`, {
           method: "POST",
+          credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email, password }),
         });
@@ -69,6 +70,7 @@ export function LoginPage() {
       } else {
         const response = await fetch(`${API_BASE}/auth/login`, {
           method: "POST",
+          credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email, password }),
         });

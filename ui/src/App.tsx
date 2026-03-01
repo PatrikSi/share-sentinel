@@ -4,6 +4,7 @@ import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { TopNav } from "@/components/top-nav";
 import { getAccessToken } from "@/lib/auth";
 import { AdminPage } from "@/pages/admin-page";
+import { AccountPage } from "@/pages/account-page";
 import { LoginPage } from "@/pages/login-page";
 import { ProjectImportPage } from "@/pages/project-import-page";
 import { ProjectInventoryPage } from "@/pages/project-inventory-page";
@@ -79,6 +80,14 @@ export function App() {
               element={
                 <RequireAuth>
                   <AdminPage />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/account"
+              element={
+                <RequireAuth>
+                  <AccountPage />
                 </RequireAuth>
               }
             />

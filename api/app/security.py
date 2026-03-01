@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from fastapi import Response
 from jose import JWTError, jwt
 from passlib.exc import UnknownHashError
 from passlib.context import CryptContext
@@ -68,3 +69,39 @@ def validate_password_strength(password: str, min_length: int) -> None:
         raise ValueError("password must include an uppercase letter")
     if not re.search(r"\d", password):
         raise ValueError("password must include a number")
+
+
+def generate_csrf_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def set_auth_cookies(response: Response, access_token: str, csrf_token: str) -> None:
+    settings = get_settings()
+    cookie_common = {
+        "domain": settings.auth_cookie_domain,
+        "path": settings.auth_cookie_path,
+        "secure": settings.auth_cookie_secure,
+        "samesite": settings.auth_cookie_samesite,
+    }
+    response.set_cookie(
+        key=settings.auth_cookie_name,
+        value=access_token,
+        httponly=True,
+        **cookie_common,
+    )
+    response.set_cookie(
+        key=settings.auth_csrf_cookie_name,
+        value=csrf_token,
+        httponly=False,
+        **cookie_common,
+    )
+
+
+def clear_auth_cookies(response: Response) -> None:
+    settings = get_settings()
+    cookie_common = {
+        "domain": settings.auth_cookie_domain,
+        "path": settings.auth_cookie_path,
+    }
+    response.delete_cookie(settings.auth_cookie_name, **cookie_common)
+    response.delete_cookie(settings.auth_csrf_cookie_name, **cookie_common)
