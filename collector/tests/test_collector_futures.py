@@ -1,5 +1,6 @@
 import concurrent.futures
 import importlib.util
+import socket
 import sys
 import threading
 from pathlib import Path
@@ -72,3 +73,37 @@ def test_collect_scan_results_emits_error_for_exception_future() -> None:
     assert record["code"] == "SCAN_THREAD_FAILED"
     assert record["endpoint_key"] == "10.0.0.10:445"
     assert "boom" in record["message"]
+
+
+def test_collect_scan_results_maps_timeout_exception_to_specific_code() -> None:
+    collector = _load_collector_module()
+    writer = _Writer()
+    stats = collector.Stats()
+    lock = threading.Lock()
+    run_id = "run-3"
+    futures = {
+        _done_future(exc=socket.timeout("timeout")): "10.0.0.11",
+    }
+
+    host_failures = collector._collect_scan_results(futures, run_id, writer, stats, lock)
+
+    assert host_failures == 1
+    assert stats.errors == 1
+    assert writer.records[0]["code"] == "SCAN_TIMEOUT"
+
+
+def test_collect_scan_results_emits_error_for_cancelled_future() -> None:
+    collector = _load_collector_module()
+    writer = _Writer()
+    stats = collector.Stats()
+    lock = threading.Lock()
+    run_id = "run-4"
+    futures = {
+        _done_future(exc=concurrent.futures.CancelledError()): "10.0.0.12",
+    }
+
+    host_failures = collector._collect_scan_results(futures, run_id, writer, stats, lock)
+
+    assert host_failures == 1
+    assert stats.errors == 1
+    assert writer.records[0]["code"] == "SCAN_THREAD_CANCELLED"

@@ -13,6 +13,7 @@ from typing import Any
 import boto3
 import psycopg
 import redis
+from botocore.exceptions import BotoCoreError, ClientError
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -62,6 +63,17 @@ s3 = boto3.client(
     aws_access_key_id=S3_ACCESS_KEY,
     aws_secret_access_key=S3_SECRET_KEY,
 )
+
+INGEST_OPERATION_EXCEPTIONS = (
+    psycopg.Error,
+    BotoCoreError,
+    ClientError,
+    OSError,
+    RuntimeError,
+    ValueError,
+    TypeError,
+)
+STREAM_MESSAGE_RETRYABLE_EXCEPTIONS = INGEST_OPERATION_EXCEPTIONS + (redis.RedisError,)
 
 
 def _safe_run_id(fields: dict[str, str] | None) -> str | None:
@@ -222,7 +234,7 @@ def parse_offset(raw: Any) -> int:
     value = raw.get("line_offset", 0)
     try:
         return max(0, int(value))
-    except Exception:  # noqa: BLE001
+    except (TypeError, ValueError):
         return 0
 
 
@@ -247,7 +259,7 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
         try:
             if int(rec.get("schema_version")) != 1:
                 return False, "unsupported schema_version"
-        except Exception:  # noqa: BLE001
+        except (TypeError, ValueError):
             return False, "invalid schema_version"
 
     if rec_type == "item" and not rec.get("name"):
@@ -586,7 +598,7 @@ def process_job(fields: dict[str, str]) -> None:
                 try:
                     json_doc = json.loads(raw_bytes.decode("utf-8", errors="replace"))
                     json_records = records_from_json_document(json_doc, run_id)
-                except Exception:
+                except (TypeError, ValueError):
                     json_records = None
                     reader = raw_bytes.splitlines()
             else:
@@ -655,7 +667,7 @@ def process_job(fields: dict[str, str]) -> None:
             conn.commit()
             last_line_offset = line_offset
             last_counts = counts.copy()
-        except Exception as exc:  # noqa: BLE001
+        except INGEST_OPERATION_EXCEPTIONS as exc:
             logger.exception("job failed run_id=%s", run_id)
             try:
                 update_run_status(conn, run_id, "FAILED", last_line_offset, last_counts, last_error=str(exc))
@@ -669,7 +681,7 @@ def process_job(fields: dict[str, str]) -> None:
                         {"worker": CONSUMER_NAME, "error": str(exc)},
                     )
                 conn.commit()
-            except Exception:  # noqa: BLE001
+            except psycopg.Error:
                 logger.exception("failed to persist ingest failure state run_id=%s", run_id)
             raise
         finally:
@@ -735,7 +747,7 @@ def main() -> int:
                     try:
                         process_job(fields)
                         redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
-                    except Exception:
+                    except STREAM_MESSAGE_RETRYABLE_EXCEPTIONS:
                         logger.exception(
                             "failed processing stream message message_id=%s run_id=%s",
                             message_id,
@@ -748,7 +760,7 @@ def main() -> int:
             try:
                 process_job(fields)
                 redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
-            except Exception:
+            except STREAM_MESSAGE_RETRYABLE_EXCEPTIONS:
                 logger.exception(
                     "failed processing claimed stream message message_id=%s run_id=%s",
                     message_id,
@@ -760,7 +772,7 @@ def main() -> int:
             for recovered in discover_uploaded_runs(limit=5):
                 try:
                     process_job(recovered)
-                except Exception:
+                except STREAM_MESSAGE_RETRYABLE_EXCEPTIONS:
                     logger.exception("failed processing recovered uploaded run run_id=%s", _safe_run_id(recovered))
                     time.sleep(1)
             last_recovery_scan = time.time()

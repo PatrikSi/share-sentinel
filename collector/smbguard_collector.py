@@ -23,9 +23,11 @@ import requests
 
 try:
     from impacket.smbconnection import SMBConnection, SessionError
-except Exception:  # noqa: BLE001
+except ImportError:
     SMBConnection = None
-    SessionError = Exception
+
+    class SessionError(Exception):
+        """Fallback error type used when impacket is unavailable."""
 
 
 @dataclass
@@ -207,7 +209,7 @@ def _signing_label(conn: SMBConnection) -> str:
     try:
         required = bool(conn.isSigningRequired())
         return "required" if required else "enabled"
-    except Exception:  # noqa: BLE001
+    except (AttributeError, OSError, SessionError, TypeError, ValueError):
         return "enabled"
 
 
@@ -320,13 +322,43 @@ def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWr
                     )
                     with lock:
                         stats.items += 1
-            except Exception as exc:  # noqa: BLE001
+            except SessionError as exc:
                 writer.emit(
                     {
                         "type": "error",
                         "run_id": run_id,
                         "severity": "warn",
-                        "code": "LIST_FAILED",
+                        "code": "LIST_SESSION_ERROR",
+                        "message": str(exc),
+                        "endpoint_key": endpoint_key,
+                        "resource_name": share_name,
+                        "path": "\\",
+                    }
+                )
+                with lock:
+                    stats.errors += 1
+            except (socket.timeout, TimeoutError):
+                writer.emit(
+                    {
+                        "type": "error",
+                        "run_id": run_id,
+                        "severity": "warn",
+                        "code": "LIST_TIMEOUT",
+                        "message": "share listing timeout",
+                        "endpoint_key": endpoint_key,
+                        "resource_name": share_name,
+                        "path": "\\",
+                    }
+                )
+                with lock:
+                    stats.errors += 1
+            except OSError as exc:
+                writer.emit(
+                    {
+                        "type": "error",
+                        "run_id": run_id,
+                        "severity": "warn",
+                        "code": "LIST_IO_ERROR",
                         "message": str(exc),
                         "endpoint_key": endpoint_key,
                         "resource_name": share_name,
@@ -338,7 +370,7 @@ def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWr
 
         try:
             conn.logoff()
-        except Exception:  # noqa: BLE001
+        except (SessionError, OSError):
             pass
         return True
 
@@ -364,13 +396,24 @@ def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWr
                 "endpoint_key": endpoint_key,
             }
         )
-    except Exception as exc:  # noqa: BLE001
+    except (OSError, ConnectionError) as exc:
         writer.emit(
             {
                 "type": "error",
                 "run_id": run_id,
                 "severity": "error",
-                "code": "SMB_SCAN_FAILED",
+                "code": "SMB_NETWORK_FAILED",
+                "message": str(exc),
+                "endpoint_key": endpoint_key,
+            }
+        )
+    except (TypeError, ValueError) as exc:
+        writer.emit(
+            {
+                "type": "error",
+                "run_id": run_id,
+                "severity": "error",
+                "code": "SMB_INPUT_INVALID",
                 "message": str(exc),
                 "endpoint_key": endpoint_key,
             }
@@ -484,15 +527,19 @@ def _collect_scan_results(
     for future in concurrent.futures.as_completed(futures_by_host):
         host = futures_by_host[future]
         try:
-            ok = bool(future.result())
-        except Exception as exc:  # noqa: BLE001
+            exc = future.exception()
+        except concurrent.futures.CancelledError as cancelled_error:
+            exc = cancelled_error
+
+        if exc is not None:
+            message = str(exc) or type(exc).__name__
             writer.emit(
                 {
                     "type": "error",
                     "run_id": run_id,
                     "severity": "error",
-                    "code": "SCAN_THREAD_FAILED",
-                    "message": str(exc),
+                    "code": _scan_thread_error_code(exc),
+                    "message": message,
                     "endpoint_key": f"{host}:445",
                 }
             )
@@ -501,9 +548,24 @@ def _collect_scan_results(
             host_failures += 1
             continue
 
+        ok = bool(future.result())
         if not ok:
             host_failures += 1
     return host_failures
+
+
+def _scan_thread_error_code(exc: BaseException) -> str:
+    if isinstance(exc, concurrent.futures.CancelledError):
+        return "SCAN_THREAD_CANCELLED"
+    if isinstance(exc, SessionError):
+        return "SCAN_SESSION_ERROR"
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "SCAN_TIMEOUT"
+    if isinstance(exc, OSError):
+        return "SCAN_IO_ERROR"
+    if isinstance(exc, (TypeError, ValueError)):
+        return "SCAN_INPUT_ERROR"
+    return "SCAN_THREAD_FAILED"
 
 
 def main() -> int:

@@ -46,3 +46,38 @@ def test_read_int_env_validates_and_enforces_minimum(monkeypatch) -> None:
 def test_read_int_env_uses_default_for_invalid_values(monkeypatch) -> None:
     monkeypatch.setenv("TEST_WORKER_INT", "not-an-int")
     assert main._read_int_env("TEST_WORKER_INT", default=9, min_value=1) == 9
+
+
+def test_parse_offset_returns_zero_for_non_numeric_values() -> None:
+    assert main.parse_offset({"line_offset": "12"}) == 12
+    assert main.parse_offset({"line_offset": -7}) == 0
+    assert main.parse_offset({"line_offset": "nan"}) == 0
+    assert main.parse_offset({"line_offset": None}) == 0
+
+
+def test_validate_record_requires_numeric_schema_version_for_run_meta() -> None:
+    invalid, invalid_reason = main.validate_record(
+        {
+            "type": "run_meta",
+            "schema_version": "x",
+            "tool": "collector",
+            "tool_version": "1.0",
+            "run_id": "run-1",
+            "started_at": "2026-01-01T00:00:00Z",
+        }
+    )
+    assert invalid is False
+    assert invalid_reason == "invalid schema_version"
+
+    unsupported, unsupported_reason = main.validate_record(
+        {
+            "type": "run_meta",
+            "schema_version": 2,
+            "tool": "collector",
+            "tool_version": "1.0",
+            "run_id": "run-1",
+            "started_at": "2026-01-01T00:00:00Z",
+        }
+    )
+    assert unsupported is False
+    assert unsupported_reason == "unsupported schema_version"
