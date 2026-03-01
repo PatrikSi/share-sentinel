@@ -3,13 +3,18 @@ import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 
 import { TopNav } from "@/components/top-nav";
 import { getAccessToken } from "@/lib/auth";
-import { AdminPage } from "@/pages/admin-page";
 import { AccountPage } from "@/pages/account-page";
 import { LoginPage } from "@/pages/login-page";
 import { ProjectImportPage } from "@/pages/project-import-page";
 import { ProjectInventoryPage } from "@/pages/project-inventory-page";
 import { ProjectsPage } from "@/pages/projects-page";
 import { RunDetailPage } from "@/pages/run-detail-page";
+import { SettingsApiTokensPage } from "@/pages/settings-api-tokens-page";
+import { SettingsAuditLogsPage } from "@/pages/settings-audit-logs-page";
+import { SettingsLayout } from "@/pages/settings-layout";
+import { SettingsRbacPage } from "@/pages/settings-rbac-page";
+import { SettingsSecurityPage } from "@/pages/settings-security-page";
+import { SettingsUsersPage } from "@/pages/settings-users-page";
 
 function RequireAuth({ children }: { children: JSX.Element }) {
   const location = useLocation();
@@ -79,10 +84,25 @@ export function App() {
               path="/admin"
               element={
                 <RequireAuth>
-                  <AdminPage />
+                  <Navigate to="/settings/users" replace />
                 </RequireAuth>
               }
             />
+            <Route
+              path="/settings"
+              element={
+                <RequireAuth>
+                  <SettingsLayout />
+                </RequireAuth>
+              }
+            >
+              <Route index element={<Navigate to="/settings/users" replace />} />
+              <Route path="users" element={<SettingsUsersPage />} />
+              <Route path="rbac" element={<SettingsRbacPage />} />
+              <Route path="api-tokens" element={<SettingsApiTokensPage />} />
+              <Route path="audit-logs" element={<SettingsAuditLogsPage />} />
+              <Route path="security" element={<SettingsSecurityPage />} />
+            </Route>
             <Route
               path="/account"
               element={
