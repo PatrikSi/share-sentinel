@@ -53,16 +53,34 @@ ui_body=$(cat /tmp/share_sentinel_ui.out 2>/dev/null || true)
 assert_contains "$ui_status" "200" "UI /projects should return 200"
 assert_contains "$ui_body" "<!doctype html>" "UI should return app shell"
 
+settings_ui_status=$(request_with_retries "$base_url/settings/users" "GET" "" "" "200" /tmp/share_sentinel_settings_ui.out)
+settings_ui_body=$(cat /tmp/share_sentinel_settings_ui.out 2>/dev/null || true)
+assert_contains "$settings_ui_status" "200" "UI /settings/users should return 200"
+assert_contains "$settings_ui_body" "<!doctype html>" "Settings route should return app shell"
+
 api_health_status=$(request_with_retries "$base_url/api/healthz" "GET" "" "" "200" /tmp/share_sentinel_health.out)
 api_health_body=$(cat /tmp/share_sentinel_health.out 2>/dev/null || true)
 assert_contains "$api_health_status" "200" "API /api/healthz should return 200"
 assert_contains "$api_health_body" "\"ok\":true" "API health payload should include ok=true"
 
+# Global settings endpoint should be reachable through API router and reject unauthenticated calls with JSON.
+settings_api_status=$(request_with_retries "$base_url/api/settings/projects" "GET" "" "" "401,403" /tmp/share_sentinel_settings_api.out)
+settings_api_body=$(cat /tmp/share_sentinel_settings_api.out 2>/dev/null || true)
+if [[ "$settings_api_body" == *"<h1>404 Not Found</h1>"* || "$settings_api_body" == *"404 page not found"* ]]; then
+  echo "FAIL: /api/settings/projects appears unrouted"
+  exit 1
+fi
+if [[ "$settings_api_status" != "401" && "$settings_api_status" != "403" ]]; then
+  echo "FAIL: /api/settings/projects returned unexpected status: $settings_api_status"
+  echo "$settings_api_body"
+  exit 1
+fi
+
 # Detect nginx HTML 404 responses for API routes.
 api_login_status=$(request_with_retries "$base_url/api/auth/login" "POST" '{"email":"missing@example.com","password":"bad"}' "application/json" "401,403,422,429" /tmp/share_sentinel_login.out)
 api_login_body=$(cat /tmp/share_sentinel_login.out 2>/dev/null || true)
-if [[ "$api_login_body" == *"<h1>404 Not Found</h1>"* ]]; then
-  echo "FAIL: API login route returned nginx 404 HTML"
+if [[ "$api_login_body" == *"<h1>404 Not Found</h1>"* || "$api_login_body" == *"404 page not found"* ]]; then
+  echo "FAIL: API login route returned a proxy 404 response"
   exit 1
 fi
 if [[ "$api_login_status" != "401" && "$api_login_status" != "403" && "$api_login_status" != "422" && "$api_login_status" != "429" ]]; then
