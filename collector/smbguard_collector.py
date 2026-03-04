@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import collections
 import concurrent.futures
+from contextlib import contextmanager
 import gzip
 import ipaddress
 import json
@@ -25,10 +26,17 @@ import requests
 
 try:
     from impacket.smbconnection import SMBConnection, SessionError
+    from impacket.nmb import NetBIOSError, NetBIOSTimeout
 except ImportError:
     SMBConnection = None
 
     class SessionError(Exception):
+        """Fallback error type used when impacket is unavailable."""
+
+    class NetBIOSError(Exception):
+        """Fallback error type used when impacket is unavailable."""
+
+    class NetBIOSTimeout(Exception):
         """Fallback error type used when impacket is unavailable."""
 
 
@@ -105,6 +113,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  Authenticated SMB scan:\n"
             "    smbguard_collector.py --hosts hosts.txt --share-types smb --username corp\\\\svc_scan --password '***' --output run.ndjson.gz --gzip\n\n"
+            "  Domain shell / ticket cache auth:\n"
+            "    smbguard_collector.py --hosts hosts.txt --share-types smb --use-session-creds --output kerberos.ndjson\n\n"
             "  Anonymous SMB scan:\n"
             "    smbguard_collector.py --cidr 10.20.0.0/24 --share-types smb --smb-anonymous --output anon.ndjson\n\n"
             "  NFS + SMB combined scan:\n"
@@ -115,6 +125,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  - SMB authentication modes:\n"
             "      * NTLM: set --username (and password or hashes)\n"
             "      * Kerberos: add --kerberos and --username\n"
+            "      * Session credentials: use --use-session-creds to use the active Kerberos ticket cache\n"
             "      * Anonymous: set --smb-anonymous or omit SMB credentials\n"
             "  - NFS export enumeration uses `showmount -e`; if unavailable, host reachability is still recorded.\n"
             "  - When no endpoint/resource/item data is collected, output files are not written."
@@ -150,10 +161,21 @@ def _build_parser() -> argparse.ArgumentParser:
     smb_auth.add_argument("--local-auth", action="store_true", help="Use local SAM auth (empty domain) for NTLM.")
     smb_auth.add_argument("--kerberos", action="store_true", help="Use Kerberos authentication for SMB.")
     smb_auth.add_argument("--ccache", type=str, help="Use Kerberos credential cache.")
+    smb_auth.add_argument(
+        "--use-session-creds",
+        action="store_true",
+        help="Use current Kerberos session credentials from KRB5CCNAME/default cache (implies --kerberos).",
+    )
 
     tuning = parser.add_argument_group("Enumeration Tuning")
     tuning.add_argument("--max-depth", type=int, default=1, help="Max directory traversal depth per share.")
     tuning.add_argument("--max-entries-per-share", type=int, default=5000, help="Cap listed entries per share/export.")
+    tuning.add_argument(
+        "--include-share",
+        action="append",
+        default=[],
+        help="Known SMB share name to scan. Can be repeated; skips share enumeration when provided.",
+    )
     tuning.add_argument("--exclude-share", action="append", default=[], help="SMB share name to skip. Can be repeated.")
     tuning.add_argument("--exclude-path-regex", type=str, help="Regex for paths to exclude.")
     tuning.add_argument("--extensions-only", type=str, help="Comma-separated file extensions filter, e.g. .docx,.pdf")
@@ -218,6 +240,8 @@ def list_share_entries(
     max_entries: int,
     exclude_path_regex: re.Pattern[str] | None,
     extensions: set[str] | None,
+    on_list_error=None,
+    on_limit_reached=None,
 ):
     queue = collections.deque([("", 0)])
     emitted = 0
@@ -228,7 +252,12 @@ def list_share_entries(
 
         try:
             entries = conn.listPath(share_name, wildcard)
-        except SessionError:
+        except (SessionError, NetBIOSError, NetBIOSTimeout, socket.timeout, TimeoutError, OSError) as exc:
+            if on_list_error is not None:
+                try:
+                    on_list_error(rel_path or "\\", exc)
+                except Exception:
+                    pass
             continue
 
         for entry in entries:
@@ -253,10 +282,16 @@ def list_share_entries(
                 "is_dir": is_dir,
             }
 
-            if emitted >= max_entries:
-                break
             if is_dir and depth + 1 < max_depth:
                 queue.append((full_path.strip("\\"), depth + 1))
+            if emitted >= max_entries:
+                break
+
+    if emitted >= max_entries and queue and on_limit_reached is not None:
+        try:
+            on_limit_reached(emitted)
+        except Exception:
+            pass
 
 
 def _dialect_label(raw: str) -> str:
@@ -289,11 +324,67 @@ def _selected_share_types(raw_value: str) -> set[str]:
 def _resolve_smb_auth_method(args: argparse.Namespace) -> str:
     if args.smb_anonymous:
         return "anonymous"
+    if getattr(args, "use_session_creds", False):
+        return "kerberos"
     if args.kerberos:
         return "kerberos"
     if args.username:
         return "ntlm"
     return "anonymous"
+
+
+def _resolve_ccache_env_value(raw_path: str | None) -> str | None:
+    if raw_path:
+        value = str(raw_path).strip()
+        if not value:
+            return None
+        if value.upper().startswith("FILE:"):
+            return value
+        expanded = os.path.abspath(os.path.expanduser(value))
+        return f"FILE:{expanded}"
+
+    fallback = str(os.getenv("KRB5CCNAME", "") or "").strip()
+    return fallback or None
+
+
+def _principal_from_ccache_env(ccache_env_value: str | None) -> tuple[str | None, str | None, str | None]:
+    if not ccache_env_value:
+        return None, None, "no Kerberos credential cache configured"
+
+    try:
+        from impacket.krb5.ccache import CCache
+    except Exception as exc:  # pragma: no cover - dependency import error path
+        return None, None, f"unable to read Kerberos cache: {exc}"
+
+    previous = os.environ.get("KRB5CCNAME")
+    try:
+        os.environ["KRB5CCNAME"] = ccache_env_value
+        domain, username, _tgt, _tgs = CCache.parseFile()
+    except Exception as exc:
+        return None, None, f"unable to parse Kerberos cache {ccache_env_value}: {exc}"
+    finally:
+        if previous is None:
+            os.environ.pop("KRB5CCNAME", None)
+        else:
+            os.environ["KRB5CCNAME"] = previous
+
+    if not username:
+        return None, None, f"Kerberos cache {ccache_env_value} has no default username"
+    return str(username), str(domain or ""), None
+
+
+@contextmanager
+def _temporary_kerberos_cache(ccache_env_value: str | None):
+    previous = os.environ.get("KRB5CCNAME")
+    if ccache_env_value:
+        os.environ["KRB5CCNAME"] = ccache_env_value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("KRB5CCNAME", None)
+        else:
+            os.environ["KRB5CCNAME"] = previous
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -302,9 +393,11 @@ def _validate_args(args: argparse.Namespace) -> None:
     hosts = getattr(args, "hosts", None)
     kerberos = bool(getattr(args, "kerberos", False))
     smb_anonymous = bool(getattr(args, "smb_anonymous", False))
+    use_session_creds = bool(getattr(args, "use_session_creds", False))
     username = str(getattr(args, "username", "") or "")
     password = str(getattr(args, "password", "") or "")
     hashes = getattr(args, "hashes", None)
+    ccache = getattr(args, "ccache", None)
     upload = bool(getattr(args, "upload", False))
     api_base = getattr(args, "api_base", None)
     project_id = getattr(args, "project_id", None)
@@ -320,10 +413,20 @@ def _validate_args(args: argparse.Namespace) -> None:
 
     if kerberos and smb_anonymous:
         raise SystemExit("--kerberos cannot be combined with --smb-anonymous")
+    if use_session_creds and smb_anonymous:
+        raise SystemExit("--use-session-creds cannot be combined with --smb-anonymous")
 
     if "smb" in selected_share_types:
-        if kerberos and not username:
+        if kerberos and not username and not use_session_creds:
             raise SystemExit("--kerberos requires --username")
+        if ccache and not kerberos and not use_session_creds:
+            raise SystemExit("--ccache requires --kerberos (or --use-session-creds)")
+        if use_session_creds and hashes:
+            raise SystemExit("--use-session-creds cannot be combined with --hashes")
+        if use_session_creds and password:
+            raise SystemExit("--use-session-creds cannot be combined with --password")
+        if hashes and ":" not in str(hashes):
+            raise SystemExit("--hashes must be in LMHASH:NTHASH format")
         if hashes and not username and not smb_anonymous:
             raise SystemExit("--hashes requires --username unless --smb-anonymous is set")
         if password and not username and not smb_anonymous:
@@ -435,6 +538,8 @@ def _session_error_hint(raw_error: str, auth_method: str) -> str | None:
     if "STATUS_LOGON_FAILURE" in upper:
         return "Check SMB username/password or hash values and confirm domain/local auth mode."
     if "STATUS_ACCESS_DENIED" in upper:
+        if auth_method == "anonymous":
+            return "Anonymous session is allowed but not authorized to enumerate this share/path."
         return "Credentials are valid but not authorized for this share or path."
     if "STATUS_ACCOUNT_DISABLED" in upper:
         return "Enable the account or use a different service account."
@@ -514,18 +619,21 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
     try:
         conn = SMBConnection(host, host, sess_port=445, timeout=args.timeout)
         if attempted_auth == "kerberos":
-            conn.kerberosLogin(
-                args.username,
-                args.password,
-                args.domain,
-                lmhash="",
-                nthash="",
-                aesKey=None,
-                kdcHost=None,
-                TGT=None,
-                TGS=None,
-                useCache=bool(args.ccache),
-            )
+            ccache_env_value = getattr(args, "ccache_env_value", None)
+            use_cache = bool(ccache_env_value)
+            with _temporary_kerberos_cache(ccache_env_value):
+                conn.kerberosLogin(
+                    args.username,
+                    args.password,
+                    args.domain,
+                    lmhash="",
+                    nthash="",
+                    aesKey=None,
+                    kdcHost=None,
+                    TGT=None,
+                    TGS=None,
+                    useCache=use_cache,
+                )
         elif attempted_auth == "ntlm":
             lmhash = ""
             nthash = ""
@@ -557,6 +665,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             stats.endpoints += 1
 
         excluded_shares = {s.upper() for s in args.exclude_share}
+        include_shares = [str(share).strip() for share in getattr(args, "include_share", []) if str(share).strip()]
         exclude_path_regex = getattr(args, "exclude_path_pattern", None)
         if exclude_path_regex is None and args.exclude_path_regex:
             exclude_path_regex = re.compile(args.exclude_path_regex)
@@ -564,7 +673,66 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
         if args.extensions_only:
             extensions = {e.strip().lower() for e in args.extensions_only.split(",") if e.strip()}
 
-        shares = conn.listShares()
+        if include_shares:
+            shares = [{"shi1_netname": f"{name}\x00", "shi1_remark": "user-specified share"} for name in include_shares]
+        else:
+            try:
+                shares = conn.listShares()
+            except SessionError as exc:
+                detail = _error_detail(exc)
+                message = f"SMB share enumeration failed: {detail}"
+                hint = (
+                    "Anonymous session established but share enumeration is blocked. Use SMB credentials or pass known names with --include-share."
+                    if attempted_auth == "anonymous"
+                    else "Credentials authenticated but are not allowed to enumerate shares. Use a higher-privilege account or --include-share."
+                )
+                _emit_error(
+                    writer,
+                    run_id,
+                    severity="warn",
+                    code="LIST_SHARES_DENIED",
+                    message=message,
+                    endpoint_key=endpoint_key,
+                    hint=hint,
+                )
+                _record_error(stats, lock, "LIST_SHARES_DENIED", message)
+                try:
+                    conn.logoff()
+                except (SessionError, OSError):
+                    pass
+                return True
+
+        def _handle_list_error(share_name: str, denied_path: str, exc: BaseException) -> None:
+            detail = _error_detail(exc)
+            message = f"SMB share listing failed for {share_name}: {detail}"
+            _emit_error(
+                writer,
+                run_id,
+                severity="warn",
+                code="LIST_SESSION_ERROR",
+                message=message,
+                endpoint_key=endpoint_key,
+                resource_name=share_name,
+                path=denied_path,
+                hint=_session_error_hint(detail, attempted_auth),
+            )
+            _record_error(stats, lock, "LIST_SESSION_ERROR", message)
+
+        def _handle_list_limit(share_name: str, emitted: int) -> None:
+            message = f"SMB share listing reached max entries ({emitted}) for {share_name}."
+            _emit_error(
+                writer,
+                run_id,
+                severity="warn",
+                code="LIST_LIMIT_REACHED",
+                message=message,
+                endpoint_key=endpoint_key,
+                resource_name=share_name,
+                path="\\",
+                hint="Increase --max-entries-per-share for deeper coverage of large shares.",
+            )
+            _record_error(stats, lock, "LIST_LIMIT_REACHED", message)
+
         for share in shares:
             share_name = share["shi1_netname"].rstrip("\x00")
             if share_name.upper() in excluded_shares:
@@ -593,6 +761,8 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                     max_entries=max(1, args.max_entries_per_share),
                     exclude_path_regex=exclude_path_regex,
                     extensions=extensions,
+                    on_list_error=lambda denied_path, exc, share_name=share_name: _handle_list_error(share_name, denied_path, exc),
+                    on_limit_reached=lambda emitted, share_name=share_name: _handle_list_limit(share_name, emitted),
                 ):
                     writer.emit(
                         {
@@ -651,6 +821,8 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                     hint="Check share permissions and target SMB server health.",
                 )
                 _record_error(stats, lock, "LIST_IO_ERROR", message)
+            except (NetBIOSError, NetBIOSTimeout) as exc:
+                _handle_list_error(share_name, "\\", exc)
 
         try:
             conn.logoff()
@@ -682,6 +854,16 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
         code = "SMB_AUTH_FAILED"
         message = f"SMB {attempted_auth} session failed: {detail}"
         hint = _session_error_hint(detail, attempted_auth)
+    except NetBIOSTimeout as exc:
+        detail = _error_detail(exc)
+        code = "SMB_TIMEOUT"
+        message = f"SMB NETBIOS session timed out: {detail}"
+        hint = "Increase --timeout, reduce --workers, and verify target SMB responsiveness."
+    except NetBIOSError as exc:
+        detail = _error_detail(exc)
+        code = "SMB_NETWORK_FAILED"
+        message = f"SMB NETBIOS transport error: {detail}"
+        hint = "Verify SMB connectivity and check for transport-level resets or middlebox interference."
     except (OSError, ConnectionError) as exc:
         detail = _error_detail(exc)
         code = "SMB_NETWORK_FAILED"
@@ -964,6 +1146,10 @@ def _collect_scan_results(
 def _scan_thread_error_code(exc: BaseException) -> str:
     if isinstance(exc, concurrent.futures.CancelledError):
         return "SCAN_THREAD_CANCELLED"
+    if isinstance(exc, (NetBIOSTimeout,)):
+        return "SCAN_TIMEOUT"
+    if isinstance(exc, (NetBIOSError,)):
+        return "SCAN_IO_ERROR"
     if isinstance(exc, SessionError):
         return "SCAN_SESSION_ERROR"
     if isinstance(exc, (socket.timeout, TimeoutError)):
@@ -977,7 +1163,32 @@ def _scan_thread_error_code(exc: BaseException) -> str:
 
 def main() -> int:
     args = parse_args()
+    if getattr(args, "use_session_creds", False):
+        args.kerberos = True
+    if getattr(args, "kerberos", False) and not getattr(args, "username", ""):
+        preflight_ccache = _resolve_ccache_env_value(getattr(args, "ccache", None))
+        if preflight_ccache:
+            username, domain, _principal_error = _principal_from_ccache_env(preflight_ccache)
+            if username:
+                args.username = username
+            if not getattr(args, "domain", "") and domain:
+                args.domain = domain
     _validate_args(args)
+
+    args.ccache_env_value = _resolve_ccache_env_value(getattr(args, "ccache", None))
+    if getattr(args, "use_session_creds", False):
+        username, domain, principal_error = _principal_from_ccache_env(args.ccache_env_value)
+        if principal_error:
+            print(f"configuration error: {principal_error}", file=sys.stderr)
+            print(
+                "set KRB5CCNAME or pass --ccache pointing to a valid Kerberos ticket cache, or provide explicit SMB credentials.",
+                file=sys.stderr,
+            )
+            return 2
+        args.username = str(getattr(args, "username", "") or username or "")
+        if not getattr(args, "domain", "") and domain:
+            args.domain = domain
+
     args.exclude_path_pattern = re.compile(args.exclude_path_regex) if args.exclude_path_regex else None
     selected_share_types = sorted(_selected_share_types(args.share_types))
     disabled_share_types, dependency_warnings, dependency_fatals = _validate_runtime_dependencies(set(selected_share_types))

@@ -40,6 +40,43 @@ not-a-path value
     assert exports == ["/srv/public", "/srv/private"]
 
 
+def test_list_share_entries_emits_limit_callback_when_truncated() -> None:
+    collector = _load_collector_module()
+    callbacks: list[int] = []
+
+    class _Entry:
+        def __init__(self, name: str, is_dir: bool):
+            self._name = name
+            self._is_dir = is_dir
+
+        def get_longname(self):
+            return self._name
+
+        def is_directory(self):
+            return self._is_dir
+
+    class _Conn:
+        def listPath(self, _share_name, wildcard):
+            if wildcard == "*":
+                return [_Entry("folder", True), _Entry("file.txt", False)]
+            return []
+
+    rows = list(
+        collector.list_share_entries(
+            _Conn(),
+            "General",
+            max_depth=3,
+            max_entries=1,
+            exclude_path_regex=None,
+            extensions=None,
+            on_limit_reached=lambda emitted: callbacks.append(emitted),
+        )
+    )
+
+    assert len(rows) == 1
+    assert callbacks == [1]
+
+
 def test_scan_host_dispatch_runs_only_selected_share_scanners(monkeypatch) -> None:
     collector = _load_collector_module()
     calls: list[str] = []
@@ -107,6 +144,84 @@ def test_validate_args_rejects_password_without_username_for_smb() -> None:
     raise AssertionError("expected SystemExit when password is provided without username")
 
 
+def test_validate_args_rejects_invalid_hash_format() -> None:
+    collector = _load_collector_module()
+    args = SimpleNamespace(
+        cidr=["10.0.0.0/24"],
+        hosts=None,
+        share_types="smb",
+        kerberos=False,
+        smb_anonymous=False,
+        use_session_creds=False,
+        username="svc",
+        password="",
+        hashes="not-valid",
+        ccache=None,
+        upload=False,
+        api_base=None,
+        project_id=None,
+        api_token=None,
+    )
+
+    try:
+        collector._validate_args(args)
+    except SystemExit as exc:
+        assert "--hashes must be in LMHASH:NTHASH format" in str(exc)
+        return
+    raise AssertionError("expected SystemExit for invalid --hashes format")
+
+
+def test_validate_args_rejects_ccache_without_kerberos() -> None:
+    collector = _load_collector_module()
+    args = SimpleNamespace(
+        cidr=["10.0.0.0/24"],
+        hosts=None,
+        share_types="smb",
+        kerberos=False,
+        smb_anonymous=False,
+        use_session_creds=False,
+        username="svc",
+        password="secret",
+        hashes=None,
+        ccache="/tmp/krb5cc",
+        upload=False,
+        api_base=None,
+        project_id=None,
+        api_token=None,
+    )
+
+    try:
+        collector._validate_args(args)
+    except SystemExit as exc:
+        assert "--ccache requires --kerberos" in str(exc)
+        return
+    raise AssertionError("expected SystemExit for --ccache without --kerberos")
+
+
+def test_resolve_smb_auth_method_prefers_session_creds() -> None:
+    collector = _load_collector_module()
+    args = SimpleNamespace(smb_anonymous=False, use_session_creds=True, kerberos=False, username="")
+    assert collector._resolve_smb_auth_method(args) == "kerberos"
+
+
+def test_resolve_ccache_env_value_normalizes_paths(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    monkeypatch.delenv("KRB5CCNAME", raising=False)
+
+    file_path = tmp_path / "krb5cc_test"
+    file_path.write_text("dummy", encoding="utf-8")
+    resolved = collector._resolve_ccache_env_value(str(file_path))
+
+    assert resolved == f"FILE:{file_path}"
+
+
+def test_resolve_ccache_env_value_falls_back_to_environment(monkeypatch) -> None:
+    collector = _load_collector_module()
+    monkeypatch.setenv("KRB5CCNAME", "FILE:/tmp/from-env")
+
+    assert collector._resolve_ccache_env_value(None) == "FILE:/tmp/from-env"
+
+
 def test_scan_host_smb_uses_anonymous_auth_when_username_missing(monkeypatch) -> None:
     collector = _load_collector_module()
 
@@ -149,6 +264,7 @@ def test_scan_host_smb_uses_anonymous_auth_when_username_missing(monkeypatch) ->
         ccache=None,
         hashes=None,
         local_auth=False,
+        include_share=[],
         exclude_share=[],
         exclude_path_regex=None,
         extensions_only=None,
@@ -172,6 +288,150 @@ def test_help_text_contains_common_and_examples_sections() -> None:
     assert "Common Options" in help_text
     assert "SMB Authentication" in help_text
     assert "Examples:" in help_text
+    assert "--use-session-creds" in help_text
+
+
+def test_scan_host_smb_reports_share_enumeration_denied_with_anonymous_hint(monkeypatch) -> None:
+    collector = _load_collector_module()
+    fake_session_error = type("FakeSessionError", (Exception,), {})
+    monkeypatch.setattr(collector, "SessionError", fake_session_error)
+
+    class _Conn:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def getDialect(self):
+            return "768"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            raise fake_session_error("STATUS_ACCESS_DENIED")
+
+        def logoff(self):
+            return None
+
+    monkeypatch.setattr(collector, "SMBConnection", _Conn)
+
+    class _Writer:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=False,
+        username="",
+        password="",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=[],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=1,
+    )
+    writer = _Writer()
+    stats = collector.Stats()
+
+    ok = collector.scan_host_smb("10.0.0.6", args, "run-1", writer, stats, threading.Lock())
+
+    assert ok is True
+    assert stats.endpoints == 1
+    assert stats.resources == 0
+    assert stats.errors == 1
+    error_record = next(row for row in writer.records if row.get("type") == "error")
+    assert error_record["code"] == "LIST_SHARES_DENIED"
+    assert "--include-share" in error_record["hint"]
+
+
+def test_scan_host_smb_scans_user_specified_shares_without_enumeration(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _Entry:
+        def __init__(self, name: str, is_dir: bool):
+            self._name = name
+            self._is_dir = is_dir
+
+        def get_longname(self):
+            return self._name
+
+        def is_directory(self):
+            return self._is_dir
+
+    class _Conn:
+        def __init__(self, *_args, **_kwargs):
+            self.paths = []
+
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def getDialect(self):
+            return "768"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            raise AssertionError("listShares should not be called when include_share is provided")
+
+        def listPath(self, share_name, wildcard):
+            self.paths.append((share_name, wildcard))
+            return [_Entry("report.txt", False)]
+
+        def logoff(self):
+            return None
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: fake_conn)
+
+    class _Writer:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=True,
+        username="",
+        password="",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=["Public"],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=10,
+    )
+    writer = _Writer()
+    stats = collector.Stats()
+
+    ok = collector.scan_host_smb("10.0.0.7", args, "run-2", writer, stats, threading.Lock())
+
+    assert ok is True
+    assert ("Public", "*") in fake_conn.paths
+    resource_record = next(row for row in writer.records if row.get("type") == "resource")
+    item_record = next(row for row in writer.records if row.get("type") == "item")
+    assert resource_record["name"] == "Public"
+    assert item_record["resource_name"] == "Public"
 
 
 def test_scan_host_smb_auth_failure_includes_actionable_hint(monkeypatch) -> None:
@@ -205,6 +465,7 @@ def test_scan_host_smb_auth_failure_includes_actionable_hint(monkeypatch) -> Non
         ccache=None,
         hashes=None,
         local_auth=False,
+        include_share=[],
         exclude_share=[],
         exclude_path_regex=None,
         exclude_path_pattern=None,

@@ -39,6 +39,7 @@ def _base_args(output_path: str):
         local_auth=False,
         kerberos=False,
         ccache=None,
+        use_session_creds=False,
         max_depth=1,
         max_entries_per_share=10,
         exclude_share=[],
@@ -105,3 +106,22 @@ def test_main_reports_dependency_error_without_writing_output(monkeypatch, tmp_p
     assert rc == 2
     assert not output_path.exists()
     assert "impacket" in stderr_capture.getvalue().lower()
+
+
+def test_main_reports_session_credential_configuration_error(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "session-auth.ndjson"
+    args = _base_args(str(output_path))
+    args.use_session_creds = True
+    args.smb_anonymous = False
+    stderr_capture = io.StringIO()
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "_principal_from_ccache_env", lambda *_args, **_kwargs: (None, None, "cache missing principal"))
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == 2
+    assert not output_path.exists()
+    assert "cache missing principal" in stderr_capture.getvalue()

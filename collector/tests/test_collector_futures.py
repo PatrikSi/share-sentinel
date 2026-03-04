@@ -92,6 +92,23 @@ def test_collect_scan_results_maps_timeout_exception_to_specific_code() -> None:
     assert writer.records[0]["code"] == "SCAN_TIMEOUT"
 
 
+def test_collect_scan_results_maps_netbios_timeout_to_scan_timeout() -> None:
+    collector = _load_collector_module()
+    writer = _Writer()
+    stats = collector.Stats()
+    lock = threading.Lock()
+    run_id = "run-3b"
+    futures = {
+        _done_future(exc=collector.NetBIOSTimeout("nb-timeout")): "10.0.0.15",
+    }
+
+    host_failures = collector._collect_scan_results(futures, run_id, writer, stats, lock)
+
+    assert host_failures == 1
+    assert stats.errors == 1
+    assert writer.records[0]["code"] == "SCAN_TIMEOUT"
+
+
 def test_collect_scan_results_emits_error_for_cancelled_future() -> None:
     collector = _load_collector_module()
     writer = _Writer()
