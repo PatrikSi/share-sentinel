@@ -495,6 +495,18 @@ def _error_detail(exc: BaseException) -> str:
     return detail if detail else type(exc).__name__
 
 
+def _share_info_value(share: object, key: str, default: str = "") -> str:
+    try:
+        value = share[key]  # type: ignore[index]
+    except Exception:
+        if isinstance(share, dict):
+            value = share.get(key, default)
+        else:
+            value = getattr(share, key, default)
+    text = str(value or default)
+    return text.rstrip("\x00")
+
+
 def _record_error(stats: Stats, lock: threading.Lock, code: str, message: str) -> None:
     with lock:
         stats.errors += 1
@@ -541,6 +553,10 @@ def _session_error_hint(raw_error: str, auth_method: str) -> str | None:
         if auth_method == "anonymous":
             return "Anonymous session is allowed but not authorized to enumerate this share/path."
         return "Credentials are valid but not authorized for this share or path."
+    if "STATUS_BAD_NETWORK_NAME" in upper:
+        return "Share name was not found on target. Verify share spelling/casing and include-share values."
+    if "STATUS_CONNECTION_REFUSED" in upper:
+        return "Target refused tree connect for this share/path. System shares like IPC$ are commonly restricted."
     if "STATUS_ACCOUNT_DISABLED" in upper:
         return "Enable the account or use a different service account."
     if "STATUS_PASSWORD_EXPIRED" in upper:
@@ -734,11 +750,11 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             _record_error(stats, lock, "LIST_LIMIT_REACHED", message)
 
         for share in shares:
-            share_name = share["shi1_netname"].rstrip("\x00")
+            share_name = _share_info_value(share, "shi1_netname")
             if share_name.upper() in excluded_shares:
                 continue
 
-            remark = share.get("shi1_remark", "")
+            remark = _share_info_value(share, "shi1_remark")
             resource_record = {
                 "type": "resource",
                 "run_id": run_id,

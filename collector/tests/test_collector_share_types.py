@@ -222,6 +222,14 @@ def test_resolve_ccache_env_value_falls_back_to_environment(monkeypatch) -> None
     assert collector._resolve_ccache_env_value(None) == "FILE:/tmp/from-env"
 
 
+def test_session_error_hint_includes_share_name_guidance() -> None:
+    collector = _load_collector_module()
+
+    hint = collector._session_error_hint("STATUS_BAD_NETWORK_NAME", "anonymous")
+    assert hint is not None
+    assert "share name" in hint.lower()
+
+
 def test_scan_host_smb_uses_anonymous_auth_when_username_missing(monkeypatch) -> None:
     collector = _load_collector_module()
 
@@ -432,6 +440,77 @@ def test_scan_host_smb_scans_user_specified_shares_without_enumeration(monkeypat
     item_record = next(row for row in writer.records if row.get("type") == "item")
     assert resource_record["name"] == "Public"
     assert item_record["resource_name"] == "Public"
+
+
+def test_scan_host_smb_handles_share_info_objects_without_get(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _ShareInfo:
+        def __init__(self, name: str, remark: str):
+            self._data = {"shi1_netname": f"{name}\x00", "shi1_remark": f"{remark}\x00"}
+
+        def __getitem__(self, key):
+            return self._data[key]
+
+    class _Conn:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def getDialect(self):
+            return "768"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            return [_ShareInfo("General", "open-share")]
+
+        def listPath(self, *_args, **_kwargs):
+            return []
+
+        def logoff(self):
+            return None
+
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: _Conn())
+
+    class _Writer:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=False,
+        username="tester",
+        password="tester",
+        domain="",
+        ccache=None,
+        use_session_creds=False,
+        hashes=None,
+        local_auth=False,
+        include_share=[],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=10,
+    )
+    writer = _Writer()
+    stats = collector.Stats()
+
+    ok = collector.scan_host_smb("10.0.0.8", args, "run-obj", writer, stats, threading.Lock())
+
+    assert ok is True
+    resource = next(row for row in writer.records if row.get("type") == "resource")
+    assert resource["name"] == "General"
+    assert resource["remark"] == "open-share"
 
 
 def test_scan_host_smb_auth_failure_includes_actionable_hint(monkeypatch) -> None:
