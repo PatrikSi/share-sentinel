@@ -56,7 +56,7 @@ class NDJSONWriter:
         self._path = path
         self._gzip = bool(gzip_output and path is not None)
         self._closed = False
-        fd, buffer_path = tempfile.mkstemp(prefix="smbguard-buffer-", suffix=".ndjson")
+        fd, buffer_path = tempfile.mkstemp(prefix="share-sentinel-buffer-", suffix=".ndjson")
         os.close(fd)
         self._buffer_path = buffer_path
         self._fp = open(self._buffer_path, "w", encoding="utf-8")
@@ -112,15 +112,15 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  Authenticated SMB scan:\n"
-            "    smbguard_collector.py --hosts hosts.txt --share-types smb --username corp\\\\svc_scan --password '***' --output run.ndjson.gz --gzip\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --username corp\\\\svc_scan --password '***' --output run.ndjson.gz --gzip\n\n"
             "  Domain shell / ticket cache auth:\n"
-            "    smbguard_collector.py --hosts hosts.txt --share-types smb --use-session-creds --output kerberos.ndjson\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --use-session-creds --output kerberos.ndjson\n\n"
             "  Anonymous SMB scan:\n"
-            "    smbguard_collector.py --cidr 10.20.0.0/24 --share-types smb --smb-anonymous --output anon.ndjson\n\n"
+            "    share_sentinel_collector.py --cidr 10.20.0.0/24 --share-types smb --smb-anonymous --output anon.ndjson\n\n"
             "  NFS + SMB combined scan:\n"
-            "    smbguard_collector.py --hosts hosts.txt --share-types both --username corp\\\\svc_scan --password '***' --output combined.ndjson.gz --gzip\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --share-types both --username corp\\\\svc_scan --password '***' --output combined.ndjson.gz --gzip\n\n"
             "  Upload after scan:\n"
-            "    smbguard_collector.py --hosts hosts.txt --share-types smb --username svc --password '***' --upload --api-base https://api.example --project-id <uuid> --api-token <token>\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --username svc --password '***' --upload --api-base https://api.example --project-id <uuid> --api-token <token>\n\n"
             "Notes:\n"
             "  - SMB authentication modes:\n"
             "      * NTLM: set --username (and password or hashes)\n"
@@ -1236,7 +1236,7 @@ def main() -> int:
 
     if args.upload and output_path is None:
         suffix = ".ndjson.gz" if args.gzip else ".ndjson"
-        fd, temp_artifact = tempfile.mkstemp(prefix="smbguard-", suffix=suffix)
+        fd, temp_artifact = tempfile.mkstemp(prefix="share-sentinel-", suffix=suffix)
         os.close(fd)
         output_path = temp_artifact
 
@@ -1248,7 +1248,7 @@ def main() -> int:
         {
             "type": "run_meta",
             "schema_version": 1,
-            "tool": "smbguard-collector",
+            "tool": "share-sentinel-collector",
             "tool_version": "0.1.0",
             "run_id": run_id,
             "started_at": started_at.isoformat(),

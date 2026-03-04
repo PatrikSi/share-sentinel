@@ -37,13 +37,13 @@ def _read_int_env(name: str, default: int, min_value: int = 1) -> int:
 
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://smbguard:smbguard@db:5432/smbguard").replace(
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://share_sentinel:share_sentinel@db:5432/share_sentinel").replace(
     "postgresql+psycopg://", "postgresql://"
 )
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
-S3_BUCKET = os.getenv("S3_BUCKET", "smbguard-artifacts")
+S3_BUCKET = os.getenv("S3_BUCKET", "share-sentinel-artifacts")
 
 STREAM_NAME = "ingest_jobs"
 GROUP_NAME = "ingest_workers"

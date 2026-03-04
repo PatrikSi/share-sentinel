@@ -5,7 +5,7 @@ One-off SMB collector that writes NDJSON or NDJSON.GZ and can upload artifacts t
 ## Example
 
 ```bash
-python smbguard_collector.py \
+python share_sentinel_collector.py \
   --cidr 10.0.0.0/24 \
   --domain CONTOSO \
   --username alice \
@@ -20,7 +20,7 @@ python smbguard_collector.py \
 ## Upload mode
 
 ```bash
-python smbguard_collector.py \
+python share_sentinel_collector.py \
   --hosts hosts.txt \
   --domain CONTOSO \
   --username alice \

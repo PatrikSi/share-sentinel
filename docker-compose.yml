@@ -19,13 +19,13 @@ services:
   db:
     image: postgres:16
     environment:
-      POSTGRES_DB: smbguard
-      POSTGRES_USER: smbguard
+      POSTGRES_DB: share_sentinel
+      POSTGRES_USER: share_sentinel
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U smbguard -d smbguard"]
+      test: ["CMD-SHELL", "pg_isready -U share_sentinel -d share_sentinel"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -66,21 +66,21 @@ services:
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-change-me} &&
-      mc mb -p local/smbguard-artifacts || true
+      mc mb -p local/share-sentinel-artifacts || true
       "
     restart: "no"
 
   api:
     build: ./api
     environment:
-      DATABASE_URL: postgresql+psycopg://smbguard:${POSTGRES_PASSWORD:-change-me}@db:5432/smbguard
+      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:-change-me}@db:5432/share_sentinel
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT: http://minio:9000
       S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change-me}
-      S3_BUCKET: smbguard-artifacts
+      S3_BUCKET: share-sentinel-artifacts
       JWT_SECRET: ${JWT_SECRET:-change-me-super-long-random-string}
-      JWT_ISSUER: smbguard
+      JWT_ISSUER: share-sentinel
       TOKEN_PEPPER: ${TOKEN_PEPPER:-change-me-long-random-string}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
       API_ROOT_PATH: /api
@@ -111,12 +111,12 @@ services:
   worker:
     build: ./worker
     environment:
-      DATABASE_URL: postgresql+psycopg://smbguard:${POSTGRES_PASSWORD:-change-me}@db:5432/smbguard
+      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:-change-me}@db:5432/share_sentinel
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT: http://minio:9000
       S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change-me}
-      S3_BUCKET: smbguard-artifacts
+      S3_BUCKET: share-sentinel-artifacts
       LOG_LEVEL: INFO
     depends_on:
       db:
@@ -132,7 +132,7 @@ services:
     build: ./api
     command: ["bash", "-lc", "alembic upgrade head && python -m app.seed"]
     environment:
-      DATABASE_URL: postgresql+psycopg://smbguard:${POSTGRES_PASSWORD:-change-me}@db:5432/smbguard
+      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:-change-me}@db:5432/share_sentinel
       SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@example.com}
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-ChangeMe123456}
       TOKEN_PEPPER: ${TOKEN_PEPPER:-change-me-long-random-string}

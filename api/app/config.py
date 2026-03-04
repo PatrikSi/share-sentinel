@@ -12,16 +12,16 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     api_root_path: str = ""
 
-    database_url: str = "postgresql+psycopg://smbguard:smbguard@db:5432/smbguard"
+    database_url: str = "postgresql+psycopg://share_sentinel:share_sentinel@db:5432/share_sentinel"
     redis_url: str = "redis://redis:6379/0"
 
     s3_endpoint: str = "http://minio:9000"
     s3_access_key: str = "minioadmin"
     s3_secret_key: str = "minioadmin"
-    s3_bucket: str = "smbguard-artifacts"
+    s3_bucket: str = "share-sentinel-artifacts"
 
     jwt_secret: str = "dev-secret"
-    jwt_issuer: str = "smbguard"
+    jwt_issuer: str = "share-sentinel"
     access_token_minutes: int = 15
     refresh_token_days: int = 14
     token_pepper: str = "dev-pepper"

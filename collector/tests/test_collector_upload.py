@@ -7,8 +7,8 @@ import requests
 
 
 def _load_collector_module():
-    module_path = Path(__file__).resolve().parents[1] / "smbguard_collector.py"
-    spec = importlib.util.spec_from_file_location("smbguard_collector", module_path)
+    module_path = Path(__file__).resolve().parents[1] / "share_sentinel_collector.py"
+    spec = importlib.util.spec_from_file_location("share_sentinel_collector", module_path)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
