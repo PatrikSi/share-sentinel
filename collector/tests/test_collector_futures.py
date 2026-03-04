@@ -4,6 +4,7 @@ import socket
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _load_collector_module():
@@ -124,3 +125,37 @@ def test_collect_scan_results_emits_error_for_cancelled_future() -> None:
     assert host_failures == 1
     assert stats.errors == 1
     assert writer.records[0]["code"] == "SCAN_THREAD_CANCELLED"
+
+
+def test_collect_scan_results_uses_nfs_endpoint_key_when_nfs_only() -> None:
+    collector = _load_collector_module()
+    writer = _Writer()
+    stats = collector.Stats()
+    lock = threading.Lock()
+    run_id = "run-5"
+    futures = {
+        _done_future(exc=RuntimeError("boom")): "10.0.0.21",
+    }
+    args = SimpleNamespace(share_types="nfs", disabled_share_types=set())
+
+    host_failures = collector._collect_scan_results(futures, run_id, writer, stats, lock, args=args)
+
+    assert host_failures == 1
+    assert writer.records[0]["endpoint_key"] == "10.0.0.21:2049"
+
+
+def test_collect_scan_results_omits_endpoint_key_when_share_types_mixed() -> None:
+    collector = _load_collector_module()
+    writer = _Writer()
+    stats = collector.Stats()
+    lock = threading.Lock()
+    run_id = "run-6"
+    futures = {
+        _done_future(exc=RuntimeError("boom")): "10.0.0.22",
+    }
+    args = SimpleNamespace(share_types="both", disabled_share_types=set())
+
+    host_failures = collector._collect_scan_results(futures, run_id, writer, stats, lock, args=args)
+
+    assert host_failures == 1
+    assert "endpoint_key" not in writer.records[0]

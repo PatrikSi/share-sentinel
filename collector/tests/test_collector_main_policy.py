@@ -125,3 +125,56 @@ def test_main_reports_session_credential_configuration_error(monkeypatch, tmp_pa
     assert rc == 2
     assert not output_path.exists()
     assert "cache missing principal" in stderr_capture.getvalue()
+
+
+def test_main_reports_kerberos_preflight_error_without_username(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "kerberos-auth.ndjson"
+    args = _base_args(str(output_path))
+    args.smb_anonymous = False
+    args.kerberos = True
+    args.ccache = "/tmp/bad.ccache"
+    stderr_capture = io.StringIO()
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        collector,
+        "_principal_from_ccache_env",
+        lambda *_args, **_kwargs: (None, None, "unable to parse Kerberos cache FILE:/tmp/bad.ccache: bad format"),
+    )
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == 2
+    assert "unable to parse kerberos cache" in stderr_capture.getvalue().lower()
+    assert "pass --username with --kerberos" in stderr_capture.getvalue()
+
+
+def test_main_reports_output_write_errors_instead_of_traceback(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "ok.ndjson"
+    args = _base_args(str(output_path))
+    stderr_capture = io.StringIO()
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        with lock:
+            stats.endpoints += 1
+        return True
+
+    def _raise_on_close(self, keep_output=True):  # noqa: ARG001
+        raise FileNotFoundError("No such file or directory")
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "parse_targets", lambda *_args, **_kwargs: ["10.0.0.5"])
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+    monkeypatch.setattr(collector.NDJSONWriter, "close", _raise_on_close)
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == 2
+    assert "output error: failed to write output" in stderr_capture.getvalue().lower()

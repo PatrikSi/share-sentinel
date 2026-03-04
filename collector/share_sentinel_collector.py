@@ -339,11 +339,13 @@ def _resolve_ccache_env_value(raw_path: str | None) -> str | None:
         if not value:
             return None
         if value.upper().startswith("FILE:"):
-            return value
+            value = value[5:]
         expanded = os.path.abspath(os.path.expanduser(value))
-        return f"FILE:{expanded}"
+        return expanded
 
     fallback = str(os.getenv("KRB5CCNAME", "") or "").strip()
+    if fallback.upper().startswith("FILE:"):
+        fallback = fallback[5:]
     return fallback or None
 
 
@@ -374,10 +376,13 @@ def _principal_from_ccache_env(ccache_env_value: str | None) -> tuple[str | None
 
 
 @contextmanager
-def _temporary_kerberos_cache(ccache_env_value: str | None):
+def _run_scoped_kerberos_cache(ccache_env_value: str | None):
+    if not ccache_env_value:
+        yield
+        return
+
     previous = os.environ.get("KRB5CCNAME")
-    if ccache_env_value:
-        os.environ["KRB5CCNAME"] = ccache_env_value
+    os.environ["KRB5CCNAME"] = ccache_env_value
     try:
         yield
     finally:
@@ -402,6 +407,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     api_base = getattr(args, "api_base", None)
     project_id = getattr(args, "project_id", None)
     api_token = getattr(args, "api_token", None)
+    output_path = str(getattr(args, "output", "") or "").strip()
     workers = int(getattr(args, "workers", 1))
     timeout = float(getattr(args, "timeout", 1.0))
     max_depth = int(getattr(args, "max_depth", 1))
@@ -434,6 +440,15 @@ def _validate_args(args: argparse.Namespace) -> None:
 
     if upload and (not api_base or not project_id or not api_token):
         raise SystemExit("--upload requires --api-base, --project-id, and --api-token")
+    if output_path:
+        output = Path(output_path).expanduser()
+        parent = output.parent if str(output.parent) else Path(".")
+        if not parent.exists():
+            raise SystemExit(f"--output directory does not exist: {parent}")
+        if not parent.is_dir():
+            raise SystemExit(f"--output parent is not a directory: {parent}")
+        if output.exists() and output.is_dir():
+            raise SystemExit(f"--output points to a directory, expected file path: {output}")
     if workers <= 0:
         raise SystemExit("--workers must be greater than zero")
     if timeout <= 0:
@@ -637,19 +652,18 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
         if attempted_auth == "kerberos":
             ccache_env_value = getattr(args, "ccache_env_value", None)
             use_cache = bool(ccache_env_value)
-            with _temporary_kerberos_cache(ccache_env_value):
-                conn.kerberosLogin(
-                    args.username,
-                    args.password,
-                    args.domain,
-                    lmhash="",
-                    nthash="",
-                    aesKey=None,
-                    kdcHost=None,
-                    TGT=None,
-                    TGS=None,
-                    useCache=use_cache,
-                )
+            conn.kerberosLogin(
+                args.username,
+                args.password,
+                args.domain,
+                lmhash="",
+                nthash="",
+                aesKey=None,
+                kdcHost=None,
+                TGT=None,
+                TGS=None,
+                useCache=use_cache,
+            )
         elif attempted_auth == "ntlm":
             lmhash = ""
             nthash = ""
@@ -1128,6 +1142,7 @@ def _collect_scan_results(
     writer: NDJSONWriter,
     stats: Stats,
     lock: threading.Lock,
+    args: argparse.Namespace | None = None,
 ) -> int:
     host_failures = 0
     for future in concurrent.futures.as_completed(futures_by_host):
@@ -1138,15 +1153,16 @@ def _collect_scan_results(
             exc = cancelled_error
 
         if exc is not None:
-            message = _error_detail(exc)
+            message = f"scan worker failed for host {host}: {_error_detail(exc)}"
             code = _scan_thread_error_code(exc)
+            endpoint_key = _scan_thread_endpoint_key(host, args)
             _emit_error(
                 writer,
                 run_id,
                 severity="error",
                 code=code,
                 message=message,
-                endpoint_key=f"{host}:445",
+                endpoint_key=endpoint_key,
                 hint="Unhandled worker exception; inspect traceback/logs for root cause.",
             )
             _record_error(stats, lock, code, message)
@@ -1177,21 +1193,46 @@ def _scan_thread_error_code(exc: BaseException) -> str:
     return "SCAN_THREAD_FAILED"
 
 
+def _scan_thread_endpoint_key(host: str, args: argparse.Namespace | None) -> str | None:
+    if args is None:
+        return f"{host}:445"
+
+    selected = _selected_share_types(getattr(args, "share_types", "smb"))
+    disabled = set(getattr(args, "disabled_share_types", set()) or set())
+    active = selected - disabled
+    if active == {"smb"}:
+        return f"{host}:445"
+    if active == {"nfs"}:
+        return f"{host}:2049"
+    return None
+
+
 def main() -> int:
     args = parse_args()
     if getattr(args, "use_session_creds", False):
         args.kerberos = True
+    preflight_ccache = _resolve_ccache_env_value(getattr(args, "ccache", None))
     if getattr(args, "kerberos", False) and not getattr(args, "username", ""):
-        preflight_ccache = _resolve_ccache_env_value(getattr(args, "ccache", None))
         if preflight_ccache:
-            username, domain, _principal_error = _principal_from_ccache_env(preflight_ccache)
+            username, domain, principal_error = _principal_from_ccache_env(preflight_ccache)
+            if principal_error and not getattr(args, "use_session_creds", False):
+                print(f"configuration error: {principal_error}", file=sys.stderr)
+                print(
+                    "pass --username with --kerberos, or provide a valid --ccache/KRB5CCNAME with a default principal.",
+                    file=sys.stderr,
+                )
+                return 2
             if username:
                 args.username = username
             if not getattr(args, "domain", "") and domain:
                 args.domain = domain
-    _validate_args(args)
+    try:
+        _validate_args(args)
+    except SystemExit as exc:
+        print(f"configuration error: {_error_detail(exc)}", file=sys.stderr)
+        return 2
 
-    args.ccache_env_value = _resolve_ccache_env_value(getattr(args, "ccache", None))
+    args.ccache_env_value = preflight_ccache
     if getattr(args, "use_session_creds", False):
         username, domain, principal_error = _principal_from_ccache_env(args.ccache_env_value)
         if principal_error:
@@ -1285,9 +1326,11 @@ def main() -> int:
 
     host_failures = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures_by_host = {executor.submit(scan_host, host, args, run_id, writer, stats, lock): host for host in targets}
-        host_failures = _collect_scan_results(futures_by_host, run_id, writer, stats, lock)
+    run_ccache = args.ccache_env_value if smb_auth_method == "kerberos" else None
+    with _run_scoped_kerberos_cache(run_ccache):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+            futures_by_host = {executor.submit(scan_host, host, args, run_id, writer, stats, lock): host for host in targets}
+            host_failures = _collect_scan_results(futures_by_host, run_id, writer, stats, lock, args=args)
 
     writer.emit(
         {
@@ -1305,14 +1348,26 @@ def main() -> int:
 
     run_has_data = _is_successful_run(stats)
     keep_output = run_has_data
-    writer.close(keep_output=keep_output)
+    writer_close_error: OSError | None = None
+    try:
+        writer.close(keep_output=keep_output)
+    except OSError as exc:
+        writer_close_error = exc
 
     try:
-        if args.upload and keep_output and output_path is not None:
+        if writer_close_error is None and args.upload and keep_output and output_path is not None:
             upload_artifact(args, run_id, output_path, host_inputs)
     finally:
         if temp_artifact and os.path.exists(temp_artifact):
             os.unlink(temp_artifact)
+
+    if writer_close_error is not None:
+        destination = output_path or "stdout"
+        print(
+            f"output error: failed to write output to {destination}: {_error_detail(writer_close_error)}",
+            file=sys.stderr,
+        )
+        return 2
 
     if not keep_output:
         _print_scan_failure_summary(

@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 import threading
 from pathlib import Path
@@ -198,6 +199,34 @@ def test_validate_args_rejects_ccache_without_kerberos() -> None:
     raise AssertionError("expected SystemExit for --ccache without --kerberos")
 
 
+def test_validate_args_rejects_output_path_with_missing_parent(tmp_path) -> None:
+    collector = _load_collector_module()
+    args = SimpleNamespace(
+        cidr=["10.0.0.0/24"],
+        hosts=None,
+        share_types="smb",
+        kerberos=False,
+        smb_anonymous=True,
+        use_session_creds=False,
+        username="",
+        password="",
+        hashes=None,
+        ccache=None,
+        output=str(tmp_path / "missing-parent" / "out.ndjson"),
+        upload=False,
+        api_base=None,
+        project_id=None,
+        api_token=None,
+    )
+
+    try:
+        collector._validate_args(args)
+    except SystemExit as exc:
+        assert "--output directory does not exist" in str(exc)
+        return
+    raise AssertionError("expected SystemExit for missing output parent directory")
+
+
 def test_resolve_smb_auth_method_prefers_session_creds() -> None:
     collector = _load_collector_module()
     args = SimpleNamespace(smb_anonymous=False, use_session_creds=True, kerberos=False, username="")
@@ -212,14 +241,14 @@ def test_resolve_ccache_env_value_normalizes_paths(monkeypatch, tmp_path) -> Non
     file_path.write_text("dummy", encoding="utf-8")
     resolved = collector._resolve_ccache_env_value(str(file_path))
 
-    assert resolved == f"FILE:{file_path}"
+    assert resolved == str(file_path)
 
 
 def test_resolve_ccache_env_value_falls_back_to_environment(monkeypatch) -> None:
     collector = _load_collector_module()
     monkeypatch.setenv("KRB5CCNAME", "FILE:/tmp/from-env")
 
-    assert collector._resolve_ccache_env_value(None) == "FILE:/tmp/from-env"
+    assert collector._resolve_ccache_env_value(None) == "/tmp/from-env"
 
 
 def test_session_error_hint_includes_share_name_guidance() -> None:
@@ -287,6 +316,66 @@ def test_scan_host_smb_uses_anonymous_auth_when_username_missing(monkeypatch) ->
     assert fake_conn.login_args == ("", "", "", "", "")
     endpoint = next(row for row in writer.records if row.get("type") == "endpoint")
     assert endpoint["auth"]["method"] == "anonymous"
+
+
+def test_scan_host_smb_kerberos_does_not_mutate_ccache_env_per_call(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _Conn:
+        def __init__(self, *_args, **_kwargs):
+            self.use_cache = None
+
+        def kerberosLogin(self, *_args, **kwargs):
+            self.use_cache = kwargs.get("useCache")
+            return None
+
+        def getDialect(self):
+            return "768"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            return []
+
+        def logoff(self):
+            return None
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setenv("KRB5CCNAME", "FILE:/tmp/original-cache")
+
+    class _Writer:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=True,
+        smb_anonymous=False,
+        username="svc",
+        password="secret",
+        domain="EXAMPLE",
+        ccache_env_value="FILE:/tmp/alternate-cache",
+        hashes=None,
+        local_auth=False,
+        include_share=[],
+        exclude_share=[],
+        exclude_path_regex=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=1,
+    )
+    writer = _Writer()
+    stats = collector.Stats()
+    ok = collector.scan_host_smb("10.0.0.5", args, "run-kerb-1", writer, stats, threading.Lock())
+
+    assert ok is True
+    assert fake_conn.use_cache is True
+    assert os.environ.get("KRB5CCNAME") == "FILE:/tmp/original-cache"
 
 
 def test_help_text_contains_common_and_examples_sections() -> None:
