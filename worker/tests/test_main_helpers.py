@@ -1,3 +1,5 @@
+import io
+import json
 from pathlib import Path
 import sys
 import uuid
@@ -220,3 +222,43 @@ def test_records_from_compact_json_includes_run_meta_issue_summary_and_run_end()
     assert run_meta["collection"]["command"] == "share_sentinel_collector.py"
     assert error["code"] == "LIST_SHARES_DENIED"
     assert run_end["stats"]["errors"] == 3
+
+
+def test_iter_records_from_streamable_json_file_streams_compact_json() -> None:
+    run_id = str(uuid.uuid4())
+    payload = {
+        "schema_version": 1,
+        "meta": {
+            "tool": "share-sentinel-collector",
+            "tool_version": "0.2.0",
+            "run_id": run_id,
+            "started_at": "2026-03-10T10:00:00Z",
+            "finished_at": "2026-03-10T10:05:00Z",
+        },
+        "summary": {
+            "endpoints": 1,
+            "resources": 1,
+            "items": 1,
+            "errors": 0,
+        },
+        "endpoints": [
+            {
+                "endpoint_key": "host:445",
+                "shares": [
+                    {
+                        "name": "Public",
+                        "share_type": "smb",
+                        "entries": [{"name": "report.txt", "is_dir": False}],
+                    }
+                ],
+            }
+        ],
+    }
+
+    stream = io.BytesIO(json.dumps(payload).encode("utf-8"))
+    records = list(main._iter_records_from_streamable_json_file(stream, run_id))
+
+    assert records[0]["type"] == "run_meta"
+    assert any(record.get("type") == "endpoint" for record in records)
+    assert any(record.get("type") == "resource" for record in records)
+    assert records[-1]["type"] == "run_end"

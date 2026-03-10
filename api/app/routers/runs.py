@@ -34,6 +34,14 @@ from app.token_scopes import SCOPE_READ_RUNS, SCOPE_WRITE_RUNS
 router = APIRouter(prefix="/projects/{project_id}/runs", tags=["runs"])
 rate_limiter = RateLimiter()
 logger = logging.getLogger("share_sentinel.runs")
+ALLOWED_ARTIFACT_SUFFIXES = (".json", ".json.gz", ".ndjson", ".ndjson.gz", ".jsonl", ".jsonl.gz")
+ALLOWED_ARTIFACT_CONTENT_TYPES = {
+    "application/json",
+    "application/x-ndjson",
+    "application/gzip",
+    "application/x-gzip",
+    "application/octet-stream",
+}
 
 
 def _get_run(db: Session, project_id: uuid.UUID, run_id: uuid.UUID) -> ScanRun:
@@ -78,6 +86,7 @@ async def _upload_artifact_stream(
 ) -> tuple[int, str]:
     settings = get_settings()
     chunk_bytes = max(5 * 1024 * 1024, settings.upload_chunk_bytes)
+    artifact_kind = _artifact_kind(content_type, key)
 
     upload_id = await run_in_threadpool(create_multipart_upload, key, content_type)
     sha256 = hashlib.sha256()
@@ -85,6 +94,8 @@ async def _upload_artifact_stream(
     part_number = 1
     parts: list[dict] = []
     buffer = bytearray()
+    signature_buffer = bytearray()
+    signature_checked = False
 
     async def flush_parts(force: bool = False) -> None:
         nonlocal part_number
@@ -110,6 +121,9 @@ async def _upload_artifact_stream(
                 if size > settings.upload_max_bytes:
                     raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="upload too large")
                 sha256.update(chunk)
+                if not signature_checked and len(signature_buffer) < 64:
+                    signature_buffer.extend(chunk[: 64 - len(signature_buffer)])
+                    signature_checked = _validate_artifact_signature(artifact_kind, bytes(signature_buffer))
                 buffer.extend(chunk)
                 await flush_parts()
         else:
@@ -120,11 +134,16 @@ async def _upload_artifact_stream(
                 if size > settings.upload_max_bytes:
                     raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="upload too large")
                 sha256.update(chunk)
+                if not signature_checked and len(signature_buffer) < 64:
+                    signature_buffer.extend(chunk[: 64 - len(signature_buffer)])
+                    signature_checked = _validate_artifact_signature(artifact_kind, bytes(signature_buffer))
                 buffer.extend(chunk)
                 await flush_parts()
 
         if size == 0:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="empty upload")
+        if not signature_checked:
+            _validate_artifact_signature(artifact_kind, bytes(signature_buffer), final=True)
 
         await flush_parts(force=True)
         await run_in_threadpool(complete_multipart_upload, key, upload_id, parts)
@@ -138,7 +157,7 @@ async def _upload_artifact_stream(
 
 
 def _artifact_suffix(content_type: str | None, filename: str | None) -> str:
-    lowered_content_type = (content_type or "").lower()
+    lowered_content_type = _normalize_content_type(content_type)
     lowered_filename = (filename or "").lower()
     if lowered_filename.endswith(".json.gz"):
         return ".json.gz"
@@ -153,6 +172,56 @@ def _artifact_suffix(content_type: str | None, filename: str | None) -> str:
     if "application/json" in lowered_content_type:
         return ".json.gz" if is_gzip else ".json"
     return ".ndjson.gz" if is_gzip else ".ndjson"
+
+
+def _normalize_content_type(content_type: str | None) -> str:
+    return str(content_type or "").split(";", 1)[0].strip().lower()
+
+
+def _artifact_kind(content_type: str | None, filename_or_key: str | None) -> str:
+    lowered_content_type = _normalize_content_type(content_type)
+    lowered_name = (filename_or_key or "").lower()
+    if lowered_name.endswith(".json.gz") or lowered_name.endswith(".ndjson.gz") or lowered_name.endswith(".jsonl.gz"):
+        return "gzip"
+    if lowered_name.endswith(".ndjson") or lowered_name.endswith(".jsonl"):
+        return "ndjson"
+    if lowered_name.endswith(".json"):
+        return "json"
+    if lowered_content_type in {"application/gzip", "application/x-gzip"}:
+        return "gzip"
+    if lowered_content_type == "application/x-ndjson":
+        return "ndjson"
+    return "json"
+
+
+def _validate_artifact_upload_headers(content_type: str | None, filename: str | None) -> None:
+    normalized_content_type = _normalize_content_type(content_type)
+    lowered_filename = (filename or "").lower()
+
+    if normalized_content_type not in ALLOWED_ARTIFACT_CONTENT_TYPES:
+        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="unsupported artifact content type")
+    if lowered_filename and not any(lowered_filename.endswith(suffix) for suffix in ALLOWED_ARTIFACT_SUFFIXES):
+        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="unsupported artifact filename")
+    if not lowered_filename and normalized_content_type in {"", "application/octet-stream"}:
+        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="content type required for raw artifact upload")
+
+
+def _validate_artifact_signature(kind: str, sample: bytes, final: bool = False) -> bool:
+    if kind == "gzip":
+        if len(sample) < 2:
+            if final:
+                raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="artifact does not match gzip payload")
+            return False
+        if not sample.startswith(b"\x1f\x8b"):
+            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="artifact does not match gzip payload")
+        return True
+
+    stripped = sample.lstrip(b" \t\r\n")
+    if not stripped:
+        return final
+    if stripped[:1] not in {b"{", b"["}:
+        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="artifact does not look like JSON")
+    return True
 
 
 def _write_read_audit(
@@ -330,7 +399,8 @@ async def upload_artifact(
     if run.status not in {RunStatus.PENDING_UPLOAD, RunStatus.UPLOADED, RunStatus.FAILED}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run state does not accept upload")
 
-    content_type = file.content_type if file else request.headers.get("content-type", "application/octet-stream")
+    content_type = _normalize_content_type(file.content_type if file else request.headers.get("content-type", "application/octet-stream"))
+    _validate_artifact_upload_headers(content_type, file.filename if file else None)
     suffix = _artifact_suffix(content_type, file.filename if file else None)
     key = f"projects/{project_id}/runs/{run_id}/artifact{suffix}"
 

@@ -1,10 +1,10 @@
 import gzip
-import io
 import json
 import logging
 import os
 import socket
 import sys
+import tempfile
 import time
 import uuid
 from datetime import UTC, datetime
@@ -12,6 +12,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 import boto3
+import ijson
 import psycopg
 import redis
 from botocore.exceptions import BotoCoreError, ClientError
@@ -361,6 +362,60 @@ def _iter_items_from_entries(
             yield from _iter_items_from_entries(run_id, endpoint_key, resource_name, children, share_type, full_path)
 
 
+def _records_from_endpoint_payload(raw_endpoint: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
+    endpoint_key = str(raw_endpoint.get("endpoint_key") or "").strip()
+    if not endpoint_key:
+        ip = str(raw_endpoint.get("ip") or "").strip()
+        hostname = str(raw_endpoint.get("hostname") or "").strip()
+        endpoint_key = f"{ip}:445" if ip else (f"{hostname}:445" if hostname else "unknown:445")
+
+    records = [
+        {
+            "type": "endpoint",
+            "run_id": run_id,
+            "endpoint_key": endpoint_key,
+            "ip": raw_endpoint.get("ip"),
+            "hostname": raw_endpoint.get("hostname"),
+            "domain": raw_endpoint.get("domain"),
+            "auth": raw_endpoint.get("auth") if isinstance(raw_endpoint.get("auth"), dict) else None,
+            "smb": raw_endpoint.get("smb") if isinstance(raw_endpoint.get("smb"), dict) else None,
+            "nfs": raw_endpoint.get("nfs") if isinstance(raw_endpoint.get("nfs"), dict) else None,
+        }
+    ]
+
+    raw_shares = raw_endpoint.get("shares")
+    if not isinstance(raw_shares, list):
+        return records
+
+    for raw_share in raw_shares:
+        if not isinstance(raw_share, dict):
+            continue
+
+        share_name = str(raw_share.get("name") or "").strip()
+        if not share_name:
+            continue
+        share_type = _normalize_share_type(raw_share.get("share_type"), raw_share.get("resource_type"))
+
+        records.append(
+            {
+                "type": "resource",
+                "run_id": run_id,
+                "endpoint_key": endpoint_key,
+                "resource_type": _resource_type_from_share_type(share_type),
+                "share_type": share_type,
+                "name": share_name,
+                "remark": raw_share.get("remark"),
+                "access_level": raw_share.get("access_level", "no_access"),
+            }
+        )
+
+        raw_entries = raw_share.get("entries")
+        if isinstance(raw_entries, list):
+            records.extend(_iter_items_from_entries(run_id, endpoint_key, share_name, raw_entries, share_type=share_type))
+
+    return records
+
+
 def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
     endpoints_raw = doc.get("endpoints")
     if not isinstance(endpoints_raw, list):
@@ -407,56 +462,7 @@ def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str
     for raw_endpoint in endpoints_raw:
         if not isinstance(raw_endpoint, dict):
             continue
-
-        endpoint_key = str(raw_endpoint.get("endpoint_key") or "").strip()
-        if not endpoint_key:
-            ip = str(raw_endpoint.get("ip") or "").strip()
-            hostname = str(raw_endpoint.get("hostname") or "").strip()
-            endpoint_key = f"{ip}:445" if ip else (f"{hostname}:445" if hostname else "unknown:445")
-
-        records.append(
-            {
-                "type": "endpoint",
-                "run_id": run_id,
-                "endpoint_key": endpoint_key,
-                "ip": raw_endpoint.get("ip"),
-                "hostname": raw_endpoint.get("hostname"),
-                "domain": raw_endpoint.get("domain"),
-                "auth": raw_endpoint.get("auth") if isinstance(raw_endpoint.get("auth"), dict) else None,
-                "smb": raw_endpoint.get("smb") if isinstance(raw_endpoint.get("smb"), dict) else None,
-                "nfs": raw_endpoint.get("nfs") if isinstance(raw_endpoint.get("nfs"), dict) else None,
-            }
-        )
-
-        raw_shares = raw_endpoint.get("shares")
-        if not isinstance(raw_shares, list):
-            continue
-
-        for raw_share in raw_shares:
-            if not isinstance(raw_share, dict):
-                continue
-
-            share_name = str(raw_share.get("name") or "").strip()
-            if not share_name:
-                continue
-            share_type = _normalize_share_type(raw_share.get("share_type"), raw_share.get("resource_type"))
-
-            records.append(
-                {
-                    "type": "resource",
-                    "run_id": run_id,
-                    "endpoint_key": endpoint_key,
-                    "resource_type": _resource_type_from_share_type(share_type),
-                    "share_type": share_type,
-                    "name": share_name,
-                    "remark": raw_share.get("remark"),
-                    "access_level": raw_share.get("access_level", "no_access"),
-                }
-            )
-
-            raw_entries = raw_share.get("entries")
-            if isinstance(raw_entries, list):
-                records.extend(_iter_items_from_entries(run_id, endpoint_key, share_name, raw_entries, share_type=share_type))
+        records.extend(_records_from_endpoint_payload(raw_endpoint, run_id))
 
     summary_raw = doc.get("summary")
     if isinstance(summary_raw, dict):
@@ -511,6 +517,100 @@ def _load_json_records_from_bytes(raw_bytes: bytes, run_id: str) -> list[dict[st
     except (TypeError, ValueError):
         return None
     return records_from_json_document(json_doc, run_id)
+
+
+def _load_first_json_item(fp, prefix: str) -> Any:
+    fp.seek(0)
+    iterator = ijson.items(fp, prefix)
+    try:
+        return next(iterator)
+    except StopIteration:
+        return None
+
+
+def _iter_records_from_streamable_json_file(fp, run_id: str):
+    meta_raw = _load_first_json_item(fp, "meta")
+    run_raw = _load_first_json_item(fp, "run")
+    collection_raw = _load_first_json_item(fp, "collection")
+    summary_raw = _load_first_json_item(fp, "summary")
+    schema_version = _load_first_json_item(fp, "schema_version")
+    started_at = (meta_raw or {}).get("started_at") if isinstance(meta_raw, dict) else None
+    started_at = started_at or ((run_raw or {}).get("created_at") if isinstance(run_raw, dict) else None) or now_iso()
+    finished_at = (meta_raw or {}).get("finished_at") if isinstance(meta_raw, dict) else None
+    finished_at = finished_at or now_iso()
+
+    if isinstance(meta_raw, dict) or isinstance(run_raw, dict) or isinstance(collection_raw, dict) or isinstance(summary_raw, dict):
+        yield {
+            "type": "run_meta",
+            "schema_version": int(schema_version) if isinstance(schema_version, int) else 1,
+            "tool": (meta_raw or {}).get("tool") if isinstance(meta_raw, dict) else "share-sentinel-import",
+            "tool_version": (meta_raw or {}).get("tool_version") if isinstance(meta_raw, dict) else "unknown",
+            "run_id": (meta_raw or {}).get("run_id") if isinstance(meta_raw, dict) else None,
+            "started_at": started_at,
+            "operator_label": (meta_raw or {}).get("operator_label") if isinstance(meta_raw, dict) else None,
+            "collection": collection_raw if isinstance(collection_raw, dict) else None,
+            "auth": (meta_raw or {}).get("auth") if isinstance(meta_raw, dict) and isinstance((meta_raw or {}).get("auth"), dict) else None,
+        }
+
+    issue_seen = False
+    fp.seek(0)
+    for issue in ijson.items(fp, "issue_summary.item"):
+        if not isinstance(issue, dict):
+            continue
+        issue_seen = True
+        yield {
+            "type": "error",
+            "run_id": run_id,
+            "severity": issue.get("severity", "error"),
+            "code": issue.get("code", "UNKNOWN"),
+            "message": issue.get("sample_message") or issue.get("message") or "issue summary entry",
+            "hint": issue.get("sample_hint") or issue.get("hint"),
+        }
+
+    endpoint_seen = False
+    fp.seek(0)
+    for raw_endpoint in ijson.items(fp, "endpoints.item"):
+        if not isinstance(raw_endpoint, dict):
+            continue
+        endpoint_seen = True
+        for record in _records_from_endpoint_payload(raw_endpoint, run_id):
+            yield record
+
+    if isinstance(summary_raw, dict):
+        yield {
+            "type": "run_end",
+            "run_id": run_id,
+            "finished_at": finished_at,
+            "stats": summary_raw,
+        }
+
+    if not endpoint_seen and not issue_seen and not isinstance(meta_raw, dict) and not isinstance(run_raw, dict) and not isinstance(summary_raw, dict):
+        raise ValueError("unsupported JSON artifact format")
+
+
+def _materialize_json_artifact(body, gzip_input: bool) -> str:
+    fd, temp_path = tempfile.mkstemp(prefix="share-sentinel-json-", suffix=".json")
+    os.close(fd)
+    try:
+        with open(temp_path, "wb") as temp_fp:
+            if gzip_input:
+                with gzip.GzipFile(fileobj=body) as gzip_reader:
+                    while True:
+                        chunk = gzip_reader.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        temp_fp.write(chunk)
+            else:
+                while True:
+                    chunk = body.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    temp_fp.write(chunk)
+        return temp_path
+    except Exception:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
 
 
 def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
@@ -697,77 +797,86 @@ def process_job(fields: dict[str, str]) -> None:
                         "errors": int(incoming.get("errors", counts["errors"])),
                     }
 
-            raw_bytes: bytes | None = None
+            def process_record_iter(records_iter) -> int:
+                nonlocal line_offset, last_line_offset, last_counts
+                current_line = 0
+                for rec in records_iter:
+                    current_line += 1
+                    if current_line <= line_offset:
+                        continue
+                    line_offset = current_line
+                    process_record(rec)
+
+                    if line_offset % PROGRESS_EVERY_LINES == 0:
+                        flush_item_batch(conn, item_batch)
+                        flush_error_batch(conn, error_batch)
+                        update_run_status(conn, run_id, "INGESTING", line_offset, counts)
+                        conn.commit()
+                        last_line_offset = line_offset
+                        last_counts = counts.copy()
+                return current_line
+
             json_records: list[dict[str, Any]] | None = None
             content_type = str(artifact_content_type or "").lower()
-            size_value = int(artifact_size or 0)
-            json_candidate = size_value <= JSON_COMPAT_MAX_BYTES and _is_json_artifact(artifact_key, content_type)
+            json_candidate = _is_json_artifact(artifact_key, content_type)
+            json_temp_path: str | None = None
 
-            if artifact_key.endswith(".gz"):
-                compressed_bytes = body.read()
+            try:
                 if json_candidate:
-                    with gzip.GzipFile(fileobj=io.BytesIO(compressed_bytes)) as gzip_reader:
-                        raw_bytes = gzip_reader.read(JSON_COMPAT_MAX_BYTES + 1)
-                    if len(raw_bytes) <= JSON_COMPAT_MAX_BYTES:
-                        json_records = _load_json_records_from_bytes(raw_bytes, run_id)
-                if json_records is None:
-                    reader = gzip.GzipFile(fileobj=io.BytesIO(compressed_bytes))
-            elif json_candidate:
-                raw_bytes = body.read(JSON_COMPAT_MAX_BYTES + 1)
-                if len(raw_bytes) <= JSON_COMPAT_MAX_BYTES:
-                    json_records = _load_json_records_from_bytes(raw_bytes, run_id)
-                if json_records is None:
-                    reader = raw_bytes.splitlines()
-            else:
-                reader = body.iter_lines()
-
-            current_line = 0
-            if json_records is not None:
-                for rec in json_records:
-                    current_line += 1
-                    if current_line <= line_offset:
-                        continue
-                    line_offset = current_line
-                    process_record(rec)
-
-                    if line_offset % PROGRESS_EVERY_LINES == 0:
-                        flush_item_batch(conn, item_batch)
-                        flush_error_batch(conn, error_batch)
-                        update_run_status(conn, run_id, "INGESTING", line_offset, counts)
-                        conn.commit()
-                        last_line_offset = line_offset
-                        last_counts = counts.copy()
-            else:
-                for raw_line in reader:
-                    current_line += 1
-                    if current_line <= line_offset:
-                        continue
-
-                    line_offset = current_line
-                    if isinstance(raw_line, bytes):
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                    else:
-                        line = str(raw_line).strip()
-                    if not line:
-                        continue
-
+                    json_temp_path = _materialize_json_artifact(body, gzip_input=artifact_key.endswith(".gz"))
                     try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        error_batch.append((run_id, "error", "JSON_DECODE_ERROR", str(exc), None, None, None))
-                        counts["errors"] += 1
-                        if len(error_batch) >= BATCH_SIZE:
-                            flush_error_batch(conn, error_batch)
-                        continue
+                        with open(json_temp_path, "rb") as json_fp:
+                            process_record_iter(_iter_records_from_streamable_json_file(json_fp, run_id))
+                    except ValueError:
+                        if os.path.getsize(json_temp_path) > JSON_COMPAT_MAX_BYTES:
+                            raise ValueError("JSON artifact exceeds non-streamable compatibility limit")
+                        with open(json_temp_path, "rb") as fallback_fp:
+                            raw_json = fallback_fp.read()
+                        json_records = _load_json_records_from_bytes(raw_json, run_id)
+                        if json_records is None:
+                            raise ValueError("unsupported JSON artifact format")
+                elif artifact_key.endswith(".gz"):
+                    reader = gzip.GzipFile(fileobj=body)
+                else:
+                    reader = body.iter_lines()
 
-                    process_record(rec)
-                    if line_offset % PROGRESS_EVERY_LINES == 0:
-                        flush_item_batch(conn, item_batch)
-                        flush_error_batch(conn, error_batch)
-                        update_run_status(conn, run_id, "INGESTING", line_offset, counts)
-                        conn.commit()
-                        last_line_offset = line_offset
-                        last_counts = counts.copy()
+                if json_records is not None:
+                    process_record_iter(json_records)
+                elif not json_candidate:
+                    current_line = 0
+                    for raw_line in reader:
+                        current_line += 1
+                        if current_line <= line_offset:
+                            continue
+
+                        line_offset = current_line
+                        if isinstance(raw_line, bytes):
+                            line = raw_line.decode("utf-8", errors="replace").strip()
+                        else:
+                            line = str(raw_line).strip()
+                        if not line:
+                            continue
+
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            error_batch.append((run_id, "error", "JSON_DECODE_ERROR", str(exc), None, None, None))
+                            counts["errors"] += 1
+                            if len(error_batch) >= BATCH_SIZE:
+                                flush_error_batch(conn, error_batch)
+                            continue
+
+                        process_record(rec)
+                        if line_offset % PROGRESS_EVERY_LINES == 0:
+                            flush_item_batch(conn, item_batch)
+                            flush_error_batch(conn, error_batch)
+                            update_run_status(conn, run_id, "INGESTING", line_offset, counts)
+                            conn.commit()
+                            last_line_offset = line_offset
+                            last_counts = counts.copy()
+            finally:
+                if json_temp_path and os.path.exists(json_temp_path):
+                    os.unlink(json_temp_path)
 
             flush_item_batch(conn, item_batch)
             flush_error_batch(conn, error_batch)

@@ -52,7 +52,7 @@ def test_upload_stream_preserves_original_error_when_abort_fails(monkeypatch) ->
     monkeypatch.setattr(runs_router, "complete_multipart_upload", lambda *_args, **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="upload failed"):
-        asyncio.run(_run_upload(_FakeUploadFile([b"abc"])))
+        asyncio.run(_run_upload(_FakeUploadFile([b'{\"type\":\"run_meta\"}'])))
 
     assert aborted == [("projects/p/runs/r/artifact.ndjson", "upload-1")]
 
@@ -71,7 +71,7 @@ def test_upload_stream_aborts_and_raises_original_error(monkeypatch) -> None:
     monkeypatch.setattr(runs_router, "complete_multipart_upload", lambda *_args, **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="upload exploded"):
-        asyncio.run(_run_upload(_FakeUploadFile([b"xyz"])))
+        asyncio.run(_run_upload(_FakeUploadFile([b'{\"type\":\"run_meta\"}'])))
 
     assert aborted == [("projects/p/runs/r/artifact.ndjson", "upload-2")]
 
@@ -80,3 +80,17 @@ def test_artifact_suffix_preserves_json_extensions() -> None:
     assert runs_router._artifact_suffix("application/json", "artifact.json") == ".json"
     assert runs_router._artifact_suffix("application/gzip", "artifact.json.gz") == ".json.gz"
     assert runs_router._artifact_suffix("application/x-ndjson", "artifact.ndjson") == ".ndjson"
+
+
+def test_validate_artifact_upload_headers_rejects_unknown_filename() -> None:
+    with pytest.raises(runs_router.HTTPException, match="unsupported artifact filename") as exc:
+        runs_router._validate_artifact_upload_headers("application/json", "artifact.exe")
+
+    assert exc.value.status_code == 415
+
+
+def test_validate_artifact_signature_rejects_invalid_gzip_magic() -> None:
+    with pytest.raises(runs_router.HTTPException, match="does not match gzip payload") as exc:
+        runs_router._validate_artifact_signature("gzip", b"not-gzip", final=True)
+
+    assert exc.value.status_code == 415
