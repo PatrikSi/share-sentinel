@@ -12,6 +12,7 @@ import { RunDetailPage } from "@/pages/run-detail-page";
 import { SettingsApiTokensPage } from "@/pages/settings-api-tokens-page";
 import { SettingsAuditLogsPage } from "@/pages/settings-audit-logs-page";
 import { SettingsIamPage } from "@/pages/settings-iam-page";
+import { SettingsIamUserPage } from "@/pages/settings-iam-user-page";
 import { SettingsLayout } from "@/pages/settings-layout";
 import { SettingsOverviewPage } from "@/pages/settings-overview-page";
 
@@ -98,6 +99,7 @@ export function App() {
               <Route index element={<Navigate to="/settings/overview" replace />} />
               <Route path="overview" element={<SettingsOverviewPage />} />
               <Route path="iam" element={<SettingsIamPage />} />
+              <Route path="iam/users/:userId" element={<SettingsIamUserPage />} />
               <Route path="users" element={<Navigate to="/settings/iam" replace />} />
               <Route path="rbac" element={<Navigate to="/settings/iam" replace />} />
               <Route path="api-tokens" element={<SettingsApiTokensPage />} />

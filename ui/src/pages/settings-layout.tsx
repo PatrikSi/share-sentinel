@@ -29,7 +29,7 @@ export function SettingsLayout() {
     return (
       <section className="workspace">
         <div className="workspace-header">
-          <h1 className="text-2xl font-bold">Setings</h1>
+          <h1 className="text-2xl font-bold">Settings</h1>
           <p className="text-sm text-slate-600 dark:text-slate-300">Loading settings…</p>
         </div>
       </section>
@@ -40,7 +40,7 @@ export function SettingsLayout() {
     return (
       <section className="workspace">
         <div className="workspace-header">
-          <h1 className="text-2xl font-bold">Setings</h1>
+          <h1 className="text-2xl font-bold">Settings</h1>
           <p className="rounded-xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{error}</p>
         </div>
       </section>
@@ -51,7 +51,7 @@ export function SettingsLayout() {
     return (
       <section className="workspace">
         <div className="workspace-header">
-          <h1 className="text-2xl font-bold">Setings</h1>
+          <h1 className="text-2xl font-bold">Settings</h1>
           <p className="text-sm text-slate-600 dark:text-slate-300">You need sysadmin access to view system settings.</p>
         </div>
       </section>
@@ -61,7 +61,7 @@ export function SettingsLayout() {
   return (
     <section className="workspace">
       <div className="workspace-header">
-        <h1 className="text-2xl font-bold">Setings</h1>
+        <h1 className="text-2xl font-bold">Settings</h1>
         <p className="text-sm text-slate-600 dark:text-slate-300">System-wide configuration, access control, and governance.</p>
         <nav className="flex flex-wrap gap-2 border-t border-[var(--app-border)] pt-3">
           {SETTINGS_TABS.map((tab) => (
