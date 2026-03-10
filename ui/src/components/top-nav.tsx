@@ -29,7 +29,7 @@ export function TopNav() {
   const navItems = [
     { to: "/projects", label: "Operations", match: "/projects" },
     { to: "/account", label: "Account", match: "/account" },
-    { to: "/settings/users", label: "Setings", match: "/settings" },
+    { to: "/settings/users", label: "Settings", match: "/settings" },
   ];
 
   return (
