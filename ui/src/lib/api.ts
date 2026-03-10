@@ -36,6 +36,15 @@ function parseResponseBody(response: Response, body: string) {
   throw new Error(`Unexpected API response type (${contentType || "unknown"}).`);
 }
 
+function contentDispositionFilename(response: Response): string | null {
+  const header = response.headers.get("content-disposition") || "";
+  const utf8Match = header.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match) return decodeURIComponent(utf8Match[1]);
+  const plainMatch = header.match(/filename="?([^\";]+)"?/i);
+  if (plainMatch) return plainMatch[1];
+  return null;
+}
+
 async function refreshAccessToken(): Promise<string | null> {
   const refreshToken = getRefreshToken();
   if (!refreshToken) return null;
@@ -99,6 +108,49 @@ export async function apiFetch(path: string, init: RequestInit = {}, allowRefres
 
   const body = await response.text();
   return parseResponseBody(response, body);
+}
+
+export async function apiFetchBlob(
+  path: string,
+  init: RequestInit = {},
+  allowRefresh = true,
+): Promise<{ blob: Blob; filename: string | null; contentType: string }> {
+  const token = getAccessToken();
+  const headers = new Headers(init.headers || {});
+  const method = (init.method || "GET").toUpperCase();
+
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  if (UNSAFE_METHODS.has(method) && !headers.has(CSRF_HEADER_NAME)) {
+    const csrfToken = getCookieValue(CSRF_COOKIE_NAME);
+    if (csrfToken) {
+      headers.set(CSRF_HEADER_NAME, csrfToken);
+    }
+  }
+
+  const response = await fetch(`${API_BASE}${path}`, { ...init, headers, credentials: "include" });
+  if (response.status === 401) {
+    if (allowRefresh) {
+      const refreshed = await refreshAccessToken();
+      if (refreshed) {
+        return apiFetchBlob(path, init, false);
+      }
+    }
+    clearTokens();
+    window.location.href = loginRedirectPath();
+    throw new Error("Unauthorized");
+  }
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(toErrorMessage(body, response.status));
+  }
+
+  return {
+    blob: await response.blob(),
+    filename: contentDispositionFilename(response),
+    contentType: response.headers.get("content-type") || "application/octet-stream",
+  };
 }
 
 function getCookieValue(name: string): string | null {

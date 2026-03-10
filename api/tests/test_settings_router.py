@@ -182,6 +182,37 @@ def test_settings_audit_lists_global_events() -> None:
     assert payload["items"][0]["metadata"]["ip"] == "127.0.0.1"
 
 
+def test_settings_audit_export_returns_csv_attachment() -> None:
+    fake_db = _FakeDb()
+    event = SimpleNamespace(
+        id=43,
+        ts=datetime.now(tz=UTC),
+        actor_user_id=uuid.uuid4(),
+        actor_token_id=None,
+        project_id=uuid.uuid4(),
+        action="RUN_CREATED",
+        object_type="scan_run",
+        object_id="run-1",
+        metadata_json={"ip": "127.0.0.1", "source": "ui"},
+    )
+    row = SimpleNamespace(AuditEvent=event, actor_email="auditor@example.com", project_name="Core")
+    fake_db.execute_queue.append(_ExecuteResult([row]))
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get("/settings/audit/export?format=csv&q=run")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "attachment; filename=" in response.headers["content-disposition"]
+    assert "RUN_CREATED" in response.text
+    assert "auditor@example.com" in response.text
+    assert '"source"' in response.text
+    assert '"ui"' in response.text
+
+
 def test_settings_rbac_upsert_and_remove_membership() -> None:
     fake_db = _FakeDb()
     project_id = uuid.uuid4()

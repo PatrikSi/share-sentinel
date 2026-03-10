@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiFetchBlob } from "@/lib/api";
 
 type AuditEventRow = {
   id: number;
@@ -33,6 +33,7 @@ export function SettingsAuditLogsPage() {
   const [nextCursor, setNextCursor] = useState<string | null>(null);
 
   const [error, setError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState<"csv" | "json" | null>(null);
 
   async function loadAuditLogs() {
     setLoading(true);
@@ -74,6 +75,28 @@ export function SettingsAuditLogsPage() {
     setCursor(nextCursor);
   }
 
+  async function exportAuditLogs(format: "csv" | "json") {
+    setError(null);
+    setExporting(format);
+    try {
+      const query = new URLSearchParams({ format, max_rows: "5000" });
+      if (search.trim()) query.set("q", search.trim());
+      const { blob, filename } = await apiFetchBlob(`/settings/audit/export?${query.toString()}`);
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename || `share-sentinel-audit.${format}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to export audit logs");
+    } finally {
+      setExporting(null);
+    }
+  }
+
   return (
     <>
       {error ? (
@@ -85,29 +108,47 @@ export function SettingsAuditLogsPage() {
       <div className="workspace-section space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-lg font-semibold">Global Audit Logs</h2>
-          <form className="flex items-center gap-2" onSubmit={onSearch}>
-            <input
-              className="rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
-              placeholder="Search action, object, actor, project"
-              value={searchDraft}
-              onChange={(event) => setSearchDraft(event.target.value)}
-            />
-            <button className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700" type="submit">
-              Search
+          <div className="flex flex-wrap items-center gap-2">
+            <form className="flex items-center gap-2" onSubmit={onSearch}>
+              <input
+                className="rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+                placeholder="Search action, object, actor, project"
+                value={searchDraft}
+                onChange={(event) => setSearchDraft(event.target.value)}
+              />
+              <button className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700" type="submit">
+                Search
+              </button>
+              <button
+                className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
+                type="button"
+                onClick={() => {
+                  setSearchDraft("");
+                  setSearch("");
+                  setCursor(null);
+                  setHistory([]);
+                }}
+              >
+                Clear
+              </button>
+            </form>
+            <button
+              className="rounded border border-slate-300 px-2 py-1 text-xs font-semibold uppercase dark:border-slate-700 disabled:opacity-50"
+              type="button"
+              onClick={() => exportAuditLogs("csv")}
+              disabled={exporting !== null}
+            >
+              {exporting === "csv" ? "Exporting CSV…" : "Export CSV"}
             </button>
             <button
-              className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
+              className="rounded border border-slate-300 px-2 py-1 text-xs font-semibold uppercase dark:border-slate-700 disabled:opacity-50"
               type="button"
-              onClick={() => {
-                setSearchDraft("");
-                setSearch("");
-                setCursor(null);
-                setHistory([]);
-              }}
+              onClick={() => exportAuditLogs("json")}
+              disabled={exporting !== null}
             >
-              Clear
+              {exporting === "json" ? "Exporting JSON…" : "Export JSON"}
             </button>
-          </form>
+          </div>
         </div>
 
         {loading ? <p className="text-sm text-slate-500">Loading audit logs…</p> : null}

@@ -1,7 +1,10 @@
+import csv
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -42,6 +45,49 @@ ROLE_ORDER = {
     ProjectRole.OPERATOR: 2,
     ProjectRole.ADMIN: 3,
 }
+
+
+def _global_audit_stmt(q: str | None):
+    stmt = (
+        select(
+            AuditEvent,
+            User.email.label("actor_email"),
+            Project.name.label("project_name"),
+        )
+        .outerjoin(User, User.id == AuditEvent.actor_user_id)
+        .outerjoin(Project, Project.id == AuditEvent.project_id)
+    )
+    if q:
+        pattern = f"%{q.strip()}%"
+        stmt = stmt.where(
+            or_(
+                AuditEvent.action.ilike(pattern),
+                AuditEvent.object_type.ilike(pattern),
+                AuditEvent.object_id.ilike(pattern),
+                User.email.ilike(pattern),
+                Project.name.ilike(pattern),
+            )
+        )
+    return stmt
+
+
+def _serialize_audit_rows(rows) -> list[dict]:
+    return [
+        AuditEventOut(
+            id=row.AuditEvent.id,
+            ts=row.AuditEvent.ts,
+            actor_user_id=row.AuditEvent.actor_user_id,
+            actor_email=row.actor_email,
+            actor_token_id=row.AuditEvent.actor_token_id,
+            project_id=row.AuditEvent.project_id,
+            project_name=row.project_name,
+            action=row.AuditEvent.action,
+            object_type=row.AuditEvent.object_type,
+            object_id=row.AuditEvent.object_id,
+            metadata=row.AuditEvent.metadata_json,
+        ).model_dump(mode="json")
+        for row in rows
+    ]
 
 
 @router.get("/projects", response_model=list[ProjectOut])
@@ -368,44 +414,9 @@ def list_global_audit(
     _ = __
     offset = parse_cursor(cursor)
 
-    stmt = (
-        select(
-            AuditEvent,
-            User.email.label("actor_email"),
-            Project.name.label("project_name"),
-        )
-        .outerjoin(User, User.id == AuditEvent.actor_user_id)
-        .outerjoin(Project, Project.id == AuditEvent.project_id)
-    )
-    if q:
-        pattern = f"%{q.strip()}%"
-        stmt = stmt.where(
-            or_(
-                AuditEvent.action.ilike(pattern),
-                AuditEvent.object_type.ilike(pattern),
-                AuditEvent.object_id.ilike(pattern),
-                User.email.ilike(pattern),
-                Project.name.ilike(pattern),
-            )
-        )
-
+    stmt = _global_audit_stmt(q)
     rows = db.execute(stmt.order_by(AuditEvent.ts.desc(), AuditEvent.id.desc()).offset(offset).limit(limit)).all()
-    items = [
-        AuditEventOut(
-            id=row.AuditEvent.id,
-            ts=row.AuditEvent.ts,
-            actor_user_id=row.AuditEvent.actor_user_id,
-            actor_email=row.actor_email,
-            actor_token_id=row.AuditEvent.actor_token_id,
-            project_id=row.AuditEvent.project_id,
-            project_name=row.project_name,
-            action=row.AuditEvent.action,
-            object_type=row.AuditEvent.object_type,
-            object_id=row.AuditEvent.object_id,
-            metadata=row.AuditEvent.metadata_json,
-        ).model_dump(mode="json")
-        for row in rows
-    ]
+    items = _serialize_audit_rows(rows)
 
     write_audit_event(
         db,
@@ -417,6 +428,82 @@ def list_global_audit(
     )
     db.commit()
     return {"items": items, "next_cursor": next_cursor(offset, limit, len(items))}
+
+
+@router.get("/audit/export")
+def export_global_audit(
+    request: Request,
+    q: str | None = Query(default=None),
+    format: str = Query(default="csv", pattern="^(csv|json)$"),
+    max_rows: int = Query(default=5000, ge=1, le=20000),
+    db: Session = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_AUDIT)),
+    __: User = Depends(require_sysadmin),
+):
+    _ = __
+    rows = db.execute(_global_audit_stmt(q).order_by(AuditEvent.ts.desc(), AuditEvent.id.desc()).limit(max_rows)).all()
+    items = _serialize_audit_rows(rows)
+
+    write_audit_event(
+        db,
+        action="SETTINGS_AUDIT_EXPORTED",
+        object_type="system",
+        object_id="audit",
+        actor_user_id=auth.user_id,
+        metadata={**request_meta(request), "q": q, "format": format, "max_rows": max_rows, "exported_count": len(items)},
+    )
+    db.commit()
+
+    timestamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+    if format == "json":
+        filename = f"share-sentinel-audit-{timestamp}.json"
+        return Response(
+            content=json.dumps(items, ensure_ascii=True, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "id",
+            "ts",
+            "action",
+            "object_type",
+            "object_id",
+            "actor_email",
+            "actor_user_id",
+            "actor_token_id",
+            "project_name",
+            "project_id",
+            "metadata",
+        ],
+    )
+    writer.writeheader()
+    for item in items:
+        writer.writerow(
+            {
+                "id": item["id"],
+                "ts": item["ts"],
+                "action": item["action"],
+                "object_type": item["object_type"],
+                "object_id": item["object_id"],
+                "actor_email": item["actor_email"] or "",
+                "actor_user_id": item["actor_user_id"] or "",
+                "actor_token_id": item["actor_token_id"] or "",
+                "project_name": item["project_name"] or "",
+                "project_id": item["project_id"] or "",
+                "metadata": json.dumps(item["metadata"] or {}, ensure_ascii=True, sort_keys=True),
+            }
+        )
+    filename = f"share-sentinel-audit-{timestamp}.csv"
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/rbac/project-memberships", response_model=dict)
