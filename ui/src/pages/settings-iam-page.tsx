@@ -407,10 +407,24 @@ export function SettingsIamPage() {
           </form>
         </section>
 
-        <section className="workspace-card">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <h2 className="text-lg font-semibold">Identity and Access Matrix</h2>
-            <div className="text-xs text-slate-500">Single-table IAM view for identity state and project assignments.</div>
+        <section className="workspace-card space-y-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-semibold">Access Administration</h2>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+                Review identity state, current project access, and baseline assignment actions from one responsive view.
+              </p>
+            </div>
+            <div className="grid min-w-[220px] gap-2 text-xs text-slate-500 sm:grid-cols-2">
+              <div className="rounded-lg border border-slate-300 p-2 dark:border-slate-700">
+                <p className="font-semibold text-slate-700 dark:text-slate-200">Current access</p>
+                <p className="mt-1">Inspect per-project roles and adjust them inline.</p>
+              </div>
+              <div className="rounded-lg border border-slate-300 p-2 dark:border-slate-700">
+                <p className="font-semibold text-slate-700 dark:text-slate-200">Grant access</p>
+                <p className="mt-1">Add one project or apply a baseline role across all projects.</p>
+              </div>
+            </div>
           </div>
 
           <div className="mt-3 grid gap-2 md:grid-cols-5">
@@ -461,262 +475,303 @@ export function SettingsIamPage() {
             </select>
           </div>
 
-          {usersLoading || membershipsLoading ? <p className="mt-3 text-sm text-slate-500">Loading IAM matrix…</p> : null}
-          <div className="mt-3 overflow-auto">
-            <table className="data-table min-w-[1450px]">
-              <thead>
-                <tr>
-                  <th>Identity</th>
-                  <th>System Role</th>
-                  <th>Status</th>
-                  <th>Project Assignments</th>
-                  <th>Assignment Actions</th>
-                  <th>Identity Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visibleUsers.length === 0 ? (
-                  <tr>
-                    <td className="text-sm text-slate-500" colSpan={6}>
-                      No identities found.
-                    </td>
-                  </tr>
-                ) : (
-                  visibleUsers.map((user) => {
-                    const assigned = membershipsByUserId.get(user.id) || [];
-                    const available = availableProjectsForUser(user.id);
-                    const addProjectId = rowProjectDraft[user.id] || (available[0]?.id ?? "");
-                    const addRole = rowRoleDraft[user.id] || "viewer";
-                    const allRole = rowAllProjectsRoleDraft[user.id] || "viewer";
-                    const allOverwrite = !!rowAllProjectsOverwrite[user.id];
-                    return (
-                      <tr key={user.id}>
-                        <td>
-                          <div className="font-semibold">{user.email}</div>
-                          <div className="text-xs text-slate-500">Created: {new Date(user.created_at).toLocaleString()}</div>
-                        </td>
-                        <td>
-                          <span
-                            className={`rounded px-2 py-1 text-xs font-semibold uppercase tracking-wide ${
-                              user.is_sysadmin
-                                ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-200"
-                                : "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200"
-                            }`}
-                          >
-                            {user.is_sysadmin ? "System Admin" : "Standard User"}
-                          </span>
-                        </td>
-                        <td className="text-xs">
-                          <div>{user.is_active ? "active" : "disabled"}</div>
-                          <div>{user.is_approved ? "approved" : "pending approval"}</div>
-                          {user.id === me.id ? <div className="mt-1 text-amber-700">self-protection enabled</div> : null}
-                        </td>
-                        <td>
-                          <div className="max-w-[420px] space-y-2 text-xs">
-                            {assigned.length === 0 ? <p className="text-slate-500">No project assignments.</p> : null}
-                            {assigned.map((membership) => {
-                              const key = assignmentKey(membership);
-                              const draftRole = membershipRoleDraft[key] || membership.role;
-                              const changed = draftRole !== membership.role;
-                              return (
-                                <div className="rounded border border-slate-200 p-2 dark:border-slate-700" key={key}>
-                                  <div className="mb-2 flex items-center justify-between gap-2">
-                                    <span className="font-semibold">{membership.project_name}</span>
-                                    <span className={`rounded px-2 py-1 text-[10px] font-semibold uppercase tracking-wide ${rolePillClass(membership.role)}`}>
-                                      {membership.role}
-                                    </span>
-                                  </div>
-                                  <div className="flex flex-wrap items-center gap-2">
-                                    <select
-                                      className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
-                                      value={draftRole}
-                                      onChange={(event) =>
-                                        setMembershipRoleDraft((prev) => ({ ...prev, [key]: event.target.value }))
-                                      }
-                                    >
-                                      {PROJECT_ROLES.map((role) => (
-                                        <option key={role} value={role}>
-                                          {role}
-                                        </option>
-                                      ))}
-                                    </select>
-                                    <button
-                                      className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 disabled:opacity-50"
-                                      disabled={!changed}
-                                      onClick={() =>
-                                        upsertMembership(
-                                          membership.user_id,
-                                          membership.project_id,
-                                          draftRole,
-                                          `Updated ${membership.project_name} assignment for ${membership.user_email}.`,
-                                        )
-                                      }
-                                      type="button"
-                                    >
-                                      Update
-                                    </button>
-                                    <button
-                                      className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
-                                      onClick={() => removeMembership(membership)}
-                                      type="button"
-                                    >
-                                      Remove
-                                    </button>
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-500 dark:border-slate-700">
+            <span>{visibleUsers.length} identities in view</span>
+            <span>Assignments load separately so access changes stay responsive.</span>
+          </div>
+
+          {usersLoading || membershipsLoading ? <p className="text-sm text-slate-500">Loading IAM matrix…</p> : null}
+
+          <div className="space-y-4">
+            {visibleUsers.length === 0 ? <p className="text-sm text-slate-500">No identities found.</p> : null}
+            {visibleUsers.map((user) => {
+              const assigned = membershipsByUserId.get(user.id) || [];
+              const available = availableProjectsForUser(user.id);
+              const addProjectId = rowProjectDraft[user.id] || (available[0]?.id ?? "");
+              const addRole = rowRoleDraft[user.id] || "viewer";
+              const allRole = rowAllProjectsRoleDraft[user.id] || "viewer";
+              const allOverwrite = !!rowAllProjectsOverwrite[user.id];
+
+              return (
+                <article className="rounded-xl border border-slate-300 p-4 dark:border-slate-700" key={user.id}>
+                  <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 pb-3 dark:border-slate-800">
+                    <div className="space-y-2">
+                      <div>
+                        <h3 className="text-base font-semibold">{user.email}</h3>
+                        <p className="text-xs text-slate-500">Created {new Date(user.created_at).toLocaleString()}</p>
+                      </div>
+                      <div className="flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-wide">
+                        <span
+                          className={`rounded-full px-2 py-1 ${
+                            user.is_sysadmin
+                              ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-200"
+                              : "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200"
+                          }`}
+                        >
+                          {user.is_sysadmin ? "System Admin" : "Standard User"}
+                        </span>
+                        <span
+                          className={`rounded-full px-2 py-1 ${
+                            user.is_active
+                              ? "bg-sky-100 text-sky-800 dark:bg-sky-900/30 dark:text-sky-200"
+                              : "bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-200"
+                          }`}
+                        >
+                          {user.is_active ? "Active" : "Disabled"}
+                        </span>
+                        <span
+                          className={`rounded-full px-2 py-1 ${
+                            user.is_approved
+                              ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-200"
+                              : "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200"
+                          }`}
+                        >
+                          {user.is_approved ? "Approved" : "Pending Approval"}
+                        </span>
+                        {user.id === me.id ? <span className="rounded-full bg-amber-100 px-2 py-1 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200">Self-protection</span> : null}
+                      </div>
+                    </div>
+
+                    <div className="grid gap-2 text-xs text-slate-500 sm:grid-cols-3">
+                      <div className="rounded-lg border border-slate-300 px-3 py-2 dark:border-slate-700">
+                        <div className="text-[10px] uppercase tracking-wide">Projects</div>
+                        <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-slate-100">{assigned.length}</div>
+                      </div>
+                      <div className="rounded-lg border border-slate-300 px-3 py-2 dark:border-slate-700">
+                        <div className="text-[10px] uppercase tracking-wide">Available Grants</div>
+                        <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-slate-100">{available.length}</div>
+                      </div>
+                      <div className="rounded-lg border border-slate-300 px-3 py-2 dark:border-slate-700">
+                        <div className="text-[10px] uppercase tracking-wide">Bulk Baseline</div>
+                        <div className="mt-1 text-sm font-semibold capitalize text-slate-900 dark:text-slate-100">{allRole}</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)_minmax(0,0.9fr)]">
+                    <section className="space-y-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <h4 className="text-sm font-semibold">Current Project Access</h4>
+                          <p className="text-xs text-slate-500">Adjust roles or remove access one project at a time.</p>
+                        </div>
+                      </div>
+
+                      {assigned.length === 0 ? (
+                        <div className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-sm text-slate-500 dark:border-slate-700">
+                          No project assignments yet.
+                        </div>
+                      ) : null}
+
+                      <div className="space-y-2">
+                        {assigned.map((membership) => {
+                          const key = assignmentKey(membership);
+                          const draftRole = membershipRoleDraft[key] || membership.role;
+                          const changed = draftRole !== membership.role;
+                          return (
+                            <div className="rounded-lg border border-slate-300 p-3 dark:border-slate-700" key={key}>
+                              <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_180px_auto] md:items-center">
+                                <div>
+                                  <div className="font-semibold">{membership.project_name}</div>
+                                  <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-wide text-slate-500">
+                                    <span className={`rounded-full px-2 py-1 ${rolePillClass(membership.role)}`}>{membership.role}</span>
+                                    <span>{membership.user_email}</span>
                                   </div>
                                 </div>
-                              );
-                            })}
-                          </div>
-                        </td>
-                        <td>
-                          <div className="max-w-[280px] space-y-3 text-xs">
-                            <div className="rounded border border-slate-200 p-2 dark:border-slate-700">
-                              <p className="mb-1 font-semibold">Add project assignment</p>
-                              <div className="space-y-1">
-                                <select
-                                  className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
-                                  value={addProjectId}
-                                  onChange={(event) =>
-                                    setRowProjectDraft((prev) => ({ ...prev, [user.id]: event.target.value }))
-                                  }
-                                  disabled={available.length === 0}
-                                >
-                                  {available.length === 0 ? <option value="">No unassigned projects</option> : null}
-                                  {available.map((project) => (
-                                    <option key={project.id} value={project.id}>
-                                      {project.name}
-                                    </option>
-                                  ))}
-                                </select>
-                                <select
-                                  className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
-                                  value={addRole}
-                                  onChange={(event) =>
-                                    setRowRoleDraft((prev) => ({ ...prev, [user.id]: event.target.value }))
-                                  }
-                                >
-                                  {PROJECT_ROLES.map((role) => (
-                                    <option key={role} value={role}>
-                                      {role}
-                                    </option>
-                                  ))}
-                                </select>
-                                <button
-                                  className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 disabled:opacity-50"
-                                  disabled={!addProjectId}
-                                  onClick={() =>
-                                    upsertMembership(
-                                      user.id,
-                                      addProjectId,
-                                      addRole,
-                                      `Added ${user.email} to selected project.`,
-                                    )
-                                  }
-                                  type="button"
-                                >
-                                  Add assignment
-                                </button>
-                              </div>
-                            </div>
-
-                            <div className="rounded border border-slate-200 p-2 dark:border-slate-700">
-                              <p className="mb-1 font-semibold">Apply all-project baseline</p>
-                              <div className="space-y-1">
-                                <select
-                                  className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
-                                  value={allRole}
-                                  onChange={(event) =>
-                                    setRowAllProjectsRoleDraft((prev) => ({ ...prev, [user.id]: event.target.value }))
-                                  }
-                                >
-                                  {PROJECT_ROLES.map((role) => (
-                                    <option key={role} value={role}>
-                                      {role}
-                                    </option>
-                                  ))}
-                                </select>
-                                <label className="flex items-center gap-1">
-                                  <input
-                                    checked={allOverwrite}
-                                    onChange={(event) =>
-                                      setRowAllProjectsOverwrite((prev) => ({ ...prev, [user.id]: event.target.checked }))
-                                    }
-                                    type="checkbox"
-                                  />
-                                  Overwrite existing assignments
+                                <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                  Role
+                                  <select
+                                    className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                                    value={draftRole}
+                                    onChange={(event) => setMembershipRoleDraft((prev) => ({ ...prev, [key]: event.target.value }))}
+                                  >
+                                    {PROJECT_ROLES.map((role) => (
+                                      <option key={role} value={role}>
+                                        {role}
+                                      </option>
+                                    ))}
+                                  </select>
                                 </label>
-                                <button
-                                  className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
-                                  onClick={() => assignAllProjectsForUser(user)}
-                                  type="button"
-                                >
-                                  Apply all projects
-                                </button>
+                                <div className="flex flex-wrap gap-2">
+                                  <button
+                                    className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700 disabled:opacity-50"
+                                    disabled={!changed}
+                                    onClick={() =>
+                                      upsertMembership(
+                                        membership.user_id,
+                                        membership.project_id,
+                                        draftRole,
+                                        `Updated ${membership.project_name} assignment for ${membership.user_email}.`,
+                                      )
+                                    }
+                                    type="button"
+                                  >
+                                    Save role
+                                  </button>
+                                  <button
+                                    className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700"
+                                    onClick={() => removeMembership(membership)}
+                                    type="button"
+                                  >
+                                    Remove access
+                                  </button>
+                                </div>
                               </div>
                             </div>
-                          </div>
-                        </td>
-                        <td>
-                          <div className="max-w-[210px] space-y-1 text-xs">
-                            <button
-                              className="w-full rounded border border-slate-300 px-2 py-1 dark:border-slate-700 disabled:opacity-50"
-                              disabled={user.id === me.id}
-                              onClick={() =>
-                                patchUser(
-                                  user.id,
-                                  { is_active: !user.is_active },
-                                  user.is_active ? `Disabled ${user.email}.` : `Enabled ${user.email}.`,
-                                )
-                              }
-                              type="button"
+                          );
+                        })}
+                      </div>
+                    </section>
+
+                    <section className="space-y-3">
+                      <div>
+                        <h4 className="text-sm font-semibold">Grant Access</h4>
+                        <p className="text-xs text-slate-500">Add one project directly or apply a baseline role everywhere.</p>
+                      </div>
+
+                      <div className="rounded-lg border border-slate-300 p-3 dark:border-slate-700">
+                        <p className="text-sm font-semibold">Grant one project</p>
+                        <p className="mt-1 text-xs text-slate-500">Choose an unassigned project and the role to grant.</p>
+                        <div className="mt-3 space-y-3">
+                          <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                            Project
+                            <select
+                              className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                              value={addProjectId}
+                              onChange={(event) => setRowProjectDraft((prev) => ({ ...prev, [user.id]: event.target.value }))}
+                              disabled={available.length === 0}
                             >
-                              {user.is_active ? "Disable" : "Enable"}
-                            </button>
-                            <button
-                              className="w-full rounded border border-slate-300 px-2 py-1 dark:border-slate-700 disabled:opacity-50"
-                              disabled={user.id === me.id}
-                              onClick={() =>
-                                patchUser(
-                                  user.id,
-                                  { is_approved: !user.is_approved },
-                                  user.is_approved ? `Unapproved ${user.email}.` : `Approved ${user.email}.`,
-                                )
-                              }
-                              type="button"
+                              {available.length === 0 ? <option value="">No unassigned projects</option> : null}
+                              {available.map((project) => (
+                                <option key={project.id} value={project.id}>
+                                  {project.name}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                            Role
+                            <select
+                              className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                              value={addRole}
+                              onChange={(event) => setRowRoleDraft((prev) => ({ ...prev, [user.id]: event.target.value }))}
                             >
-                              {user.is_approved ? "Unapprove" : "Approve"}
-                            </button>
-                            <button
-                              className="w-full rounded border border-slate-300 px-2 py-1 dark:border-slate-700 disabled:opacity-50"
-                              disabled={user.id === me.id}
-                              onClick={() =>
-                                patchUser(
-                                  user.id,
-                                  { is_sysadmin: !user.is_sysadmin },
-                                  user.is_sysadmin
-                                    ? `Removed System Admin from ${user.email}.`
-                                    : `Granted System Admin to ${user.email}.`,
-                                )
-                              }
-                              type="button"
+                              {PROJECT_ROLES.map((role) => (
+                                <option key={role} value={role}>
+                                  {role}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <button
+                            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700 disabled:opacity-50"
+                            disabled={!addProjectId}
+                            onClick={() => upsertMembership(user.id, addProjectId, addRole, `Added ${user.email} to selected project.`)}
+                            type="button"
+                          >
+                            Grant project access
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-slate-300 p-3 dark:border-slate-700">
+                        <p className="text-sm font-semibold">Apply baseline to all projects</p>
+                        <p className="mt-1 text-xs text-slate-500">Use this for broad viewer/operator/admin access defaults across the project catalog.</p>
+                        <div className="mt-3 space-y-3">
+                          <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                            Baseline role
+                            <select
+                              className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                              value={allRole}
+                              onChange={(event) => setRowAllProjectsRoleDraft((prev) => ({ ...prev, [user.id]: event.target.value }))}
                             >
-                              {user.is_sysadmin ? "Demote" : "Promote"}
-                            </button>
-                            <button
-                              className="w-full rounded border border-slate-300 px-2 py-1 dark:border-slate-700"
-                              onClick={() => resetPassword(user)}
-                              type="button"
-                            >
-                              Reset Password
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-            </table>
+                              {PROJECT_ROLES.map((role) => (
+                                <option key={role} value={role}>
+                                  {role}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="flex items-center gap-2 text-sm">
+                            <input
+                              checked={allOverwrite}
+                              onChange={(event) => setRowAllProjectsOverwrite((prev) => ({ ...prev, [user.id]: event.target.checked }))}
+                              type="checkbox"
+                            />
+                            Replace existing project roles with the selected baseline
+                          </label>
+                          <button
+                            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700"
+                            onClick={() => assignAllProjectsForUser(user)}
+                            type="button"
+                          >
+                            Apply baseline
+                          </button>
+                        </div>
+                      </div>
+                    </section>
+
+                    <section className="space-y-3">
+                      <div>
+                        <h4 className="text-sm font-semibold">Identity Controls</h4>
+                        <p className="text-xs text-slate-500">Handle lifecycle changes that affect all access.</p>
+                      </div>
+                      <div className="space-y-2 rounded-lg border border-slate-300 p-3 dark:border-slate-700">
+                        <button
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700 disabled:opacity-50"
+                          disabled={user.id === me.id}
+                          onClick={() =>
+                            patchUser(
+                              user.id,
+                              { is_active: !user.is_active },
+                              user.is_active ? `Disabled ${user.email}.` : `Enabled ${user.email}.`,
+                            )
+                          }
+                          type="button"
+                        >
+                          {user.is_active ? "Disable identity" : "Enable identity"}
+                        </button>
+                        <button
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700 disabled:opacity-50"
+                          disabled={user.id === me.id}
+                          onClick={() =>
+                            patchUser(
+                              user.id,
+                              { is_approved: !user.is_approved },
+                              user.is_approved ? `Unapproved ${user.email}.` : `Approved ${user.email}.`,
+                            )
+                          }
+                          type="button"
+                        >
+                          {user.is_approved ? "Revoke approval" : "Approve identity"}
+                        </button>
+                        <button
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700 disabled:opacity-50"
+                          disabled={user.id === me.id}
+                          onClick={() =>
+                            patchUser(
+                              user.id,
+                              { is_sysadmin: !user.is_sysadmin },
+                              user.is_sysadmin ? `Removed System Admin from ${user.email}.` : `Granted System Admin to ${user.email}.`,
+                            )
+                          }
+                          type="button"
+                        >
+                          {user.is_sysadmin ? "Remove system admin" : "Grant system admin"}
+                        </button>
+                        <button
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700"
+                          onClick={() => resetPassword(user)}
+                          type="button"
+                        >
+                          Reset password
+                        </button>
+                      </div>
+                    </section>
+                  </div>
+                </article>
+              );
+            })}
           </div>
         </section>
       </div>
