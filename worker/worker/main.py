@@ -262,6 +262,15 @@ def _resource_type_from_share_type(share_type: str) -> str:
     return SHARE_TYPE_TO_RESOURCE_TYPE.get(share_type, "smb_share")
 
 
+def _bind_record_to_ingest_run(rec: dict[str, Any], run_id: str) -> dict[str, Any]:
+    record_run_id = rec.get("run_id")
+    if record_run_id is None or str(record_run_id) != run_id:
+        normalized = dict(rec)
+        normalized["run_id"] = run_id
+        return normalized
+    return rec
+
+
 def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
     rec_type = rec.get("type")
     if rec_type not in {"run_meta", "endpoint", "resource", "item", "error", "run_end"}:
@@ -525,6 +534,7 @@ def process_job(fields: dict[str, str]) -> None:
             body = obj["Body"]
             def process_record(rec: dict[str, Any]) -> None:
                 nonlocal counts
+                rec = _bind_record_to_ingest_run(rec, run_id)
 
                 valid, reason = validate_record(rec)
                 if not valid:
@@ -545,9 +555,6 @@ def process_job(fields: dict[str, str]) -> None:
                     return
 
                 rec_type = rec.get("type")
-                rec_run_id = rec.get("run_id")
-                if rec_run_id and str(rec_run_id) != run_id:
-                    return
 
                 if rec_type == "endpoint":
                     endpoint_id = upsert_endpoint(conn, run_id, rec)

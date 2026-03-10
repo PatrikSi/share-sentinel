@@ -112,6 +112,21 @@ def test_validate_record_normalizes_share_type_and_resource_type() -> None:
     assert item_record["resource_type"] == "nfs_share"
 
 
+def test_bind_record_to_ingest_run_overrides_mismatched_run_id() -> None:
+    original = {"type": "endpoint", "run_id": "old-run", "endpoint_key": "host:445"}
+    rebound = main._bind_record_to_ingest_run(original, "new-run")
+
+    assert rebound["run_id"] == "new-run"
+    assert original["run_id"] == "old-run"
+
+
+def test_bind_record_to_ingest_run_keeps_matching_record_identity() -> None:
+    record = {"type": "endpoint", "run_id": "run-1", "endpoint_key": "host:445"}
+    same = main._bind_record_to_ingest_run(record, "run-1")
+
+    assert same is record
+
+
 def test_records_from_nested_json_preserves_share_type() -> None:
     run_id = str(uuid.uuid4())
     records = main.records_from_json_document(
