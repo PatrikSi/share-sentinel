@@ -48,6 +48,12 @@ def test_read_int_env_uses_default_for_invalid_values(monkeypatch) -> None:
     assert main._read_int_env("TEST_WORKER_INT", default=9, min_value=1) == 9
 
 
+def test_is_json_artifact_supports_json_and_json_gz() -> None:
+    assert main._is_json_artifact("artifact.json", "application/json") is True
+    assert main._is_json_artifact("artifact.json.gz", "application/gzip") is True
+    assert main._is_json_artifact("artifact.ndjson", "application/x-ndjson") is False
+
+
 def test_parse_offset_returns_zero_for_non_numeric_values() -> None:
     assert main.parse_offset({"line_offset": "12"}) == 12
     assert main.parse_offset({"line_offset": -7}) == 0
@@ -154,3 +160,63 @@ def test_records_from_nested_json_preserves_share_type() -> None:
     assert resource["resource_type"] == "nfs_share"
     assert item["share_type"] == "nfs"
     assert item["resource_type"] == "nfs_share"
+
+
+def test_records_from_compact_json_includes_run_meta_issue_summary_and_run_end() -> None:
+    run_id = str(uuid.uuid4())
+    records = main.records_from_json_document(
+        {
+            "schema_version": 1,
+            "meta": {
+                "tool": "share-sentinel-collector",
+                "tool_version": "0.2.0",
+                "run_id": run_id,
+                "started_at": "2026-03-10T10:00:00Z",
+                "finished_at": "2026-03-10T10:05:00Z",
+                "auth": {"method": "anonymous"},
+            },
+            "collection": {
+                "command": "share_sentinel_collector.py",
+                "arguments": ["--cidr", "10.0.0.0/24"],
+            },
+            "summary": {
+                "endpoints": 1,
+                "resources": 1,
+                "items": 1,
+                "errors": 3,
+            },
+            "issue_summary": [
+                {
+                    "severity": "warn",
+                    "code": "LIST_SHARES_DENIED",
+                    "count": 3,
+                    "sample_message": "share enumeration denied",
+                    "sample_hint": "use include-share",
+                }
+            ],
+            "endpoints": [
+                {
+                    "endpoint_key": "host:445",
+                    "ip": "10.0.0.5",
+                    "auth": {"method": "anonymous", "success": True},
+                    "shares": [
+                        {
+                            "name": "Public",
+                            "share_type": "smb",
+                            "entries": [{"name": "report.txt", "is_dir": False}],
+                        }
+                    ],
+                }
+            ],
+        },
+        run_id,
+    )
+
+    run_meta = next(record for record in records if record.get("type") == "run_meta")
+    error = next(record for record in records if record.get("type") == "error")
+    run_end = next(record for record in records if record.get("type") == "run_end")
+
+    assert run_meta["tool_version"] == "0.2.0"
+    assert run_meta["collection"]["command"] == "share_sentinel_collector.py"
+    assert error["code"] == "LIST_SHARES_DENIED"
+    assert run_end["stats"]["errors"] == 3

@@ -1,6 +1,6 @@
 # Collector
 
-One-off SMB collector that writes NDJSON or NDJSON.GZ and can upload artifacts to Share Sentinel.
+One-off collector that writes compact JSON or JSON.GZ artifacts and can upload them to Share Sentinel.
 
 ## Example
 
@@ -13,7 +13,7 @@ python share_sentinel_collector.py \
   --workers 200 \
   --timeout 3 \
   --max-depth 1 \
-  --output out.ndjson.gz \
+  --output out.json.gz \
   --gzip
 ```
 
@@ -25,7 +25,7 @@ python share_sentinel_collector.py \
   --domain CONTOSO \
   --username alice \
   --password '***' \
-  --output out.ndjson.gz --gzip \
+  --output out.json.gz --gzip \
   --upload \
   --api-base https://api.example.com \
   --project-id <project-uuid> \

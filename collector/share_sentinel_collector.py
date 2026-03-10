@@ -40,6 +40,10 @@ except ImportError:
         """Fallback error type used when impacket is unavailable."""
 
 
+TOOL_VERSION = "0.2.0"
+SENSITIVE_ARGUMENT_FLAGS = {"--password", "--hashes", "--api-token"}
+
+
 @dataclass
 class Stats:
     endpoints: int = 0
@@ -56,78 +60,287 @@ class NDJSONWriter:
         self._path = path
         self._gzip = bool(gzip_output and path is not None)
         self._closed = False
-        fd, buffer_path = tempfile.mkstemp(prefix="share-sentinel-buffer-", suffix=".ndjson")
-        os.close(fd)
-        self._buffer_path = buffer_path
-        self._fp = open(self._buffer_path, "w", encoding="utf-8")
+        self._buffer_dir = tempfile.mkdtemp(prefix="share-sentinel-buffer-")
+        self._endpoint_paths: dict[str, str] = {}
+        self._run_meta: dict[str, object] | None = None
+        self._run_end: dict[str, object] | None = None
+        self._issues: dict[str, dict[str, object]] = {}
 
     def emit(self, record: dict) -> None:
-        line = json.dumps(record, ensure_ascii=True)
         with self._lock:
             if self._closed:
                 return
-            self._fp.write(line + "\n")
+            rec_type = str(record.get("type") or "")
+            if rec_type == "run_meta":
+                self._run_meta = dict(record)
+                return
+            if rec_type == "run_end":
+                self._run_end = dict(record)
+                return
+            if rec_type == "error":
+                self._record_issue(record)
+                return
+            if rec_type not in {"endpoint", "resource", "item"}:
+                return
+
+            endpoint_key = str(record.get("endpoint_key") or "").strip()
+            if not endpoint_key:
+                return
+
+            endpoint_path = self._endpoint_paths.get(endpoint_key)
+            if endpoint_path is None:
+                endpoint_path = os.path.join(self._buffer_dir, f"{uuid.uuid4().hex}.jsonl")
+                self._endpoint_paths[endpoint_key] = endpoint_path
+            with open(endpoint_path, "a", encoding="utf-8") as endpoint_fp:
+                endpoint_fp.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n")
 
     def close(self, keep_output: bool = True) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            self._fp.close()
 
         try:
             if not keep_output:
                 return
             if self._path is None:
-                with open(self._buffer_path, "r", encoding="utf-8") as buffer_fp:
-                    shutil.copyfileobj(buffer_fp, sys.stdout)
+                self._write_document(sys.stdout)
                 sys.stdout.flush()
                 return
             if self._gzip:
-                with open(self._buffer_path, "rb") as source_fp:
-                    with gzip.open(self._path, "wb") as target_fp:
-                        shutil.copyfileobj(source_fp, target_fp)
+                with gzip.open(self._path, "wt", encoding="utf-8") as target_fp:
+                    self._write_document(target_fp)
                 return
-            os.replace(self._buffer_path, self._path)
-            self._buffer_path = ""
+            with open(self._path, "w", encoding="utf-8") as target_fp:
+                self._write_document(target_fp)
         finally:
-            if self._buffer_path and os.path.exists(self._buffer_path):
-                os.unlink(self._buffer_path)
+            shutil.rmtree(self._buffer_dir, ignore_errors=True)
+
+    def _record_issue(self, record: dict[str, object]) -> None:
+        code = str(record.get("code") or "UNKNOWN")
+        severity = str(record.get("severity") or "error")
+        key = f"{severity}:{code}"
+        issue = self._issues.setdefault(
+            key,
+            {
+                "severity": severity,
+                "code": code,
+                "count": 0,
+                "sample_message": str(record.get("message") or ""),
+                "sample_hint": str(record.get("hint") or "") or None,
+            },
+        )
+        issue["count"] = int(issue.get("count", 0)) + 1
+        if not issue.get("sample_message") and record.get("message"):
+            issue["sample_message"] = str(record.get("message"))
+        if not issue.get("sample_hint") and record.get("hint"):
+            issue["sample_hint"] = str(record.get("hint"))
+
+    def _build_endpoint_document(self, endpoint_path: str) -> dict[str, object] | None:
+        endpoint: dict[str, object] | None = None
+        share_states: dict[tuple[str, str], dict[str, object]] = {}
+        share_order: list[tuple[str, str]] = []
+
+        with open(endpoint_path, "r", encoding="utf-8") as endpoint_fp:
+            for raw_line in endpoint_fp:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                rec_type = str(record.get("type") or "")
+                if rec_type == "endpoint":
+                    endpoint = {
+                        "endpoint_key": record.get("endpoint_key"),
+                        "ip": record.get("ip"),
+                        "hostname": record.get("hostname"),
+                        "domain": record.get("domain"),
+                    }
+                    if isinstance(record.get("auth"), dict):
+                        endpoint["auth"] = record["auth"]
+                    if isinstance(record.get("smb"), dict):
+                        endpoint["smb"] = record["smb"]
+                    if isinstance(record.get("nfs"), dict):
+                        endpoint["nfs"] = record["nfs"]
+                    continue
+
+                if rec_type == "resource":
+                    share_name = str(record.get("name") or "").strip()
+                    if not share_name:
+                        continue
+                    share_type = str(record.get("share_type") or "smb")
+                    share_key = (share_name, share_type)
+                    if share_key not in share_states:
+                        share_doc = {
+                            "name": share_name,
+                            "share_type": share_type,
+                            "resource_type": record.get("resource_type"),
+                            "remark": record.get("remark"),
+                            "access_level": record.get("access_level", "no_access"),
+                            "entries": [],
+                        }
+                        share_states[share_key] = {
+                            "doc": share_doc,
+                            "index": {},
+                        }
+                        share_order.append(share_key)
+                    continue
+
+                if rec_type == "item":
+                    share_name = str(record.get("resource_name") or "").strip()
+                    if not share_name:
+                        continue
+                    share_type = str(record.get("share_type") or "smb")
+                    share_key = (share_name, share_type)
+                    share_state = share_states.get(share_key)
+                    if share_state is None:
+                        share_doc = {
+                            "name": share_name,
+                            "share_type": share_type,
+                            "resource_type": record.get("resource_type"),
+                            "remark": None,
+                            "access_level": "no_access",
+                            "entries": [],
+                        }
+                        share_state = {
+                            "doc": share_doc,
+                            "index": {},
+                        }
+                        share_states[share_key] = share_state
+                        share_order.append(share_key)
+                    self._insert_item(share_state, record)
+
+        if endpoint is None or not share_order:
+            return None
+
+        endpoint["shares"] = [share_states[key]["doc"] for key in share_order]
+        return endpoint
+
+    @staticmethod
+    def _insert_item(share_state: dict[str, object], record: dict[str, object]) -> None:
+        share_doc = share_state["doc"]
+        index = share_state["index"]
+        full_path = str(record.get("path") or "\\").replace("/", "\\").strip() or "\\"
+        if not full_path.startswith("\\"):
+            full_path = f"\\{full_path}"
+        leaf_name = str(record.get("name") or "").strip()
+        if not leaf_name:
+            return
+
+        parts = [part for part in full_path.split("\\") if part]
+        parent_children = share_doc["entries"]
+        parent_path = "\\"
+
+        for offset, part in enumerate(parts):
+            is_last = offset == len(parts) - 1
+            current_path = parent_path if parent_path == "\\" else parent_path.rstrip("\\")
+            candidate_full_path = f"{current_path}\\{part}" if current_path != "\\" else f"\\{part}"
+            node = index.get(candidate_full_path)
+            if node is None:
+                node = {
+                    "path": parent_path,
+                    "name": part,
+                    "is_dir": (not is_last) or bool(record.get("is_dir", False)),
+                }
+                if node["is_dir"]:
+                    node["children"] = []
+                parent_children.append(node)
+                index[candidate_full_path] = node
+
+            if not is_last:
+                if not node.get("is_dir"):
+                    node["is_dir"] = True
+                    node["children"] = []
+                parent_children = node.setdefault("children", [])
+                parent_path = candidate_full_path
+                continue
+
+            if part == leaf_name:
+                node["path"] = parent_path
+                node["name"] = leaf_name
+                node["is_dir"] = bool(record.get("is_dir", False))
+                if node["is_dir"]:
+                    node.setdefault("children", [])
+                else:
+                    node.pop("children", None)
+
+    def _write_document(self, target_fp) -> None:
+        run_meta = dict(self._run_meta or {})
+        run_end = dict(self._run_end or {})
+        summary = dict((run_end.get("stats") or {})) if isinstance(run_end.get("stats"), dict) else {}
+        collection = dict(run_meta.get("collection") or {}) if isinstance(run_meta.get("collection"), dict) else {}
+        meta = {
+            "tool": run_meta.get("tool"),
+            "tool_version": run_meta.get("tool_version"),
+            "run_id": run_meta.get("run_id"),
+            "started_at": run_meta.get("started_at"),
+            "finished_at": run_end.get("finished_at"),
+            "operator_label": run_meta.get("operator_label"),
+            "auth": run_meta.get("auth"),
+        }
+        target_fp.write("{")
+        target_fp.write(f"\"schema_version\":{json.dumps(run_meta.get('schema_version', 1))}")
+        target_fp.write(",\"format\":\"share_sentinel_compact_json\"")
+        target_fp.write(",\"meta\":")
+        json.dump(meta, target_fp, ensure_ascii=True, separators=(",", ":"))
+        target_fp.write(",\"collection\":")
+        json.dump(collection, target_fp, ensure_ascii=True, separators=(",", ":"))
+        target_fp.write(",\"summary\":")
+        json.dump(summary, target_fp, ensure_ascii=True, separators=(",", ":"))
+        target_fp.write(",\"issue_summary\":")
+        json.dump(self._serialized_issues(), target_fp, ensure_ascii=True, separators=(",", ":"))
+        target_fp.write(",\"endpoints\":[")
+
+        wrote_endpoint = False
+        for endpoint_key in sorted(self._endpoint_paths):
+            endpoint_doc = self._build_endpoint_document(self._endpoint_paths[endpoint_key])
+            if endpoint_doc is None:
+                continue
+            if wrote_endpoint:
+                target_fp.write(",")
+            json.dump(endpoint_doc, target_fp, ensure_ascii=True, separators=(",", ":"))
+            wrote_endpoint = True
+
+        target_fp.write("]}")
+
+    def _serialized_issues(self) -> list[dict[str, object]]:
+        issues = list(self._issues.values())
+        issues.sort(key=lambda issue: (-int(issue.get("count", 0)), str(issue.get("code") or "")))
+        return issues
 
 
-class _CollectorHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+class _CollectorHelpFormatter(argparse.RawDescriptionHelpFormatter):
     pass
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Collect SMB and/or NFS share inventory and output NDJSON records.\n\n"
-            "Most common workflow:\n"
-            "  1) Pick targets with --hosts and/or --cidr\n"
+            "Collect SMB and/or NFS share inventory and write a compact JSON artifact.\n\n"
+            "Workflow:\n"
+            "  1) Select targets with --hosts and/or --cidr\n"
             "  2) Choose --share-types smb|nfs|both\n"
-            "  3) For SMB choose authenticated credentials or anonymous mode\n"
+            "  3) Pick SMB auth mode if SMB is enabled\n"
             "  4) Save with --output and optionally upload with --upload"
         ),
         epilog=(
             "Examples:\n"
             "  Authenticated SMB scan:\n"
-            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --username corp\\\\svc_scan --password '***' --output run.ndjson.gz --gzip\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --username corp\\\\svc_scan --password '***' --output run.json.gz --gzip\n\n"
             "  Domain shell / ticket cache auth:\n"
-            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --use-session-creds --output kerberos.ndjson\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --use-session-creds --output kerberos.json\n\n"
             "  Anonymous SMB scan:\n"
-            "    share_sentinel_collector.py --cidr 10.20.0.0/24 --share-types smb --smb-anonymous --output anon.ndjson\n\n"
+            "    share_sentinel_collector.py --cidr 10.20.0.0/24 --share-types smb --smb-anonymous --output anon.json\n\n"
             "  NFS + SMB combined scan:\n"
-            "    share_sentinel_collector.py --hosts hosts.txt --share-types both --username corp\\\\svc_scan --password '***' --output combined.ndjson.gz --gzip\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --share-types both --username corp\\\\svc_scan --password '***' --output combined.json.gz --gzip\n\n"
             "  Upload after scan:\n"
             "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --username svc --password '***' --upload --api-base https://api.example --project-id <uuid> --api-token <token>\n\n"
             "Notes:\n"
             "  - SMB authentication modes:\n"
-            "      * NTLM: set --username (and password or hashes)\n"
+                "      * NTLM: set --username (and password or hashes)\n"
             "      * Kerberos: add --kerberos and --username\n"
             "      * Session credentials: use --use-session-creds to use the active Kerberos ticket cache\n"
             "      * Anonymous: set --smb-anonymous or omit SMB credentials\n"
-            "  - NFS export enumeration uses `showmount -e`; if unavailable, host reachability is still recorded.\n"
+            "  - NFS export enumeration uses `showmount -e`; if unavailable, only summary issues are recorded.\n"
             "  - When no endpoint/resource/item data is collected, output files are not written."
         ),
         formatter_class=_CollectorHelpFormatter,
@@ -145,7 +358,7 @@ def _build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--output",
         type=str,
-        help="Write NDJSON output to this file. Output is only committed when scan data is collected.",
+        help="Write compact JSON output to this file. Output is only committed when scan data is collected.",
     )
     common.add_argument("--gzip", action="store_true", help="Gzip-compress output when writing to a file.")
     common.add_argument("--workers", type=int, default=100, help="Concurrent host workers.")
@@ -219,6 +432,29 @@ def parse_hosts_file(hosts_file: str | None) -> list[str]:
         if line and not line.startswith("#"):
             hosts.append(line)
     return hosts
+
+
+def _redact_cli_arguments(argv: list[str]) -> list[str]:
+    redacted: list[str] = []
+    skip_next = False
+    for raw_arg in argv:
+        if skip_next:
+            redacted.append("<redacted>")
+            skip_next = False
+            continue
+
+        arg = str(raw_arg)
+        flag, separator, value = arg.partition("=")
+        if flag in SENSITIVE_ARGUMENT_FLAGS:
+            if separator:
+                redacted.append(f"{flag}=<redacted>")
+            else:
+                redacted.append(flag)
+                skip_next = True
+            continue
+
+        redacted.append(arg)
+    return redacted
 
 
 def normalize_path(base: str, child: str) -> str:
@@ -690,9 +926,6 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "success": True,
             },
         }
-        writer.emit(endpoint_record)
-        with lock:
-            stats.endpoints += 1
 
         excluded_shares = {s.upper() for s in args.exclude_share}
         include_shares = [str(share).strip() for share in getattr(args, "include_share", []) if str(share).strip()]
@@ -732,6 +965,24 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                     pass
                 return True
 
+        eligible_shares = []
+        for share in shares:
+            share_name = _share_info_value(share, "shi1_netname")
+            if not share_name or share_name.upper() in excluded_shares:
+                continue
+            eligible_shares.append(share)
+
+        if not eligible_shares:
+            try:
+                conn.logoff()
+            except (SessionError, OSError):
+                pass
+            return True
+
+        writer.emit(endpoint_record)
+        with lock:
+            stats.endpoints += 1
+
         def _handle_list_error(share_name: str, denied_path: str, exc: BaseException) -> None:
             detail = _error_detail(exc)
             message = f"SMB share listing failed for {share_name}: {detail}"
@@ -763,11 +1014,8 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             )
             _record_error(stats, lock, "LIST_LIMIT_REACHED", message)
 
-        for share in shares:
+        for share in eligible_shares:
             share_name = _share_info_value(share, "shi1_netname")
-            if share_name.upper() in excluded_shares:
-                continue
-
             remark = _share_info_value(share, "shi1_remark")
             resource_record = {
                 "type": "resource",
@@ -980,6 +1228,23 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
         _record_error(stats, lock, "NFS_CONNECT_FAILED", message)
         return False
 
+    exports, export_error = _discover_nfs_exports(host, args.timeout)
+    if export_error:
+        message = f"Failed to enumerate NFS exports on {host}: {export_error}"
+        _emit_error(
+            writer,
+            run_id,
+            severity="warn",
+            code="NFS_EXPORT_ENUM_FAILED",
+            message=message,
+            endpoint_key=endpoint_key,
+            hint="Install and verify `showmount`, and ensure rpcbind/mountd access from this host.",
+        )
+        _record_error(stats, lock, "NFS_EXPORT_ENUM_FAILED", message)
+
+    if not exports:
+        return True
+
     writer.emit(
         {
             "type": "endpoint",
@@ -999,20 +1264,6 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
     )
     with lock:
         stats.endpoints += 1
-
-    exports, export_error = _discover_nfs_exports(host, args.timeout)
-    if export_error:
-        message = f"Failed to enumerate NFS exports on {host}: {export_error}"
-        _emit_error(
-            writer,
-            run_id,
-            severity="warn",
-            code="NFS_EXPORT_ENUM_FAILED",
-            message=message,
-            endpoint_key=endpoint_key,
-            hint="Install and verify `showmount`, and ensure rpcbind/mountd access from this host.",
-        )
-        _record_error(stats, lock, "NFS_EXPORT_ENUM_FAILED", message)
 
     for export_path in exports:
         writer.emit(
@@ -1082,7 +1333,13 @@ def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str, h
         create_resp.raise_for_status()
 
     upload_url = f"{base}/projects/{args.project_id}/runs/{run_id}/artifact"
-    content_type = "application/gzip" if artifact_path.endswith(".gz") else "application/x-ndjson"
+    normalized_artifact_path = artifact_path.lower()
+    if normalized_artifact_path.endswith(".gz"):
+        content_type = "application/gzip"
+    elif normalized_artifact_path.endswith(".ndjson") or normalized_artifact_path.endswith(".jsonl"):
+        content_type = "application/x-ndjson"
+    else:
+        content_type = "application/json"
     upload_resp = _post_with_retries(
         lambda: _upload_artifact_once(upload_url, headers, content_type, artifact_path),
     )
@@ -1276,7 +1533,7 @@ def main() -> int:
     output_path = args.output
 
     if args.upload and output_path is None:
-        suffix = ".ndjson.gz" if args.gzip else ".ndjson"
+        suffix = ".json.gz" if args.gzip else ".json"
         fd, temp_artifact = tempfile.mkstemp(prefix="share-sentinel-", suffix=suffix)
         os.close(fd)
         output_path = temp_artifact
@@ -1290,15 +1547,30 @@ def main() -> int:
             "type": "run_meta",
             "schema_version": 1,
             "tool": "share-sentinel-collector",
-            "tool_version": "0.1.0",
+            "tool_version": TOOL_VERSION,
             "run_id": run_id,
             "started_at": started_at.isoformat(),
             "operator_label": args.operator_label,
-            "target_scope": {
-                "cidrs": args.cidr,
-                "hosts": host_inputs,
-                "share_types": selected_share_types,
-                "disabled_share_types": sorted(disabled_share_types),
+            "collection": {
+                "command": Path(__file__).name,
+                "arguments": _redact_cli_arguments(sys.argv[1:]),
+                "target_scope": {
+                    "cidrs": args.cidr,
+                    "hosts": host_inputs,
+                    "target_count": len(targets),
+                    "share_types": selected_share_types,
+                    "disabled_share_types": sorted(disabled_share_types),
+                },
+                "enumeration": {
+                    "workers": args.workers,
+                    "timeout_seconds": args.timeout,
+                    "max_depth": args.max_depth,
+                    "max_entries_per_share": args.max_entries_per_share,
+                    "include_share": list(getattr(args, "include_share", []) or []),
+                    "exclude_share": list(getattr(args, "exclude_share", []) or []),
+                    "exclude_path_regex": args.exclude_path_regex or None,
+                    "extensions_only": args.extensions_only or None,
+                },
             },
             "auth": {
                 "mode": (
@@ -1336,11 +1608,13 @@ def main() -> int:
         {
             "type": "run_end",
             "run_id": run_id,
-            "finished_at": datetime.now(tz=UTC).isoformat(),
-            "stats": {
-                "endpoints": stats.endpoints,
-                "resources": stats.resources,
-                "items": stats.items,
+                "finished_at": datetime.now(tz=UTC).isoformat(),
+                "stats": {
+                    "targets_scanned": len(targets),
+                    "host_failures": host_failures,
+                    "endpoints": stats.endpoints,
+                    "resources": stats.resources,
+                    "items": stats.items,
                 "errors": stats.errors,
             },
         }

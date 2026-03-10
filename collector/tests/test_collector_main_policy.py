@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,7 +51,7 @@ def _base_args(output_path: str):
 
 def test_main_does_not_persist_output_when_run_has_no_data(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
-    output_path = tmp_path / "failed.ndjson"
+    output_path = tmp_path / "failed.json"
     args = _base_args(str(output_path))
 
     monkeypatch.setattr(collector, "parse_args", lambda: args)
@@ -67,13 +68,24 @@ def test_main_does_not_persist_output_when_run_has_no_data(monkeypatch, tmp_path
 
 def test_main_persists_output_when_run_has_endpoint_data(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
-    output_path = tmp_path / "success.ndjson"
+    output_path = tmp_path / "success.json"
     args = _base_args(str(output_path))
 
     def _scan_host(_host, _args, run_id, writer, stats, lock):
         writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        writer.emit(
+            {
+                "type": "resource",
+                "run_id": run_id,
+                "endpoint_key": "10.0.0.5:445",
+                "share_type": "smb",
+                "resource_type": "smb_share",
+                "name": "Public",
+            }
+        )
         with lock:
             stats.endpoints += 1
+            stats.resources += 1
         return True
 
     monkeypatch.setattr(collector, "parse_args", lambda: args)
@@ -86,14 +98,14 @@ def test_main_persists_output_when_run_has_endpoint_data(monkeypatch, tmp_path) 
 
     assert rc == 0
     assert output_path.exists()
-    payload = output_path.read_text(encoding="utf-8")
-    assert '"type": "run_meta"' in payload
-    assert '"type": "run_end"' in payload
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["meta"]["tool"] == "share-sentinel-collector"
+    assert payload["endpoints"][0]["shares"][0]["name"] == "Public"
 
 
 def test_main_reports_dependency_error_without_writing_output(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
-    output_path = tmp_path / "missing-dep.ndjson"
+    output_path = tmp_path / "missing-dep.json"
     args = _base_args(str(output_path))
     stderr_capture = io.StringIO()
 
@@ -110,7 +122,7 @@ def test_main_reports_dependency_error_without_writing_output(monkeypatch, tmp_p
 
 def test_main_reports_session_credential_configuration_error(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
-    output_path = tmp_path / "session-auth.ndjson"
+    output_path = tmp_path / "session-auth.json"
     args = _base_args(str(output_path))
     args.use_session_creds = True
     args.smb_anonymous = False
@@ -129,7 +141,7 @@ def test_main_reports_session_credential_configuration_error(monkeypatch, tmp_pa
 
 def test_main_reports_kerberos_preflight_error_without_username(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
-    output_path = tmp_path / "kerberos-auth.ndjson"
+    output_path = tmp_path / "kerberos-auth.json"
     args = _base_args(str(output_path))
     args.smb_anonymous = False
     args.kerberos = True
@@ -153,14 +165,25 @@ def test_main_reports_kerberos_preflight_error_without_username(monkeypatch, tmp
 
 def test_main_reports_output_write_errors_instead_of_traceback(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
-    output_path = tmp_path / "ok.ndjson"
+    output_path = tmp_path / "ok.json"
     args = _base_args(str(output_path))
     stderr_capture = io.StringIO()
 
     def _scan_host(_host, _args, run_id, writer, stats, lock):
         writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        writer.emit(
+            {
+                "type": "resource",
+                "run_id": run_id,
+                "endpoint_key": "10.0.0.5:445",
+                "share_type": "smb",
+                "resource_type": "smb_share",
+                "name": "Public",
+            }
+        )
         with lock:
             stats.endpoints += 1
+            stats.resources += 1
         return True
 
     def _raise_on_close(self, keep_output=True):  # noqa: ARG001

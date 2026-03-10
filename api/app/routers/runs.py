@@ -140,10 +140,19 @@ async def _upload_artifact_stream(
 def _artifact_suffix(content_type: str | None, filename: str | None) -> str:
     lowered_content_type = (content_type or "").lower()
     lowered_filename = (filename or "").lower()
-    extension = os.path.splitext(lowered_filename)[1]
-    if "gzip" in lowered_content_type or extension == ".gz":
+    if lowered_filename.endswith(".json.gz"):
+        return ".json.gz"
+    if lowered_filename.endswith(".ndjson.gz") or lowered_filename.endswith(".jsonl.gz"):
         return ".ndjson.gz"
-    return ".ndjson"
+    if lowered_filename.endswith(".json"):
+        return ".json"
+    if lowered_filename.endswith(".ndjson") or lowered_filename.endswith(".jsonl"):
+        return ".ndjson"
+
+    is_gzip = "gzip" in lowered_content_type or lowered_filename.endswith(".gz")
+    if "application/json" in lowered_content_type:
+        return ".json.gz" if is_gzip else ".json"
+    return ".ndjson.gz" if is_gzip else ".ndjson"
 
 
 def _write_read_audit(

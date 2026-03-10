@@ -251,6 +251,24 @@ def test_resolve_ccache_env_value_falls_back_to_environment(monkeypatch) -> None
     assert collector._resolve_ccache_env_value(None) == "/tmp/from-env"
 
 
+def test_redact_cli_arguments_hides_sensitive_values() -> None:
+    collector = _load_collector_module()
+
+    redacted = collector._redact_cli_arguments(
+        [
+            "--username",
+            "svc",
+            "--password",
+            "secret",
+            "--hashes=LMHASH:NTHASH",
+            "--api-token",
+            "token-value",
+        ]
+    )
+
+    assert redacted == ["--username", "svc", "--password", "<redacted>", "--hashes=<redacted>", "--api-token", "<redacted>"]
+
+
 def test_session_error_hint_includes_share_name_guidance() -> None:
     collector = _load_collector_module()
 
@@ -276,6 +294,9 @@ def test_scan_host_smb_uses_anonymous_auth_when_username_missing(monkeypatch) ->
             return False
 
         def listShares(self):
+            return [{"shi1_netname": "Public\x00", "shi1_remark": "open\x00"}]
+
+        def listPath(self, *_args, **_kwargs):
             return []
 
         def logoff(self):
@@ -336,6 +357,9 @@ def test_scan_host_smb_kerberos_does_not_mutate_ccache_env_per_call(monkeypatch)
             return False
 
         def listShares(self):
+            return [{"shi1_netname": "Public\x00", "shi1_remark": "open\x00"}]
+
+        def listPath(self, *_args, **_kwargs):
             return []
 
         def logoff(self):
@@ -445,7 +469,7 @@ def test_scan_host_smb_reports_share_enumeration_denied_with_anonymous_hint(monk
     ok = collector.scan_host_smb("10.0.0.6", args, "run-1", writer, stats, threading.Lock())
 
     assert ok is True
-    assert stats.endpoints == 1
+    assert stats.endpoints == 0
     assert stats.resources == 0
     assert stats.errors == 1
     error_record = next(row for row in writer.records if row.get("type") == "error")

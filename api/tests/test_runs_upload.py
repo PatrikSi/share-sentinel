@@ -74,3 +74,9 @@ def test_upload_stream_aborts_and_raises_original_error(monkeypatch) -> None:
         asyncio.run(_run_upload(_FakeUploadFile([b"xyz"])))
 
     assert aborted == [("projects/p/runs/r/artifact.ndjson", "upload-2")]
+
+
+def test_artifact_suffix_preserves_json_extensions() -> None:
+    assert runs_router._artifact_suffix("application/json", "artifact.json") == ".json"
+    assert runs_router._artifact_suffix("application/gzip", "artifact.json.gz") == ".json.gz"
+    assert runs_router._artifact_suffix("application/x-ndjson", "artifact.ndjson") == ".ndjson"

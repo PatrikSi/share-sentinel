@@ -1,4 +1,5 @@
 import gzip
+import io
 import json
 import logging
 import os
@@ -366,6 +367,43 @@ def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str
         return []
 
     records: list[dict[str, Any]] = []
+    meta_raw = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+    run_raw = doc.get("run") if isinstance(doc.get("run"), dict) else {}
+    collection_raw = doc.get("collection") if isinstance(doc.get("collection"), dict) else {}
+    schema_version = doc.get("schema_version", 1)
+    started_at = meta_raw.get("started_at") or run_raw.get("created_at") or now_iso()
+    finished_at = meta_raw.get("finished_at") or now_iso()
+
+    records.append(
+        {
+            "type": "run_meta",
+            "schema_version": int(schema_version) if isinstance(schema_version, int) else 1,
+            "tool": meta_raw.get("tool") or "share-sentinel-import",
+            "tool_version": meta_raw.get("tool_version") or "unknown",
+            "run_id": meta_raw.get("run_id") or run_raw.get("run_id") or run_id,
+            "started_at": started_at,
+            "operator_label": meta_raw.get("operator_label"),
+            "collection": collection_raw or None,
+            "auth": meta_raw.get("auth") if isinstance(meta_raw.get("auth"), dict) else None,
+        }
+    )
+
+    issue_summary = doc.get("issue_summary")
+    if isinstance(issue_summary, list):
+        for issue in issue_summary:
+            if not isinstance(issue, dict):
+                continue
+            records.append(
+                {
+                    "type": "error",
+                    "run_id": run_id,
+                    "severity": issue.get("severity", "error"),
+                    "code": issue.get("code", "UNKNOWN"),
+                    "message": issue.get("sample_message") or issue.get("message") or "issue summary entry",
+                    "hint": issue.get("sample_hint") or issue.get("hint"),
+                }
+            )
+
     for raw_endpoint in endpoints_raw:
         if not isinstance(raw_endpoint, dict):
             continue
@@ -384,6 +422,9 @@ def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str
                 "ip": raw_endpoint.get("ip"),
                 "hostname": raw_endpoint.get("hostname"),
                 "domain": raw_endpoint.get("domain"),
+                "auth": raw_endpoint.get("auth") if isinstance(raw_endpoint.get("auth"), dict) else None,
+                "smb": raw_endpoint.get("smb") if isinstance(raw_endpoint.get("smb"), dict) else None,
+                "nfs": raw_endpoint.get("nfs") if isinstance(raw_endpoint.get("nfs"), dict) else None,
             }
         )
 
@@ -417,6 +458,17 @@ def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str
             if isinstance(raw_entries, list):
                 records.extend(_iter_items_from_entries(run_id, endpoint_key, share_name, raw_entries, share_type=share_type))
 
+    summary_raw = doc.get("summary")
+    if isinstance(summary_raw, dict):
+        records.append(
+            {
+                "type": "run_end",
+                "run_id": run_id,
+                "finished_at": finished_at,
+                "stats": summary_raw,
+            }
+        )
+
     return records
 
 
@@ -444,6 +496,21 @@ def records_from_json_document(doc: Any, run_id: str) -> list[dict[str, Any]]:
             return nested
 
     raise ValueError("unsupported JSON artifact format")
+
+
+def _is_json_artifact(artifact_key: str, content_type: str) -> bool:
+    normalized_key = artifact_key.lower()
+    if normalized_key.endswith(".json") or normalized_key.endswith(".json.gz"):
+        return True
+    return "json" in content_type and "ndjson" not in content_type
+
+
+def _load_json_records_from_bytes(raw_bytes: bytes, run_id: str) -> list[dict[str, Any]] | None:
+    try:
+        json_doc = json.loads(raw_bytes.decode("utf-8", errors="replace"))
+    except (TypeError, ValueError):
+        return None
+    return records_from_json_document(json_doc, run_id)
 
 
 def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
@@ -634,16 +701,22 @@ def process_job(fields: dict[str, str]) -> None:
             json_records: list[dict[str, Any]] | None = None
             content_type = str(artifact_content_type or "").lower()
             size_value = int(artifact_size or 0)
+            json_candidate = size_value <= JSON_COMPAT_MAX_BYTES and _is_json_artifact(artifact_key, content_type)
 
             if artifact_key.endswith(".gz"):
-                reader = gzip.GzipFile(fileobj=body)
-            elif "json" in content_type and "ndjson" not in content_type and size_value <= JSON_COMPAT_MAX_BYTES:
-                raw_bytes = body.read()
-                try:
-                    json_doc = json.loads(raw_bytes.decode("utf-8", errors="replace"))
-                    json_records = records_from_json_document(json_doc, run_id)
-                except (TypeError, ValueError):
-                    json_records = None
+                compressed_bytes = body.read()
+                if json_candidate:
+                    with gzip.GzipFile(fileobj=io.BytesIO(compressed_bytes)) as gzip_reader:
+                        raw_bytes = gzip_reader.read(JSON_COMPAT_MAX_BYTES + 1)
+                    if len(raw_bytes) <= JSON_COMPAT_MAX_BYTES:
+                        json_records = _load_json_records_from_bytes(raw_bytes, run_id)
+                if json_records is None:
+                    reader = gzip.GzipFile(fileobj=io.BytesIO(compressed_bytes))
+            elif json_candidate:
+                raw_bytes = body.read(JSON_COMPAT_MAX_BYTES + 1)
+                if len(raw_bytes) <= JSON_COMPAT_MAX_BYTES:
+                    json_records = _load_json_records_from_bytes(raw_bytes, run_id)
+                if json_records is None:
                     reader = raw_bytes.splitlines()
             else:
                 reader = body.iter_lines()
