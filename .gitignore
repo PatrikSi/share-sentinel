@@ -21,7 +21,8 @@ node_modules/
 *.jsonl.gz
 *.log
 .env
-dummy-scan-data.json
+dummy-scan-data*.json
+dummy-scan-data*.json.gz
 
 # OS / editor
 .DS_Store
