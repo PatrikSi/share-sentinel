@@ -2,6 +2,7 @@ import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { apiFetch } from "@/lib/api";
+import { parseInventoryQuery, type InventoryQueryClause, type InventoryQueryField, type InventoryQueryGroup } from "@/lib/inventory-query";
 
 type Project = { id: string; name: string };
 type RunOption = { id: string; name: string; status: string; created_at: string };
@@ -63,6 +64,12 @@ type ItemColumnKey =
   | "is_dir";
 type ResourceColumnKey = "name" | "share_type" | "access_level" | "endpoint_key" | "hostname" | "item_count" | "run_name" | "run_id" | "remark";
 type EndpointColumnKey = "endpoint_key" | "hostname" | "ip" | "domain" | "smb_signing" | "resource_count" | "item_count" | "run_name" | "run_id";
+type QueryFilterReflection = {
+  value: string;
+  modeLabel: string | null;
+  summary: string | null;
+  selectValue: string;
+};
 
 const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
   { key: "path", label: "Path" },
@@ -99,6 +106,74 @@ const ENDPOINT_COLUMN_OPTIONS: Array<{ key: EndpointColumnKey; label: string }> 
   { key: "run_name", label: "Run Name" },
   { key: "run_id", label: "Run ID" },
 ];
+const QUERYABLE_FIELDS: InventoryQueryField[] = ["search", "endpoint", "share", "path", "ext", "access"];
+const ACCESS_QUERY_ALIASES: Record<string, string> = {
+  no_access: "no_access",
+  none: "no_access",
+  denied: "no_access",
+  list_only: "list_only",
+  list: "list_only",
+  browse: "list_only",
+  readable: "readable",
+  read: "readable",
+  read_only: "readable",
+  read_write: "readable",
+  "read-write": "readable",
+  write: "readable",
+  writable: "readable",
+};
+
+function normalizeReflectionValue(field: InventoryQueryField, value: string): string {
+  const trimmed = value.trim();
+  if (field === "ext") {
+    if (!trimmed) return "";
+    return trimmed.startsWith(".") ? trimmed.toLowerCase() : `.${trimmed.toLowerCase()}`;
+  }
+  if (field === "access") {
+    return ACCESS_QUERY_ALIASES[trimmed.toLowerCase().replaceAll(" ", "_")] || trimmed.toLowerCase();
+  }
+  return trimmed;
+}
+
+function formatClauseMode(clause: InventoryQueryClause): string {
+  const operatorLabel = clause.operator === "equals" ? "equals" : clause.operator;
+  return `${clause.negated ? "NOT " : ""}${operatorLabel}`;
+}
+
+function formatClauseSummary(clause: InventoryQueryClause): string {
+  return `${formatClauseMode(clause)} ${normalizeReflectionValue(clause.field, clause.value)}`;
+}
+
+function buildQueryFilterReflection(groups: InventoryQueryGroup[], field: InventoryQueryField): QueryFilterReflection {
+  const clauses = groups.flatMap((group) => group.filter((clause) => clause.field === field));
+  if (clauses.length === 0) {
+    return { value: "", modeLabel: null, summary: null, selectValue: "" };
+  }
+
+  const normalizedValues = clauses.map((clause) => normalizeReflectionValue(field, clause.value));
+  const modeLabel = clauses.length === 1 ? formatClauseMode(clauses[0]) : `${clauses.length} clauses`;
+  const summary = clauses.map((clause) => formatClauseSummary(clause)).join(" OR ");
+  const selectValue =
+    clauses.length === 1 && !clauses[0].negated && clauses[0].operator === "equals" ? normalizedValues[0] : "";
+
+  return {
+    value: clauses.length === 1 ? normalizedValues[0] : normalizedValues.join(" | "),
+    modeLabel,
+    summary,
+    selectValue,
+  };
+}
+
+function blankQueryFilterReflections(): Record<InventoryQueryField, QueryFilterReflection> {
+  return {
+    search: { value: "", modeLabel: null, summary: null, selectValue: "" },
+    endpoint: { value: "", modeLabel: null, summary: null, selectValue: "" },
+    share: { value: "", modeLabel: null, summary: null, selectValue: "" },
+    path: { value: "", modeLabel: null, summary: null, selectValue: "" },
+    ext: { value: "", modeLabel: null, summary: null, selectValue: "" },
+    access: { value: "", modeLabel: null, summary: null, selectValue: "" },
+  };
+}
 
 export function ProjectInventoryPage() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -114,6 +189,9 @@ export function ProjectInventoryPage() {
   const [pathPrefix, setPathPrefix] = useState("");
   const [extFilter, setExtFilter] = useState("");
   const [resourceAccess, setResourceAccess] = useState("");
+  const [inventoryQueryInput, setInventoryQueryInput] = useState("");
+  const [appliedInventoryQuery, setAppliedInventoryQuery] = useState("");
+  const [appliedInventoryQueryGroups, setAppliedInventoryQueryGroups] = useState<InventoryQueryGroup[]>([]);
 
   const [extensions, setExtensions] = useState<ExtensionFacet[]>([]);
   const [items, setItems] = useState<InventoryItem[]>([]);
@@ -125,6 +203,7 @@ export function ProjectInventoryPage() {
   const [nextCursor, setNextCursor] = useState<string | null>(null);
 
   const [error, setError] = useState<string | null>(null);
+  const [queryError, setQueryError] = useState<string | null>(null);
   const [itemColumns, setItemColumns] = useState<ItemColumnKey[]>(["path", "name", "resource_name", "share_type", "hostname", "run_name", "is_dir"]);
   const [resourceColumns, setResourceColumns] = useState<ResourceColumnKey[]>([
     "name",
@@ -142,6 +221,58 @@ export function ProjectInventoryPage() {
 
   const runIdsParam = useMemo(() => selectedRunIds.join(","), [selectedRunIds]);
   const endpointQuery = useMemo(() => [query.trim(), endpointFilter.trim()].filter(Boolean).join(" "), [query, endpointFilter]);
+  const queryModeActive = appliedInventoryQuery.trim().length > 0;
+  const queryFilterReflections = useMemo(() => {
+    if (!queryModeActive) return blankQueryFilterReflections();
+    const reflections = blankQueryFilterReflections();
+    for (const field of QUERYABLE_FIELDS) {
+      reflections[field] = buildQueryFilterReflection(appliedInventoryQueryGroups, field);
+    }
+    return reflections;
+  }, [appliedInventoryQueryGroups, queryModeActive]);
+
+  function clearAppliedInventoryQuery() {
+    setAppliedInventoryQuery("");
+    setAppliedInventoryQueryGroups([]);
+    setQueryError(null);
+  }
+
+  function applyParsedInventoryQuery(groups: InventoryQueryGroup[], raw: string) {
+    const reflections = blankQueryFilterReflections();
+    for (const field of QUERYABLE_FIELDS) {
+      reflections[field] = buildQueryFilterReflection(groups, field);
+    }
+
+    setAppliedInventoryQuery(raw.trim());
+    setAppliedInventoryQueryGroups(groups);
+    setQuery(reflections.search.value);
+    setEndpointFilter(reflections.endpoint.value);
+    setShareFilter(reflections.share.value);
+    setPathPrefix(reflections.path.value);
+    setExtFilter(reflections.ext.selectValue);
+    setResourceAccess(reflections.access.selectValue);
+    setQueryError(null);
+  }
+
+  function handleInventoryQueryApply() {
+    if (!inventoryQueryInput.trim()) {
+      clearAppliedInventoryQuery();
+      return;
+    }
+    try {
+      const groups = parseInventoryQuery(inventoryQueryInput);
+      applyParsedInventoryQuery(groups, inventoryQueryInput);
+    } catch (err) {
+      setQueryError(err instanceof Error ? err.message : "Invalid inventory query.");
+    }
+  }
+
+  function handleSimpleFilterChange<T>(setter: (value: T) => void, value: T) {
+    if (queryModeActive) {
+      clearAppliedInventoryQuery();
+    }
+    setter(value);
+  }
 
   useEffect(() => {
     if (!projectId) return;
@@ -167,20 +298,23 @@ export function ProjectInventoryPage() {
   useEffect(() => {
     setCursor(null);
     setCursorHistory([]);
-  }, [activeTab, projectId, runIdsParam, query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess]);
+  }, [activeTab, appliedInventoryQuery, projectId, runIdsParam, query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess]);
 
   useEffect(() => {
     if (!projectId) return;
     const queryParams = new URLSearchParams({ limit: "200" });
     if (cursor) queryParams.set("cursor", cursor);
     if (runIdsParam) queryParams.set("run_ids", runIdsParam);
+    if (queryModeActive) queryParams.set("query_dsl", appliedInventoryQuery.trim());
 
     if (activeTab === "items") {
-      if (query.trim()) queryParams.set("q", query.trim());
-      if (endpointFilter.trim()) queryParams.set("endpoint", endpointFilter.trim());
-      if (shareFilter.trim()) queryParams.set("share", shareFilter.trim());
-      if (pathPrefix.trim()) queryParams.set("path_prefix", pathPrefix.trim());
-      if (extFilter.trim()) queryParams.set("ext", extFilter.trim());
+      if (!queryModeActive) {
+        if (query.trim()) queryParams.set("q", query.trim());
+        if (endpointFilter.trim()) queryParams.set("endpoint", endpointFilter.trim());
+        if (shareFilter.trim()) queryParams.set("share", shareFilter.trim());
+        if (pathPrefix.trim()) queryParams.set("path_prefix", pathPrefix.trim());
+        if (extFilter.trim()) queryParams.set("ext", extFilter.trim());
+      }
 
       apiFetch(`/projects/${projectId}/inventory/items?${queryParams.toString()}`)
         .then((data) => {
@@ -192,9 +326,11 @@ export function ProjectInventoryPage() {
     }
 
     if (activeTab === "resources") {
-      if (query.trim()) queryParams.set("q", query.trim());
-      if (endpointFilter.trim()) queryParams.set("endpoint", endpointFilter.trim());
-      if (resourceAccess.trim()) queryParams.set("access_level", resourceAccess.trim());
+      if (!queryModeActive) {
+        if (query.trim()) queryParams.set("q", query.trim());
+        if (endpointFilter.trim()) queryParams.set("endpoint", endpointFilter.trim());
+        if (resourceAccess.trim()) queryParams.set("access_level", resourceAccess.trim());
+      }
 
       apiFetch(`/projects/${projectId}/inventory/resources?${queryParams.toString()}`)
         .then((data) => {
@@ -205,14 +341,14 @@ export function ProjectInventoryPage() {
       return;
     }
 
-    if (endpointQuery) queryParams.set("q", endpointQuery);
+    if (!queryModeActive && endpointQuery) queryParams.set("q", endpointQuery);
     apiFetch(`/projects/${projectId}/inventory/endpoints?${queryParams.toString()}`)
       .then((data) => {
         setEndpoints((data?.items || []) as InventoryEndpoint[]);
         setNextCursor((data?.next_cursor as string | null) || null);
       })
       .catch((err) => setError(err.message));
-  }, [activeTab, cursor, endpointFilter, endpointQuery, extFilter, pathPrefix, projectId, query, resourceAccess, runIdsParam, shareFilter]);
+  }, [activeTab, appliedInventoryQuery, cursor, endpointFilter, endpointQuery, extFilter, pathPrefix, projectId, query, queryModeActive, resourceAccess, runIdsParam, shareFilter]);
 
   function moveNext() {
     if (!nextCursor) return;
@@ -333,65 +469,154 @@ export function ProjectInventoryPage() {
               {project ? `${project.name} (${project.id})` : projectId}
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            <Link className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700" to="/projects">
-              Back to Projects
-            </Link>
-          </div>
+        <div className="flex items-center gap-2">
+          <Link className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700" to="/projects">
+            Back to Projects
+          </Link>
         </div>
+      </div>
         {error ? <p className="rounded-lg bg-rose-100 p-2 text-sm text-rose-700 dark:bg-rose-900/20 dark:text-rose-200">{error}</p> : null}
+        {queryError ? <p className="rounded-lg bg-amber-100 p-2 text-sm text-amber-800 dark:bg-amber-900/20 dark:text-amber-200">{queryError}</p> : null}
       </div>
 
       <div className="workspace-section">
-        <div className="grid gap-3 md:grid-cols-6">
+        <div className="rounded-2xl border border-slate-300 bg-slate-50/70 p-4 dark:border-slate-700 dark:bg-slate-900/40">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Inventory Query</p>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+                Use `field operator value` clauses with `AND`, `OR`, `NOT`, or `!`. Supported fields: `search`, `endpoint`, `share`, `path`, `ext`, `access`.
+              </p>
+              <p className="mt-1 text-xs text-slate-500">
+                Operators: `equals` or `=`, `contains` or `~`, `startswith` or `^`. AND has higher precedence than OR. Use quotes for spaces.
+              </p>
+            </div>
+            {queryModeActive ? (
+              <span className="rounded-full bg-emerald-100 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-200">
+                Query mode active
+              </span>
+            ) : null}
+          </div>
+
+          <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto_auto] lg:items-start">
+            <textarea
+              className="min-h-[86px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+              placeholder={'endpoint startswith "fs-" AND share contains finance AND !ext = .tmp'}
+              value={inventoryQueryInput}
+              onChange={(event) => setInventoryQueryInput(event.target.value)}
+            />
+            <button
+              className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700"
+              onClick={handleInventoryQueryApply}
+              type="button"
+            >
+              Apply Query
+            </button>
+            <button
+              className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700"
+              onClick={() => {
+                setInventoryQueryInput("");
+                clearAppliedInventoryQuery();
+              }}
+              type="button"
+            >
+              Clear Query
+            </button>
+          </div>
+
+          {queryModeActive ? (
+            <p className="mt-3 text-xs text-slate-500">
+              The query is the source of truth while active. The filters below show the extracted values; editing a filter switches back to simple filter mode.
+            </p>
+          ) : null}
+        </div>
+
+        <div className="mt-4 grid gap-3 md:grid-cols-6">
           <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-            Search
+            <span className="flex flex-wrap items-center gap-2">
+              <span>Search</span>
+              {queryModeActive && queryFilterReflections.search.modeLabel ? (
+                <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] dark:bg-slate-800">{queryFilterReflections.search.modeLabel}</span>
+              ) : null}
+            </span>
             <input
               className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
               placeholder="File, path, hostname, share"
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => handleSimpleFilterChange(setQuery, event.target.value)}
             />
+            {queryModeActive && queryFilterReflections.search.summary ? (
+              <p className="mt-1 text-[11px] normal-case tracking-normal text-slate-500">{queryFilterReflections.search.summary}</p>
+            ) : null}
           </label>
 
           <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-            Endpoint
+            <span className="flex flex-wrap items-center gap-2">
+              <span>Endpoint</span>
+              {queryModeActive && queryFilterReflections.endpoint.modeLabel ? (
+                <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] dark:bg-slate-800">{queryFilterReflections.endpoint.modeLabel}</span>
+              ) : null}
+            </span>
             <input
               className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
               placeholder="host or ip"
               value={endpointFilter}
-              onChange={(event) => setEndpointFilter(event.target.value)}
+              onChange={(event) => handleSimpleFilterChange(setEndpointFilter, event.target.value)}
             />
+            {queryModeActive && queryFilterReflections.endpoint.summary ? (
+              <p className="mt-1 text-[11px] normal-case tracking-normal text-slate-500">{queryFilterReflections.endpoint.summary}</p>
+            ) : null}
           </label>
 
           <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-            Share
+            <span className="flex flex-wrap items-center gap-2">
+              <span>Share</span>
+              {queryModeActive && queryFilterReflections.share.modeLabel ? (
+                <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] dark:bg-slate-800">{queryFilterReflections.share.modeLabel}</span>
+              ) : null}
+            </span>
             <input
               className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
               placeholder="share name"
               value={shareFilter}
-              onChange={(event) => setShareFilter(event.target.value)}
+              onChange={(event) => handleSimpleFilterChange(setShareFilter, event.target.value)}
               disabled={activeTab !== "items"}
             />
+            {queryModeActive && queryFilterReflections.share.summary ? (
+              <p className="mt-1 text-[11px] normal-case tracking-normal text-slate-500">{queryFilterReflections.share.summary}</p>
+            ) : null}
           </label>
 
           <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-            Path Prefix
+            <span className="flex flex-wrap items-center gap-2">
+              <span>Path Prefix</span>
+              {queryModeActive && queryFilterReflections.path.modeLabel ? (
+                <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] dark:bg-slate-800">{queryFilterReflections.path.modeLabel}</span>
+              ) : null}
+            </span>
             <input
               className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
               placeholder="\\HR\\"
               value={pathPrefix}
-              onChange={(event) => setPathPrefix(event.target.value)}
+              onChange={(event) => handleSimpleFilterChange(setPathPrefix, event.target.value)}
               disabled={activeTab !== "items"}
             />
+            {queryModeActive && queryFilterReflections.path.summary ? (
+              <p className="mt-1 text-[11px] normal-case tracking-normal text-slate-500">{queryFilterReflections.path.summary}</p>
+            ) : null}
           </label>
 
           <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-            Extension
+            <span className="flex flex-wrap items-center gap-2">
+              <span>Extension</span>
+              {queryModeActive && queryFilterReflections.ext.modeLabel ? (
+                <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] dark:bg-slate-800">{queryFilterReflections.ext.modeLabel}</span>
+              ) : null}
+            </span>
             <select
               className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
               value={extFilter}
-              onChange={(event) => setExtFilter(event.target.value)}
+              onChange={(event) => handleSimpleFilterChange(setExtFilter, event.target.value)}
               disabled={activeTab !== "items"}
             >
               <option value="">All</option>
@@ -401,14 +626,22 @@ export function ProjectInventoryPage() {
                 </option>
               ))}
             </select>
+            {queryModeActive && queryFilterReflections.ext.summary ? (
+              <p className="mt-1 text-[11px] normal-case tracking-normal text-slate-500">{queryFilterReflections.ext.summary}</p>
+            ) : null}
           </label>
 
           <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-            Share Access
+            <span className="flex flex-wrap items-center gap-2">
+              <span>Share Access</span>
+              {queryModeActive && queryFilterReflections.access.modeLabel ? (
+                <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] dark:bg-slate-800">{queryFilterReflections.access.modeLabel}</span>
+              ) : null}
+            </span>
             <select
               className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
               value={resourceAccess}
-              onChange={(event) => setResourceAccess(event.target.value)}
+              onChange={(event) => handleSimpleFilterChange(setResourceAccess, event.target.value)}
               disabled={activeTab !== "resources"}
             >
               <option value="">All</option>
@@ -416,6 +649,9 @@ export function ProjectInventoryPage() {
               <option value="list_only">list_only</option>
               <option value="no_access">no_access</option>
             </select>
+            {queryModeActive && queryFilterReflections.access.summary ? (
+              <p className="mt-1 text-[11px] normal-case tracking-normal text-slate-500">{queryFilterReflections.access.summary}</p>
+            ) : null}
           </label>
         </div>
 
@@ -597,7 +833,7 @@ export function ProjectInventoryPage() {
               <button
                 className={`rounded-full border px-2 py-1 ${extFilter === facet.ext ? "border-emerald-600 bg-emerald-50 dark:bg-emerald-900/20" : "border-slate-300 dark:border-slate-700"}`}
                 key={facet.ext}
-                onClick={() => setExtFilter((prev) => (prev === facet.ext ? "" : facet.ext))}
+                onClick={() => handleSimpleFilterChange(setExtFilter, extFilter === facet.ext ? "" : facet.ext)}
               >
                 {facet.ext} ({facet.count})
               </button>

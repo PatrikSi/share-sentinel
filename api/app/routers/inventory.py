@@ -1,7 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, and_, cast, func, not_, or_, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -11,6 +11,7 @@ from app.models import Endpoint, Item, Resource, SavedInvestigation, ScanRun
 from app.pagination import next_cursor, parse_cursor
 from app.schemas import SavedInvestigationIn, SavedInvestigationOut
 from app.share_types import share_type_from_resource_type
+from app.services.inventory_query import InventoryQueryClause, parse_inventory_query
 from app.services.audit import write_audit_event
 from app.token_scopes import SCOPE_READ_INVENTORY
 
@@ -73,6 +74,194 @@ def _audit_read(
         project_id=project_id,
         metadata={**request_meta(request), **metadata},
     )
+
+
+ACCESS_LEVEL_ALIASES = {
+    "no_access": "no_access",
+    "none": "no_access",
+    "denied": "no_access",
+    "list_only": "list_only",
+    "list": "list_only",
+    "browse": "list_only",
+    "readable": "readable",
+    "read": "readable",
+    "read_only": "readable",
+    "read_write": "readable",
+    "read-write": "readable",
+    "write": "readable",
+    "writable": "readable",
+}
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _normalize_access_query_value(value: str) -> str:
+    token = value.strip().lower().replace(" ", "_")
+    return ACCESS_LEVEL_ALIASES.get(token, token)
+
+
+def _normalize_ext_query_value(value: str) -> str:
+    token = value.strip().lower()
+    if token and not token.startswith("."):
+        token = f".{token}"
+    return token
+
+
+def _string_match_expression(column, operator: str, value: str):
+    normalized_column = func.coalesce(cast(column, String), "")
+    if operator == "equals":
+        return func.lower(normalized_column) == value.lower()
+
+    escaped = _escape_like(value)
+    if operator == "startswith":
+        return normalized_column.ilike(f"{escaped}%", escape="\\")
+    return normalized_column.ilike(f"%{escaped}%", escape="\\")
+
+
+def _multi_column_string_match(columns: tuple, operator: str, value: str):
+    expressions = [_string_match_expression(column, operator, value) for column in columns]
+    return or_(*expressions)
+
+
+def _ext_match_expression(column, operator: str, value: str):
+    normalized = _normalize_ext_query_value(value)
+    return _string_match_expression(column, operator, normalized)
+
+
+def _access_match_expression(column, operator: str, value: str):
+    normalized = _normalize_access_query_value(value)
+    return _string_match_expression(column, operator, normalized)
+
+
+def _apply_inventory_query_groups(stmt, groups: list[list[InventoryQueryClause]], clause_builder):
+    if not groups:
+        return stmt
+
+    group_expressions = []
+    for group in groups:
+        clause_expressions = [clause_builder(clause) for clause in group]
+        if not clause_expressions:
+            continue
+        group_expressions.append(and_(*clause_expressions) if len(clause_expressions) > 1 else clause_expressions[0])
+
+    if not group_expressions:
+        return stmt
+    if len(group_expressions) == 1:
+        return stmt.where(group_expressions[0])
+    return stmt.where(or_(*group_expressions))
+
+
+def _item_inventory_clause_expression(clause: InventoryQueryClause):
+    ext_expr = func.lower(func.substring(Item.name, r"\.[^.]+$"))
+    if clause.field == "search":
+        expression = _multi_column_string_match(
+            (Item.name, Item.path, Resource.name, Endpoint.endpoint_key, Endpoint.hostname, Endpoint.ip),
+            clause.operator,
+            clause.value,
+        )
+    elif clause.field == "endpoint":
+        expression = _multi_column_string_match((Endpoint.endpoint_key, Endpoint.hostname, Endpoint.ip), clause.operator, clause.value)
+    elif clause.field == "share":
+        expression = _string_match_expression(Resource.name, clause.operator, clause.value)
+    elif clause.field == "path":
+        expression = _string_match_expression(Item.path, clause.operator, clause.value)
+    elif clause.field == "ext":
+        expression = _ext_match_expression(ext_expr, clause.operator, clause.value)
+    else:
+        expression = _access_match_expression(Resource.access_level, clause.operator, clause.value)
+    return not_(expression) if clause.negated else expression
+
+
+def _resource_inventory_clause_expression(clause: InventoryQueryClause):
+    ext_expr = func.lower(func.substring(Item.name, r"\.[^.]+$"))
+    if clause.field == "search":
+        expression = _multi_column_string_match(
+            (Resource.name, Resource.remark, Endpoint.endpoint_key, Endpoint.hostname),
+            clause.operator,
+            clause.value,
+        )
+        return not_(expression) if clause.negated else expression
+
+    if clause.field == "endpoint":
+        expression = _multi_column_string_match((Endpoint.endpoint_key, Endpoint.hostname), clause.operator, clause.value)
+        return not_(expression) if clause.negated else expression
+
+    if clause.field == "share":
+        expression = _string_match_expression(Resource.name, clause.operator, clause.value)
+        return not_(expression) if clause.negated else expression
+
+    if clause.field == "access":
+        expression = _access_match_expression(Resource.access_level, clause.operator, clause.value)
+        return not_(expression) if clause.negated else expression
+
+    item_subquery = select(1).select_from(Item).where(Item.run_id == Resource.run_id, Item.resource_id == Resource.id).correlate(Resource)
+    if clause.field == "path":
+        item_subquery = item_subquery.where(_string_match_expression(Item.path, clause.operator, clause.value))
+    else:
+        item_subquery = item_subquery.where(_ext_match_expression(ext_expr, clause.operator, clause.value))
+
+    expression = item_subquery.exists()
+    return not_(expression) if clause.negated else expression
+
+
+def _endpoint_inventory_clause_expression(clause: InventoryQueryClause):
+    ext_expr = func.lower(func.substring(Item.name, r"\.[^.]+$"))
+    if clause.field == "search":
+        expression = _multi_column_string_match(
+            (Endpoint.endpoint_key, Endpoint.ip, Endpoint.hostname, Endpoint.domain),
+            clause.operator,
+            clause.value,
+        )
+        return not_(expression) if clause.negated else expression
+
+    if clause.field == "endpoint":
+        expression = _multi_column_string_match((Endpoint.endpoint_key, Endpoint.ip, Endpoint.hostname), clause.operator, clause.value)
+        return not_(expression) if clause.negated else expression
+
+    if clause.field == "share":
+        expression = (
+            select(1)
+            .select_from(Resource)
+            .where(
+                Resource.run_id == Endpoint.run_id,
+                Resource.endpoint_id == Endpoint.id,
+                _string_match_expression(Resource.name, clause.operator, clause.value),
+            )
+            .correlate(Endpoint)
+            .exists()
+        )
+        return not_(expression) if clause.negated else expression
+
+    if clause.field == "access":
+        expression = (
+            select(1)
+            .select_from(Resource)
+            .where(
+                Resource.run_id == Endpoint.run_id,
+                Resource.endpoint_id == Endpoint.id,
+                _access_match_expression(Resource.access_level, clause.operator, clause.value),
+            )
+            .correlate(Endpoint)
+            .exists()
+        )
+        return not_(expression) if clause.negated else expression
+
+    item_subquery = (
+        select(1)
+        .select_from(Resource)
+        .join(Item, (Item.resource_id == Resource.id) & (Item.run_id == Resource.run_id))
+        .where(Resource.run_id == Endpoint.run_id, Resource.endpoint_id == Endpoint.id)
+        .correlate(Endpoint)
+    )
+    if clause.field == "path":
+        item_subquery = item_subquery.where(_string_match_expression(Item.path, clause.operator, clause.value))
+    else:
+        item_subquery = item_subquery.where(_ext_match_expression(ext_expr, clause.operator, clause.value))
+
+    expression = item_subquery.exists()
+    return not_(expression) if clause.negated else expression
 
 
 @router.get("/investigations", response_model=dict)
@@ -308,6 +497,7 @@ def inventory_items(
     project_id: uuid.UUID,
     request: Request,
     q: str | None = Query(default=None),
+    query_dsl: str | None = Query(default=None),
     ext: str | None = Query(default=None),
     endpoint: str | None = Query(default=None),
     share: str | None = Query(default=None),
@@ -322,6 +512,7 @@ def inventory_items(
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     run_id_list = _parse_run_ids(run_ids)
+    query_groups = parse_inventory_query(query_dsl)
     offset = parse_cursor(cursor)
 
     stmt = (
@@ -375,6 +566,8 @@ def inventory_items(
             normalized = f".{normalized}"
         ext_expr = func.lower(func.substring(Item.name, r"\.[^.]+$"))
         stmt = stmt.where(ext_expr == normalized)
+    if query_groups:
+        stmt = _apply_inventory_query_groups(stmt, query_groups, _item_inventory_clause_expression)
 
     rows = db.execute(stmt.order_by(Item.id.desc()).offset(offset).limit(limit)).all()
     items = [
@@ -401,7 +594,16 @@ def inventory_items(
         auth,
         project_id,
         action="PROJECT_INVENTORY_ITEMS_LISTED",
-        metadata={"q": q, "ext": ext, "endpoint": endpoint, "share": share, "path_prefix": path_prefix, "run_ids": run_ids, "limit": limit},
+        metadata={
+            "q": q,
+            "query_dsl": query_dsl,
+            "ext": ext,
+            "endpoint": endpoint,
+            "share": share,
+            "path_prefix": path_prefix,
+            "run_ids": run_ids,
+            "limit": limit,
+        },
     )
     db.commit()
     return {"items": items, "next_cursor": next_cursor(offset, limit, len(items))}
@@ -412,6 +614,7 @@ def inventory_resources(
     project_id: uuid.UUID,
     request: Request,
     q: str | None = Query(default=None),
+    query_dsl: str | None = Query(default=None),
     endpoint: str | None = Query(default=None),
     access_level: str | None = Query(default=None),
     run_ids: str | None = Query(default=None, description="comma-separated run UUIDs"),
@@ -423,6 +626,7 @@ def inventory_resources(
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     run_id_list = _parse_run_ids(run_ids)
+    query_groups = parse_inventory_query(query_dsl)
     offset = parse_cursor(cursor)
 
     stmt = (
@@ -469,6 +673,8 @@ def inventory_resources(
     if q:
         pattern = f"%{q.strip()}%"
         stmt = stmt.where(or_(Resource.name.ilike(pattern), Resource.remark.ilike(pattern), Endpoint.endpoint_key.ilike(pattern)))
+    if query_groups:
+        stmt = _apply_inventory_query_groups(stmt, query_groups, _resource_inventory_clause_expression)
 
     rows = db.execute(stmt.order_by(Resource.id.desc()).offset(offset).limit(limit)).all()
     items = [
@@ -493,7 +699,14 @@ def inventory_resources(
         auth,
         project_id,
         action="PROJECT_INVENTORY_RESOURCES_LISTED",
-        metadata={"q": q, "endpoint": endpoint, "access_level": access_level, "run_ids": run_ids, "limit": limit},
+        metadata={
+            "q": q,
+            "query_dsl": query_dsl,
+            "endpoint": endpoint,
+            "access_level": access_level,
+            "run_ids": run_ids,
+            "limit": limit,
+        },
     )
     db.commit()
     return {"items": items, "next_cursor": next_cursor(offset, limit, len(items))}
@@ -504,6 +717,7 @@ def inventory_endpoints(
     project_id: uuid.UUID,
     request: Request,
     q: str | None = Query(default=None),
+    query_dsl: str | None = Query(default=None),
     run_ids: str | None = Query(default=None, description="comma-separated run UUIDs"),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
@@ -513,6 +727,7 @@ def inventory_endpoints(
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     run_id_list = _parse_run_ids(run_ids)
+    query_groups = parse_inventory_query(query_dsl)
     offset = parse_cursor(cursor)
 
     stmt = (
@@ -557,6 +772,8 @@ def inventory_endpoints(
                 Endpoint.domain.ilike(pattern),
             )
         )
+    if query_groups:
+        stmt = _apply_inventory_query_groups(stmt, query_groups, _endpoint_inventory_clause_expression)
 
     rows = db.execute(stmt.order_by(Endpoint.id.desc()).offset(offset).limit(limit)).all()
     items = [
@@ -581,7 +798,7 @@ def inventory_endpoints(
         auth,
         project_id,
         action="PROJECT_INVENTORY_ENDPOINTS_LISTED",
-        metadata={"q": q, "run_ids": run_ids, "limit": limit},
+        metadata={"q": q, "query_dsl": query_dsl, "run_ids": run_ids, "limit": limit},
     )
     db.commit()
     return {"items": items, "next_cursor": next_cursor(offset, limit, len(items))}
