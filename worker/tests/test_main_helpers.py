@@ -120,6 +120,23 @@ def test_validate_record_normalizes_share_type_and_resource_type() -> None:
     assert item_record["resource_type"] == "nfs_share"
 
 
+def test_validate_record_normalizes_access_level_aliases() -> None:
+    resource_record = {
+        "type": "resource",
+        "run_id": "run-1",
+        "endpoint_key": "host:445",
+        "name": "Finance",
+        "access_level": "read_write",
+    }
+    ok, reason = main.validate_record(resource_record)
+
+    assert ok is True
+    assert reason is None
+    assert resource_record["access_level"] == "readable"
+    assert main._normalize_access_level("list") == "list_only"
+    assert main._normalize_access_level("unknown-value") == "no_access"
+
+
 def test_bind_record_to_ingest_run_overrides_mismatched_run_id() -> None:
     original = {"type": "endpoint", "run_id": "old-run", "endpoint_key": "host:445"}
     rebound = main._bind_record_to_ingest_run(original, "new-run")

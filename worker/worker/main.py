@@ -81,6 +81,26 @@ SHARE_TYPE_TO_RESOURCE_TYPE = {
     "nfs": "nfs_share",
 }
 RESOURCE_TYPE_TO_SHARE_TYPE = {value: key for key, value in SHARE_TYPE_TO_RESOURCE_TYPE.items()}
+ACCESS_LEVEL_ALIASES = {
+    "no_access": "no_access",
+    "none": "no_access",
+    "denied": "no_access",
+    "list_only": "list_only",
+    "list": "list_only",
+    "browse": "list_only",
+    "enumerate": "list_only",
+    "readable": "readable",
+    "read": "readable",
+    "read_only": "readable",
+    "read-write": "readable",
+    "read_write": "readable",
+    "write": "readable",
+    "writable": "readable",
+    "modify": "readable",
+    "full": "readable",
+    "full_control": "readable",
+    "rw": "readable",
+}
 
 
 def _safe_run_id(fields: dict[str, str] | None) -> str | None:
@@ -166,7 +186,7 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
             rec.get("resource_type", "smb_share"),
             rec.get("name"),
             rec.get("remark"),
-            rec.get("access_level", "no_access"),
+            _normalize_access_level(rec.get("access_level")),
         ),
     ).fetchone()
     return int(row[0])
@@ -264,6 +284,14 @@ def _resource_type_from_share_type(share_type: str) -> str:
     return SHARE_TYPE_TO_RESOURCE_TYPE.get(share_type, "smb_share")
 
 
+def _normalize_access_level(raw_access_level: Any) -> str:
+    if isinstance(raw_access_level, str):
+        normalized = raw_access_level.strip().lower().replace(" ", "_")
+        if normalized in ACCESS_LEVEL_ALIASES:
+            return ACCESS_LEVEL_ALIASES[normalized]
+    return "no_access"
+
+
 def _bind_record_to_ingest_run(rec: dict[str, Any], run_id: str) -> dict[str, Any]:
     record_run_id = rec.get("run_id")
     if record_run_id is None or str(record_run_id) != run_id:
@@ -304,6 +332,8 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
         share_type = _normalize_share_type(rec.get("share_type"), rec.get("resource_type"))
         rec["share_type"] = share_type
         rec["resource_type"] = _resource_type_from_share_type(share_type)
+    if rec_type == "resource":
+        rec["access_level"] = _normalize_access_level(rec.get("access_level"))
     return True, None
 
 
@@ -896,6 +926,10 @@ def process_job(fields: dict[str, str]) -> None:
         except INGEST_OPERATION_EXCEPTIONS as exc:
             logger.exception("job failed run_id=%s", run_id)
             try:
+                conn.rollback()
+            except psycopg.Error:
+                logger.exception("failed to rollback aborted ingest transaction run_id=%s", run_id)
+            try:
                 update_run_status(conn, run_id, "FAILED", last_line_offset, last_counts, last_error=str(exc))
                 if project_id:
                     write_audit(
@@ -909,9 +943,16 @@ def process_job(fields: dict[str, str]) -> None:
                 conn.commit()
             except psycopg.Error:
                 logger.exception("failed to persist ingest failure state run_id=%s", run_id)
+                try:
+                    conn.rollback()
+                except psycopg.Error:
+                    logger.exception("failed to rollback after ingest failure state persistence run_id=%s", run_id)
             raise
         finally:
-            conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+            try:
+                conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+            except psycopg.Error:
+                logger.exception("failed to release ingest advisory lock run_id=%s", run_id)
 
 
 def ensure_group() -> None:
