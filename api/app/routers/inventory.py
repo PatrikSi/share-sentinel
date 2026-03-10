@@ -7,13 +7,29 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_token_scopes
 from app.enums import ProjectRole, RunStatus
-from app.models import Endpoint, Item, Resource, ScanRun
+from app.models import Endpoint, Item, Resource, SavedInvestigation, ScanRun
 from app.pagination import next_cursor, parse_cursor
+from app.schemas import SavedInvestigationIn, SavedInvestigationOut
 from app.share_types import share_type_from_resource_type
 from app.services.audit import write_audit_event
 from app.token_scopes import SCOPE_READ_INVENTORY
 
 router = APIRouter(prefix="/projects/{project_id}/inventory", tags=["inventory"])
+
+
+def _saved_investigation_out(model: SavedInvestigation) -> SavedInvestigationOut:
+    return SavedInvestigationOut(
+        id=model.id,
+        project_id=model.project_id,
+        created_by_user_id=model.created_by_user_id,
+        name=model.name,
+        description=model.description,
+        target_tab=model.target_tab,
+        query_text=model.query_text,
+        definition=model.definition_json or {},
+        created_at=model.created_at,
+        updated_at=model.updated_at,
+    )
 
 
 def _parse_run_ids(raw: str | None) -> list[uuid.UUID]:
@@ -57,6 +73,103 @@ def _audit_read(
         project_id=project_id,
         metadata={**request_meta(request), **metadata},
     )
+
+
+@router.get("/investigations", response_model=dict)
+def list_saved_investigations(
+    project_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    investigations = (
+        db.execute(
+            select(SavedInvestigation)
+            .where(SavedInvestigation.project_id == project_id)
+            .order_by(SavedInvestigation.updated_at.desc(), SavedInvestigation.created_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+
+    _audit_read(
+        db,
+        request,
+        auth,
+        project_id,
+        action="PROJECT_INVESTIGATIONS_LISTED",
+        metadata={"result_count": len(investigations)},
+    )
+    db.commit()
+    return {"items": [_saved_investigation_out(model).model_dump(mode="json") for model in investigations]}
+
+
+@router.post("/investigations", response_model=SavedInvestigationOut)
+def create_saved_investigation(
+    project_id: uuid.UUID,
+    payload: SavedInvestigationIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    investigation = SavedInvestigation(
+        project_id=project_id,
+        created_by_user_id=auth.user_id,
+        name=payload.name,
+        description=payload.description,
+        target_tab=payload.target_tab,
+        query_text=payload.query_text,
+        definition_json=payload.definition,
+    )
+    db.add(investigation)
+    db.flush()
+
+    write_audit_event(
+        db,
+        action="PROJECT_INVESTIGATION_CREATED",
+        object_type="project_inventory",
+        object_id=str(investigation.id),
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata={**request_meta(request), "name": investigation.name, "target_tab": investigation.target_tab},
+    )
+    db.commit()
+    db.refresh(investigation)
+    return _saved_investigation_out(investigation)
+
+
+@router.delete("/investigations/{investigation_id}")
+def delete_saved_investigation(
+    project_id: uuid.UUID,
+    investigation_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    investigation = db.get(SavedInvestigation, investigation_id)
+    if investigation is None or investigation.project_id != project_id:
+        raise HTTPException(status_code=404, detail="investigation not found")
+
+    db.delete(investigation)
+    write_audit_event(
+        db,
+        action="PROJECT_INVESTIGATION_DELETED",
+        object_type="project_inventory",
+        object_id=str(investigation_id),
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata=request_meta(request),
+    )
+    db.commit()
+    return {"ok": True}
 
 
 @router.get("/stats")

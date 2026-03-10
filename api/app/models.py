@@ -187,7 +187,28 @@ class AuditEvent(Base):
     metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
 
 
+class SavedInvestigation(Base):
+    __tablename__ = "saved_investigations"
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    name: Mapped[str] = mapped_column(sa.String(120), nullable=False)
+    description: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    target_tab: Mapped[str] = mapped_column(sa.String(32), nullable=False, server_default="items")
+    query_text: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="")
+    definition_json: Mapped[dict] = mapped_column("definition", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+        onupdate=sa.func.now(),
+    )
+
+
 Index("ix_scan_runs_project_created", ScanRun.project_id, ScanRun.created_at)
 Index("ix_scan_runs_status_created", ScanRun.status, ScanRun.created_at)
 Index("ix_refresh_tokens_user_revoked", RefreshToken.user_id, RefreshToken.revoked_at)
 Index("ix_users_approval_status", User.is_approved, User.created_at)
+Index("ix_saved_investigations_project_updated", SavedInvestigation.project_id, SavedInvestigation.updated_at)

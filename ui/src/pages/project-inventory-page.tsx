@@ -6,6 +6,30 @@ import { apiFetch } from "@/lib/api";
 type Project = { id: string; name: string };
 type RunOption = { id: string; name: string; status: string; created_at: string };
 type ExtensionFacet = { ext: string; count: number };
+type ItemTypeFilter = "all" | "file" | "dir";
+type SavedInvestigation = {
+  id: string;
+  project_id: string;
+  created_by_user_id: string | null;
+  name: string;
+  description: string | null;
+  target_tab: Tab;
+  query_text: string;
+  definition: InvestigationDefinition;
+  created_at: string;
+  updated_at: string;
+};
+type InvestigationDefinition = {
+  active_tab: Tab;
+  query: string;
+  endpoint: string;
+  share: string;
+  path_prefix: string;
+  ext: string;
+  access_level: string;
+  item_type: ItemTypeFilter;
+  selected_run_ids: string[];
+};
 
 type InventoryItem = {
   id: number;
@@ -100,6 +124,151 @@ const ENDPOINT_COLUMN_OPTIONS: Array<{ key: EndpointColumnKey; label: string }> 
   { key: "run_id", label: "Run ID" },
 ];
 
+const DEFAULT_INVESTIGATION_DEFINITION: InvestigationDefinition = {
+  active_tab: "items",
+  query: "",
+  endpoint: "",
+  share: "",
+  path_prefix: "",
+  ext: "",
+  access_level: "",
+  item_type: "all",
+  selected_run_ids: [],
+};
+
+function tokenizeInvestigationQuery(raw: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+
+  for (const char of raw.trim()) {
+    if (quote) {
+      current += char;
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      current += char;
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function stripQueryQuotes(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2 && ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'")))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function appendQuery(existing: string, nextValue: string): string {
+  return [existing, nextValue].filter(Boolean).join(" ").trim();
+}
+
+function normalizeTabToken(value: string, fallback: Tab): Tab {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "items" || normalized === "files" || normalized === "folders") return "items";
+  if (normalized === "resources" || normalized === "resource" || normalized === "shares" || normalized === "share") return "resources";
+  if (normalized === "endpoints" || normalized === "hosts" || normalized === "endpoint") return "endpoints";
+  return fallback;
+}
+
+function normalizeItemTypeToken(value: string): ItemTypeFilter {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "file" || normalized === "files") return "file";
+  if (normalized === "dir" || normalized === "dirs" || normalized === "directory" || normalized === "directories" || normalized === "folder") return "dir";
+  return "all";
+}
+
+function parseInvestigationQuery(raw: string, fallbackTab: Tab): InvestigationDefinition {
+  const next: InvestigationDefinition = { ...DEFAULT_INVESTIGATION_DEFINITION, active_tab: fallbackTab, selected_run_ids: [] };
+
+  for (const token of tokenizeInvestigationQuery(raw)) {
+    const separatorIndex = token.indexOf(":");
+    if (separatorIndex > 0) {
+      const key = token.slice(0, separatorIndex).trim().toLowerCase();
+      const value = stripQueryQuotes(token.slice(separatorIndex + 1));
+
+      if (key === "tab" || key === "view") {
+        next.active_tab = normalizeTabToken(value, next.active_tab);
+        continue;
+      }
+      if (key === "query" || key === "q" || key === "text") {
+        next.query = appendQuery(next.query, value);
+        continue;
+      }
+      if (key === "endpoint" || key === "host" || key === "hostname" || key === "ip") {
+        next.endpoint = value;
+        continue;
+      }
+      if (key === "share") {
+        next.share = value;
+        continue;
+      }
+      if (key === "path") {
+        next.path_prefix = value;
+        continue;
+      }
+      if (key === "ext" || key === "extension") {
+        next.ext = value;
+        continue;
+      }
+      if (key === "access") {
+        next.access_level = value;
+        continue;
+      }
+      if (key === "type") {
+        next.item_type = normalizeItemTypeToken(value);
+        continue;
+      }
+      if (key === "run" || key === "runs") {
+        next.selected_run_ids = value
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean);
+        continue;
+      }
+    }
+
+    next.query = appendQuery(next.query, stripQueryQuotes(token));
+  }
+
+  return next;
+}
+
+function quoteInvestigationValue(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return /\s/.test(trimmed) ? `"${trimmed}"` : trimmed;
+}
+
+function buildInvestigationQuery(definition: InvestigationDefinition): string {
+  const tokens: string[] = [];
+  if (definition.active_tab !== "items") tokens.push(`tab:${definition.active_tab}`);
+  if (definition.query) tokens.push(`query:${quoteInvestigationValue(definition.query)}`);
+  if (definition.endpoint) tokens.push(`endpoint:${quoteInvestigationValue(definition.endpoint)}`);
+  if (definition.share) tokens.push(`share:${quoteInvestigationValue(definition.share)}`);
+  if (definition.path_prefix) tokens.push(`path:${quoteInvestigationValue(definition.path_prefix)}`);
+  if (definition.ext) tokens.push(`ext:${quoteInvestigationValue(definition.ext)}`);
+  if (definition.access_level) tokens.push(`access:${quoteInvestigationValue(definition.access_level)}`);
+  if (definition.item_type !== "all") tokens.push(`type:${definition.item_type}`);
+  if (definition.selected_run_ids.length > 0) tokens.push(`runs:${definition.selected_run_ids.join(",")}`);
+  return tokens.join(" ");
+}
+
 export function ProjectInventoryPage() {
   const { projectId } = useParams<{ projectId: string }>();
 
@@ -114,6 +283,12 @@ export function ProjectInventoryPage() {
   const [pathPrefix, setPathPrefix] = useState("");
   const [extFilter, setExtFilter] = useState("");
   const [resourceAccess, setResourceAccess] = useState("");
+  const [itemTypeFilter, setItemTypeFilter] = useState<ItemTypeFilter>("all");
+  const [investigationQuery, setInvestigationQuery] = useState("");
+  const [investigationName, setInvestigationName] = useState("");
+  const [investigationDescription, setInvestigationDescription] = useState("");
+  const [savedInvestigations, setSavedInvestigations] = useState<SavedInvestigation[]>([]);
+  const [investigationsLoading, setInvestigationsLoading] = useState(false);
 
   const [extensions, setExtensions] = useState<ExtensionFacet[]>([]);
   const [items, setItems] = useState<InventoryItem[]>([]);
@@ -125,6 +300,7 @@ export function ProjectInventoryPage() {
   const [nextCursor, setNextCursor] = useState<string | null>(null);
 
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
   const [itemColumns, setItemColumns] = useState<ItemColumnKey[]>(["path", "name", "resource_name", "share_type", "hostname", "run_name", "is_dir"]);
   const [resourceColumns, setResourceColumns] = useState<ResourceColumnKey[]>([
     "name",
@@ -154,6 +330,22 @@ export function ProjectInventoryPage() {
       .catch((err) => setError(err.message));
   }, [projectId]);
 
+  async function loadInvestigations() {
+    if (!projectId) return;
+    setInvestigationsLoading(true);
+    try {
+      const data = await apiFetch(`/projects/${projectId}/inventory/investigations`);
+      setSavedInvestigations((data?.items || []) as SavedInvestigation[]);
+    } finally {
+      setInvestigationsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadInvestigations().catch((err) => setError(err instanceof Error ? err.message : "Failed to load saved investigations"));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
+
   useEffect(() => {
     if (!projectId) return;
     const queryParams = new URLSearchParams({ limit: "100" });
@@ -167,7 +359,7 @@ export function ProjectInventoryPage() {
   useEffect(() => {
     setCursor(null);
     setCursorHistory([]);
-  }, [activeTab, projectId, runIdsParam, query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess]);
+  }, [activeTab, projectId, runIdsParam, query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess, itemTypeFilter]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -181,6 +373,8 @@ export function ProjectInventoryPage() {
       if (shareFilter.trim()) queryParams.set("share", shareFilter.trim());
       if (pathPrefix.trim()) queryParams.set("path_prefix", pathPrefix.trim());
       if (extFilter.trim()) queryParams.set("ext", extFilter.trim());
+      if (itemTypeFilter === "file") queryParams.set("is_dir", "false");
+      if (itemTypeFilter === "dir") queryParams.set("is_dir", "true");
 
       apiFetch(`/projects/${projectId}/inventory/items?${queryParams.toString()}`)
         .then((data) => {
@@ -212,7 +406,96 @@ export function ProjectInventoryPage() {
         setNextCursor((data?.next_cursor as string | null) || null);
       })
       .catch((err) => setError(err.message));
-  }, [activeTab, cursor, endpointFilter, endpointQuery, extFilter, pathPrefix, projectId, query, resourceAccess, runIdsParam, shareFilter]);
+  }, [activeTab, cursor, endpointFilter, endpointQuery, extFilter, itemTypeFilter, pathPrefix, projectId, query, resourceAccess, runIdsParam, shareFilter]);
+
+  function currentInvestigationDefinition(): InvestigationDefinition {
+    return {
+      active_tab: activeTab,
+      query: query.trim(),
+      endpoint: endpointFilter.trim(),
+      share: shareFilter.trim(),
+      path_prefix: pathPrefix.trim(),
+      ext: extFilter.trim(),
+      access_level: resourceAccess.trim(),
+      item_type: itemTypeFilter,
+      selected_run_ids: selectedRunIds,
+    };
+  }
+
+  function applyInvestigationDefinition(definition: InvestigationDefinition, queryText?: string, successMessage?: string) {
+    const normalized = { ...DEFAULT_INVESTIGATION_DEFINITION, ...definition };
+    setActiveTab(normalized.active_tab || "items");
+    setQuery(normalized.query || "");
+    setEndpointFilter(normalized.endpoint || "");
+    setShareFilter(normalized.share || "");
+    setPathPrefix(normalized.path_prefix || "");
+    setExtFilter(normalized.ext || "");
+    setResourceAccess(normalized.access_level || "");
+    setItemTypeFilter(normalized.item_type || "all");
+    setSelectedRunIds(Array.isArray(normalized.selected_run_ids) ? normalized.selected_run_ids : []);
+    setInvestigationQuery(queryText || buildInvestigationQuery(normalized));
+    setError(null);
+    if (successMessage) setInfo(successMessage);
+  }
+
+  function applyInvestigationQuery() {
+    const parsed = parseInvestigationQuery(investigationQuery, activeTab);
+    applyInvestigationDefinition(parsed, investigationQuery, "Applied investigation query.");
+  }
+
+  function captureCurrentFilters() {
+    const definition = currentInvestigationDefinition();
+    setInvestigationQuery(buildInvestigationQuery(definition));
+    setError(null);
+    setInfo("Captured the current filters into the investigation query.");
+  }
+
+  async function saveInvestigation() {
+    if (!projectId) return;
+    if (!investigationName.trim()) {
+      setError("Investigation name is required.");
+      return;
+    }
+
+    const definition = investigationQuery.trim() ? parseInvestigationQuery(investigationQuery, activeTab) : currentInvestigationDefinition();
+    const queryText = investigationQuery.trim() || buildInvestigationQuery(definition);
+
+    setError(null);
+    setInfo(null);
+    try {
+      await apiFetch(`/projects/${projectId}/inventory/investigations`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: investigationName.trim(),
+          description: investigationDescription.trim() || null,
+          target_tab: definition.active_tab,
+          query_text: queryText,
+          definition,
+        }),
+      });
+      setInvestigationName("");
+      setInvestigationDescription("");
+      setInfo("Saved investigation.");
+      await loadInvestigations();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save investigation");
+    }
+  }
+
+  async function deleteInvestigation(investigation: SavedInvestigation) {
+    if (!projectId) return;
+    if (!window.confirm(`Delete saved investigation "${investigation.name}"?`)) return;
+
+    setError(null);
+    setInfo(null);
+    try {
+      await apiFetch(`/projects/${projectId}/inventory/investigations/${investigation.id}`, { method: "DELETE" });
+      setInfo(`Deleted "${investigation.name}".`);
+      await loadInvestigations();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete investigation");
+    }
+  }
 
   function moveNext() {
     if (!nextCursor) return;
@@ -340,10 +623,130 @@ export function ProjectInventoryPage() {
           </div>
         </div>
         {error ? <p className="rounded-lg bg-rose-100 p-2 text-sm text-rose-700 dark:bg-rose-900/20 dark:text-rose-200">{error}</p> : null}
+        {info ? <p className="rounded-lg bg-emerald-100 p-2 text-sm text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-200">{info}</p> : null}
       </div>
 
       <div className="workspace-section">
-        <div className="grid gap-3 md:grid-cols-6">
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.7fr)_minmax(320px,0.9fr)]">
+          <div className="workspace-card space-y-4">
+            <div>
+              <h2 className="text-lg font-semibold">Investigation Query</h2>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+                Use a simple `field:value` query to repeat audit workflows without resetting each filter manually.
+              </p>
+              <p className="mt-2 text-xs text-slate-500">
+                Supported keys: `tab`, `query`, `endpoint`, `share`, `path`, `ext`, `access`, `type`, `runs`.
+              </p>
+            </div>
+
+            <textarea
+              className="min-h-[96px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+              placeholder={'query:"finance review" endpoint:fs-01 ext:.xlsx type:file'}
+              value={investigationQuery}
+              onChange={(event) => setInvestigationQuery(event.target.value)}
+            />
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700"
+                onClick={applyInvestigationQuery}
+                type="button"
+              >
+                Apply Query
+              </button>
+              <button
+                className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700"
+                onClick={captureCurrentFilters}
+                type="button"
+              >
+                Capture Current Filters
+              </button>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-end">
+              <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                Save As
+                <input
+                  className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  placeholder="Quarterly finance workbook review"
+                  value={investigationName}
+                  onChange={(event) => setInvestigationName(event.target.value)}
+                />
+              </label>
+              <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                Notes
+                <input
+                  className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  placeholder="Optional analyst note"
+                  value={investigationDescription}
+                  onChange={(event) => setInvestigationDescription(event.target.value)}
+                />
+              </label>
+              <button
+                className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase dark:border-slate-700"
+                onClick={saveInvestigation}
+                type="button"
+              >
+                Save Investigation
+              </button>
+            </div>
+          </div>
+
+          <div className="workspace-card">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h2 className="text-lg font-semibold">Saved Investigations</h2>
+                <p className="mt-1 text-xs text-slate-500">Persisted per project for repeat audit work.</p>
+              </div>
+              {investigationsLoading ? <span className="text-xs text-slate-500">Loading…</span> : null}
+            </div>
+
+            <ul className="mt-3 max-h-[320px] space-y-2 overflow-auto">
+              {savedInvestigations.length === 0 ? <li className="text-sm text-slate-500">No saved investigations yet.</li> : null}
+              {savedInvestigations.map((investigation) => (
+                <li className="rounded-lg border border-slate-300 p-3 dark:border-slate-700" key={investigation.id}>
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <p className="font-semibold">{investigation.name}</p>
+                      <p className="mt-1 text-[11px] uppercase tracking-wide text-slate-500">{investigation.target_tab}</p>
+                    </div>
+                    <button
+                      className="rounded border border-slate-300 px-2 py-1 text-[10px] font-semibold uppercase dark:border-slate-700"
+                      onClick={() => deleteInvestigation(investigation)}
+                      type="button"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                  {investigation.description ? <p className="mt-2 text-xs text-slate-500">{investigation.description}</p> : null}
+                  <div className="mt-2 rounded bg-slate-100 px-2 py-2 text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                    {investigation.query_text || buildInvestigationQuery(investigation.definition)}
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-2 text-[11px] text-slate-500">
+                    <span>Updated {new Date(investigation.updated_at).toLocaleString()}</span>
+                    <button
+                      className="rounded border border-slate-300 px-2 py-1 font-semibold uppercase dark:border-slate-700"
+                      onClick={() =>
+                        applyInvestigationDefinition(
+                          investigation.definition || DEFAULT_INVESTIGATION_DEFINITION,
+                          investigation.query_text,
+                          `Applied "${investigation.name}".`,
+                        )
+                      }
+                      type="button"
+                    >
+                      Apply
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div className="workspace-section">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-7">
           <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
             Search
             <input
@@ -415,6 +818,20 @@ export function ProjectInventoryPage() {
               <option value="readable">readable</option>
               <option value="list_only">list_only</option>
               <option value="no_access">no_access</option>
+            </select>
+          </label>
+
+          <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+            Entry Type
+            <select
+              className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
+              value={itemTypeFilter}
+              onChange={(event) => setItemTypeFilter(event.target.value as ItemTypeFilter)}
+              disabled={activeTab !== "items"}
+            >
+              <option value="all">All</option>
+              <option value="file">Files</option>
+              <option value="dir">Directories</option>
             </select>
           </label>
         </div>

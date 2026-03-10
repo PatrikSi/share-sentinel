@@ -253,3 +253,32 @@ class ProjectMembershipUpsertIn(BaseModel):
     project_id: uuid.UUID
     user_id: uuid.UUID
     role: ProjectRole
+
+
+class SavedInvestigationIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+    target_tab: str = Field(default="items", min_length=1, max_length=32)
+    query_text: str = Field(default="", max_length=4000)
+    definition: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("target_tab")
+    @classmethod
+    def validate_target_tab(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"items", "resources", "endpoints"}:
+            raise ValueError("target_tab must be one of: items, resources, endpoints")
+        return normalized
+
+
+class SavedInvestigationOut(BaseModel):
+    id: uuid.UUID
+    project_id: uuid.UUID
+    created_by_user_id: uuid.UUID | None
+    name: str
+    description: str | None
+    target_tab: str
+    query_text: str
+    definition: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
