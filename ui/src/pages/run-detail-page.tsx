@@ -12,6 +12,12 @@ type RunInfo = {
   target_scope: Record<string, unknown>;
   summary: { endpoints?: number; resources?: number; items?: number; errors?: number };
 };
+type RunCompareOption = {
+  id: string;
+  name: string;
+  status: string;
+  created_at: string;
+};
 
 type Endpoint = {
   id: number;
@@ -23,6 +29,35 @@ type Endpoint = {
 type Resource = { id: number; name: string; access_level: string; remark: string | null; share_type: string };
 type Item = { id: number; path: string; is_dir: boolean; resource_id?: number; name?: string };
 type SavedQuery = { id: string; label: string; q: string; ext: string };
+type RunDiffShare = {
+  endpoint_key: string;
+  hostname: string | null;
+  ip: string | null;
+  share_name: string;
+  share_type: string;
+  access_level: string | null;
+  item_count: number;
+};
+type RunDiffChurn = RunDiffShare & {
+  added_items: number;
+  removed_items: number;
+  added_examples: string[];
+  removed_examples: string[];
+};
+type RunDiffResult = {
+  current_run: { id: string; name: string; created_at: string | null; status: string };
+  baseline_run: { id: string; name: string; created_at: string | null; status: string } | null;
+  summary: {
+    new_shares: number;
+    disappeared_shares: number;
+    changed_shares: number;
+    added_items: number;
+    removed_items: number;
+  };
+  new_shares: RunDiffShare[];
+  disappeared_shares: RunDiffShare[];
+  item_churn: RunDiffChurn[];
+};
 
 const RUN_STATUS_COLORS: Record<string, string> = {
   PENDING_UPLOAD: "bg-slate-200 text-slate-900 dark:bg-slate-800 dark:text-slate-200",
@@ -36,7 +71,12 @@ export function RunDetailPage() {
   const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
 
   const [run, setRun] = useState<RunInfo | null>(null);
+  const [projectRuns, setProjectRuns] = useState<RunCompareOption[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [selectedBaselineRunId, setSelectedBaselineRunId] = useState("");
+  const [runDiff, setRunDiff] = useState<RunDiffResult | null>(null);
 
   const [endpointSearch, setEndpointSearch] = useState("");
   const [itemSearch, setItemSearch] = useState("");
@@ -93,6 +133,49 @@ export function RunDetailPage() {
       .then((data) => setRun(data as RunInfo))
       .catch((err) => setError(err.message));
   }, [projectId, runId]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    apiFetch(`/projects/${projectId}/runs?limit=200`)
+      .then((data) => setProjectRuns((data?.items || []) as RunCompareOption[]))
+      .catch((err) => setError(err.message));
+  }, [projectId]);
+
+  const baselineOptions = useMemo(() => {
+    if (!runId) return [];
+    const currentCreatedAt = run ? new Date(run.created_at).getTime() : Number.POSITIVE_INFINITY;
+    return projectRuns.filter((candidate) => {
+      if (candidate.id === runId || candidate.status !== "COMPLETE") return false;
+      const createdAt = new Date(candidate.created_at).getTime();
+      return Number.isFinite(createdAt) ? createdAt <= currentCreatedAt : true;
+    });
+  }, [projectRuns, run, runId]);
+
+  useEffect(() => {
+    setSelectedBaselineRunId("");
+    setRunDiff(null);
+    setDiffError(null);
+  }, [runId]);
+
+  useEffect(() => {
+    if (!projectId || !runId) return;
+    setDiffLoading(true);
+    setDiffError(null);
+    const query = new URLSearchParams();
+    if (selectedBaselineRunId) query.set("baseline_run_id", selectedBaselineRunId);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+
+    apiFetch(`/projects/${projectId}/runs/${runId}/diff${suffix}`)
+      .then((data) => {
+        const payload = data as RunDiffResult;
+        setRunDiff(payload);
+        if (!selectedBaselineRunId && payload.baseline_run?.id) {
+          setSelectedBaselineRunId(payload.baseline_run.id);
+        }
+      })
+      .catch((err) => setDiffError(err.message))
+      .finally(() => setDiffLoading(false));
+  }, [projectId, runId, selectedBaselineRunId]);
 
   useEffect(() => {
     if (!projectId || !runId || !run) return;
@@ -252,6 +335,166 @@ export function RunDetailPage() {
           ) : null}
         </div>
         {error ? <p className="mt-2 text-sm text-red-600">{error}</p> : null}
+      </div>
+
+      <div className="workspace-section space-y-4">
+        <div className="workspace-card">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-semibold">Run-to-Run Diff</h2>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+                Compare this run against a prior complete run to see new shares, disappeared shares, and item churn.
+              </p>
+            </div>
+            <label className="block min-w-[280px] text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Baseline run
+              <select
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                value={selectedBaselineRunId}
+                onChange={(event) => setSelectedBaselineRunId(event.target.value)}
+              >
+                <option value="">Nearest previous complete run</option>
+                {baselineOptions.map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {candidate.name} [{candidate.status}] {new Date(candidate.created_at).toLocaleString()}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          {diffLoading ? <p className="mt-3 text-sm text-slate-500">Loading run diff…</p> : null}
+          {diffError ? <p className="mt-3 text-sm text-red-600">{diffError}</p> : null}
+
+          {runDiff && !diffLoading ? (
+            runDiff.baseline_run ? (
+              <div className="mt-4 space-y-4">
+                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+                  <div className="rounded-lg border border-slate-300 p-3 text-sm dark:border-slate-700">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Baseline</p>
+                    <p className="mt-1 font-semibold">{runDiff.baseline_run.name}</p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {runDiff.baseline_run.status} •{" "}
+                      {runDiff.baseline_run.created_at ? new Date(runDiff.baseline_run.created_at).toLocaleString() : "unknown time"}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-slate-300 p-3 text-sm dark:border-slate-700">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Current</p>
+                    <p className="mt-1 font-semibold">{runDiff.current_run.name}</p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {runDiff.current_run.status} •{" "}
+                      {runDiff.current_run.created_at ? new Date(runDiff.current_run.created_at).toLocaleString() : "unknown time"}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                  <div className="rounded-lg border border-slate-300 p-3 dark:border-slate-700">
+                    <p className="text-[11px] uppercase tracking-wide text-slate-500">New Shares</p>
+                    <p className="mt-1 text-2xl font-semibold">{runDiff.summary.new_shares}</p>
+                  </div>
+                  <div className="rounded-lg border border-slate-300 p-3 dark:border-slate-700">
+                    <p className="text-[11px] uppercase tracking-wide text-slate-500">Disappeared Shares</p>
+                    <p className="mt-1 text-2xl font-semibold">{runDiff.summary.disappeared_shares}</p>
+                  </div>
+                  <div className="rounded-lg border border-slate-300 p-3 dark:border-slate-700">
+                    <p className="text-[11px] uppercase tracking-wide text-slate-500">Changed Shares</p>
+                    <p className="mt-1 text-2xl font-semibold">{runDiff.summary.changed_shares}</p>
+                  </div>
+                  <div className="rounded-lg border border-slate-300 p-3 dark:border-slate-700">
+                    <p className="text-[11px] uppercase tracking-wide text-slate-500">Added Items</p>
+                    <p className="mt-1 text-2xl font-semibold">{runDiff.summary.added_items}</p>
+                  </div>
+                  <div className="rounded-lg border border-slate-300 p-3 dark:border-slate-700">
+                    <p className="text-[11px] uppercase tracking-wide text-slate-500">Removed Items</p>
+                    <p className="mt-1 text-2xl font-semibold">{runDiff.summary.removed_items}</p>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <p className="mt-3 text-sm text-slate-500">No earlier complete run is available for comparison yet.</p>
+            )
+          ) : null}
+        </div>
+
+        {runDiff?.baseline_run ? (
+          <div className="grid gap-4 xl:grid-cols-3">
+            <div className="workspace-card">
+              <h3 className="text-base font-semibold">New Shares</h3>
+              <p className="mt-1 text-xs text-slate-500">Shares present now but absent in the baseline run.</p>
+              <ul className="mt-3 max-h-[320px] space-y-2 overflow-auto">
+                {runDiff.new_shares.length === 0 ? <li className="text-sm text-slate-500">No newly discovered shares.</li> : null}
+                {runDiff.new_shares.map((share) => (
+                  <li className="rounded-lg border border-slate-300 p-3 text-xs dark:border-slate-700" key={`${share.endpoint_key}:${share.share_name}`}>
+                    <div className="font-semibold">{share.share_name}</div>
+                    <div className="mt-1 text-slate-500">{share.endpoint_key}</div>
+                    <div className="mt-1 text-slate-500">
+                      {share.share_type.toUpperCase()} • {share.access_level || "unknown"} • {share.item_count} item(s)
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            <div className="workspace-card">
+              <h3 className="text-base font-semibold">Disappeared Shares</h3>
+              <p className="mt-1 text-xs text-slate-500">Shares that existed in the baseline run but are gone now.</p>
+              <ul className="mt-3 max-h-[320px] space-y-2 overflow-auto">
+                {runDiff.disappeared_shares.length === 0 ? <li className="text-sm text-slate-500">No disappeared shares.</li> : null}
+                {runDiff.disappeared_shares.map((share) => (
+                  <li className="rounded-lg border border-slate-300 p-3 text-xs dark:border-slate-700" key={`${share.endpoint_key}:${share.share_name}`}>
+                    <div className="font-semibold">{share.share_name}</div>
+                    <div className="mt-1 text-slate-500">{share.endpoint_key}</div>
+                    <div className="mt-1 text-slate-500">
+                      {share.share_type.toUpperCase()} • {share.access_level || "unknown"} • {share.item_count} item(s)
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            <div className="workspace-card">
+              <h3 className="text-base font-semibold">Item Churn</h3>
+              <p className="mt-1 text-xs text-slate-500">Shares that remained in scope but changed contents between runs.</p>
+              <ul className="mt-3 max-h-[320px] space-y-2 overflow-auto">
+                {runDiff.item_churn.length === 0 ? <li className="text-sm text-slate-500">No item churn detected.</li> : null}
+                {runDiff.item_churn.map((share) => (
+                  <li className="rounded-lg border border-slate-300 p-3 text-xs dark:border-slate-700" key={`${share.endpoint_key}:${share.share_name}`}>
+                    <div className="font-semibold">{share.share_name}</div>
+                    <div className="mt-1 text-slate-500">{share.endpoint_key}</div>
+                    <div className="mt-1 text-slate-500">
+                      +{share.added_items} / -{share.removed_items} item(s)
+                    </div>
+                    {share.added_examples.length > 0 ? (
+                      <div className="mt-2">
+                        <p className="font-semibold text-emerald-700 dark:text-emerald-300">Added</p>
+                        <ul className="mt-1 space-y-1 text-slate-500">
+                          {share.added_examples.map((path) => (
+                            <li className="font-mono" key={`add:${share.endpoint_key}:${share.share_name}:${path}`}>
+                              {path}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                    {share.removed_examples.length > 0 ? (
+                      <div className="mt-2">
+                        <p className="font-semibold text-rose-700 dark:text-rose-300">Removed</p>
+                        <ul className="mt-1 space-y-1 text-slate-500">
+                          {share.removed_examples.map((path) => (
+                            <li className="font-mono" key={`remove:${share.endpoint_key}:${share.share_name}:${path}`}>
+                              {path}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        ) : null}
       </div>
 
       <div className="workspace-section grid gap-4 md:grid-cols-3">

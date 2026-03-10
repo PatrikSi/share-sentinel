@@ -4,6 +4,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
@@ -64,6 +65,182 @@ def _to_run_out(run: ScanRun) -> RunOut:
         artifact_size=run.artifact_size,
         summary=run.summary,
     )
+
+
+def _run_summary_payload(run: ScanRun) -> dict:
+    return {
+        "id": str(run.id),
+        "name": run.name,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "status": run.status.value if hasattr(run.status, "value") else run.status,
+    }
+
+
+def _resource_identity(endpoint_key: str, resource_type: str, share_name: str) -> tuple[str, str, str]:
+    return (endpoint_key or "", resource_type or "", share_name or "")
+
+
+def _sorted_resource_keys(keys: Iterable[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    return sorted(keys, key=lambda value: (value[0].lower(), value[2].lower(), value[1].lower()))
+
+
+def _load_run_diff_snapshot(db: Session, run_id: uuid.UUID) -> dict[tuple[str, str, str], dict]:
+    resource_rows = db.execute(
+        select(
+            Resource.name,
+            Resource.access_level,
+            Resource.resource_type,
+            Endpoint.endpoint_key,
+            Endpoint.hostname,
+            Endpoint.ip,
+        )
+        .select_from(Resource)
+        .join(Endpoint, (Endpoint.id == Resource.endpoint_id) & (Endpoint.run_id == Resource.run_id))
+        .where(Resource.run_id == run_id)
+    ).all()
+
+    snapshot: dict[tuple[str, str, str], dict] = {}
+    for row in resource_rows:
+        resource_type = row.resource_type.value if hasattr(row.resource_type, "value") else str(row.resource_type)
+        access_level = row.access_level.value if hasattr(row.access_level, "value") else row.access_level
+        identity = _resource_identity(row.endpoint_key, resource_type, row.name)
+        snapshot[identity] = {
+            "endpoint_key": row.endpoint_key,
+            "hostname": row.hostname,
+            "ip": row.ip,
+            "share_name": row.name,
+            "resource_type": resource_type,
+            "share_type": share_type_from_resource_type(row.resource_type),
+            "access_level": access_level,
+            "item_paths": set(),
+        }
+
+    item_rows = db.execute(
+        select(
+            Resource.name,
+            Resource.resource_type,
+            Endpoint.endpoint_key,
+            Item.path,
+        )
+        .select_from(Item)
+        .join(Resource, (Resource.id == Item.resource_id) & (Resource.run_id == Item.run_id))
+        .join(Endpoint, (Endpoint.id == Resource.endpoint_id) & (Endpoint.run_id == Resource.run_id))
+        .where(Item.run_id == run_id)
+    ).all()
+
+    for row in item_rows:
+        resource_type = row.resource_type.value if hasattr(row.resource_type, "value") else str(row.resource_type)
+        identity = _resource_identity(row.endpoint_key, resource_type, row.name)
+        record = snapshot.get(identity)
+        if record is None:
+            record = {
+                "endpoint_key": row.endpoint_key,
+                "hostname": None,
+                "ip": None,
+                "share_name": row.name,
+                "resource_type": resource_type,
+                "share_type": share_type_from_resource_type(row.resource_type),
+                "access_level": None,
+                "item_paths": set(),
+            }
+            snapshot[identity] = record
+        record["item_paths"].add(row.path)
+
+    return snapshot
+
+
+def _build_run_diff(current_snapshot: dict[tuple[str, str, str], dict], baseline_snapshot: dict[tuple[str, str, str], dict], example_limit: int = 5) -> dict:
+    current_keys = set(current_snapshot)
+    baseline_keys = set(baseline_snapshot)
+
+    new_shares = []
+    for key in _sorted_resource_keys(current_keys - baseline_keys):
+        resource = current_snapshot[key]
+        new_shares.append(
+            {
+                "endpoint_key": resource["endpoint_key"],
+                "hostname": resource["hostname"],
+                "ip": resource["ip"],
+                "share_name": resource["share_name"],
+                "share_type": resource["share_type"],
+                "access_level": resource["access_level"],
+                "item_count": len(resource["item_paths"]),
+            }
+        )
+
+    disappeared_shares = []
+    for key in _sorted_resource_keys(baseline_keys - current_keys):
+        resource = baseline_snapshot[key]
+        disappeared_shares.append(
+            {
+                "endpoint_key": resource["endpoint_key"],
+                "hostname": resource["hostname"],
+                "ip": resource["ip"],
+                "share_name": resource["share_name"],
+                "share_type": resource["share_type"],
+                "access_level": resource["access_level"],
+                "item_count": len(resource["item_paths"]),
+            }
+        )
+
+    item_churn = []
+    for key in _sorted_resource_keys(current_keys & baseline_keys):
+        current_resource = current_snapshot[key]
+        baseline_resource = baseline_snapshot[key]
+        added_paths = sorted(current_resource["item_paths"] - baseline_resource["item_paths"])
+        removed_paths = sorted(baseline_resource["item_paths"] - current_resource["item_paths"])
+        if not added_paths and not removed_paths:
+            continue
+        item_churn.append(
+            {
+                "endpoint_key": current_resource["endpoint_key"],
+                "hostname": current_resource["hostname"] or baseline_resource["hostname"],
+                "ip": current_resource["ip"] or baseline_resource["ip"],
+                "share_name": current_resource["share_name"],
+                "share_type": current_resource["share_type"],
+                "access_level": current_resource["access_level"] or baseline_resource["access_level"],
+                "added_items": len(added_paths),
+                "removed_items": len(removed_paths),
+                "added_examples": added_paths[:example_limit],
+                "removed_examples": removed_paths[:example_limit],
+            }
+        )
+
+    item_churn.sort(
+        key=lambda item: (
+            -(item["added_items"] + item["removed_items"]),
+            item["endpoint_key"].lower(),
+            item["share_name"].lower(),
+        )
+    )
+
+    return {
+        "summary": {
+            "new_shares": len(new_shares),
+            "disappeared_shares": len(disappeared_shares),
+            "changed_shares": len(item_churn),
+            "added_items": sum(item["added_items"] for item in item_churn),
+            "removed_items": sum(item["removed_items"] for item in item_churn),
+        },
+        "new_shares": new_shares,
+        "disappeared_shares": disappeared_shares,
+        "item_churn": item_churn,
+    }
+
+
+def _default_baseline_run(db: Session, project_id: uuid.UUID, run: ScanRun) -> ScanRun | None:
+    stmt = (
+        select(ScanRun)
+        .where(
+            ScanRun.project_id == project_id,
+            ScanRun.id != run.id,
+            ScanRun.status == RunStatus.COMPLETE,
+            ScanRun.created_at <= run.created_at,
+        )
+        .order_by(ScanRun.created_at.desc())
+        .limit(1)
+    )
+    return db.execute(stmt).scalar_one_or_none()
 
 
 async def _enqueue_with_retries(payload: dict, retries: int) -> bool:
@@ -352,6 +529,61 @@ def get_run(
     )
     db.commit()
     return _to_run_out(run)
+
+
+@router.get("/{run_id}/diff", response_model=dict)
+def diff_run(
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+    request: Request,
+    baseline_run_id: uuid.UUID | None = Query(default=None),
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    current_run = _get_run(db, project_id, run_id)
+    baseline_run = _get_run(db, project_id, baseline_run_id) if baseline_run_id else _default_baseline_run(db, project_id, current_run)
+
+    if baseline_run is None:
+        _write_read_audit(
+            db,
+            request,
+            auth,
+            project_id,
+            action="RUN_DIFF_VIEWED",
+            object_type="scan_run",
+            object_id=str(run_id),
+            metadata={"baseline_run_id": None, "has_baseline": False},
+        )
+        db.commit()
+        return {
+            "current_run": _run_summary_payload(current_run),
+            "baseline_run": None,
+            "summary": {"new_shares": 0, "disappeared_shares": 0, "changed_shares": 0, "added_items": 0, "removed_items": 0},
+            "new_shares": [],
+            "disappeared_shares": [],
+            "item_churn": [],
+        }
+
+    current_snapshot = _load_run_diff_snapshot(db, current_run.id)
+    baseline_snapshot = _load_run_diff_snapshot(db, baseline_run.id)
+    payload = _build_run_diff(current_snapshot, baseline_snapshot)
+    payload["current_run"] = _run_summary_payload(current_run)
+    payload["baseline_run"] = _run_summary_payload(baseline_run)
+
+    _write_read_audit(
+        db,
+        request,
+        auth,
+        project_id,
+        action="RUN_DIFF_VIEWED",
+        object_type="scan_run",
+        object_id=str(run_id),
+        metadata={**payload["summary"], "baseline_run_id": str(baseline_run.id)},
+    )
+    db.commit()
+    return payload
 
 
 @router.delete("/{run_id}")

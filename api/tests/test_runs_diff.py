@@ -1,0 +1,87 @@
+from app.routers import runs as runs_router
+
+
+def test_build_run_diff_reports_new_removed_and_changed_shares() -> None:
+    baseline_snapshot = {
+        ("10.0.0.10:445", "smb_share", "Finance"): {
+            "endpoint_key": "10.0.0.10:445",
+            "hostname": "fs-01",
+            "ip": "10.0.0.10",
+            "share_name": "Finance",
+            "share_type": "smb",
+            "access_level": "read",
+            "item_paths": {"\\Budget.xlsx", "\\Policies", "\\Policies\\Readme.txt"},
+        },
+        ("10.0.0.11:445", "smb_share", "HR"): {
+            "endpoint_key": "10.0.0.11:445",
+            "hostname": "fs-02",
+            "ip": "10.0.0.11",
+            "share_name": "HR",
+            "share_type": "smb",
+            "access_level": "read",
+            "item_paths": {"\\Handbook.pdf"},
+        },
+    }
+    current_snapshot = {
+        ("10.0.0.10:445", "smb_share", "Finance"): {
+            "endpoint_key": "10.0.0.10:445",
+            "hostname": "fs-01",
+            "ip": "10.0.0.10",
+            "share_name": "Finance",
+            "share_type": "smb",
+            "access_level": "read_write",
+            "item_paths": {"\\Budget.xlsx", "\\Policies", "\\Policies\\Q1.xlsx"},
+        },
+        ("10.0.0.12:445", "nfs_share", "/exports/backups"): {
+            "endpoint_key": "10.0.0.12:445",
+            "hostname": "nfs-01",
+            "ip": "10.0.0.12",
+            "share_name": "/exports/backups",
+            "share_type": "nfs",
+            "access_level": "read",
+            "item_paths": {"\\nightly", "\\nightly\\backup-01.zip"},
+        },
+    }
+
+    payload = runs_router._build_run_diff(current_snapshot, baseline_snapshot, example_limit=3)
+
+    assert payload["summary"] == {
+        "new_shares": 1,
+        "disappeared_shares": 1,
+        "changed_shares": 1,
+        "added_items": 1,
+        "removed_items": 1,
+    }
+    assert payload["new_shares"][0]["share_name"] == "/exports/backups"
+    assert payload["new_shares"][0]["item_count"] == 2
+    assert payload["disappeared_shares"][0]["share_name"] == "HR"
+    assert payload["item_churn"][0]["share_name"] == "Finance"
+    assert payload["item_churn"][0]["added_examples"] == ["\\Policies\\Q1.xlsx"]
+    assert payload["item_churn"][0]["removed_examples"] == ["\\Policies\\Readme.txt"]
+
+
+def test_build_run_diff_returns_empty_summary_for_identical_snapshots() -> None:
+    snapshot = {
+        ("10.0.0.10:445", "smb_share", "Finance"): {
+            "endpoint_key": "10.0.0.10:445",
+            "hostname": "fs-01",
+            "ip": "10.0.0.10",
+            "share_name": "Finance",
+            "share_type": "smb",
+            "access_level": "read",
+            "item_paths": {"\\Budget.xlsx"},
+        }
+    }
+
+    payload = runs_router._build_run_diff(snapshot, snapshot, example_limit=3)
+
+    assert payload["summary"] == {
+        "new_shares": 0,
+        "disappeared_shares": 0,
+        "changed_shares": 0,
+        "added_items": 0,
+        "removed_items": 0,
+    }
+    assert payload["new_shares"] == []
+    assert payload["disappeared_shares"] == []
+    assert payload["item_churn"] == []
