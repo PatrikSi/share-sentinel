@@ -31,6 +31,11 @@ class RegisterIn(BaseModel):
 
 class RegistrationSettingsOut(BaseModel):
     allow_self_registration: bool
+    password_min_length: int
+    password_require_lowercase: bool
+    password_require_uppercase: bool
+    password_require_number: bool
+    password_require_special: bool
 
 
 class SecuritySettingsOut(BaseModel):

@@ -49,7 +49,14 @@ rate_limiter = RateLimiter()
 @router.get("/registration-settings", response_model=RegistrationSettingsOut)
 def registration_settings():
     settings = get_settings()
-    return RegistrationSettingsOut(allow_self_registration=settings.allow_self_registration)
+    return RegistrationSettingsOut(
+        allow_self_registration=settings.allow_self_registration,
+        password_min_length=settings.password_min_length,
+        password_require_lowercase=settings.password_require_lowercase,
+        password_require_uppercase=settings.password_require_uppercase,
+        password_require_number=settings.password_require_number,
+        password_require_special=settings.password_require_special,
+    )
 
 
 @router.get("/security-settings", response_model=SecuritySettingsOut)
