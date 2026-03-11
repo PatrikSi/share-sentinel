@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     upload_chunk_bytes: int = 8 * 1024 * 1024
     rate_limit_fail_open: bool = False
     redis_stream_retries: int = 3
+    redis_stream_maxlen: int = 0
     auth_login_max_attempts: int = 8
     auth_login_window_seconds: int = 300
     auth_login_lockout_seconds: int = 900
