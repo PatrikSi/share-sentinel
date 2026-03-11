@@ -8,7 +8,7 @@ from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_token_scopes
 from app.enums import ProjectRole, RunStatus
 from app.models import Endpoint, Item, Resource, SavedInvestigation, ScanRun
-from app.pagination import next_cursor, parse_cursor
+from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_int_cursor_value
 from app.schemas import SavedInvestigationIn, SavedInvestigationOut
 from app.share_types import share_type_from_resource_type
 from app.services.inventory_query import InventoryQueryClause, parse_inventory_query
@@ -16,6 +16,9 @@ from app.services.audit import write_audit_event
 from app.token_scopes import SCOPE_READ_INVENTORY
 
 router = APIRouter(prefix="/projects/{project_id}/inventory", tags=["inventory"])
+INVENTORY_ITEM_CURSOR = (KeysetColumn("id", Item.id, direction="desc", parser=parse_int_cursor_value),)
+INVENTORY_RESOURCE_CURSOR = (KeysetColumn("id", Resource.id, direction="desc", parser=parse_int_cursor_value),)
+INVENTORY_ENDPOINT_CURSOR = (KeysetColumn("id", Endpoint.id, direction="desc", parser=parse_int_cursor_value),)
 
 
 def _saved_investigation_out(model: SavedInvestigation) -> SavedInvestigationOut:
@@ -513,7 +516,6 @@ def inventory_items(
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     run_id_list = _parse_run_ids(run_ids)
     query_groups = parse_inventory_query(query_dsl)
-    offset = parse_cursor(cursor)
 
     stmt = (
         select(
@@ -569,7 +571,8 @@ def inventory_items(
     if query_groups:
         stmt = _apply_inventory_query_groups(stmt, query_groups, _item_inventory_clause_expression)
 
-    rows = db.execute(stmt.order_by(Item.id.desc()).offset(offset).limit(limit)).all()
+    stmt = apply_keyset_pagination(stmt, INVENTORY_ITEM_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).all(), INVENTORY_ITEM_CURSOR, limit)
     items = [
         {
             "id": row.id,
@@ -606,7 +609,7 @@ def inventory_items(
         },
     )
     db.commit()
-    return {"items": items, "next_cursor": next_cursor(offset, limit, len(items))}
+    return {"items": items, "next_cursor": next_cursor}
 
 
 @router.get("/resources")
@@ -627,7 +630,6 @@ def inventory_resources(
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     run_id_list = _parse_run_ids(run_ids)
     query_groups = parse_inventory_query(query_dsl)
-    offset = parse_cursor(cursor)
 
     stmt = (
         select(
@@ -676,7 +678,8 @@ def inventory_resources(
     if query_groups:
         stmt = _apply_inventory_query_groups(stmt, query_groups, _resource_inventory_clause_expression)
 
-    rows = db.execute(stmt.order_by(Resource.id.desc()).offset(offset).limit(limit)).all()
+    stmt = apply_keyset_pagination(stmt, INVENTORY_RESOURCE_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).all(), INVENTORY_RESOURCE_CURSOR, limit)
     items = [
         {
             "id": row.id,
@@ -709,7 +712,7 @@ def inventory_resources(
         },
     )
     db.commit()
-    return {"items": items, "next_cursor": next_cursor(offset, limit, len(items))}
+    return {"items": items, "next_cursor": next_cursor}
 
 
 @router.get("/endpoints")
@@ -728,7 +731,6 @@ def inventory_endpoints(
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     run_id_list = _parse_run_ids(run_ids)
     query_groups = parse_inventory_query(query_dsl)
-    offset = parse_cursor(cursor)
 
     stmt = (
         select(
@@ -775,7 +777,8 @@ def inventory_endpoints(
     if query_groups:
         stmt = _apply_inventory_query_groups(stmt, query_groups, _endpoint_inventory_clause_expression)
 
-    rows = db.execute(stmt.order_by(Endpoint.id.desc()).offset(offset).limit(limit)).all()
+    stmt = apply_keyset_pagination(stmt, INVENTORY_ENDPOINT_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).all(), INVENTORY_ENDPOINT_CURSOR, limit)
     items = [
         {
             "id": row.id,
@@ -801,4 +804,4 @@ def inventory_endpoints(
         metadata={"q": q, "query_dsl": query_dsl, "run_ids": run_ids, "limit": limit},
     )
     db.commit()
-    return {"items": items, "next_cursor": next_cursor(offset, limit, len(items))}
+    return {"items": items, "next_cursor": next_cursor}

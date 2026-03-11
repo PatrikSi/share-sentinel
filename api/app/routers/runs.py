@@ -18,7 +18,14 @@ from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_token_scopes
 from app.enums import ProjectRole, RunStatus
 from app.models import Endpoint, Item, Resource, ScanRun
-from app.pagination import next_cursor, parse_cursor
+from app.pagination import (
+    KeysetColumn,
+    apply_keyset_pagination,
+    paginate_rows,
+    parse_datetime_cursor_value,
+    parse_int_cursor_value,
+    parse_uuid_cursor_value,
+)
 from app.rate_limit import RateLimiter
 from app.schemas import RunCreateIn, RunOut
 from app.share_types import share_type_from_resource_type
@@ -43,6 +50,12 @@ ALLOWED_ARTIFACT_CONTENT_TYPES = {
     "application/x-gzip",
     "application/octet-stream",
 }
+RUN_LIST_CURSOR = (
+    KeysetColumn("created_at", ScanRun.created_at, direction="desc", parser=parse_datetime_cursor_value),
+    KeysetColumn("id", ScanRun.id, direction="desc", parser=parse_uuid_cursor_value),
+)
+RUN_ENDPOINT_CURSOR = (KeysetColumn("id", Endpoint.id, parser=parse_int_cursor_value),)
+RUN_ITEM_CURSOR = (KeysetColumn("id", Item.id, parser=parse_int_cursor_value),)
 
 
 def _get_run(db: Session, project_id: uuid.UUID, run_id: uuid.UUID) -> ScanRun:
@@ -647,16 +660,10 @@ def list_runs(
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
-    offset = parse_cursor(cursor)
 
-    stmt = (
-        select(ScanRun)
-        .where(ScanRun.project_id == project_id)
-        .order_by(ScanRun.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-    )
-    runs = db.execute(stmt).scalars().all()
+    stmt = select(ScanRun).where(ScanRun.project_id == project_id)
+    stmt = apply_keyset_pagination(stmt, RUN_LIST_CURSOR, cursor, limit)
+    runs, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), RUN_LIST_CURSOR, limit)
 
     _write_read_audit(
         db,
@@ -672,7 +679,7 @@ def list_runs(
 
     return {
         "items": [_to_run_out(r).model_dump(mode="json") for r in runs],
-        "next_cursor": next_cursor(offset, limit, len(runs)),
+        "next_cursor": next_cursor,
     }
 
 
@@ -890,8 +897,6 @@ def list_endpoints(
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     _get_run(db, project_id, run_id)
 
-    offset = parse_cursor(cursor)
-
     stmt = select(Endpoint).where(Endpoint.run_id == run_id)
     if search:
         pattern = f"%{search}%"
@@ -904,8 +909,8 @@ def list_endpoints(
             )
         )
 
-    stmt = stmt.order_by(Endpoint.id.asc()).offset(offset).limit(limit)
-    rows = db.execute(stmt).scalars().all()
+    stmt = apply_keyset_pagination(stmt, RUN_ENDPOINT_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), RUN_ENDPOINT_CURSOR, limit)
 
     _write_read_audit(
         db,
@@ -933,7 +938,7 @@ def list_endpoints(
             }
             for r in rows
         ],
-        "next_cursor": next_cursor(offset, limit, len(rows)),
+        "next_cursor": next_cursor,
     }
 
 
@@ -1001,16 +1006,14 @@ def resource_items(
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     _get_run(db, project_id, run_id)
 
-    offset = parse_cursor(cursor)
-
     stmt = select(Item).where(Item.run_id == run_id, Item.resource_id == resource_id)
     if search:
         stmt = stmt.where(Item.name.ilike(f"%{search}%"))
     if path_prefix:
         stmt = stmt.where(Item.path.ilike(f"{path_prefix}%"))
 
-    stmt = stmt.order_by(Item.id.asc()).offset(offset).limit(limit)
-    items = db.execute(stmt).scalars().all()
+    stmt = apply_keyset_pagination(stmt, RUN_ITEM_CURSOR, cursor, limit)
+    items, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), RUN_ITEM_CURSOR, limit)
 
     _write_read_audit(
         db,
@@ -1043,7 +1046,7 @@ def resource_items(
             }
             for i in items
         ],
-        "next_cursor": next_cursor(offset, limit, len(items)),
+        "next_cursor": next_cursor,
     }
 
 
@@ -1063,8 +1066,6 @@ def search_items(
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     _get_run(db, project_id, run_id)
 
-    offset = parse_cursor(cursor)
-
     stmt = select(Item).where(Item.run_id == run_id)
     if q:
         stmt = stmt.where(or_(Item.name.ilike(f"%{q}%"), cast(Item.path, String).ilike(f"%{q}%")))
@@ -1072,8 +1073,8 @@ def search_items(
         ext = ext if ext.startswith(".") else f".{ext}"
         stmt = stmt.where(func.lower(Item.name).like(f"%{ext.lower()}"))
 
-    stmt = stmt.order_by(Item.id.asc()).offset(offset).limit(limit)
-    items = db.execute(stmt).scalars().all()
+    stmt = apply_keyset_pagination(stmt, RUN_ITEM_CURSOR, cursor, limit)
+    items, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), RUN_ITEM_CURSOR, limit)
 
     _write_read_audit(
         db,
@@ -1098,5 +1099,5 @@ def search_items(
             }
             for i in items
         ],
-        "next_cursor": next_cursor(offset, limit, len(items)),
+        "next_cursor": next_cursor,
     }

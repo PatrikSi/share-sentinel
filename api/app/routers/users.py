@@ -11,12 +11,17 @@ from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
 from app.enums import ProjectRole
 from app.models import Project, ProjectMember, RefreshToken, User
+from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_datetime_cursor_value, parse_uuid_cursor_value
 from app.schemas import UserApprovalIn, UserAssignAllProjectsIn, UserCreateIn, UserOut, UserUpdateIn
 from app.security import hash_password, validate_password_strength
 from app.services.audit import write_audit_event
 from app.token_scopes import SCOPE_READ_USERS, SCOPE_WRITE_MEMBERS, SCOPE_WRITE_USERS, has_required_scope
 
 router = APIRouter(prefix="/users", tags=["users"])
+USER_LIST_CURSOR = (
+    KeysetColumn("created_at", User.created_at, direction="desc", parser=parse_datetime_cursor_value),
+    KeysetColumn("id", User.id, direction="desc", parser=parse_uuid_cursor_value),
+)
 
 
 @router.post("", response_model=UserOut)
@@ -94,12 +99,6 @@ def list_users(
     __: User = Depends(require_sysadmin),
 ):
     _ = __
-    offset = 0
-    if cursor:
-        try:
-            offset = max(0, int(cursor))
-        except ValueError:
-            offset = 0
 
     stmt = select(User)
     if search:
@@ -113,8 +112,8 @@ def list_users(
     if is_sysadmin is not None:
         stmt = stmt.where(User.is_sysadmin.is_(is_sysadmin))
 
-    stmt = stmt.order_by(User.created_at.desc()).offset(offset).limit(limit)
-    users = db.execute(stmt).scalars().all()
+    stmt = apply_keyset_pagination(stmt, USER_LIST_CURSOR, cursor, limit)
+    users, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), USER_LIST_CURSOR, limit)
     return {
         "items": [
             {
@@ -130,7 +129,7 @@ def list_users(
             }
             for u in users
         ],
-        "next_cursor": str(offset + limit) if len(users) == limit else None,
+        "next_cursor": next_cursor,
     }
 
 

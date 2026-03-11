@@ -8,11 +8,15 @@ from app.db import get_db
 from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
 from app.enums import ProjectRole
 from app.models import AuditEvent
-from app.pagination import next_cursor, parse_cursor
+from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_datetime_cursor_value
 from app.services.audit import write_audit_event
 from app.token_scopes import SCOPE_READ_AUDIT
 
 router = APIRouter(prefix="/projects/{project_id}/audit", tags=["audit"])
+PROJECT_AUDIT_CURSOR = (
+    KeysetColumn("ts", AuditEvent.ts, direction="desc", parser=parse_datetime_cursor_value),
+    KeysetColumn("id", AuditEvent.id, direction="desc"),
+)
 
 
 @router.get("")
@@ -26,16 +30,10 @@ def list_audit_events(
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
-    offset = parse_cursor(cursor)
 
-    stmt = (
-        select(AuditEvent)
-        .where(AuditEvent.project_id == project_id)
-        .order_by(AuditEvent.ts.desc(), AuditEvent.id.desc())
-        .offset(offset)
-        .limit(limit)
-    )
-    events = db.execute(stmt).scalars().all()
+    stmt = select(AuditEvent).where(AuditEvent.project_id == project_id)
+    stmt = apply_keyset_pagination(stmt, PROJECT_AUDIT_CURSOR, cursor, limit)
+    events, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), PROJECT_AUDIT_CURSOR, limit)
     write_audit_event(
         db,
         action="AUDIT_VIEWED",
@@ -61,5 +59,5 @@ def list_audit_events(
             }
             for e in events
         ],
-        "next_cursor": next_cursor(offset, limit, len(events)),
+        "next_cursor": next_cursor,
     }

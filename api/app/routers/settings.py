@@ -13,7 +13,13 @@ from app.db import get_db
 from app.enums import ProjectRole
 from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
 from app.models import ApiToken, AuditEvent, Project, ProjectMember, User
-from app.pagination import next_cursor, parse_cursor
+from app.pagination import (
+    KeysetColumn,
+    apply_keyset_pagination,
+    paginate_rows,
+    parse_datetime_cursor_value,
+    parse_uuid_cursor_value,
+)
 from app.schemas import (
     ApiTokenAdminCreateIn,
     ApiTokenAdminCreateOut,
@@ -39,6 +45,38 @@ from app.token_scopes import (
 )
 
 router = APIRouter(prefix="/settings", tags=["settings"])
+SETTINGS_API_TOKEN_CURSOR = (
+    KeysetColumn(
+        "created_at",
+        ApiToken.created_at,
+        direction="desc",
+        parser=parse_datetime_cursor_value,
+        getter=lambda row: row.ApiToken.created_at,
+    ),
+    KeysetColumn(
+        "id",
+        ApiToken.id,
+        direction="desc",
+        parser=parse_uuid_cursor_value,
+        getter=lambda row: row.ApiToken.id,
+    ),
+)
+SETTINGS_AUDIT_CURSOR = (
+    KeysetColumn(
+        "ts",
+        AuditEvent.ts,
+        direction="desc",
+        parser=parse_datetime_cursor_value,
+        getter=lambda row: row.AuditEvent.ts,
+    ),
+    KeysetColumn("id", AuditEvent.id, direction="desc", getter=lambda row: row.AuditEvent.id),
+)
+SETTINGS_PROJECT_MEMBERSHIP_CURSOR = (
+    KeysetColumn("project_name", Project.name),
+    KeysetColumn("user_email", User.email),
+    KeysetColumn("project_id", ProjectMember.project_id, parser=parse_uuid_cursor_value),
+    KeysetColumn("user_id", ProjectMember.user_id, parser=parse_uuid_cursor_value),
+)
 
 ROLE_ORDER = {
     ProjectRole.VIEWER: 1,
@@ -113,7 +151,6 @@ def list_all_api_tokens(
     __: User = Depends(require_sysadmin),
 ):
     _ = __
-    offset = parse_cursor(cursor)
 
     stmt = (
         select(ApiToken, User.email.label("user_email"), Project.name.label("project_name"))
@@ -131,7 +168,8 @@ def list_all_api_tokens(
             )
         )
 
-    rows = db.execute(stmt.order_by(ApiToken.created_at.desc()).offset(offset).limit(limit)).all()
+    stmt = apply_keyset_pagination(stmt, SETTINGS_API_TOKEN_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).all(), SETTINGS_API_TOKEN_CURSOR, limit)
     items = [
         ApiTokenAdminOut(
             id=row.ApiToken.id,
@@ -159,7 +197,7 @@ def list_all_api_tokens(
         metadata={**request_meta(request), "q": q, "limit": limit, "cursor": cursor, "result_count": len(items)},
     )
     db.commit()
-    return {"items": items, "next_cursor": next_cursor(offset, limit, len(items))}
+    return {"items": items, "next_cursor": next_cursor}
 
 
 @router.post("/api-tokens", response_model=ApiTokenAdminCreateOut)
@@ -412,10 +450,9 @@ def list_global_audit(
     __: User = Depends(require_sysadmin),
 ):
     _ = __
-    offset = parse_cursor(cursor)
-
     stmt = _global_audit_stmt(q)
-    rows = db.execute(stmt.order_by(AuditEvent.ts.desc(), AuditEvent.id.desc()).offset(offset).limit(limit)).all()
+    stmt = apply_keyset_pagination(stmt, SETTINGS_AUDIT_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).all(), SETTINGS_AUDIT_CURSOR, limit)
     items = _serialize_audit_rows(rows)
 
     write_audit_event(
@@ -427,7 +464,7 @@ def list_global_audit(
         metadata={**request_meta(request), "q": q, "limit": limit, "cursor": cursor, "result_count": len(items)},
     )
     db.commit()
-    return {"items": items, "next_cursor": next_cursor(offset, limit, len(items))}
+    return {"items": items, "next_cursor": next_cursor}
 
 
 @router.get("/audit/export")
@@ -516,8 +553,6 @@ def list_project_memberships(
     __: User = Depends(require_sysadmin),
 ):
     _ = __
-    offset = parse_cursor(cursor)
-
     stmt = (
         select(
             ProjectMember.project_id,
@@ -540,7 +575,8 @@ def list_project_memberships(
             )
         )
 
-    rows = db.execute(stmt.order_by(Project.name.asc(), User.email.asc()).offset(offset).limit(limit)).all()
+    stmt = apply_keyset_pagination(stmt, SETTINGS_PROJECT_MEMBERSHIP_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).all(), SETTINGS_PROJECT_MEMBERSHIP_CURSOR, limit)
     items = [
         ProjectMembershipOut(
             project_id=row.project_id,
@@ -551,7 +587,7 @@ def list_project_memberships(
         ).model_dump(mode="json")
         for row in rows
     ]
-    return {"items": items, "next_cursor": next_cursor(offset, limit, len(items))}
+    return {"items": items, "next_cursor": next_cursor}
 
 
 @router.post("/rbac/project-memberships")
