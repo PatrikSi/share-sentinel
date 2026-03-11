@@ -1,4 +1,5 @@
 import { createContext, ReactNode, useContext, useEffect, useState } from "react";
+import { matchPath, useLocation, useNavigate } from "react-router-dom";
 
 import { apiFetch } from "@/lib/api";
 
@@ -17,28 +18,56 @@ export type DashboardProject = {
 type DashboardWorkspaceContextValue = {
   canCreateProject: boolean;
   createProject: (name: string) => Promise<DashboardProject>;
+  inProjectArea: boolean;
+  projectCount: number;
   projectLoadError: string | null;
+  projectSectionLabel: string;
   projects: DashboardProject[];
   projectsReady: boolean;
   refreshProjects: () => Promise<void>;
   selectedProject: string;
   selectedProjectName: string;
-  setSelectedProject: (projectId: string) => void;
+  switchProject: (projectId: string) => void;
 };
 
 const DashboardWorkspaceContext = createContext<DashboardWorkspaceContextValue | null>(null);
 
 export function DashboardWorkspaceProvider({ children }: { children: ReactNode }) {
+  const location = useLocation();
+  const navigate = useNavigate();
   const [canCreateProject, setCanCreateProject] = useState(false);
   const [projectLoadError, setProjectLoadError] = useState<string | null>(null);
   const [projects, setProjects] = useState<DashboardProject[]>([]);
   const [projectsReady, setProjectsReady] = useState(false);
-  const [selectedProject, setSelectedProject] = useState("");
+  const [dashboardProjectId, setDashboardProjectId] = useState("");
+
+  const inventoryMatch = matchPath("/projects/:projectId/inventory", location.pathname);
+  const importMatch = matchPath("/projects/:projectId/import", location.pathname);
+  const runMatch = matchPath("/projects/:projectId/runs/:runId", location.pathname);
+  const routeProjectId = inventoryMatch?.params.projectId || importMatch?.params.projectId || runMatch?.params.projectId || "";
+  const inProjectArea = location.pathname.startsWith("/projects");
+  const projectSectionLabel = inventoryMatch
+    ? "Inventory"
+    : importMatch
+      ? "Import Scan"
+      : runMatch
+        ? "Run Explorer"
+        : "Dashboard";
+  const selectedProject = routeProjectId || dashboardProjectId;
+
+  useEffect(() => {
+    if (routeProjectId) {
+      setDashboardProjectId(routeProjectId);
+    }
+  }, [routeProjectId]);
 
   async function refreshProjects() {
     const data = ((await apiFetch("/projects")) as DashboardProject[]) || [];
     setProjects(data);
-    setSelectedProject((current) => {
+    setDashboardProjectId((current) => {
+      if (routeProjectId && data.some((project) => project.id === routeProjectId)) {
+        return routeProjectId;
+      }
       if (current && data.some((project) => project.id === current)) {
         return current;
       }
@@ -51,9 +80,28 @@ export function DashboardWorkspaceProvider({ children }: { children: ReactNode }
       method: "POST",
       body: JSON.stringify({ name: name.trim() }),
     })) as DashboardProject;
-    setSelectedProject(created.id);
+    setDashboardProjectId(created.id);
     await refreshProjects();
     return created;
+  }
+
+  function switchProject(projectId: string) {
+    setDashboardProjectId(projectId);
+    if (!inProjectArea) return;
+
+    if (inventoryMatch) {
+      navigate(`/projects/${projectId}/inventory`);
+      return;
+    }
+    if (importMatch) {
+      navigate(`/projects/${projectId}/import`);
+      return;
+    }
+    if (runMatch) {
+      navigate(`/projects/${projectId}/inventory`);
+      return;
+    }
+    navigate("/projects");
   }
 
   useEffect(() => {
@@ -67,7 +115,10 @@ export function DashboardWorkspaceProvider({ children }: { children: ReactNode }
         setCanCreateProject(!!(meData as UserMe | null)?.is_sysadmin);
         const rows = ((projectData as DashboardProject[]) || []) as DashboardProject[];
         setProjects(rows);
-        setSelectedProject((current) => {
+        setDashboardProjectId((current) => {
+          if (routeProjectId && rows.some((project) => project.id === routeProjectId)) {
+            return routeProjectId;
+          }
           if (current && rows.some((project) => project.id === current)) {
             return current;
           }
@@ -78,7 +129,7 @@ export function DashboardWorkspaceProvider({ children }: { children: ReactNode }
         if (cancelled) return;
         setCanCreateProject(false);
         setProjects([]);
-        setSelectedProject("");
+        setDashboardProjectId("");
         setProjectLoadError(err instanceof Error ? err.message : "Failed to load dashboard workspace");
       } finally {
         if (!cancelled) {
@@ -91,18 +142,21 @@ export function DashboardWorkspaceProvider({ children }: { children: ReactNode }
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [routeProjectId]);
 
   const value = {
     canCreateProject,
     createProject,
+    inProjectArea,
+    projectCount: projects.length,
     projectLoadError,
+    projectSectionLabel,
     projects,
     projectsReady,
     refreshProjects,
     selectedProject,
     selectedProjectName: projects.find((project) => project.id === selectedProject)?.name || "",
-    setSelectedProject,
+    switchProject,
   };
 
   return <DashboardWorkspaceContext.Provider value={value}>{children}</DashboardWorkspaceContext.Provider>;

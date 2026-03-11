@@ -9,8 +9,18 @@ export function TopNav() {
   const location = useLocation();
   const navigate = useNavigate();
   const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "/api";
-  const { canCreateProject, createProject, projectLoadError, projects, projectsReady, selectedProject, setSelectedProject } =
-    useDashboardWorkspace();
+  const {
+    canCreateProject,
+    createProject,
+    inProjectArea,
+    projectLoadError,
+    projectSectionLabel,
+    projects,
+    projectsReady,
+    selectedProject,
+    selectedProjectName,
+    switchProject,
+  } = useDashboardWorkspace();
   const [creatingProject, setCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
   const [projectError, setProjectError] = useState<string | null>(null);
@@ -40,7 +50,7 @@ export function TopNav() {
     { to: "/account", label: "Account", match: "/account" },
     { to: "/settings/users", label: "Settings", match: "/settings" },
   ];
-  const showDashboardControls = location.pathname === "/projects";
+  const showDashboardControls = inProjectArea;
 
   async function onCreateProject(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -82,7 +92,23 @@ export function TopNav() {
 
         {showDashboardControls ? (
           <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-300 bg-slate-50/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900/70">
-            <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">Workspace</span>
+            <div className="basis-full flex flex-wrap items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+              <Link className="hover:text-slate-700 dark:hover:text-slate-200" to="/projects">
+                Dashboard
+              </Link>
+              {selectedProjectName ? (
+                <>
+                  <span>/</span>
+                  <span className="text-slate-700 dark:text-slate-200">{selectedProjectName}</span>
+                </>
+              ) : null}
+              {projectSectionLabel !== "Dashboard" ? (
+                <>
+                  <span>/</span>
+                  <span className="text-slate-700 dark:text-slate-200">{projectSectionLabel}</span>
+                </>
+              ) : null}
+            </div>
             <select
               className="min-w-[220px] rounded-xl border border-slate-300 bg-white/90 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
               disabled={!projectsReady || projects.length === 0}
@@ -90,7 +116,7 @@ export function TopNav() {
               onChange={(event) => {
                 setProjectError(null);
                 setProjectInfo(null);
-                setSelectedProject(event.target.value);
+                switchProject(event.target.value);
               }}
             >
               {!projectsReady ? <option value="">Loading projects...</option> : null}
@@ -111,9 +137,9 @@ export function TopNav() {
                 }}
                 type="button"
               >
-                {showCreateProjectForm ? "Close" : "New Project"}
-              </button>
-            ) : null}
+                  {showCreateProjectForm ? "Close" : "New Project"}
+                </button>
+              ) : null}
             {canCreateProject && showCreateProjectForm ? (
               <form className="flex flex-wrap items-center gap-2" onSubmit={onCreateProject}>
                 <input

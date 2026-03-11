@@ -62,7 +62,7 @@ function RunMetric({ label, value }: { label: string; value: number | null | und
 }
 
 export function ProjectsPage() {
-  const { canCreateProject, projectLoadError, projects, projectsReady, selectedProject, selectedProjectName } = useDashboardWorkspace();
+  const { canCreateProject, projectCount, projectLoadError, projectsReady, selectedProject, selectedProjectName } = useDashboardWorkspace();
   const [projectRole, setProjectRole] = useState<string | null>(null);
 
   const [runs, setRuns] = useState<Run[]>([]);
@@ -190,6 +190,7 @@ export function ProjectsPage() {
   const canDeleteRuns = projectRole === "admin";
   const latestRunAtText = projectStats?.latest_run_at ? new Date(projectStats.latest_run_at).toLocaleString() : "No completed runs yet";
   const visibleError = error || projectLoadError;
+  const roleLabel = projectRole ? projectRole.toUpperCase() : "ROLE UNKNOWN";
 
   function formatCount(value: number | null | undefined): string {
     if (value === null || value === undefined) return loadingStats ? "..." : "0";
@@ -205,16 +206,36 @@ export function ProjectsPage() {
   return (
     <section className="workspace">
       <div className="workspace-header">
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.6fr)_340px]">
-          <div className="rounded-[28px] border border-slate-200 bg-[linear-gradient(135deg,rgba(255,255,255,0.98),rgba(226,232,240,0.9))] p-6 shadow-sm dark:border-slate-800 dark:bg-[linear-gradient(135deg,rgba(15,23,42,0.96),rgba(15,23,42,0.78))]">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Dashboard Workspace</p>
-            <h1 className="mt-3 text-3xl font-bold tracking-tight">{selectedProjectName || "Dashboard"}</h1>
-            <p className="mt-3 max-w-2xl text-sm text-slate-600 dark:text-slate-300">
-              Keep project selection, run intake, and inventory review in one flow. Use the dashboard bar above to switch
-              workspaces quickly, confirm coverage, then move directly into the run or inventory view you need.
-            </p>
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.45fr)_360px]">
+          <div className="rounded-[28px] border border-slate-200 bg-[linear-gradient(135deg,rgba(255,255,255,0.98),rgba(226,232,240,0.88))] p-5 shadow-sm dark:border-slate-800 dark:bg-[linear-gradient(135deg,rgba(15,23,42,0.96),rgba(15,23,42,0.8))]">
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div className="min-w-0 flex-1">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Dashboard</p>
+                <h1 className="mt-2 text-3xl font-bold tracking-tight">{selectedProjectName || "Select a project"}</h1>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <span className="rounded-full border border-slate-300 bg-white/70 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] dark:border-slate-700 dark:bg-slate-950/40">
+                    {roleLabel}
+                  </span>
+                  <span className="rounded-full border border-slate-300 bg-white/70 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] dark:border-slate-700 dark:bg-slate-950/40">
+                    {activeRunCount.toLocaleString()} active ingest{activeRunCount === 1 ? "" : "s"}
+                  </span>
+                  <span className="rounded-full border border-slate-300 bg-white/70 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] dark:border-slate-700 dark:bg-slate-950/40">
+                    {projectCount.toLocaleString()} project{projectCount === 1 ? "" : "s"}
+                  </span>
+                  {latestRun ? (
+                    <span className={`rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] ${RUN_STATUS_COLORS[latestRun.status] || "bg-slate-200 text-slate-900"}`}>
+                      Latest run: {latestRun.status}
+                    </span>
+                  ) : null}
+                </div>
+                <p className="mt-3 max-w-2xl text-sm text-slate-600 dark:text-slate-300">
+                  Work from one project at a time: switch context in the top bar, jump straight into inventory, or monitor the newest ingest without leaving the dashboard.
+                </p>
+              </div>
+            </div>
+
             {selectedProject ? (
-              <div className="mt-5 flex flex-wrap gap-2">
+              <div className="mt-4 flex flex-wrap gap-2">
                 <Link
                   className="rounded-2xl bg-emerald-600 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-emerald-500"
                   to={`/projects/${selectedProject}/inventory`}
@@ -230,7 +251,7 @@ export function ProjectsPage() {
                   </Link>
                 ) : (
                   <span className="rounded-2xl border border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-slate-500 dark:border-slate-800 dark:text-slate-400">
-                    Import Scan Requires Operator/Admin
+                    Import requires operator or admin
                   </span>
                 )}
                 {latestRun ? (
@@ -243,52 +264,79 @@ export function ProjectsPage() {
                 ) : null}
               </div>
             ) : null}
-            <div className="mt-6 grid gap-3 sm:grid-cols-3">
-              <div className="rounded-2xl border border-white/60 bg-white/70 px-4 py-3 dark:border-slate-800 dark:bg-slate-950/50">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Latest Activity</p>
-                <p className="mt-2 text-sm font-semibold">{latestRunAtText}</p>
-              </div>
-              <div className="rounded-2xl border border-white/60 bg-white/70 px-4 py-3 dark:border-slate-800 dark:bg-slate-950/50">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Active Ingests</p>
-                <p className="mt-2 text-sm font-semibold">{activeRunCount.toLocaleString()}</p>
-              </div>
-              <div className="rounded-2xl border border-white/60 bg-white/70 px-4 py-3 dark:border-slate-800 dark:bg-slate-950/50">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Visible Runs</p>
-                <p className="mt-2 text-sm font-semibold">{visibleRuns.length.toLocaleString()}</p>
-              </div>
-            </div>
           </div>
 
           <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
-            <div>
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Workspace Summary</p>
-                <h2 className="mt-2 text-xl font-semibold">{selectedProject ? "Current context" : "No project selected"}</h2>
-                <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-                  {selectedProject
-                    ? "Project switching and creation now live in the top bar, so you can change focus without leaving the dashboard."
-                    : canCreateProject
-                      ? "Use the top bar to create your first project and start building the dashboard workspace."
-                      : projectsReady
-                        ? "No projects are available yet. Ask a sysadmin to create one."
-                        : "Loading available dashboard workspaces."}
-                </p>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Next Action</p>
+            <h2 className="mt-2 text-xl font-semibold">
+              {!selectedProject ? "Create or select a project" : activeRunCount > 0 ? "Monitor the active ingest" : latestRun ? "Review the latest run" : "Import the first scan"}
+            </h2>
+            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+              {!selectedProject
+                ? canCreateProject
+                  ? "Use the top bar to create a workspace, then start ingesting collector output."
+                  : projectsReady
+                    ? "Ask a sysadmin to create a project before review can begin."
+                    : "Loading available workspaces."
+                : activeRunCount > 0
+                  ? `Latest activity ${latestRunAtText}. Keep the run queue visible and follow progress as artifacts ingest.`
+                  : latestRun
+                    ? `Latest completed activity ${latestRunAtText}. Open the run diff or move straight into inventory review.`
+                    : canImport
+                      ? "No runs have been ingested yet. Create one now and land directly in the run explorer when upload completes."
+                      : "No runs have been ingested yet. An operator or admin needs to upload the first artifact."}
+            </p>
+
+            <div className="mt-4 space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Latest Activity</p>
+                  <p className="mt-1 text-sm font-semibold">{latestRun ? latestRun.name : "No runs yet"}</p>
+                </div>
+                {latestRun ? (
+                  <span className={`rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] ${RUN_STATUS_COLORS[latestRun.status] || "bg-slate-200 text-slate-900"}`}>
+                    {latestRun.status}
+                  </span>
+                ) : null}
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Last update</p>
+                  <p className="mt-1 text-sm font-semibold">{latestRunAtText}</p>
+                </div>
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Visible runs</p>
+                  <p className="mt-1 text-sm font-semibold">{visibleRuns.length.toLocaleString()}</p>
+                </div>
               </div>
             </div>
 
-            <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Projects Available</p>
-              <p className="mt-2 text-sm font-semibold">{projectsReady ? projects.length.toLocaleString() : "Loading..."}</p>
-              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">Switch or create projects from the dashboard controls in the top navbar.</p>
-            </div>
-
-            <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Access</p>
-              <p className="mt-2 text-sm font-semibold">{projectRole || "Role unavailable"}</p>
-              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                Operators and admins can upload artifacts. Admins can also delete runs.
-              </p>
-            </div>
+            {selectedProject ? (
+              <div className="mt-4 flex flex-wrap gap-2">
+                {latestRun ? (
+                  <Link
+                    className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
+                    to={`/projects/${selectedProject}/runs/${latestRun.id}`}
+                  >
+                    Open Run Explorer
+                  </Link>
+                ) : null}
+                <Link
+                  className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                  to={`/projects/${selectedProject}/inventory`}
+                >
+                  Open Inventory
+                </Link>
+                {canImport ? (
+                  <Link
+                    className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                    to={`/projects/${selectedProject}/import`}
+                  >
+                    Upload New Scan
+                  </Link>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </div>
       </div>
