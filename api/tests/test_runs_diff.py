@@ -1,3 +1,6 @@
+import uuid
+from types import SimpleNamespace
+
 from app.routers import runs as runs_router
 
 
@@ -85,3 +88,112 @@ def test_build_run_diff_returns_empty_summary_for_identical_snapshots() -> None:
     assert payload["new_shares"] == []
     assert payload["disappeared_shares"] == []
     assert payload["item_churn"] == []
+
+
+def test_build_run_diff_from_iters_matches_snapshot_builder() -> None:
+    baseline_snapshot = {
+        ("10.0.0.10:445", "smb_share", "Finance"): {
+            "endpoint_key": "10.0.0.10:445",
+            "hostname": "fs-01",
+            "ip": "10.0.0.10",
+            "share_name": "Finance",
+            "share_type": "smb",
+            "access_level": "read",
+            "item_paths": {"\\Budget.xlsx", "\\Policies\\Readme.txt"},
+        }
+    }
+    current_snapshot = {
+        ("10.0.0.10:445", "smb_share", "Finance"): {
+            "endpoint_key": "10.0.0.10:445",
+            "hostname": "fs-01",
+            "ip": "10.0.0.10",
+            "share_name": "Finance",
+            "share_type": "smb",
+            "access_level": "read_write",
+            "item_paths": {"\\Budget.xlsx", "\\Policies\\Q1.xlsx"},
+        },
+        ("10.0.0.12:445", "nfs_share", "/exports/backups"): {
+            "endpoint_key": "10.0.0.12:445",
+            "hostname": "nfs-01",
+            "ip": "10.0.0.12",
+            "share_name": "/exports/backups",
+            "share_type": "nfs",
+            "access_level": "read",
+            "item_paths": {"\\nightly", "\\nightly\\backup-01.zip"},
+        },
+    }
+
+    payload = runs_router._build_run_diff_from_iters(
+        sorted(current_snapshot.items(), key=lambda item: runs_router._normalized_resource_key(item[0])),
+        sorted(baseline_snapshot.items(), key=lambda item: runs_router._normalized_resource_key(item[0])),
+        example_limit=3,
+    )
+
+    assert payload == runs_router._build_run_diff(current_snapshot, baseline_snapshot, example_limit=3)
+
+
+def test_iter_run_diff_resources_groups_item_rows_per_share() -> None:
+    run_id = uuid.uuid4()
+
+    class _FakeDb:
+        def execute(self, _stmt):
+            return [
+                SimpleNamespace(
+                    endpoint_key="10.0.0.10:445",
+                    hostname="fs-01",
+                    ip="10.0.0.10",
+                    name="Finance",
+                    resource_type="smb_share",
+                    access_level="readable",
+                    path="\\Budget.xlsx",
+                ),
+                SimpleNamespace(
+                    endpoint_key="10.0.0.10:445",
+                    hostname="fs-01",
+                    ip="10.0.0.10",
+                    name="Finance",
+                    resource_type="smb_share",
+                    access_level="readable",
+                    path="\\Policies\\Readme.txt",
+                ),
+                SimpleNamespace(
+                    endpoint_key="10.0.0.11:445",
+                    hostname="fs-02",
+                    ip="10.0.0.11",
+                    name="HR",
+                    resource_type="smb_share",
+                    access_level="list_only",
+                    path=None,
+                ),
+            ]
+
+    rows = list(runs_router._iter_run_diff_resources(_FakeDb(), run_id))
+
+    assert rows == [
+        (
+            ("10.0.0.10:445", "smb_share", "Finance"),
+            {
+                "endpoint_key": "10.0.0.10:445",
+                "hostname": "fs-01",
+                "ip": "10.0.0.10",
+                "share_name": "Finance",
+                "resource_type": "smb_share",
+                "share_type": "smb",
+                "access_level": "readable",
+                "item_paths": {"\\Budget.xlsx", "\\Policies\\Readme.txt"},
+            },
+        ),
+        (
+            ("10.0.0.11:445", "smb_share", "HR"),
+            {
+                "endpoint_key": "10.0.0.11:445",
+                "hostname": "fs-02",
+                "ip": "10.0.0.11",
+                "share_name": "HR",
+                "resource_type": "smb_share",
+                "share_type": "smb",
+                "access_level": "list_only",
+                "item_paths": set(),
+            },
+        ),
+    ]

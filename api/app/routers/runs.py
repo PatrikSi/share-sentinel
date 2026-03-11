@@ -84,6 +84,31 @@ def _sorted_resource_keys(keys: Iterable[tuple[str, str, str]]) -> list[tuple[st
     return sorted(keys, key=lambda value: (value[0].lower(), value[2].lower(), value[1].lower()))
 
 
+def _normalized_resource_key(key: tuple[str, str, str]) -> tuple[str, str, str]:
+    return (key[0].lower(), key[2].lower(), key[1].lower())
+
+
+def _resource_diff_record(
+    endpoint_key: str,
+    hostname: str | None,
+    ip: str | None,
+    share_name: str,
+    resource_type: str,
+    access_level: str | None,
+    item_paths: set[str] | None = None,
+) -> dict:
+    return {
+        "endpoint_key": endpoint_key,
+        "hostname": hostname,
+        "ip": ip,
+        "share_name": share_name,
+        "resource_type": resource_type,
+        "share_type": share_type_from_resource_type(resource_type),
+        "access_level": access_level,
+        "item_paths": item_paths or set(),
+    }
+
+
 def _load_run_diff_snapshot(db: Session, run_id: uuid.UUID) -> dict[tuple[str, str, str], dict]:
     resource_rows = db.execute(
         select(
@@ -147,6 +172,151 @@ def _load_run_diff_snapshot(db: Session, run_id: uuid.UUID) -> dict[tuple[str, s
         record["item_paths"].add(row.path)
 
     return snapshot
+
+
+def _iter_run_diff_resources(db: Session, run_id: uuid.UUID):
+    stmt = (
+        select(
+            Endpoint.endpoint_key,
+            Endpoint.hostname,
+            Endpoint.ip,
+            Resource.name,
+            Resource.resource_type,
+            Resource.access_level,
+            Item.path,
+        )
+        .select_from(Resource)
+        .join(Endpoint, (Endpoint.id == Resource.endpoint_id) & (Endpoint.run_id == Resource.run_id))
+        .outerjoin(Item, (Item.resource_id == Resource.id) & (Item.run_id == Resource.run_id))
+        .where(Resource.run_id == run_id)
+        .order_by(
+            func.lower(Endpoint.endpoint_key),
+            func.lower(cast(Resource.name, String)),
+            func.lower(cast(Resource.resource_type, String)),
+            Item.path.asc().nulls_last(),
+        )
+    )
+
+    current_key: tuple[str, str, str] | None = None
+    current_record: dict | None = None
+    for row in db.execute(stmt):
+        resource_type = row.resource_type.value if hasattr(row.resource_type, "value") else str(row.resource_type)
+        access_level = row.access_level.value if hasattr(row.access_level, "value") else row.access_level
+        key = _resource_identity(row.endpoint_key, resource_type, row.name)
+        if key != current_key:
+            if current_key is not None and current_record is not None:
+                yield current_key, current_record
+            current_key = key
+            current_record = _resource_diff_record(
+                endpoint_key=row.endpoint_key,
+                hostname=row.hostname,
+                ip=row.ip,
+                share_name=row.name,
+                resource_type=resource_type,
+                access_level=access_level,
+            )
+        if row.path is not None and current_record is not None:
+            current_record["item_paths"].add(row.path)
+
+    if current_key is not None and current_record is not None:
+        yield current_key, current_record
+
+
+def _next_resource_record(iterator):
+    try:
+        return next(iterator)
+    except StopIteration:
+        return None
+
+
+def _serialize_diff_resource(resource: dict) -> dict:
+    return {
+        "endpoint_key": resource["endpoint_key"],
+        "hostname": resource["hostname"],
+        "ip": resource["ip"],
+        "share_name": resource["share_name"],
+        "share_type": resource["share_type"],
+        "access_level": resource["access_level"],
+        "item_count": len(resource["item_paths"]),
+    }
+
+
+def _build_run_diff_from_iters(current_iter, baseline_iter, example_limit: int = 5) -> dict:
+    current_iter = iter(current_iter)
+    baseline_iter = iter(baseline_iter)
+    current_entry = _next_resource_record(current_iter)
+    baseline_entry = _next_resource_record(baseline_iter)
+
+    new_shares = []
+    disappeared_shares = []
+    item_churn = []
+
+    while current_entry is not None or baseline_entry is not None:
+        if baseline_entry is None:
+            _current_key, current_resource = current_entry
+            new_shares.append(_serialize_diff_resource(current_resource))
+            current_entry = _next_resource_record(current_iter)
+            continue
+
+        if current_entry is None:
+            _baseline_key, baseline_resource = baseline_entry
+            disappeared_shares.append(_serialize_diff_resource(baseline_resource))
+            baseline_entry = _next_resource_record(baseline_iter)
+            continue
+
+        current_key, current_resource = current_entry
+        baseline_key, baseline_resource = baseline_entry
+        if _normalized_resource_key(current_key) < _normalized_resource_key(baseline_key):
+            new_shares.append(_serialize_diff_resource(current_resource))
+            current_entry = _next_resource_record(current_iter)
+            continue
+
+        if _normalized_resource_key(current_key) > _normalized_resource_key(baseline_key):
+            disappeared_shares.append(_serialize_diff_resource(baseline_resource))
+            baseline_entry = _next_resource_record(baseline_iter)
+            continue
+
+        added_paths = sorted(current_resource["item_paths"] - baseline_resource["item_paths"])
+        removed_paths = sorted(baseline_resource["item_paths"] - current_resource["item_paths"])
+        if added_paths or removed_paths:
+            item_churn.append(
+                {
+                    "endpoint_key": current_resource["endpoint_key"],
+                    "hostname": current_resource["hostname"] or baseline_resource["hostname"],
+                    "ip": current_resource["ip"] or baseline_resource["ip"],
+                    "share_name": current_resource["share_name"],
+                    "share_type": current_resource["share_type"],
+                    "access_level": current_resource["access_level"] or baseline_resource["access_level"],
+                    "added_items": len(added_paths),
+                    "removed_items": len(removed_paths),
+                    "added_examples": added_paths[:example_limit],
+                    "removed_examples": removed_paths[:example_limit],
+                }
+            )
+
+        current_entry = _next_resource_record(current_iter)
+        baseline_entry = _next_resource_record(baseline_iter)
+
+    item_churn.sort(
+        key=lambda item: (
+            -(item["added_items"] + item["removed_items"]),
+            item["endpoint_key"].lower(),
+            item["share_name"].lower(),
+        )
+    )
+
+    return {
+        "summary": {
+            "new_shares": len(new_shares),
+            "disappeared_shares": len(disappeared_shares),
+            "changed_shares": len(item_churn),
+            "added_items": sum(item["added_items"] for item in item_churn),
+            "removed_items": sum(item["removed_items"] for item in item_churn),
+        },
+        "new_shares": new_shares,
+        "disappeared_shares": disappeared_shares,
+        "item_churn": item_churn,
+    }
 
 
 def _build_run_diff(current_snapshot: dict[tuple[str, str, str], dict], baseline_snapshot: dict[tuple[str, str, str], dict], example_limit: int = 5) -> dict:
@@ -566,9 +736,10 @@ def diff_run(
             "item_churn": [],
         }
 
-    current_snapshot = _load_run_diff_snapshot(db, current_run.id)
-    baseline_snapshot = _load_run_diff_snapshot(db, baseline_run.id)
-    payload = _build_run_diff(current_snapshot, baseline_snapshot)
+    payload = _build_run_diff_from_iters(
+        _iter_run_diff_resources(db, current_run.id),
+        _iter_run_diff_resources(db, baseline_run.id),
+    )
     payload["current_run"] = _run_summary_payload(current_run)
     payload["baseline_run"] = _run_summary_payload(baseline_run)
 
