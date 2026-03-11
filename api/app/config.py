@@ -81,8 +81,8 @@ class Settings(BaseSettings):
     @field_validator("password_min_length")
     @classmethod
     def _validate_password_min_length(cls, value: int) -> int:
-        if value < 8:
-            raise ValueError("password_min_length must be at least 8")
+        if value < 1:
+            raise ValueError("password_min_length must be at least 1")
         if value > 256:
             raise ValueError("password_min_length must be 256 or less")
         return value

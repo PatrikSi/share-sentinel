@@ -57,5 +57,18 @@ def test_seed_admin_env_requires_email_and_password_pair() -> None:
 
 
 def test_password_min_length_rejects_out_of_range_values() -> None:
-    with pytest.raises(ValueError, match="password_min_length must be at least 8"):
-        Settings(password_min_length=4)
+    with pytest.raises(ValueError, match="password_min_length must be at least 1"):
+        Settings(password_min_length=0)
+
+
+def test_password_min_length_allows_short_values_when_policy_is_explicit() -> None:
+    settings = Settings(
+        password_min_length=3,
+        password_require_lowercase=False,
+        password_require_uppercase=False,
+        password_require_number=False,
+        seed_admin_email="admin@example.com",
+        seed_admin_password="abc",
+    )
+
+    assert settings.password_min_length == 3
