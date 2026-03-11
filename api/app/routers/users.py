@@ -12,6 +12,7 @@ from app.deps import AuthContext, get_auth_context, require_sysadmin, request_me
 from app.enums import ProjectRole
 from app.models import Project, ProjectMember, RefreshToken, User
 from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_datetime_cursor_value, parse_uuid_cursor_value
+from app.password_policy import password_policy_kwargs
 from app.schemas import UserApprovalIn, UserAssignAllProjectsIn, UserCreateIn, UserOut, UserUpdateIn
 from app.security import hash_password, validate_password_strength
 from app.services.audit import write_audit_event
@@ -34,8 +35,9 @@ def create_user(
     admin: User = Depends(require_sysadmin),
 ):
     _ = admin
+    settings = get_settings()
     try:
-        validate_password_strength(payload.password, get_settings().password_min_length)
+        validate_password_strength(payload.password, **password_policy_kwargs(settings))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -159,8 +161,9 @@ def update_user(
         user.email = payload.email.lower()
 
     if payload.password is not None:
+        settings = get_settings()
         try:
-            validate_password_strength(payload.password, get_settings().password_min_length)
+            validate_password_strength(payload.password, **password_policy_kwargs(settings))
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         user.password_hash = hash_password(payload.password)

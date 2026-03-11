@@ -63,6 +63,11 @@ services:
     command: ["sh", "-lc", "alembic upgrade head && python -m app.bootstrap"]
     environment:
       DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:-change-me}@db:5432/share_sentinel
+      PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-12}
+      PASSWORD_REQUIRE_LOWERCASE: ${PASSWORD_REQUIRE_LOWERCASE:-true}
+      PASSWORD_REQUIRE_UPPERCASE: ${PASSWORD_REQUIRE_UPPERCASE:-true}
+      PASSWORD_REQUIRE_NUMBER: ${PASSWORD_REQUIRE_NUMBER:-true}
+      PASSWORD_REQUIRE_SPECIAL: ${PASSWORD_REQUIRE_SPECIAL:-false}
       SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@example.com}
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-ChangeMe123456}
       TOKEN_PEPPER: ${TOKEN_PEPPER:-change-me-long-random-string}
@@ -92,6 +97,11 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
       API_ROOT_PATH: /api
       LOG_LEVEL: INFO
+      PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-12}
+      PASSWORD_REQUIRE_LOWERCASE: ${PASSWORD_REQUIRE_LOWERCASE:-true}
+      PASSWORD_REQUIRE_UPPERCASE: ${PASSWORD_REQUIRE_UPPERCASE:-true}
+      PASSWORD_REQUIRE_NUMBER: ${PASSWORD_REQUIRE_NUMBER:-true}
+      PASSWORD_REQUIRE_SPECIAL: ${PASSWORD_REQUIRE_SPECIAL:-false}
     depends_on:
       db:
         condition: service_healthy

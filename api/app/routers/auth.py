@@ -11,6 +11,7 @@ from app.db import get_db
 from app.deps import AuthContext, get_auth_context, get_current_user, get_project_role, request_meta, require_token_scopes, resolve_client_ip
 from app.enums import ProjectRole
 from app.models import ApiToken, RefreshToken, User
+from app.password_policy import password_policy_kwargs
 from app.rate_limit import RateLimiter
 from app.schemas import (
     ApiTokenCreateIn,
@@ -62,6 +63,10 @@ def security_settings(user: User = Depends(get_current_user)):
         auth_require_csrf=settings.auth_require_csrf,
         auth_cookie_secure=settings.auth_cookie_secure,
         password_min_length=settings.password_min_length,
+        password_require_lowercase=settings.password_require_lowercase,
+        password_require_uppercase=settings.password_require_uppercase,
+        password_require_number=settings.password_require_number,
+        password_require_special=settings.password_require_special,
         auth_login_max_attempts=settings.auth_login_max_attempts,
         auth_login_window_seconds=settings.auth_login_window_seconds,
         auth_login_lockout_seconds=settings.auth_login_lockout_seconds,
@@ -92,7 +97,7 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     )
 
     try:
-        validate_password_strength(payload.password, settings.password_min_length)
+        validate_password_strength(payload.password, **password_policy_kwargs(settings))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -349,7 +354,7 @@ def change_password(
 
     settings = get_settings()
     try:
-        validate_password_strength(payload.new_password, settings.password_min_length)
+        validate_password_strength(payload.new_password, **password_policy_kwargs(settings))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 

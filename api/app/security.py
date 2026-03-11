@@ -1,5 +1,4 @@
 import hashlib
-import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -11,6 +10,7 @@ from passlib.exc import UnknownHashError
 from passlib.context import CryptContext
 
 from app.config import get_settings
+from app.password_policy import validate_password_strength
 
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
@@ -58,19 +58,6 @@ def hash_external_token(raw_token: str) -> str:
     digest.update(settings.token_pepper.encode("utf-8"))
     digest.update(raw_token.encode("utf-8"))
     return digest.hexdigest()
-
-
-def validate_password_strength(password: str, min_length: int) -> None:
-    if len(password) < min_length:
-        raise ValueError(f"password must be at least {min_length} characters")
-    if not re.search(r"[a-z]", password):
-        raise ValueError("password must include a lowercase letter")
-    if not re.search(r"[A-Z]", password):
-        raise ValueError("password must include an uppercase letter")
-    if not re.search(r"\d", password):
-        raise ValueError("password must include a number")
-
-
 def generate_csrf_token() -> str:
     return secrets.token_urlsafe(32)
 

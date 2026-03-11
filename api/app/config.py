@@ -3,6 +3,8 @@ from functools import lru_cache
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.password_policy import password_policy_kwargs, validate_password_strength
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -51,6 +53,10 @@ class Settings(BaseSettings):
     auth_login_window_seconds: int = 300
     auth_login_lockout_seconds: int = 900
     password_min_length: int = 12
+    password_require_lowercase: bool = True
+    password_require_uppercase: bool = True
+    password_require_number: bool = True
+    password_require_special: bool = False
     seed_admin_email: str | None = None
     seed_admin_password: str | None = None
 
@@ -72,6 +78,28 @@ class Settings(BaseSettings):
     def _normalize_csrf_header_name(cls, value: str) -> str:
         return str(value).strip().lower()
 
+    @field_validator("password_min_length")
+    @classmethod
+    def _validate_password_min_length(cls, value: int) -> int:
+        if value < 8:
+            raise ValueError("password_min_length must be at least 8")
+        if value > 256:
+            raise ValueError("password_min_length must be 256 or less")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_seed_admin_settings(self):
+        has_seed_email = bool(self.seed_admin_email)
+        has_seed_password = bool(self.seed_admin_password)
+        if has_seed_email != has_seed_password:
+            raise ValueError("SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD must either both be set or both be unset")
+        if self.seed_admin_password:
+            try:
+                validate_password_strength(self.seed_admin_password, **password_policy_kwargs(self))
+            except ValueError as exc:
+                raise ValueError(f"SEED_ADMIN_PASSWORD must satisfy the configured password policy: {exc}") from exc
+        return self
+
     @model_validator(mode="after")
     def _validate_production_settings(self):
         if self.app_env.lower() in {"production", "prod"}:
@@ -79,8 +107,10 @@ class Settings(BaseSettings):
                 raise ValueError("jwt_secret must be set and at least 32 characters in production")
             if self.token_pepper == "dev-pepper" or len(self.token_pepper) < 32:
                 raise ValueError("token_pepper must be set and at least 32 characters in production")
-            if self.seed_admin_password in {None, "change-me-please-12-plus"}:
-                raise ValueError("seed_admin_password must not use the default value in production")
+            if not self.seed_admin_email or not self.seed_admin_password:
+                raise ValueError("SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD must both be set in production")
+            if self.seed_admin_password in {"ChangeMe123456", "change-me-please-12-plus"}:
+                raise ValueError("SEED_ADMIN_PASSWORD must not use the default value in production")
             if not self.auth_cookie_secure:
                 raise ValueError("auth_cookie_secure must be true in production")
         return self

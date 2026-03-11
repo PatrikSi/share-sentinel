@@ -14,6 +14,7 @@ def test_production_rejects_weak_jwt_secret() -> None:
             app_env="production",
             jwt_secret="too-short",
             token_pepper="x" * 64,
+            seed_admin_email="admin@example.com",
             seed_admin_password="StrongPassword123",
         )
 
@@ -24,7 +25,8 @@ def test_production_rejects_default_seed_password() -> None:
             app_env="production",
             jwt_secret="x" * 64,
             token_pepper="y" * 64,
-            seed_admin_password="change-me-please-12-plus",
+            seed_admin_email="admin@example.com",
+            seed_admin_password="ChangeMe123456",
         )
 
 
@@ -34,6 +36,26 @@ def test_production_requires_secure_auth_cookie() -> None:
             app_env="production",
             jwt_secret="x" * 64,
             token_pepper="y" * 64,
+            seed_admin_email="admin@example.com",
             seed_admin_password="StrongPassword123",
             auth_cookie_secure=False,
         )
+
+
+def test_seed_admin_password_must_match_policy() -> None:
+    with pytest.raises(ValueError, match="SEED_ADMIN_PASSWORD must satisfy the configured password policy"):
+        Settings(
+            seed_admin_email="admin@example.com",
+            seed_admin_password="StrongPassword123",
+            password_require_special=True,
+        )
+
+
+def test_seed_admin_env_requires_email_and_password_pair() -> None:
+    with pytest.raises(ValueError, match="SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD must either both be set or both be unset"):
+        Settings(seed_admin_email="admin@example.com")
+
+
+def test_password_min_length_rejects_out_of_range_values() -> None:
+    with pytest.raises(ValueError, match="password_min_length must be at least 8"):
+        Settings(password_min_length=4)

@@ -34,6 +34,17 @@ def test_password_strength_policy() -> None:
         validate_password_strength("short1A", 12)
 
 
+def test_password_strength_policy_supports_special_character_requirement() -> None:
+    with pytest.raises(ValueError, match="special character"):
+        validate_password_strength("VeryStrongPassword123", 12, require_special=True)
+
+    validate_password_strength("VeryStrongPassword123!", 12, require_special=True)
+
+
+def test_password_strength_policy_can_disable_character_classes() -> None:
+    validate_password_strength("alllowercasepassword", 12, require_uppercase=False, require_number=False)
+
+
 def test_auth_cookie_helpers() -> None:
     response = Response()
     csrf_token = generate_csrf_token()

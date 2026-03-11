@@ -25,3 +25,13 @@ pip install -r requirements.txt
 alembic upgrade head
 uvicorn app.main:app --reload
 ```
+
+Password policy is controlled through environment variables:
+
+- `PASSWORD_MIN_LENGTH`
+- `PASSWORD_REQUIRE_LOWERCASE`
+- `PASSWORD_REQUIRE_UPPERCASE`
+- `PASSWORD_REQUIRE_NUMBER`
+- `PASSWORD_REQUIRE_SPECIAL`
+
+If `SEED_ADMIN_PASSWORD` is configured and does not match the active policy, startup fails with a configuration error so the container logs point directly at the invalid env values.

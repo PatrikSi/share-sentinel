@@ -21,12 +21,12 @@ class UserOut(BaseModel):
 
 class LoginIn(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=8, max_length=256)
+    password: str = Field(min_length=1, max_length=256)
 
 
 class RegisterIn(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=12, max_length=256)
+    password: str = Field(min_length=1, max_length=256)
 
 
 class RegistrationSettingsOut(BaseModel):
@@ -38,6 +38,10 @@ class SecuritySettingsOut(BaseModel):
     auth_require_csrf: bool
     auth_cookie_secure: bool
     password_min_length: int
+    password_require_lowercase: bool
+    password_require_uppercase: bool
+    password_require_number: bool
+    password_require_special: bool
     auth_login_max_attempts: int
     auth_login_window_seconds: int
     auth_login_lockout_seconds: int
@@ -51,8 +55,8 @@ class SecuritySettingsOut(BaseModel):
 
 
 class ChangePasswordIn(BaseModel):
-    current_password: str
-    new_password: str = Field(min_length=12, max_length=256)
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=1, max_length=256)
 
 
 class TokenPairOut(BaseModel):
@@ -145,7 +149,7 @@ class ThemeUpdateIn(BaseModel):
 
 class UserCreateIn(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=12, max_length=256)
+    password: str = Field(min_length=1, max_length=256)
     is_active: bool = True
     is_sysadmin: bool = False
     is_approved: bool = True
@@ -155,7 +159,7 @@ class UserCreateIn(BaseModel):
 
 class UserUpdateIn(BaseModel):
     email: EmailStr | None = None
-    password: str | None = Field(default=None, min_length=12, max_length=256)
+    password: str | None = Field(default=None, min_length=1, max_length=256)
     is_active: bool | None = None
     is_sysadmin: bool | None = None
     is_approved: bool | None = None

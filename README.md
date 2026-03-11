@@ -40,6 +40,16 @@ If you want a fast post-start verification (routing + API wiring):
 - `SEED_ADMIN_EMAIL`
 - `SEED_ADMIN_PASSWORD`
 
+Password policy is configurable through `.env`:
+
+- `PASSWORD_MIN_LENGTH`
+- `PASSWORD_REQUIRE_LOWERCASE`
+- `PASSWORD_REQUIRE_UPPERCASE`
+- `PASSWORD_REQUIRE_NUMBER`
+- `PASSWORD_REQUIRE_SPECIAL`
+
+If `SEED_ADMIN_PASSWORD` does not satisfy that policy, the `bootstrap` container exits with a configuration error instead of silently skipping the seed user.
+
 ## Repo layout
 
 - `api/`: FastAPI service + Alembic migrations
