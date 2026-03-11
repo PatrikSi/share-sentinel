@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
 import { StatePanel } from "@/components/state-panel";
-import { StatusBanner } from "@/components/status-banner";
 
 type SecuritySettings = {
   allow_self_registration: boolean;
@@ -131,17 +130,6 @@ export function SettingsOverviewPage() {
     return { total, active, revoked, neverExpires };
   }, [tokens]);
 
-  const warnings = useMemo(() => {
-    if (!security) return [];
-    const nextWarnings: string[] = [];
-    if (security.allow_self_registration) nextWarnings.push("Self-registration is enabled.");
-    if (userStats.pending > 0) nextWarnings.push(`${userStats.pending} account(s) are waiting for approval.`);
-    if (tokenStats.neverExpires > 0) nextWarnings.push(`${tokenStats.neverExpires} active token(s) never expire.`);
-    if (!security.mfa_enabled) nextWarnings.push("MFA is not enabled.");
-    if (!security.sso_enabled) nextWarnings.push("SSO is not enabled.");
-    return nextWarnings;
-  }, [security, tokenStats.neverExpires, userStats.pending]);
-
   if (loading) {
     return (
       <div className="workspace-section">
@@ -171,20 +159,6 @@ export function SettingsOverviewPage() {
 
   return (
     <div className="workspace-section space-y-4">
-      {warnings.length > 0 ? (
-        <StatusBanner tone="warning" title="Attention">
-          <div className="space-y-1">
-            {warnings.map((warning) => (
-              <p key={warning}>{warning}</p>
-            ))}
-          </div>
-        </StatusBanner>
-      ) : (
-        <StatusBanner tone="success" title="Posture">
-          <p>No immediate governance warnings were detected in the current settings snapshot.</p>
-        </StatusBanner>
-      )}
-
       <div className="grid gap-4 xl:grid-cols-4">
         <section className="workspace-card">
           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Registration</p>
@@ -212,7 +186,7 @@ export function SettingsOverviewPage() {
         </section>
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_360px]">
+      <div className="grid gap-4">
         <section className="workspace-card">
           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Password Policy</p>
           <h2 className="mt-2 text-xl font-semibold">Current requirements</h2>
@@ -238,41 +212,6 @@ export function SettingsOverviewPage() {
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Session timeout</p>
               <p className="mt-1 text-sm font-semibold">{security.session_idle_timeout_minutes ? `${security.session_idle_timeout_minutes} min` : "Not enforced"}</p>
               <p className="mt-1 text-xs text-slate-500">Idle session expiration.</p>
-            </div>
-          </div>
-        </section>
-
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Access Posture</p>
-          <h2 className="mt-2 text-xl font-semibold">Security capabilities</h2>
-          <div className="mt-4 space-y-3 text-sm">
-            <div className="flex items-center justify-between gap-3">
-              <span>CSRF protection</span>
-              <span className="font-semibold">{security.auth_require_csrf ? "Required" : "Off"}</span>
-            </div>
-            <div className="flex items-center justify-between gap-3">
-              <span>Secure auth cookies</span>
-              <span className="font-semibold">{security.auth_cookie_secure ? "Enabled" : "Off"}</span>
-            </div>
-            <div className="flex items-center justify-between gap-3">
-              <span>RBAC</span>
-              <span className="font-semibold">{security.rbac_enabled ? "Enabled" : "Off"}</span>
-            </div>
-            <div className="flex items-center justify-between gap-3">
-              <span>MFA</span>
-              <span className="font-semibold">{security.mfa_enabled ? "Enabled" : "Planned"}</span>
-            </div>
-            <div className="flex items-center justify-between gap-3">
-              <span>SSO</span>
-              <span className="font-semibold">{security.sso_enabled ? "Enabled" : "Planned"}</span>
-            </div>
-            <div className="flex items-center justify-between gap-3">
-              <span>SCIM</span>
-              <span className="font-semibold">{security.scim_enabled ? "Enabled" : "Planned"}</span>
-            </div>
-            <div className="flex items-center justify-between gap-3">
-              <span>Password history</span>
-              <span className="font-semibold">{security.password_history_enforced ? "Enabled" : "Not enforced"}</span>
             </div>
           </div>
         </section>
