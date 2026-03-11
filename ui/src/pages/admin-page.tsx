@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiFetchAllPages } from "@/lib/api";
 
 type UserMe = { id: string; is_sysadmin: boolean; email: string };
 type Project = { id: string; name: string };
@@ -81,12 +81,17 @@ export function AdminPage() {
   }
 
   async function loadUsers(search: string) {
-    const query = new URLSearchParams({ limit: "100" });
-    if (search.trim()) {
-      query.set("search", search.trim());
-    }
-    const data = await apiFetch(`/users?${query.toString()}`);
-    setUsers((data?.items || []) as UserRow[]);
+    const rows = await apiFetchAllPages<UserRow>((cursor) => {
+      const query = new URLSearchParams({ limit: "200" });
+      if (search.trim()) {
+        query.set("search", search.trim());
+      }
+      if (cursor) {
+        query.set("cursor", cursor);
+      }
+      return `/users?${query.toString()}`;
+    });
+    setUsers(rows);
   }
 
   useEffect(() => {

@@ -153,6 +153,30 @@ export async function apiFetchBlob(
   };
 }
 
+export async function apiFetchAllPages<T>(buildPath: (cursor: string | null) => string): Promise<T[]> {
+  const items: T[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | null = null;
+
+  while (true) {
+    if (cursor) {
+      if (seenCursors.has(cursor)) {
+        throw new Error("Pagination cursor repeated unexpectedly.");
+      }
+      seenCursors.add(cursor);
+    }
+
+    const data = await apiFetch(buildPath(cursor));
+    items.push(...(((data?.items as T[]) || []) as T[]));
+    cursor = (data?.next_cursor as string | null) || null;
+    if (!cursor) {
+      break;
+    }
+  }
+
+  return items;
+}
+
 function getCookieValue(name: string): string | null {
   if (typeof document === "undefined") return null;
   const prefix = `${name}=`;

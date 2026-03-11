@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiFetchAllPages } from "@/lib/api";
 
 type ApiTokenRow = {
   id: string;
@@ -89,19 +89,23 @@ export function SettingsApiTokensPage() {
   }, [tokens]);
 
   async function loadReferenceData() {
-    const [usersData, projectsData, scopeData] = await Promise.all([
-      apiFetch("/users?limit=500"),
+    const [userRows, projectsData, scopeData] = await Promise.all([
+      apiFetchAllPages<UserOption>((cursor) => {
+        const query = new URLSearchParams({ limit: "200" });
+        if (cursor) query.set("cursor", cursor);
+        return `/users?${query.toString()}`;
+      }),
       apiFetch("/settings/projects"),
       apiFetch("/settings/api-token-scopes"),
     ]);
-    const userRows = ((usersData?.items as UserOption[]) || []).sort((a, b) => a.email.localeCompare(b.email));
+    const sortedUsers = userRows.sort((a, b) => a.email.localeCompare(b.email));
     const projectRows = (projectsData || []) as ProjectOption[];
 
-    setUsers(userRows);
+    setUsers(sortedUsers);
     setProjects(projectRows);
     setScopeCatalog(scopeData as ScopeCatalog);
 
-    if (!createUserId && userRows.length > 0) setCreateUserId(userRows[0].id);
+    if (!createUserId && sortedUsers.length > 0) setCreateUserId(sortedUsers[0].id);
     if (!createProjectId && projectRows.length > 0) setCreateProjectId(projectRows[0].id);
   }
 

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiFetchAllPages } from "@/lib/api";
 
 type RunInfo = {
   id: string;
@@ -136,8 +136,12 @@ export function RunDetailPage() {
 
   useEffect(() => {
     if (!projectId) return;
-    apiFetch(`/projects/${projectId}/runs?limit=200`)
-      .then((data) => setProjectRuns((data?.items || []) as RunCompareOption[]))
+    apiFetchAllPages<RunCompareOption>((cursor) => {
+      const query = new URLSearchParams({ limit: "200" });
+      if (cursor) query.set("cursor", cursor);
+      return `/projects/${projectId}/runs?${query.toString()}`;
+    })
+      .then((data) => setProjectRuns(data))
       .catch((err) => setError(err.message));
   }, [projectId]);
 

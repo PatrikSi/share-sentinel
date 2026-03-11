@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useOutletContext, useParams } from "react-router-dom";
 
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiFetchAllPages } from "@/lib/api";
 import { Membership, PROJECT_ROLES, Project, rolePillClass, UserRow } from "@/lib/iam";
 import type { SettingsOutletContext } from "@/pages/settings-layout";
 
@@ -34,8 +34,12 @@ export function SettingsIamUserPage() {
   const [info, setInfo] = useState<string | null>(null);
 
   const loadUsers = async () => {
-    const data = await apiFetch("/users?limit=500");
-    setUsers((data?.items || []) as UserRow[]);
+    const rows = await apiFetchAllPages<UserRow>((cursor) => {
+      const query = new URLSearchParams({ limit: "200" });
+      if (cursor) query.set("cursor", cursor);
+      return `/users?${query.toString()}`;
+    });
+    setUsers(rows);
   };
 
   const loadProjects = async () => {
@@ -44,19 +48,12 @@ export function SettingsIamUserPage() {
   };
 
   const loadMemberships = async () => {
-    const aggregated: Membership[] = [];
-    let cursor: string | null = null;
-    let guard = 0;
-    do {
-      const query = new URLSearchParams({ limit: "500" });
+    const rows = await apiFetchAllPages<Membership>((cursor) => {
+      const query = new URLSearchParams({ limit: "200" });
       if (cursor) query.set("cursor", cursor);
-      const data = await apiFetch(`/settings/rbac/project-memberships?${query.toString()}`);
-      const items = (data?.items || []) as Membership[];
-      aggregated.push(...items);
-      cursor = (data?.next_cursor as string | null) || null;
-      guard += 1;
-    } while (cursor && guard < 20);
-    setMemberships(aggregated);
+      return `/settings/rbac/project-memberships?${query.toString()}`;
+    });
+    setMemberships(rows);
   };
 
   const refreshPage = async () => {

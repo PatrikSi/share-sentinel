@@ -1,7 +1,7 @@
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiFetchAllPages } from "@/lib/api";
 import { parseInventoryQuery, type InventoryQueryClause, type InventoryQueryField, type InventoryQueryGroup } from "@/lib/inventory-query";
 
 type Project = { id: string; name: string };
@@ -280,8 +280,12 @@ export function ProjectInventoryPage() {
       .then((data) => setProject(data as Project))
       .catch((err) => setError(err.message));
 
-    apiFetch(`/projects/${projectId}/runs?limit=200`)
-      .then((data) => setRuns((data?.items || []) as RunOption[]))
+    apiFetchAllPages<RunOption>((cursor) => {
+      const query = new URLSearchParams({ limit: "200" });
+      if (cursor) query.set("cursor", cursor);
+      return `/projects/${projectId}/runs?${query.toString()}`;
+    })
+      .then((data) => setRuns(data))
       .catch((err) => setError(err.message));
   }, [projectId]);
 
