@@ -1,15 +1,8 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { apiFetch } from "@/lib/api";
-
-type UserMe = {
-  id: string;
-  email: string;
-  is_sysadmin: boolean;
-};
-
-type Project = { id: string; name: string; created_at: string };
+import { useDashboardWorkspace } from "@/lib/dashboard-workspace";
 
 type Run = {
   id: string;
@@ -69,9 +62,7 @@ function RunMetric({ label, value }: { label: string; value: number | null | und
 }
 
 export function ProjectsPage() {
-  const [me, setMe] = useState<UserMe | null>(null);
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProject, setSelectedProject] = useState("");
+  const { canCreateProject, projectLoadError, projects, projectsReady, selectedProject, selectedProjectName } = useDashboardWorkspace();
   const [projectRole, setProjectRole] = useState<string | null>(null);
 
   const [runs, setRuns] = useState<Run[]>([]);
@@ -82,24 +73,12 @@ export function ProjectsPage() {
   const [cursorHistory, setCursorHistory] = useState<Array<string | null>>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
 
-  const [newProjectName, setNewProjectName] = useState("");
-  const [creatingProject, setCreatingProject] = useState(false);
-  const [showCreateProjectForm, setShowCreateProjectForm] = useState(false);
-
   const [projectStats, setProjectStats] = useState<ProjectStats | null>(null);
   const [topExtensions, setTopExtensions] = useState<ExtensionStat[]>([]);
   const [loadingStats, setLoadingStats] = useState(false);
 
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
-
-  async function loadProjects() {
-    const data = (await apiFetch("/projects")) as Project[];
-    setProjects(data || []);
-    if (!selectedProject && data.length > 0) {
-      setSelectedProject(data[0].id);
-    }
-  }
 
   async function loadRuns(projectId: string, pageCursor: string | null) {
     const query = new URLSearchParams({ limit: "50" });
@@ -124,13 +103,6 @@ export function ProjectsPage() {
   }
 
   useEffect(() => {
-    apiFetch("/auth/me")
-      .then((data) => setMe(data as UserMe))
-      .catch((err) => setError(err.message));
-    loadProjects().catch((err) => setError(err.message));
-  }, []);
-
-  useEffect(() => {
     if (!selectedProject) return;
     setCursor(null);
     setCursorHistory([]);
@@ -146,7 +118,10 @@ export function ProjectsPage() {
   }, [selectedProject, cursor]);
 
   useEffect(() => {
-    if (!selectedProject) return;
+    if (!selectedProject) {
+      setProjectRole(null);
+      return;
+    }
     apiFetch(`/projects/${selectedProject}/my-role`)
       .then((data) => setProjectRole((data?.role as string) || null))
       .catch(() => setProjectRole(null));
@@ -163,11 +138,6 @@ export function ProjectsPage() {
     }, 8000);
     return () => window.clearInterval(timer);
   }, [selectedProject, runs, cursor]);
-
-  const selectedProjectName = useMemo(
-    () => projects.find((project) => project.id === selectedProject)?.name || "",
-    [projects, selectedProject],
-  );
 
   const visibleRuns = useMemo(() => {
     return runs.filter((run) => {
@@ -201,30 +171,6 @@ export function ProjectsPage() {
     });
   }
 
-  async function onCreateProject(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!newProjectName.trim()) return;
-    setCreatingProject(true);
-    setError(null);
-    setInfo(null);
-
-    try {
-      const created = (await apiFetch("/projects", {
-        method: "POST",
-        body: JSON.stringify({ name: newProjectName.trim() }),
-      })) as Project;
-      setNewProjectName("");
-      setSelectedProject(created.id);
-      setShowCreateProjectForm(false);
-      setInfo(`Project created: ${created.name}`);
-      await loadProjects();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Project creation failed");
-    } finally {
-      setCreatingProject(false);
-    }
-  }
-
   async function deleteRun(runId: string) {
     if (!selectedProject) return;
     if (!window.confirm("Delete this run? This removes all ingested entities for the run.")) return;
@@ -240,10 +186,10 @@ export function ProjectsPage() {
     }
   }
 
-  const canCreateProject = !!me?.is_sysadmin;
   const canImport = projectRole === "operator" || projectRole === "admin";
   const canDeleteRuns = projectRole === "admin";
   const latestRunAtText = projectStats?.latest_run_at ? new Date(projectStats.latest_run_at).toLocaleString() : "No completed runs yet";
+  const visibleError = error || projectLoadError;
 
   function formatCount(value: number | null | undefined): string {
     if (value === null || value === undefined) return loadingStats ? "..." : "0";
@@ -261,11 +207,11 @@ export function ProjectsPage() {
       <div className="workspace-header">
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.6fr)_340px]">
           <div className="rounded-[28px] border border-slate-200 bg-[linear-gradient(135deg,rgba(255,255,255,0.98),rgba(226,232,240,0.9))] p-6 shadow-sm dark:border-slate-800 dark:bg-[linear-gradient(135deg,rgba(15,23,42,0.96),rgba(15,23,42,0.78))]">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Operations Workspace</p>
-            <h1 className="mt-3 text-3xl font-bold tracking-tight">{selectedProjectName || "Projects"}</h1>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Dashboard Workspace</p>
+            <h1 className="mt-3 text-3xl font-bold tracking-tight">{selectedProjectName || "Dashboard"}</h1>
             <p className="mt-3 max-w-2xl text-sm text-slate-600 dark:text-slate-300">
-              Keep project selection, run intake, and inventory review in one flow. Start with the workspace, confirm coverage,
-              then move directly into the run or inventory view you need.
+              Keep project selection, run intake, and inventory review in one flow. Use the dashboard bar above to switch
+              workspaces quickly, confirm coverage, then move directly into the run or inventory view you need.
             </p>
             {selectedProject ? (
               <div className="mt-5 flex flex-wrap gap-2">
@@ -314,36 +260,27 @@ export function ProjectsPage() {
           </div>
 
           <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
-            <div className="flex items-center justify-between gap-3">
+            <div>
               <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Workspace</p>
-                <h2 className="mt-2 text-xl font-semibold">Choose project</h2>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Workspace Summary</p>
+                <h2 className="mt-2 text-xl font-semibold">{selectedProject ? "Current context" : "No project selected"}</h2>
+                <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+                  {selectedProject
+                    ? "Project switching and creation now live in the top bar, so you can change focus without leaving the dashboard."
+                    : canCreateProject
+                      ? "Use the top bar to create your first project and start building the dashboard workspace."
+                      : projectsReady
+                        ? "No projects are available yet. Ask a sysadmin to create one."
+                        : "Loading available dashboard workspaces."}
+                </p>
               </div>
-              {canCreateProject ? (
-                <button
-                  className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                  onClick={() => setShowCreateProjectForm((prev) => !prev)}
-                  type="button"
-                >
-                  {showCreateProjectForm ? "Close" : "New Project"}
-                </button>
-              ) : null}
             </div>
 
-            <label className="mt-5 block text-sm font-medium text-slate-700 dark:text-slate-300">
-              Current workspace
-              <select
-                className="mt-2 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900"
-                value={selectedProject}
-                onChange={(event) => setSelectedProject(event.target.value)}
-              >
-                {projects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    {project.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Projects Available</p>
+              <p className="mt-2 text-sm font-semibold">{projectsReady ? projects.length.toLocaleString() : "Loading..."}</p>
+              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">Switch or create projects from the dashboard controls in the top navbar.</p>
+            </div>
 
             <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Access</p>
@@ -352,35 +289,13 @@ export function ProjectsPage() {
                 Operators and admins can upload artifacts. Admins can also delete runs.
               </p>
             </div>
-
-            {canCreateProject && showCreateProjectForm ? (
-              <form className="mt-4 space-y-3" onSubmit={onCreateProject}>
-                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
-                  Project name
-                  <input
-                    className="mt-2 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900"
-                    value={newProjectName}
-                    onChange={(event) => setNewProjectName(event.target.value)}
-                    placeholder="Client East - Q1 Shares"
-                    required
-                  />
-                </label>
-                <button
-                  className="w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
-                  disabled={creatingProject}
-                  type="submit"
-                >
-                  {creatingProject ? "Creating project..." : "Create project"}
-                </button>
-              </form>
-            ) : null}
           </div>
         </div>
       </div>
 
-      {error || info ? (
+      {visibleError || info ? (
         <div className="workspace-section space-y-2">
-          {error ? <p className="rounded-2xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{error}</p> : null}
+          {visibleError ? <p className="rounded-2xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{visibleError}</p> : null}
           {info ? <p className="rounded-2xl bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">{info}</p> : null}
         </div>
       ) : null}

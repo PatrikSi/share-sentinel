@@ -3,6 +3,7 @@ import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 
 import { TopNav } from "@/components/top-nav";
 import { getAccessToken } from "@/lib/auth";
+import { DashboardWorkspaceProvider } from "@/lib/dashboard-workspace";
 import { AccountPage } from "@/pages/account-page";
 import { LoginPage } from "@/pages/login-page";
 import { ProjectImportPage } from "@/pages/project-import-page";
@@ -41,7 +42,7 @@ export function App() {
     }
   }, []);
 
-  return (
+  const appShell = (
     <div className={showNav ? "app-shell" : ""}>
       {showNav ? <TopNav /> : null}
       <main className={showNav ? "app-main" : "app-login-main"}>
@@ -119,4 +120,10 @@ export function App() {
       </main>
     </div>
   );
+
+  if (!showNav) {
+    return appShell;
+  }
+
+  return <DashboardWorkspaceProvider>{appShell}</DashboardWorkspaceProvider>;
 }
