@@ -205,6 +205,12 @@ const QUERY_FIELD_LABELS: Record<InventoryQueryField, string> = {
   access: "Share Access",
 };
 
+const FILTER_LABEL_CLASS = "text-xs font-semibold uppercase tracking-wider text-slate-500";
+const FILTER_INPUT_CLASS =
+  "mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500";
+const FILTER_SELECT_CLASS =
+  "mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100";
+
 export function ProjectInventoryPage() {
   const { projectId } = useParams<{ projectId: string }>();
 
@@ -249,6 +255,7 @@ export function ProjectInventoryPage() {
   const [dragResourceColumn, setDragResourceColumn] = useState<ResourceColumnKey | null>(null);
   const [dragEndpointColumn, setDragEndpointColumn] = useState<EndpointColumnKey | null>(null);
   const [showAdvancedQuery, setShowAdvancedQuery] = useState(false);
+  const [showRunScope, setShowRunScope] = useState(false);
 
   const runIdsParam = useMemo(() => selectedRunIds.join(","), [selectedRunIds]);
   const endpointQuery = useMemo(() => [query.trim(), endpointFilter.trim()].filter(Boolean).join(" "), [query, endpointFilter]);
@@ -325,74 +332,6 @@ export function ProjectInventoryPage() {
     setSelectedRunIds([]);
     setInventoryQueryInput("");
     clearAppliedInventoryQuery();
-  }
-
-  function applyQuickFilter(kind: "finance-paths" | "pst-files" | "readable-shares" | "denied-shares" | "fs-endpoints" | "temp-files") {
-    setQueryError(null);
-    clearAppliedInventoryQuery();
-
-    if (kind === "finance-paths") {
-      setActiveTab("items");
-      setQuery("finance");
-      setEndpointFilter("");
-      setShareFilter("finance");
-      setPathPrefix("\\\\Finance\\");
-      setExtFilter("");
-      setResourceAccess("");
-      return;
-    }
-
-    if (kind === "pst-files") {
-      setActiveTab("items");
-      setQuery("");
-      setEndpointFilter("");
-      setShareFilter("");
-      setPathPrefix("");
-      setExtFilter(".pst");
-      setResourceAccess("");
-      return;
-    }
-
-    if (kind === "readable-shares") {
-      setActiveTab("resources");
-      setQuery("");
-      setEndpointFilter("");
-      setShareFilter("");
-      setPathPrefix("");
-      setExtFilter("");
-      setResourceAccess("readable");
-      return;
-    }
-
-    if (kind === "denied-shares") {
-      setActiveTab("resources");
-      setQuery("");
-      setEndpointFilter("");
-      setShareFilter("");
-      setPathPrefix("");
-      setExtFilter("");
-      setResourceAccess("no_access");
-      return;
-    }
-
-    if (kind === "fs-endpoints") {
-      setActiveTab("endpoints");
-      setQuery("");
-      setEndpointFilter("fs-");
-      setShareFilter("");
-      setPathPrefix("");
-      setExtFilter("");
-      setResourceAccess("");
-      return;
-    }
-
-    setActiveTab("items");
-    setQuery("");
-    setEndpointFilter("");
-    setShareFilter("");
-    setPathPrefix("\\\\Temp\\");
-    setExtFilter(".tmp");
-    setResourceAccess("");
   }
 
   useEffect(() => {
@@ -594,65 +533,35 @@ export function ProjectInventoryPage() {
 
   return (
     <section className="workspace">
-      <div className="workspace-header gap-4">
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.45fr)_360px]">
-          <div className="rounded-[28px] border border-slate-200 bg-[linear-gradient(135deg,rgba(255,255,255,0.98),rgba(226,232,240,0.88))] p-5 shadow-sm dark:border-slate-800 dark:bg-[linear-gradient(135deg,rgba(15,23,42,0.96),rgba(15,23,42,0.8))]">
+      <div className="workspace-header gap-3">
+        <div className="flex flex-wrap items-start justify-between gap-3 rounded-[28px] border border-slate-200 bg-[linear-gradient(135deg,rgba(255,255,255,0.98),rgba(226,232,240,0.88))] p-5 shadow-sm dark:border-slate-800 dark:bg-[linear-gradient(135deg,rgba(15,23,42,0.96),rgba(15,23,42,0.8))]">
+          <div>
             <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Inventory</p>
-            <h1 className="mt-2 text-3xl font-bold tracking-tight">{project?.name || "Project Inventory"}</h1>
-            <p className="mt-2 max-w-3xl text-sm text-slate-600 dark:text-slate-300">
-              {project ? `${project.id} • ${activeTabCopy.description}` : projectId}
-            </p>
-            <div className="mt-4 flex flex-wrap gap-2">
-              <Link
-                className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                to="/projects"
-              >
-                Open Dashboard
-              </Link>
-              {projectId ? (
-                <Link
-                  className="rounded-2xl bg-emerald-600 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-emerald-500"
-                  to={`/projects/${projectId}/import`}
-                >
-                  Import Scan
-                </Link>
-              ) : null}
-              <button
-                className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                onClick={clearAllFilters}
-                type="button"
-              >
-                Reset Filters
-              </button>
-            </div>
+            <h1 className="mt-1 text-2xl font-bold tracking-tight">{project?.name || "Project Inventory"}</h1>
+            <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">{project ? project.id : projectId}</p>
           </div>
-
-          <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Current View</p>
-            <h2 className="mt-2 text-xl font-semibold">{activeTabCopy.label}</h2>
-            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-              {queryModeActive
-                ? "Advanced query mode is active. Editing any guided filter switches this page back to guided mode."
-                : activeTabCopy.description}
-            </p>
-            <div className="mt-4 grid gap-3 sm:grid-cols-2">
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Visible Results</p>
-                <p className="mt-1 text-lg font-semibold">{activeResultCount.toLocaleString()}</p>
-              </div>
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Run Scope</p>
-                <p className="mt-1 text-lg font-semibold">{activeRunCount === 0 ? "All runs" : `${activeRunCount} selected`}</p>
-              </div>
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Visible Columns</p>
-                <p className="mt-1 text-lg font-semibold">{activeColumnCount.toLocaleString()}</p>
-              </div>
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Mode</p>
-                <p className="mt-1 text-lg font-semibold">{queryModeActive ? "Advanced query" : "Guided filters"}</p>
-              </div>
-            </div>
+          <div className="flex flex-wrap gap-2">
+            <Link
+              className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+              to="/projects"
+            >
+              Open Dashboard
+            </Link>
+            {projectId ? (
+              <Link
+                className="rounded-2xl bg-emerald-600 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-emerald-500"
+                to={`/projects/${projectId}/import`}
+              >
+                Import Scan
+              </Link>
+            ) : null}
+            <button
+              className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+              onClick={clearAllFilters}
+              type="button"
+            >
+              Reset Filters
+            </button>
           </div>
         </div>
 
@@ -665,34 +574,50 @@ export function ProjectInventoryPage() {
       </div>
 
       <div className="workspace-section space-y-4">
-        <div className="grid gap-3 lg:grid-cols-3">
-          {(["items", "resources", "endpoints"] as Tab[]).map((tab) => (
-            <button
-              className={`rounded-3xl border p-4 text-left transition ${
-                activeTab === tab
-                  ? "border-emerald-600 bg-emerald-50 dark:bg-emerald-900/20"
-                  : "border-slate-300 bg-white/80 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950/40 dark:hover:bg-slate-900/80"
-              }`}
-              key={tab}
-              onClick={() => setActiveTab(tab)}
-              type="button"
-            >
-              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">{INVENTORY_TAB_COPY[tab].label}</p>
-              <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{INVENTORY_TAB_COPY[tab].description}</p>
-            </button>
-          ))}
-        </div>
+        <div className="rounded-3xl border border-slate-200 bg-white/90 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/60">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">View</p>
+              <h2 className="mt-1 text-lg font-semibold">{activeTabCopy.label}</h2>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">{activeTabCopy.description}</p>
+            </div>
+            <div className="flex flex-wrap gap-2 text-xs">
+              <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 font-medium dark:border-slate-800 dark:bg-slate-900/80">
+                {activeResultCount.toLocaleString()} results
+              </span>
+              <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 font-medium dark:border-slate-800 dark:bg-slate-900/80">
+                {activeRunCount === 0 ? "All runs" : `${activeRunCount} runs`}
+              </span>
+              <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 font-medium dark:border-slate-800 dark:bg-slate-900/80">
+                {activeColumnCount.toLocaleString()} columns
+              </span>
+              <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 font-medium dark:border-slate-800 dark:bg-slate-900/80">
+                {queryModeActive ? "Advanced query" : "Guided filters"}
+              </span>
+            </div>
+          </div>
 
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
-          <div className="space-y-4">
-            <div className="rounded-3xl border border-slate-200 bg-white/90 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/60">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">Guided Filters</p>
-                  <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-                    Start with structured filters and only drop into the query DSL when the guided inputs are not expressive enough.
-                  </p>
-                </div>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {(["items", "resources", "endpoints"] as Tab[]).map((tab) => (
+              <button
+                className={`rounded-2xl border px-4 py-2 text-sm font-semibold transition ${
+                  activeTab === tab
+                    ? "border-emerald-600 bg-emerald-50 text-emerald-900 dark:bg-emerald-900/20 dark:text-emerald-100"
+                    : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-200 dark:hover:bg-slate-900/80"
+                }`}
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                type="button"
+              >
+                {INVENTORY_TAB_COPY[tab].label}
+              </button>
+            ))}
+          </div>
+
+          <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+            <div className="rounded-3xl border border-slate-200 bg-white/95 p-4 dark:border-slate-800 dark:bg-slate-950/40">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">Guided Filters</p>
                 <button
                   className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
                   onClick={clearSimpleFilters}
@@ -703,53 +628,60 @@ export function ProjectInventoryPage() {
               </div>
 
               {queryModeActive ? (
-                <p className="mt-3 rounded-2xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 dark:border-emerald-900/40 dark:bg-emerald-900/20 dark:text-emerald-200">
-                  Query mode is active. The inputs below reflect parsed values from the query; editing any field returns to guided mode.
-                </p>
+                <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                  {querySummaries.map((summary) => (
+                    <span
+                      className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-emerald-800 dark:border-emerald-900/40 dark:bg-emerald-900/20 dark:text-emerald-200"
+                      key={summary}
+                    >
+                      {summary}
+                    </span>
+                  ))}
+                </div>
               ) : null}
 
               {activeTab === "items" ? (
-                <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+                  <label className={FILTER_LABEL_CLASS}>
                     Search
                     <input
-                      className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      className={FILTER_INPUT_CLASS}
                       placeholder="File, folder, hostname, or share"
                       value={query}
                       onChange={(event) => handleSimpleFilterChange(setQuery, event.target.value)}
                     />
                   </label>
-                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  <label className={FILTER_LABEL_CLASS}>
                     Endpoint
                     <input
-                      className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      className={FILTER_INPUT_CLASS}
                       placeholder="fs-01 or 10.0.0.14"
                       value={endpointFilter}
                       onChange={(event) => handleSimpleFilterChange(setEndpointFilter, event.target.value)}
                     />
                   </label>
-                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  <label className={FILTER_LABEL_CLASS}>
                     Share
                     <input
-                      className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      className={FILTER_INPUT_CLASS}
                       placeholder="Finance"
                       value={shareFilter}
                       onChange={(event) => handleSimpleFilterChange(setShareFilter, event.target.value)}
                     />
                   </label>
-                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  <label className={FILTER_LABEL_CLASS}>
                     Path Prefix
                     <input
-                      className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      className={FILTER_INPUT_CLASS}
                       placeholder="\\Finance\\Quarterly"
                       value={pathPrefix}
                       onChange={(event) => handleSimpleFilterChange(setPathPrefix, event.target.value)}
                     />
                   </label>
-                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  <label className={FILTER_LABEL_CLASS}>
                     Extension
                     <input
-                      className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      className={FILTER_INPUT_CLASS}
                       list="inventory-extension-options"
                       placeholder=".pst"
                       value={extFilter}
@@ -761,28 +693,28 @@ export function ProjectInventoryPage() {
 
               {activeTab === "resources" ? (
                 <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  <label className={FILTER_LABEL_CLASS}>
                     Search
                     <input
-                      className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      className={FILTER_INPUT_CLASS}
                       placeholder="Share name or remark"
                       value={query}
                       onChange={(event) => handleSimpleFilterChange(setQuery, event.target.value)}
                     />
                   </label>
-                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  <label className={FILTER_LABEL_CLASS}>
                     Endpoint
                     <input
-                      className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      className={FILTER_INPUT_CLASS}
                       placeholder="host or ip"
                       value={endpointFilter}
                       onChange={(event) => handleSimpleFilterChange(setEndpointFilter, event.target.value)}
                     />
                   </label>
-                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  <label className={FILTER_LABEL_CLASS}>
                     Share Access
                     <select
-                      className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      className={FILTER_SELECT_CLASS}
                       value={resourceAccess}
                       onChange={(event) => handleSimpleFilterChange(setResourceAccess, event.target.value)}
                     >
@@ -797,19 +729,19 @@ export function ProjectInventoryPage() {
 
               {activeTab === "endpoints" ? (
                 <div className="mt-4 grid gap-3 md:grid-cols-2">
-                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  <label className={FILTER_LABEL_CLASS}>
                     Endpoint Search
                     <input
-                      className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      className={FILTER_INPUT_CLASS}
                       placeholder="Hostname, endpoint key, or IP"
                       value={query}
                       onChange={(event) => handleSimpleFilterChange(setQuery, event.target.value)}
                     />
                   </label>
-                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  <label className={FILTER_LABEL_CLASS}>
                     Endpoint Prefix
                     <input
-                      className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      className={FILTER_INPUT_CLASS}
                       placeholder="fs-"
                       value={endpointFilter}
                       onChange={(event) => handleSimpleFilterChange(setEndpointFilter, event.target.value)}
@@ -817,221 +749,145 @@ export function ProjectInventoryPage() {
                   </label>
                 </div>
               ) : null}
+
+              {activeTab === "items" ? (
+                <div className="mt-4 flex flex-wrap gap-2 text-xs">
+                  {extensions.slice(0, 10).map((facet) => (
+                    <button
+                      className={`rounded-full border px-3 py-1.5 font-medium transition ${
+                        extFilter === facet.ext
+                          ? "border-emerald-600 bg-emerald-50 text-emerald-900 dark:bg-emerald-900/20 dark:text-emerald-100"
+                          : "border-slate-300 text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                      }`}
+                      key={facet.ext}
+                      onClick={() => handleSimpleFilterChange(setExtFilter, extFilter === facet.ext ? "" : facet.ext)}
+                      type="button"
+                    >
+                      {facet.ext} ({facet.count})
+                    </button>
+                  ))}
+                </div>
+              ) : null}
             </div>
 
-            <div className="rounded-3xl border border-slate-200 bg-slate-50/80 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900/40">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">Advanced Query</p>
-                  <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-                    Use the DSL when you need compound boolean logic, negation, or mixed field operators.
-                  </p>
+            <div className="space-y-4">
+              <div className="rounded-3xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/40">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Run Scope</p>
+                    <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+                      {activeRunCount === 0 ? "Reviewing all runs." : `${activeRunCount} run${activeRunCount === 1 ? "" : "s"} selected.`}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      className="rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                      onClick={() => setSelectedRunIds([])}
+                      type="button"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      className="rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                      onClick={() => setShowRunScope((current) => !current)}
+                      type="button"
+                    >
+                      {showRunScope ? "Hide" : "Choose Runs"}
+                    </button>
+                  </div>
                 </div>
-                <button
-                  className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                  onClick={() => setShowAdvancedQuery((current) => !current)}
-                  type="button"
-                >
-                  {showAdvancedQuery ? "Hide Query Builder" : "Show Query Builder"}
-                </button>
+
+                {showRunScope ? (
+                  <select
+                    className="mt-3 h-36 w-full rounded-2xl border border-slate-300 bg-white p-3 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    multiple
+                    value={selectedRunIds}
+                    onChange={(event) => {
+                      const selected = Array.from(event.target.selectedOptions).map((option) => option.value);
+                      setSelectedRunIds(selected);
+                    }}
+                  >
+                    {runs.map((run) => (
+                      <option key={run.id} value={run.id}>
+                        {run.name} [{run.status}] {new Date(run.created_at).toLocaleString()}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
               </div>
 
-              {showAdvancedQuery ? (
-                <>
-                  <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto_auto] lg:items-start">
+              <div className="rounded-3xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/40">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Advanced Query</p>
+                    <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">Use the DSL only when the guided filters are not enough.</p>
+                  </div>
+                  <button
+                    className="rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                    onClick={() => setShowAdvancedQuery((current) => !current)}
+                    type="button"
+                  >
+                    {showAdvancedQuery ? "Hide" : "Open"}
+                  </button>
+                </div>
+
+                {showAdvancedQuery ? (
+                  <>
                     <textarea
-                      className="min-h-[110px] w-full rounded-2xl border border-slate-300 bg-white px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      className="mt-3 min-h-[96px] w-full rounded-2xl border border-slate-300 bg-white px-3 py-3 text-sm text-slate-900 placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
                       placeholder={'endpoint startswith "fs-" AND share contains finance AND !ext = .tmp'}
                       value={inventoryQueryInput}
                       onChange={(event) => setInventoryQueryInput(event.target.value)}
                     />
-                    <button
-                      className="rounded-2xl bg-slate-900 px-4 py-3 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
-                      onClick={handleInventoryQueryApply}
-                      type="button"
-                    >
-                      Apply Query
-                    </button>
-                    <button
-                      className="rounded-2xl border border-slate-300 px-4 py-3 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                      onClick={() => {
-                        setInventoryQueryInput("");
-                        clearAppliedInventoryQuery();
-                      }}
-                      type="button"
-                    >
-                      Clear Query
-                    </button>
-                  </div>
-
-                  <div className="mt-4 grid gap-3 md:grid-cols-2">
-                    <div className="rounded-2xl border border-slate-200 bg-white/80 p-3 dark:border-slate-800 dark:bg-slate-950/40">
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Supported Fields</p>
-                      <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-                        `search`, `endpoint`, `share`, `path`, `ext`, `access`
-                      </p>
-                      <p className="mt-2 text-xs text-slate-500">
-                        Operators: `equals` or `=`, `contains` or `~`, `startswith` or `^`. `AND` binds tighter than `OR`.
-                      </p>
-                    </div>
-                    <div className="rounded-2xl border border-slate-200 bg-white/80 p-3 dark:border-slate-800 dark:bg-slate-950/40">
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Examples</p>
-                      <div className="mt-2 flex flex-wrap gap-2 text-xs">
-                        <button
-                          className="rounded-full border border-slate-300 px-3 py-1 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                          onClick={() => setInventoryQueryInput('share contains "finance" AND ext = .xlsx')}
-                          type="button"
-                        >
-                          Finance spreadsheets
-                        </button>
-                        <button
-                          className="rounded-full border border-slate-300 px-3 py-1 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                          onClick={() => setInventoryQueryInput('endpoint startswith "fs-" AND !ext = .tmp')}
-                          type="button"
-                        >
-                          Server paths without temp files
-                        </button>
-                        <button
-                          className="rounded-full border border-slate-300 px-3 py-1 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                          onClick={() => setInventoryQueryInput('access = readable OR access = list_only')}
-                          type="button"
-                        >
-                          Reachable shares
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </>
-              ) : null}
-            </div>
-          </div>
-
-          <div className="space-y-4">
-            <div className="workspace-card space-y-3">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Run Scope</p>
-                  <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-                    Narrow inventory review to specific runs when you need to isolate a collector pass.
-                  </p>
-                </div>
-                <button
-                  className="rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                  onClick={() => setSelectedRunIds([])}
-                  type="button"
-                >
-                  Clear
-                </button>
-              </div>
-              <select
-                className="h-48 w-full rounded-2xl border border-slate-300 bg-white p-3 text-sm dark:border-slate-700 dark:bg-slate-900"
-                multiple
-                value={selectedRunIds}
-                onChange={(event) => {
-                  const selected = Array.from(event.target.selectedOptions).map((option) => option.value);
-                  setSelectedRunIds(selected);
-                }}
-              >
-                {runs.map((run) => (
-                  <option key={run.id} value={run.id}>
-                    {run.name} [{run.status}] {new Date(run.created_at).toLocaleString()}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="workspace-card space-y-3">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Quick Starts</p>
-                <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">Common pivots that prefill the guided filters for the current workflow.</p>
-              </div>
-              <div className="flex flex-wrap gap-2 text-xs">
-                {activeTab === "items" ? (
-                  <>
-                    <button
-                      className="rounded-full border border-slate-300 px-3 py-1 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                      onClick={() => applyQuickFilter("finance-paths")}
-                      type="button"
-                    >
-                      Finance paths
-                    </button>
-                    <button
-                      className="rounded-full border border-slate-300 px-3 py-1 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                      onClick={() => applyQuickFilter("pst-files")}
-                      type="button"
-                    >
-                      PST files
-                    </button>
-                    <button
-                      className="rounded-full border border-slate-300 px-3 py-1 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                      onClick={() => applyQuickFilter("temp-files")}
-                      type="button"
-                    >
-                      Temp files
-                    </button>
-                  </>
-                ) : null}
-                {activeTab === "resources" ? (
-                  <>
-                    <button
-                      className="rounded-full border border-slate-300 px-3 py-1 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                      onClick={() => applyQuickFilter("readable-shares")}
-                      type="button"
-                    >
-                      Readable shares
-                    </button>
-                    <button
-                      className="rounded-full border border-slate-300 px-3 py-1 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                      onClick={() => applyQuickFilter("denied-shares")}
-                      type="button"
-                    >
-                      No-access shares
-                    </button>
-                  </>
-                ) : null}
-                {activeTab === "endpoints" ? (
-                  <button
-                    className="rounded-full border border-slate-300 px-3 py-1 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                    onClick={() => applyQuickFilter("fs-endpoints")}
-                    type="button"
-                  >
-                    FS-prefixed hosts
-                  </button>
-                ) : null}
-                {activeTab === "items"
-                  ? extensions.slice(0, 10).map((facet) => (
+                    <div className="mt-3 flex flex-wrap gap-2 text-xs">
                       <button
-                        className={`rounded-full border px-3 py-1 transition ${
-                          extFilter === facet.ext
-                            ? "border-emerald-600 bg-emerald-50 dark:bg-emerald-900/20"
-                            : "border-slate-300 hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                        }`}
-                        key={facet.ext}
-                        onClick={() => handleSimpleFilterChange(setExtFilter, extFilter === facet.ext ? "" : facet.ext)}
+                        className="rounded-full border border-slate-300 px-3 py-1.5 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                        onClick={() => setInventoryQueryInput('share contains "finance" AND ext = .xlsx')}
                         type="button"
                       >
-                        {facet.ext} ({facet.count})
+                        Finance spreadsheets
                       </button>
-                    ))
-                  : null}
+                      <button
+                        className="rounded-full border border-slate-300 px-3 py-1.5 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                        onClick={() => setInventoryQueryInput('endpoint startswith "fs-" AND !ext = .tmp')}
+                        type="button"
+                      >
+                        Server paths without temp files
+                      </button>
+                      <button
+                        className="rounded-full border border-slate-300 px-3 py-1.5 transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                        onClick={() => setInventoryQueryInput('access = readable OR access = list_only')}
+                        type="button"
+                      >
+                        Reachable shares
+                      </button>
+                    </div>
+                    <p className="mt-3 text-xs text-slate-500">
+                      Fields: `search`, `endpoint`, `share`, `path`, `ext`, `access`. Operators: `=`, `~`, `^`, `AND`, `OR`, `!`.
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button
+                        className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
+                        onClick={handleInventoryQueryApply}
+                        type="button"
+                      >
+                        Apply Query
+                      </button>
+                      <button
+                        className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                        onClick={() => {
+                          setInventoryQueryInput("");
+                          clearAppliedInventoryQuery();
+                        }}
+                        type="button"
+                      >
+                        Clear Query
+                      </button>
+                    </div>
+                  </>
+                ) : null}
               </div>
             </div>
-
-            {queryModeActive ? (
-              <div className="workspace-card space-y-3">
-                <div>
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Active Query</p>
-                  <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">The current DSL is constraining results across this inventory view.</p>
-                </div>
-                <div className="flex flex-wrap gap-2 text-xs">
-                  {querySummaries.map((summary) => (
-                    <span className="rounded-full bg-slate-100 px-3 py-1 dark:bg-slate-800" key={summary}>
-                      {summary}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            ) : null}
           </div>
         </div>
 
