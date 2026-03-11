@@ -104,10 +104,6 @@ body {
   @apply text-lg font-semibold lowercase tracking-wide text-slate-900 dark:text-slate-100;
 }
 
-.app-nav-subtitle {
-  @apply text-xs uppercase tracking-widest text-slate-500 dark:text-slate-400;
-}
-
 .app-nav-links {
   @apply flex flex-1 flex-wrap items-center gap-1;
 }

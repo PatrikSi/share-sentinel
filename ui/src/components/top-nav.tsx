@@ -35,10 +35,9 @@ export function TopNav() {
   return (
     <header className="app-nav">
       <div className="app-nav-inner">
-        <div className="app-nav-brand">
+        <Link className="app-nav-brand" to="/projects">
           <span className="app-nav-title">share-sentinel</span>
-          <span className="app-nav-subtitle">Platform</span>
-        </div>
+        </Link>
 
         <nav className="app-nav-links">
           {navItems.map((item) => (
