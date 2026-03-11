@@ -111,43 +111,13 @@ export function LoginPage() {
   }
 
   return (
-    <section className="mx-auto mt-16 grid max-w-6xl gap-6 lg:grid-cols-[minmax(0,1fr)_440px]">
-      <div className="rounded-[32px] border border-slate-200 bg-[linear-gradient(145deg,rgba(255,255,255,0.98),rgba(226,232,240,0.88))] p-8 shadow-sm dark:border-slate-800 dark:bg-[linear-gradient(145deg,rgba(15,23,42,0.96),rgba(15,23,42,0.78))]">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">share-sentinel</p>
-        <h1 className="mt-3 max-w-xl text-4xl font-bold tracking-tight">Review share exposure, ingest collector output, and keep the audit trail visible.</h1>
-        <p className="mt-4 max-w-2xl text-sm text-slate-600 dark:text-slate-300">
-          The dashboard keeps project context, run intake, inventory review, and governance controls in one place. Sign in with an approved account to continue.
-        </p>
-        <div className="mt-6 grid gap-4 md:grid-cols-3">
-          <div className="rounded-3xl border border-white/70 bg-white/70 p-4 dark:border-slate-800 dark:bg-slate-950/40">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Dashboard</p>
-            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">Switch project context, monitor recent ingests, and jump into the latest run quickly.</p>
-          </div>
-          <div className="rounded-3xl border border-white/70 bg-white/70 p-4 dark:border-slate-800 dark:bg-slate-950/40">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Investigation</p>
-            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">Move between guided inventory filters, run diff review, and targeted search without losing context.</p>
-          </div>
-          <div className="rounded-3xl border border-white/70 bg-white/70 p-4 dark:border-slate-800 dark:bg-slate-950/40">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Governance</p>
-            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">Sysadmins approve identities, manage tokens, and review audit activity from one control surface.</p>
-          </div>
-        </div>
-      </div>
-
+    <section className="mx-auto mt-16 max-w-md">
       <div className="panel rounded-[32px] p-8">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">{registerMode ? "Registration" : "Authentication"}</p>
-        <h2 className="mt-3 text-3xl font-bold tracking-tight">{registerMode ? "Create Account" : "Sign In"}</h2>
-        <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-          {registerMode
-            ? allowRegistration
-              ? "Create an account request. A system administrator must approve it before you can sign in."
-              : "Self-registration is disabled in this deployment."
-            : "Use your approved Share Sentinel account to enter the dashboard."}
-        </p>
+        <h1 className="text-3xl font-bold tracking-tight">{registerMode ? "Create Account" : "Sign In"}</h1>
 
         {allowRegistration ? (
           <button
-            className="mt-4 text-xs font-semibold uppercase tracking-[0.18em] text-emerald-700 underline underline-offset-4 dark:text-emerald-300"
+            className="mt-3 text-xs font-semibold uppercase tracking-[0.18em] text-emerald-700 underline underline-offset-4 dark:text-emerald-300"
             type="button"
             onClick={() => {
               setRegisterMode((current) => !current);
@@ -155,13 +125,11 @@ export function LoginPage() {
               setInfo(null);
             }}
           >
-            {registerMode ? "Back to sign in" : "Request a new account"}
+            {registerMode ? "Back to sign in" : "Request access"}
           </button>
-        ) : (
-          <p className="mt-4 text-xs text-slate-500">Account creation is handled by a system administrator.</p>
-        )}
+        ) : null}
 
-        <div className="mt-6 space-y-3">
+        <div className="mt-5 space-y-3">
           {error ? (
             <StatusBanner tone="error" title="Request Failed">
               <p>{error}</p>
@@ -181,11 +149,11 @@ export function LoginPage() {
           ) : null}
         </div>
 
-        <form className="mt-6 space-y-4" onSubmit={onSubmit}>
+        <form className="mt-5 space-y-4" onSubmit={onSubmit}>
           <label className="block text-sm">
             Email
             <input
-              className="mt-1 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 dark:border-slate-700 dark:bg-slate-900"
+              className="mt-1 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 text-slate-900 placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
               type="email"
               value={email}
               onChange={(event) => setEmail(event.target.value)}
@@ -196,7 +164,7 @@ export function LoginPage() {
           <label className="block text-sm">
             {registerMode ? "Create password" : "Password"}
             <input
-              className="mt-1 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 dark:border-slate-700 dark:bg-slate-900"
+              className="mt-1 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
               type="password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
@@ -207,7 +175,7 @@ export function LoginPage() {
             <label className="block text-sm">
               Confirm password
               <input
-                className="mt-1 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 dark:border-slate-700 dark:bg-slate-900"
+                className="mt-1 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                 type="password"
                 value={confirmPassword}
                 onChange={(event) => setConfirmPassword(event.target.value)}
