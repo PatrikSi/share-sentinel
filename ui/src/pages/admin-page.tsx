@@ -442,11 +442,10 @@ export function AdminPage() {
               />
               <input
                 className="w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
-                placeholder="Password (12+ chars)"
+                placeholder="Password (must satisfy server policy)"
                 type="password"
                 value={newUserPassword}
                 onChange={(event) => setNewUserPassword(event.target.value)}
-                minLength={12}
                 required
               />
               <label className="flex items-center gap-2 text-sm">

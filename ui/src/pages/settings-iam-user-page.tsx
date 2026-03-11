@@ -111,12 +111,8 @@ export function SettingsIamUserPage() {
 
   async function resetPassword() {
     if (!user) return;
-    const nextPassword = window.prompt(`Set temporary password for ${user.email} (minimum 12 characters):`);
+    const nextPassword = window.prompt(`Set temporary password for ${user.email} (must satisfy the server password policy):`);
     if (!nextPassword) return;
-    if (nextPassword.length < 12) {
-      setError("Temporary password must be at least 12 characters.");
-      return;
-    }
     await patchUser({ password: nextPassword }, "Password reset complete.");
   }
 

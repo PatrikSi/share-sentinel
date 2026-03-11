@@ -73,6 +73,7 @@ export function AccountPage() {
       <div className="workspace-section grid gap-4 md:grid-cols-2">
         <div className="workspace-card">
           <h2 className="mb-3 text-lg font-semibold">Change Password</h2>
+          <p className="mb-3 text-sm text-slate-600 dark:text-slate-300">New passwords must satisfy the current server password policy.</p>
           <form className="space-y-3" onSubmit={changePassword}>
             <label className="block text-sm">
               Current password
@@ -91,7 +92,6 @@ export function AccountPage() {
                 type="password"
                 value={newPassword}
                 onChange={(event) => setNewPassword(event.target.value)}
-                minLength={12}
                 required
               />
             </label>
@@ -102,7 +102,6 @@ export function AccountPage() {
                 type="password"
                 value={confirmPassword}
                 onChange={(event) => setConfirmPassword(event.target.value)}
-                minLength={12}
                 required
               />
             </label>

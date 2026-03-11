@@ -207,11 +207,10 @@ export function SettingsIamPage() {
               Temporary password
               <input
                 className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-                placeholder="Minimum 12 characters"
+                placeholder="Must satisfy server password policy"
                 type="password"
                 value={newUserPassword}
                 onChange={(event) => setNewUserPassword(event.target.value)}
-                minLength={12}
                 required
               />
             </label>
