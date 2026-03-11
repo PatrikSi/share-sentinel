@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useOutletContext, useParams } from "react-router-dom";
 
+import { Dialog } from "@/components/dialog";
+import { StatePanel } from "@/components/state-panel";
+import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
 import { Membership, PROJECT_ROLES, Project, rolePillClass, UserRow } from "@/lib/iam";
 import type { SettingsOutletContext } from "@/pages/settings-layout";
@@ -15,6 +18,16 @@ function assignmentKey(membership: Membership): string {
   return `${membership.project_id}:${membership.user_id}`;
 }
 
+type SecuritySettings = {
+  password_min_length: number;
+  password_require_lowercase: boolean;
+  password_require_uppercase: boolean;
+  password_require_number: boolean;
+  password_require_special: boolean;
+};
+
+type PendingIdentityAction = "toggle_active" | "toggle_approval" | "toggle_sysadmin" | "assign_baseline";
+
 export function SettingsIamUserPage() {
   const { me } = useOutletContext<SettingsOutletContext>();
   const { userId } = useParams<{ userId: string }>();
@@ -23,12 +36,17 @@ export function SettingsIamUserPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [loading, setLoading] = useState(true);
+  const [securitySettings, setSecuritySettings] = useState<SecuritySettings | null>(null);
 
   const [membershipRoleDraft, setMembershipRoleDraft] = useState<Record<string, string>>({});
   const [newProjectId, setNewProjectId] = useState("");
   const [newProjectRole, setNewProjectRole] = useState("viewer");
   const [baselineRole, setBaselineRole] = useState("viewer");
   const [baselineOverwrite, setBaselineOverwrite] = useState(false);
+  const [passwordDraft, setPasswordDraft] = useState("");
+  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
+  const [membershipToRemove, setMembershipToRemove] = useState<Membership | null>(null);
+  const [pendingIdentityAction, setPendingIdentityAction] = useState<PendingIdentityAction | null>(null);
 
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
@@ -47,6 +65,11 @@ export function SettingsIamUserPage() {
     setProjects((data || []) as Project[]);
   };
 
+  const loadSecuritySettings = async () => {
+    const data = await apiFetch("/auth/security-settings");
+    setSecuritySettings(data as SecuritySettings);
+  };
+
   const loadMemberships = async () => {
     const rows = await apiFetchAllPages<Membership>((cursor) => {
       const query = new URLSearchParams({ limit: "200" });
@@ -60,7 +83,7 @@ export function SettingsIamUserPage() {
     setLoading(true);
     setError(null);
     try {
-      await Promise.all([loadUsers(), loadProjects(), loadMemberships()]);
+      await Promise.all([loadUsers(), loadProjects(), loadMemberships(), loadSecuritySettings()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load identity details");
     } finally {
@@ -111,9 +134,13 @@ export function SettingsIamUserPage() {
 
   async function resetPassword() {
     if (!user) return;
-    const nextPassword = window.prompt(`Set temporary password for ${user.email} (must satisfy the server password policy):`);
-    if (!nextPassword) return;
-    await patchUser({ password: nextPassword }, "Password reset complete.");
+    if (!passwordDraft) {
+      setError("A temporary password is required.");
+      return;
+    }
+    await patchUser({ password: passwordDraft }, "Password reset complete.");
+    setPasswordDraft("");
+    setPasswordDialogOpen(false);
   }
 
   async function upsertMembership(projectId: string, role: string, successMessage: string) {
@@ -133,13 +160,13 @@ export function SettingsIamUserPage() {
   }
 
   async function removeMembership(membership: Membership) {
-    if (!window.confirm(`Remove ${membership.user_email} from ${membership.project_name}?`)) return;
     setError(null);
     setInfo(null);
     try {
       await apiFetch(`/settings/rbac/project-memberships/${membership.project_id}/${membership.user_id}`, { method: "DELETE" });
       setInfo("Project access removed.");
       await refreshPage();
+      setMembershipToRemove(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to remove project assignment");
     }
@@ -157,17 +184,46 @@ export function SettingsIamUserPage() {
       const updated = typeof data?.assigned_projects === "number" ? data.assigned_projects : 0;
       setInfo(`Applied baseline for ${user.email}: ${updated} membership(s) updated.`);
       await refreshPage();
+      setPendingIdentityAction(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to apply baseline");
     }
   }
 
+  async function confirmIdentityAction() {
+    if (!user || !pendingIdentityAction) return;
+    if (pendingIdentityAction === "toggle_active") {
+      await patchUser({ is_active: !user.is_active }, user.is_active ? `Disabled ${user.email}.` : `Enabled ${user.email}.`);
+      setPendingIdentityAction(null);
+      return;
+    }
+    if (pendingIdentityAction === "toggle_approval") {
+      await patchUser({ is_approved: !user.is_approved }, user.is_approved ? `Revoked approval for ${user.email}.` : `Approved ${user.email}.`);
+      setPendingIdentityAction(null);
+      return;
+    }
+    if (pendingIdentityAction === "toggle_sysadmin") {
+      await patchUser({ is_sysadmin: !user.is_sysadmin }, user.is_sysadmin ? `Removed system admin from ${user.email}.` : `Granted system admin to ${user.email}.`);
+      setPendingIdentityAction(null);
+      return;
+    }
+    await assignAllProjects();
+  }
+
   return (
     <>
-      {error || info ? (
-        <div className="workspace-section space-y-2">
-          {error ? <p className="rounded-xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{error}</p> : null}
-          {info ? <p className="rounded-xl bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">{info}</p> : null}
+      {error ? (
+        <div className="workspace-section">
+          <StatusBanner tone="error" title="Identity Update Failed">
+            <p>{error}</p>
+          </StatusBanner>
+        </div>
+      ) : null}
+      {info ? (
+        <div className="workspace-section">
+          <StatusBanner tone="success" title="Identity Update">
+            <p>{info}</p>
+          </StatusBanner>
         </div>
       ) : null}
 
@@ -190,11 +246,15 @@ export function SettingsIamUserPage() {
             </button>
           </div>
 
-          {loading ? <p className="mt-4 text-sm text-slate-500">Loading identity…</p> : null}
+          {loading ? (
+            <div className="mt-4">
+              <StatePanel title="Loading Identity" description="Fetching lifecycle state, project assignments, and password policy." />
+            </div>
+          ) : null}
 
           {!loading && !user ? (
-            <div className="mt-4 rounded-2xl border border-dashed border-slate-300 px-4 py-8 text-sm text-slate-500 dark:border-slate-700">
-              Identity not found.
+            <div className="mt-4">
+              <StatePanel title="Identity Not Found" description="The requested user could not be found in the IAM directory." tone="warning" />
             </div>
           ) : null}
 
@@ -245,9 +305,7 @@ export function SettingsIamUserPage() {
             </div>
 
             {assigned.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-slate-300 px-4 py-8 text-sm text-slate-500 dark:border-slate-700">
-                No project assignments.
-              </div>
+              <StatePanel title="No Project Assignments" description="Grant access to one or more projects before this identity can work with customer data." />
             ) : (
               <div className="space-y-3">
                 {assigned.map((membership) => {
@@ -297,7 +355,7 @@ export function SettingsIamUserPage() {
                         </button>
                         <button
                           className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide dark:border-slate-700"
-                          onClick={() => removeMembership(membership)}
+                          onClick={() => setMembershipToRemove(membership)}
                           type="button"
                         >
                           Remove access
@@ -387,7 +445,11 @@ export function SettingsIamUserPage() {
                 Replace existing project roles with this baseline
               </label>
 
-              <button className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide dark:border-slate-700" onClick={assignAllProjects} type="button">
+              <button
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide dark:border-slate-700"
+                onClick={() => setPendingIdentityAction("assign_baseline")}
+                type="button"
+              >
                 Apply baseline
               </button>
             </section>
@@ -399,13 +461,20 @@ export function SettingsIamUserPage() {
                 <p className="mt-1 text-sm text-slate-500">These actions affect all project access for the user.</p>
               </div>
 
-              <button className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide dark:border-slate-700" onClick={resetPassword} type="button">
+              <button
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide dark:border-slate-700"
+                onClick={() => {
+                  setPasswordDraft("");
+                  setPasswordDialogOpen(true);
+                }}
+                type="button"
+              >
                 Reset password
               </button>
               <button
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide dark:border-slate-700 disabled:opacity-50"
                 disabled={user.id === me.id}
-                onClick={() => patchUser({ is_active: !user.is_active }, user.is_active ? `Disabled ${user.email}.` : `Enabled ${user.email}.`)}
+                onClick={() => setPendingIdentityAction("toggle_active")}
                 type="button"
               >
                 {user.is_active ? "Disable identity" : "Enable identity"}
@@ -413,7 +482,7 @@ export function SettingsIamUserPage() {
               <button
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide dark:border-slate-700 disabled:opacity-50"
                 disabled={user.id === me.id}
-                onClick={() => patchUser({ is_approved: !user.is_approved }, user.is_approved ? `Revoked approval for ${user.email}.` : `Approved ${user.email}.`)}
+                onClick={() => setPendingIdentityAction("toggle_approval")}
                 type="button"
               >
                 {user.is_approved ? "Revoke approval" : "Approve identity"}
@@ -421,7 +490,7 @@ export function SettingsIamUserPage() {
               <button
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide dark:border-slate-700 disabled:opacity-50"
                 disabled={user.id === me.id}
-                onClick={() => patchUser({ is_sysadmin: !user.is_sysadmin }, user.is_sysadmin ? `Removed system admin from ${user.email}.` : `Granted system admin to ${user.email}.`)}
+                onClick={() => setPendingIdentityAction("toggle_sysadmin")}
                 type="button"
               >
                 {user.is_sysadmin ? "Remove system admin" : "Grant system admin"}
@@ -431,6 +500,150 @@ export function SettingsIamUserPage() {
           </div>
         </div>
       ) : null}
+
+      <Dialog
+        open={passwordDialogOpen}
+        title="Reset password"
+        description={user ? `Set a temporary password for ${user.email}.` : undefined}
+        onClose={() => {
+          setPasswordDialogOpen(false);
+          setPasswordDraft("");
+        }}
+        footer={
+          <>
+            <button
+              className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700"
+              onClick={() => {
+                setPasswordDialogOpen(false);
+                setPasswordDraft("");
+              }}
+              type="button"
+            >
+              Cancel
+            </button>
+            <button
+              className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white dark:bg-slate-100 dark:text-slate-900"
+              onClick={resetPassword}
+              type="button"
+            >
+              Apply temporary password
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          {securitySettings ? (
+            <StatusBanner tone="info" title="Current password policy">
+              <div className="flex flex-wrap gap-2 text-xs">
+                <span className="rounded-full bg-white/70 px-3 py-1 dark:bg-slate-950/40">Min length {securitySettings.password_min_length}</span>
+                {securitySettings.password_require_lowercase ? <span className="rounded-full bg-white/70 px-3 py-1 dark:bg-slate-950/40">Lowercase</span> : null}
+                {securitySettings.password_require_uppercase ? <span className="rounded-full bg-white/70 px-3 py-1 dark:bg-slate-950/40">Uppercase</span> : null}
+                {securitySettings.password_require_number ? <span className="rounded-full bg-white/70 px-3 py-1 dark:bg-slate-950/40">Number</span> : null}
+                {securitySettings.password_require_special ? <span className="rounded-full bg-white/70 px-3 py-1 dark:bg-slate-950/40">Special character</span> : null}
+              </div>
+            </StatusBanner>
+          ) : null}
+          <label className="block text-sm">
+            Temporary password
+            <input
+              className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+              type="password"
+              value={passwordDraft}
+              onChange={(event) => setPasswordDraft(event.target.value)}
+            />
+          </label>
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={!!membershipToRemove}
+        title="Remove project access"
+        description={
+          membershipToRemove
+            ? `This removes ${membershipToRemove.user_email} from ${membershipToRemove.project_name}.`
+            : undefined
+        }
+        onClose={() => setMembershipToRemove(null)}
+        footer={
+          <>
+            <button
+              className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700"
+              onClick={() => setMembershipToRemove(null)}
+              type="button"
+            >
+              Cancel
+            </button>
+            <button
+              className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white dark:bg-slate-100 dark:text-slate-900"
+              onClick={() => {
+                if (membershipToRemove) {
+                  removeMembership(membershipToRemove).catch(() => undefined);
+                }
+              }}
+              type="button"
+            >
+              Remove access
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-slate-600 dark:text-slate-300">The user will immediately lose access to this project's runs and inventory.</p>
+      </Dialog>
+
+      <Dialog
+        open={!!pendingIdentityAction}
+        title={
+          pendingIdentityAction === "toggle_active"
+            ? user?.is_active
+              ? "Disable identity"
+              : "Enable identity"
+            : pendingIdentityAction === "toggle_approval"
+              ? user?.is_approved
+                ? "Revoke approval"
+                : "Approve identity"
+              : pendingIdentityAction === "toggle_sysadmin"
+                ? user?.is_sysadmin
+                  ? "Remove system admin"
+                  : "Grant system admin"
+                : "Apply baseline access"
+        }
+        description={
+          pendingIdentityAction === "assign_baseline"
+            ? `Apply the ${baselineRole} baseline across every project for this user.`
+            : user
+              ? `This change affects ${user.email} across the full deployment.`
+              : undefined
+        }
+        onClose={() => setPendingIdentityAction(null)}
+        footer={
+          <>
+            <button
+              className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700"
+              onClick={() => setPendingIdentityAction(null)}
+              type="button"
+            >
+              Cancel
+            </button>
+            <button
+              className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white dark:bg-slate-100 dark:text-slate-900"
+              onClick={() => confirmIdentityAction().catch(() => undefined)}
+              type="button"
+            >
+              Confirm
+            </button>
+          </>
+        }
+      >
+        {pendingIdentityAction === "assign_baseline" ? (
+          <p className="text-sm text-slate-600 dark:text-slate-300">
+            Existing roles {baselineOverwrite ? "will" : "will not"} be overwritten.
+          </p>
+        ) : (
+          <p className="text-sm text-slate-600 dark:text-slate-300">
+            Review the current identity state before applying this global change.
+          </p>
+        )}
+      </Dialog>
     </>
   );
 }

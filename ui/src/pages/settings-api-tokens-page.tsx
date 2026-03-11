@@ -1,5 +1,9 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
+import { Dialog } from "@/components/dialog";
+import { SecretReveal } from "@/components/secret-reveal";
+import { StatePanel } from "@/components/state-panel";
+import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
 
 type ApiTokenRow = {
@@ -28,6 +32,11 @@ type TokenCreateResponse = {
   token: string;
   token_meta: ApiTokenRow;
 };
+
+type PendingTokenAction =
+  | { kind: "rotate"; token: ApiTokenRow }
+  | { kind: "revoke"; token: ApiTokenRow }
+  | null;
 
 const ROLES = ["viewer", "operator", "admin"];
 
@@ -75,8 +84,8 @@ export function SettingsApiTokensPage() {
   const [editExpiryDays, setEditExpiryDays] = useState("");
   const [editNeverExpires, setEditNeverExpires] = useState(false);
 
-  const [createdSecret, setCreatedSecret] = useState<string | null>(null);
-  const [rotatedSecret, setRotatedSecret] = useState<string | null>(null);
+  const [secretReveal, setSecretReveal] = useState<{ label: string; secret: string } | null>(null);
+  const [pendingAction, setPendingAction] = useState<PendingTokenAction>(null);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
@@ -85,7 +94,8 @@ export function SettingsApiTokensPage() {
     const total = tokens.length;
     const active = tokens.filter((token) => !token.revoked_at).length;
     const revoked = total - active;
-    return { total, active, revoked };
+    const neverExpires = tokens.filter((token) => !token.revoked_at && !token.expires_at).length;
+    return { total, active, revoked, neverExpires };
   }, [tokens]);
 
   async function loadReferenceData() {
@@ -148,8 +158,7 @@ export function SettingsApiTokensPage() {
     if (!createUserId || !createProjectId) return;
     setError(null);
     setInfo(null);
-    setCreatedSecret(null);
-    setRotatedSecret(null);
+    setSecretReveal(null);
 
     const expiryDays = createExpiryDays.trim() ? Number.parseInt(createExpiryDays.trim(), 10) : Number.NaN;
     const scopes = createUseDefaults ? [] : parseScopesCsv(createScopesCsv);
@@ -166,7 +175,7 @@ export function SettingsApiTokensPage() {
           scopes,
         }),
       })) as TokenCreateResponse;
-      setCreatedSecret(data.token);
+      setSecretReveal({ label: `Token secret for ${data.token_meta.name}`, secret: data.token });
       setInfo("API token created.");
       setTokens((prev) => [data.token_meta, ...prev]);
     } catch (err) {
@@ -179,8 +188,6 @@ export function SettingsApiTokensPage() {
     if (!editToken) return;
     setError(null);
     setInfo(null);
-    setCreatedSecret(null);
-    setRotatedSecret(null);
 
     const expiryDays = editExpiryDays.trim() ? Number.parseInt(editExpiryDays.trim(), 10) : Number.NaN;
     const scopes = editUseDefaults ? [] : parseScopesCsv(editScopesCsv);
@@ -198,36 +205,33 @@ export function SettingsApiTokensPage() {
       })) as ApiTokenRow;
       setInfo("API token updated.");
       setTokens((prev) => prev.map((token) => (token.id === data.id ? data : token)));
+      setEditTokenId("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to update token");
     }
   }
 
-  async function rotateToken(tokenId: string) {
-    if (!window.confirm("Rotate this API token secret? Existing secret will stop working.")) return;
+  async function confirmPendingAction() {
+    if (!pendingAction) return;
     setError(null);
     setInfo(null);
-    setCreatedSecret(null);
-    try {
-      const data = (await apiFetch(`/settings/api-tokens/${tokenId}/rotate`, { method: "POST" })) as TokenCreateResponse;
-      setRotatedSecret(data.token);
-      setInfo("API token rotated.");
-      setTokens((prev) => prev.map((token) => (token.id === data.token_meta.id ? data.token_meta : token)));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to rotate token");
-    }
-  }
 
-  async function revokeToken(tokenId: string) {
-    if (!window.confirm("Revoke this API token?")) return;
-    setError(null);
-    setInfo(null);
     try {
-      await apiFetch(`/settings/api-tokens/${tokenId}`, { method: "DELETE" });
-      setInfo("API token revoked.");
-      setTokens((prev) => prev.map((token) => (token.id === tokenId ? { ...token, revoked_at: new Date().toISOString() } : token)));
+      if (pendingAction.kind === "rotate") {
+        const data = (await apiFetch(`/settings/api-tokens/${pendingAction.token.id}/rotate`, { method: "POST" })) as TokenCreateResponse;
+        setSecretReveal({ label: `Rotated secret for ${data.token_meta.name}`, secret: data.token });
+        setInfo("API token rotated.");
+        setTokens((prev) => prev.map((token) => (token.id === data.token_meta.id ? data.token_meta : token)));
+      } else {
+        await apiFetch(`/settings/api-tokens/${pendingAction.token.id}`, { method: "DELETE" });
+        setInfo("API token revoked.");
+        setTokens((prev) =>
+          prev.map((token) => (token.id === pendingAction.token.id ? { ...token, revoked_at: new Date().toISOString() } : token)),
+        );
+      }
+      setPendingAction(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to revoke token");
+      setError(err instanceof Error ? err.message : `Failed to ${pendingAction.kind} token`);
     }
   }
 
@@ -254,31 +258,39 @@ export function SettingsApiTokensPage() {
 
   return (
     <>
-      {error || info || createdSecret || rotatedSecret ? (
-        <div className="workspace-section space-y-2">
-          {error ? <p className="rounded-xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{error}</p> : null}
-          {info ? <p className="rounded-xl bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">{info}</p> : null}
-          {createdSecret ? (
-            <p className="rounded-xl bg-amber-100 p-3 text-xs text-amber-900 dark:bg-amber-900/30 dark:text-amber-200">
-              New token secret (shown once): <code>{createdSecret}</code>
-            </p>
-          ) : null}
-          {rotatedSecret ? (
-            <p className="rounded-xl bg-amber-100 p-3 text-xs text-amber-900 dark:bg-amber-900/30 dark:text-amber-200">
-              Rotated token secret (shown once): <code>{rotatedSecret}</code>
-            </p>
-          ) : null}
+      {error ? (
+        <div className="workspace-section">
+          <StatusBanner tone="error" title="Token Request Failed">
+            <p>{error}</p>
+          </StatusBanner>
+        </div>
+      ) : null}
+      {info ? (
+        <div className="workspace-section">
+          <StatusBanner tone="success" title="Token Update">
+            <p>{info}</p>
+          </StatusBanner>
+        </div>
+      ) : null}
+      {secretReveal ? (
+        <div className="workspace-section">
+          <SecretReveal label={secretReveal.label} secret={secretReveal.secret} onDismiss={() => setSecretReveal(null)} />
         </div>
       ) : null}
 
-      <div className="workspace-section grid gap-4 lg:grid-cols-2">
-        <div className="workspace-card space-y-3">
-          <h2 className="text-lg font-semibold">Create API Token</h2>
-          <form className="space-y-3" onSubmit={createToken}>
+      <div className="workspace-section grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_360px]">
+        <div className="workspace-card space-y-4">
+          <div>
+            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Create Token</p>
+            <h2 className="mt-2 text-xl font-semibold">Issue a machine credential</h2>
+            <p className="mt-1 text-sm text-slate-500">Pick the owner, project, and role first. Scope defaults keep new tokens aligned with policy.</p>
+          </div>
+
+          <form className="grid gap-4 md:grid-cols-2" onSubmit={createToken}>
             <label className="block text-sm">
               Owner
               <select
-                className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
+                className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
                 value={createUserId}
                 onChange={(event) => setCreateUserId(event.target.value)}
               >
@@ -292,7 +304,7 @@ export function SettingsApiTokensPage() {
             <label className="block text-sm">
               Project
               <select
-                className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
+                className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
                 value={createProjectId}
                 onChange={(event) => setCreateProjectId(event.target.value)}
               >
@@ -304,9 +316,9 @@ export function SettingsApiTokensPage() {
               </select>
             </label>
             <label className="block text-sm">
-              Name
+              Token name
               <input
-                className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
+                className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
                 value={createName}
                 onChange={(event) => setCreateName(event.target.value)}
                 minLength={1}
@@ -317,7 +329,7 @@ export function SettingsApiTokensPage() {
             <label className="block text-sm">
               Role
               <select
-                className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
+                className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
                 value={createRole}
                 onChange={(event) => setCreateRole(event.target.value)}
               >
@@ -331,166 +343,209 @@ export function SettingsApiTokensPage() {
             <label className="block text-sm">
               Expiry days
               <input
-                className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
+                className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
                 value={createExpiryDays}
                 onChange={(event) => setCreateExpiryDays(event.target.value)}
                 placeholder="90"
               />
             </label>
-            <label className="flex items-center gap-2 text-sm">
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Default scopes</p>
+              <p className="mt-1 text-sm font-semibold">{createRole}</p>
+              <p className="mt-1 text-xs text-slate-500">{scopeCatalog?.defaults_by_role?.[createRole]?.join(", ") || "Loading defaults"}</p>
+            </div>
+            <label className="flex items-center gap-2 text-sm md:col-span-2">
               <input checked={createUseDefaults} type="checkbox" onChange={(event) => setCreateUseDefaults(event.target.checked)} />
-              Use default scopes for selected role
+              Use the role defaults instead of custom scopes
             </label>
             {!createUseDefaults ? (
-              <label className="block text-sm">
-                Custom scopes (CSV)
+              <label className="block text-sm md:col-span-2">
+                Custom scopes
                 <input
-                  className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
                   value={createScopesCsv}
                   onChange={(event) => setCreateScopesCsv(event.target.value)}
                   placeholder="read:projects, read:runs"
                 />
               </label>
             ) : null}
-            <button className="rounded-lg bg-pine px-3 py-1 text-sm font-semibold text-white" type="submit">
-              Create token
+            <div className="md:col-span-2">
+              <button className="rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white" type="submit">
+                Create token
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <div className="space-y-4">
+          <section className="workspace-card">
+            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Token Posture</p>
+            <div className="mt-4 grid gap-3">
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Active</p>
+                <p className="mt-1 text-2xl font-semibold">{tokenStats.active}</p>
+              </div>
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Revoked</p>
+                <p className="mt-1 text-2xl font-semibold">{tokenStats.revoked}</p>
+              </div>
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Never expire</p>
+                <p className="mt-1 text-2xl font-semibold">{tokenStats.neverExpires}</p>
+              </div>
+            </div>
+          </section>
+
+          <section className="workspace-card">
+            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Scope Catalog</p>
+            <h2 className="mt-2 text-xl font-semibold">Allowed scopes</h2>
+            <div className="mt-4 space-y-4 text-sm">
+              {(scopeCatalog?.defaults_by_role ? Object.entries(scopeCatalog.defaults_by_role) : []).map(([role, scopes]) => (
+                <div key={role}>
+                  <p className="font-semibold">{role}</p>
+                  <p className="mt-1 text-xs text-slate-500">{scopes.join(", ") || "none"}</p>
+                </div>
+              ))}
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">All supported scopes</p>
+                <p className="mt-2 max-h-[180px] overflow-auto text-xs text-slate-500">{scopeCatalog?.allowed_scopes.join(", ") || "Loading scope catalog"}</p>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <div className="workspace-section space-y-4">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Token Directory</p>
+            <h2 className="mt-2 text-xl font-semibold">Global API tokens</h2>
+            <p className="mt-1 text-sm text-slate-500">Each card keeps the owner, project, scope posture, and administrative actions together.</p>
+          </div>
+          <form className="flex flex-wrap items-center gap-2" onSubmit={onSearch}>
+            <input
+              className="rounded-2xl border border-slate-300 px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
+              placeholder="Search token, owner, project, or id"
+              value={searchDraft}
+              onChange={(event) => setSearchDraft(event.target.value)}
+            />
+            <button className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700" type="submit">
+              Search
+            </button>
+            <button
+              className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700"
+              type="button"
+              onClick={() => {
+                setSearchDraft("");
+                setSearch("");
+                setCursor(null);
+                setHistory([]);
+              }}
+            >
+              Clear
             </button>
           </form>
         </div>
 
-        <div className="workspace-card space-y-3">
-          <h2 className="text-lg font-semibold">Scope Catalog</h2>
-          <p className="text-xs text-slate-500">Allowed scopes and role defaults used for token policy validation.</p>
-          <div className="grid gap-2 text-xs md:grid-cols-2">
-            <div>
-              <p className="mb-1 font-semibold">Role defaults</p>
-              {(scopeCatalog?.defaults_by_role ? Object.entries(scopeCatalog.defaults_by_role) : []).map(([role, scopes]) => (
-                <div className="mb-2" key={role}>
-                  <p className="font-semibold">{role}</p>
-                  <p className="text-slate-500">{scopes.join(", ") || "none"}</p>
+        {loading && tokens.length === 0 ? (
+          <StatePanel title="Loading Tokens" description="Fetching the current token inventory and policy metadata." />
+        ) : null}
+
+        {!loading && tokens.length === 0 ? (
+          <StatePanel title="No Tokens Found" description="Try a broader search or create the first API token for this deployment." />
+        ) : null}
+
+        <div className="space-y-3">
+          {tokens.map((token) => (
+            <article className="rounded-3xl border border-slate-200 bg-white/90 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/60" key={token.id}>
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{token.revoked_at ? "Revoked token" : "Active token"}</p>
+                  <h3 className="mt-1 text-lg font-semibold">{token.name}</h3>
+                  <p className="mt-1 text-xs text-slate-500">{token.id}</p>
                 </div>
-              ))}
-            </div>
-            <div>
-              <p className="mb-1 font-semibold">All supported scopes</p>
-              <p className="max-h-[200px] overflow-auto whitespace-pre-wrap break-words text-slate-500">
-                {scopeCatalog?.allowed_scopes.join(", ") || "loading..."}
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700"
+                    onClick={() => setEditTokenId(token.id)}
+                    type="button"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700 disabled:opacity-50"
+                    disabled={!!token.revoked_at}
+                    onClick={() => setPendingAction({ kind: "rotate", token })}
+                    type="button"
+                  >
+                    Rotate
+                  </button>
+                  <button
+                    className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700 disabled:opacity-50"
+                    disabled={!!token.revoked_at}
+                    onClick={() => setPendingAction({ kind: "revoke", token })}
+                    type="button"
+                  >
+                    Revoke
+                  </button>
+                </div>
+              </div>
 
-      <div className="workspace-section space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-lg font-semibold">Global API Tokens</h2>
-          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
-            <span>Total: {tokenStats.total}</span>
-            <span>Active: {tokenStats.active}</span>
-            <span>Revoked: {tokenStats.revoked}</span>
-          </div>
-        </div>
+              <div className="mt-4 grid gap-3 lg:grid-cols-4">
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Owner</p>
+                  <p className="mt-1 text-sm font-semibold">{token.user_email}</p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Project</p>
+                  <p className="mt-1 text-sm font-semibold">{token.project_name}</p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Role</p>
+                  <p className="mt-1 text-sm font-semibold">{token.role}</p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Status</p>
+                  <p className="mt-1 text-sm font-semibold">{token.revoked_at ? "Revoked" : "Active"}</p>
+                </div>
+              </div>
 
-        <form className="flex flex-wrap items-center gap-2" onSubmit={onSearch}>
-          <input
-            className="rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
-            placeholder="Search token, user, project, id"
-            value={searchDraft}
-            onChange={(event) => setSearchDraft(event.target.value)}
-          />
-          <button className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700" type="submit">
-            Search
-          </button>
-          <button
-            className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
-            type="button"
-            onClick={() => {
-              setSearchDraft("");
-              setSearch("");
-              setCursor(null);
-              setHistory([]);
-            }}
-          >
-            Clear
-          </button>
-        </form>
+              <div className="mt-4 grid gap-3 lg:grid-cols-3">
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Created</p>
+                  <p className="mt-1 text-sm font-semibold">{formatTime(token.created_at)}</p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Last used</p>
+                  <p className="mt-1 text-sm font-semibold">{formatTime(token.last_used_at)}</p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Expiry</p>
+                  <p className="mt-1 text-sm font-semibold">{formatTime(token.expires_at)}</p>
+                </div>
+              </div>
 
-        {loading ? <p className="text-sm text-slate-500">Loading API tokens…</p> : null}
-        <div className="overflow-auto">
-          <table className="data-table min-w-[1100px]">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Project</th>
-                <th>Owner</th>
-                <th>Role</th>
-                <th>Scopes</th>
-                <th>Created</th>
-                <th>Last Used</th>
-                <th>Expires</th>
-                <th>Status</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tokens.length === 0 ? (
-                <tr>
-                  <td className="text-sm text-slate-500" colSpan={10}>
-                    No tokens found.
-                  </td>
-                </tr>
-              ) : (
-                tokens.map((token) => (
-                  <tr key={token.id}>
-                    <td>
-                      <div className="font-semibold">{token.name}</div>
-                      <div className="text-xs text-slate-500">{token.id}</div>
-                    </td>
-                    <td>{token.project_name}</td>
-                    <td>{token.user_email}</td>
-                    <td>{token.role}</td>
-                    <td className="max-w-[240px] text-xs">{token.scopes.join(", ") || "none"}</td>
-                    <td className="text-xs">{formatTime(token.created_at)}</td>
-                    <td className="text-xs">{formatTime(token.last_used_at)}</td>
-                    <td className="text-xs">{formatTime(token.expires_at)}</td>
-                    <td className="text-xs">{token.revoked_at ? "revoked" : "active"}</td>
-                    <td>
-                      <div className="flex flex-wrap gap-1">
-                        <button
-                          className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700"
-                          onClick={() => setEditTokenId(token.id)}
-                          type="button"
-                        >
-                          Edit
-                        </button>
-                        <button
-                          className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 disabled:opacity-50"
-                          disabled={!!token.revoked_at}
-                          onClick={() => rotateToken(token.id)}
-                          type="button"
-                        >
-                          Rotate
-                        </button>
-                        <button
-                          className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 disabled:opacity-50"
-                          disabled={!!token.revoked_at}
-                          onClick={() => revokeToken(token.id)}
-                          type="button"
-                        >
-                          Revoke
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
+              <div className="mt-4">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Scopes</p>
+                <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                  {token.scopes.length === 0 ? (
+                    <span className="rounded-full bg-slate-100 px-3 py-1 dark:bg-slate-800">No scopes assigned</span>
+                  ) : (
+                    token.scopes.map((scope) => (
+                      <span className="rounded-full bg-slate-100 px-3 py-1 dark:bg-slate-800" key={scope}>
+                        {scope}
+                      </span>
+                    ))
+                  )}
+                </div>
+              </div>
+            </article>
+          ))}
         </div>
 
         <div className="flex items-center gap-2">
           <button
-            className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 disabled:opacity-50"
+            className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700 disabled:opacity-50"
             type="button"
             onClick={previousPage}
             disabled={history.length === 0}
@@ -498,7 +553,7 @@ export function SettingsApiTokensPage() {
             Previous
           </button>
           <button
-            className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 disabled:opacity-50"
+            className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700 disabled:opacity-50"
             type="button"
             onClick={nextPage}
             disabled={!nextCursor}
@@ -508,79 +563,127 @@ export function SettingsApiTokensPage() {
         </div>
       </div>
 
-      {editToken ? (
-        <div className="workspace-section">
-          <div className="workspace-card space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <h2 className="text-lg font-semibold">Edit Token</h2>
-              <button className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700" onClick={() => setEditTokenId("")}>
-                Close
+      <Dialog
+        open={!!editToken}
+        title="Edit API Token"
+        description={editToken ? `Update ${editToken.name} without leaving the current token directory.` : undefined}
+        onClose={() => setEditTokenId("")}
+      >
+        {editToken ? (
+          <form className="grid gap-4 md:grid-cols-2" onSubmit={saveTokenUpdates}>
+            <label className="block text-sm">
+              Name
+              <input
+                className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                value={editName}
+                onChange={(event) => setEditName(event.target.value)}
+                minLength={1}
+                maxLength={120}
+                required
+              />
+            </label>
+            <label className="block text-sm">
+              Role
+              <select
+                className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                value={editRole}
+                onChange={(event) => setEditRole(event.target.value)}
+              >
+                {ROLES.map((role) => (
+                  <option key={role} value={role}>
+                    {role}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block text-sm">
+              New expiry days
+              <input
+                className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                value={editExpiryDays}
+                onChange={(event) => setEditExpiryDays(event.target.value)}
+                placeholder="180"
+                disabled={editNeverExpires}
+              />
+            </label>
+            <label className="flex items-center gap-2 text-sm md:mt-8">
+              <input checked={editNeverExpires} type="checkbox" onChange={(event) => setEditNeverExpires(event.target.checked)} />
+              Never expire
+            </label>
+            <label className="flex items-center gap-2 text-sm md:col-span-2">
+              <input checked={editUseDefaults} type="checkbox" onChange={(event) => setEditUseDefaults(event.target.checked)} />
+              Reset scopes to the selected role defaults
+            </label>
+            {!editUseDefaults ? (
+              <label className="block text-sm md:col-span-2">
+                Scopes
+                <input
+                  className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  value={editScopesCsv}
+                  onChange={(event) => setEditScopesCsv(event.target.value)}
+                />
+              </label>
+            ) : null}
+            <div className="md:col-span-2 flex justify-end gap-3">
+              <button
+                className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700"
+                onClick={() => setEditTokenId("")}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white dark:bg-slate-100 dark:text-slate-900" type="submit">
+                Save token changes
               </button>
             </div>
-            <p className="text-xs text-slate-500">Editing {editToken.name} ({editToken.id})</p>
-            <form className="grid gap-3 md:grid-cols-2" onSubmit={saveTokenUpdates}>
-              <label className="block text-sm">
-                Name
-                <input
-                  className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
-                  value={editName}
-                  onChange={(event) => setEditName(event.target.value)}
-                  minLength={1}
-                  maxLength={120}
-                  required
-                />
-              </label>
-              <label className="block text-sm">
-                Role
-                <select
-                  className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
-                  value={editRole}
-                  onChange={(event) => setEditRole(event.target.value)}
-                >
-                  {ROLES.map((role) => (
-                    <option key={role} value={role}>
-                      {role}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="block text-sm">
-                New expiry days (leave empty to keep)
-                <input
-                  className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
-                  value={editExpiryDays}
-                  onChange={(event) => setEditExpiryDays(event.target.value)}
-                  placeholder="180"
-                  disabled={editNeverExpires}
-                />
-              </label>
-              <label className="flex items-center gap-2 text-sm md:mt-7">
-                <input checked={editNeverExpires} type="checkbox" onChange={(event) => setEditNeverExpires(event.target.checked)} />
-                Set token to never expire
-              </label>
-              <label className="flex items-center gap-2 text-sm md:col-span-2">
-                <input checked={editUseDefaults} type="checkbox" onChange={(event) => setEditUseDefaults(event.target.checked)} />
-                Reset scopes to role defaults
-              </label>
-              {!editUseDefaults ? (
-                <label className="block text-sm md:col-span-2">
-                  Scopes (CSV)
-                  <input
-                    className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
-                    value={editScopesCsv}
-                    onChange={(event) => setEditScopesCsv(event.target.value)}
-                  />
-                </label>
-              ) : null}
-              <div className="md:col-span-2">
-                <button className="rounded-lg bg-pine px-3 py-1 text-sm font-semibold text-white" type="submit">
-                  Save token changes
-                </button>
-              </div>
-            </form>
+          </form>
+        ) : null}
+      </Dialog>
+
+      <Dialog
+        open={!!pendingAction}
+        title={pendingAction?.kind === "rotate" ? "Rotate token secret" : "Revoke token"}
+        description={
+          pendingAction
+            ? pendingAction.kind === "rotate"
+              ? `Rotate ${pendingAction.token.name}. Existing clients will stop working until they switch to the new secret.`
+              : `Revoke ${pendingAction.token.name}. This immediately disables the token across ${pendingAction.token.project_name}.`
+            : undefined
+        }
+        onClose={() => setPendingAction(null)}
+        footer={
+          <>
+            <button
+              className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700"
+              onClick={() => setPendingAction(null)}
+              type="button"
+            >
+              Cancel
+            </button>
+            <button
+              className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white dark:bg-slate-100 dark:text-slate-900"
+              onClick={confirmPendingAction}
+              type="button"
+            >
+              {pendingAction?.kind === "rotate" ? "Rotate secret" : "Revoke token"}
+            </button>
+          </>
+        }
+      >
+        {pendingAction ? (
+          <div className="space-y-3 text-sm text-slate-600 dark:text-slate-300">
+            <p>
+              Owner: <span className="font-semibold text-slate-900 dark:text-slate-100">{pendingAction.token.user_email}</span>
+            </p>
+            <p>
+              Project: <span className="font-semibold text-slate-900 dark:text-slate-100">{pendingAction.token.project_name}</span>
+            </p>
+            <p>
+              Role: <span className="font-semibold text-slate-900 dark:text-slate-100">{pendingAction.token.role}</span>
+            </p>
           </div>
-        </div>
-      ) : null}
+        ) : null}
+      </Dialog>
     </>
   );
 }
