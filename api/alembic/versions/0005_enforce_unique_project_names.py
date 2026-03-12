@@ -1,6 +1,6 @@
 """enforce unique project names
 
-Revision ID: 0005_enforce_unique_project_names
+Revision ID: 0005_unique_project_names
 Revises: 0004_add_saved_investigations
 Create Date: 2026-03-12
 """
@@ -8,7 +8,7 @@ Create Date: 2026-03-12
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0005_enforce_unique_project_names"
+revision = "0005_unique_project_names"
 down_revision = "0004_add_saved_investigations"
 branch_labels = None
 depends_on = None
