@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import { Dialog } from "@/components/dialog";
 import { apiFetch } from "@/lib/api";
 import { useDashboardWorkspace } from "@/lib/dashboard-workspace";
 
@@ -76,6 +77,7 @@ export function ProjectsPage() {
   const [projectStats, setProjectStats] = useState<ProjectStats | null>(null);
   const [topExtensions, setTopExtensions] = useState<ExtensionStat[]>([]);
   const [loadingStats, setLoadingStats] = useState(false);
+  const [runToDelete, setRunToDelete] = useState<Run | null>(null);
 
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
@@ -109,6 +111,7 @@ export function ProjectsPage() {
     setInfo(null);
     setProjectStats(null);
     setTopExtensions([]);
+    setRunToDelete(null);
   }, [selectedProject]);
 
   useEffect(() => {
@@ -171,14 +174,14 @@ export function ProjectsPage() {
     });
   }
 
-  async function deleteRun(runId: string) {
-    if (!selectedProject) return;
-    if (!window.confirm("Delete this run? This removes all ingested entities for the run.")) return;
+  async function deleteRun() {
+    if (!selectedProject || !runToDelete) return;
     setError(null);
     setInfo(null);
     try {
-      await apiFetch(`/projects/${selectedProject}/runs/${runId}`, { method: "DELETE" });
-      setInfo(`Run ${runId} deleted.`);
+      await apiFetch(`/projects/${selectedProject}/runs/${runToDelete.id}`, { method: "DELETE" });
+      setInfo(`Run ${runToDelete.id} deleted.`);
+      setRunToDelete(null);
       await loadRuns(selectedProject, cursor);
       await loadProjectInsights(selectedProject);
     } catch (err) {
@@ -495,7 +498,7 @@ export function ProjectsPage() {
                           {canDeleteRuns ? (
                             <button
                               className="rounded-2xl border border-rose-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-rose-700 transition hover:bg-rose-50 dark:border-rose-700 dark:text-rose-300 dark:hover:bg-rose-950/40"
-                              onClick={() => deleteRun(run.id)}
+                              onClick={() => setRunToDelete(run)}
                             >
                               Delete
                             </button>
@@ -543,6 +546,42 @@ export function ProjectsPage() {
           </div>
         </div>
       )}
+
+      <Dialog
+        open={!!runToDelete}
+        title="Delete run"
+        description={
+          runToDelete
+            ? `Delete ${runToDelete.name}. This removes the run record and all ingested entities created from its artifact.`
+            : undefined
+        }
+        onClose={() => setRunToDelete(null)}
+        footer={
+          <>
+            <button
+              className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700"
+              onClick={() => setRunToDelete(null)}
+              type="button"
+            >
+              Cancel
+            </button>
+            <button
+              className="rounded-2xl bg-rose-600 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-rose-500"
+              onClick={() => {
+                deleteRun().catch(() => undefined);
+              }}
+              type="button"
+            >
+              Delete run
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-3 text-sm text-slate-600 dark:text-slate-300">
+          <p>Run IDs are immutable audit references. Delete runs only for bad uploads, duplicate ingest, or cleanup after verification.</p>
+          {runToDelete ? <p className="font-mono text-xs text-slate-500">{runToDelete.id}</p> : null}
+        </div>
+      </Dialog>
     </section>
   );
 }
