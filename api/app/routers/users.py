@@ -2,7 +2,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import func, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -13,7 +13,7 @@ from app.enums import ProjectRole
 from app.models import Project, ProjectMember, RefreshToken, User
 from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_datetime_cursor_value, parse_uuid_cursor_value
 from app.password_policy import password_policy_kwargs
-from app.schemas import UserApprovalIn, UserAssignAllProjectsIn, UserCreateIn, UserOut, UserUpdateIn
+from app.schemas import UserAdminOut, UserApprovalIn, UserAssignAllProjectsIn, UserCreateIn, UserOut, UserUpdateIn
 from app.security import hash_password, validate_password_strength
 from app.services.audit import write_audit_event
 from app.token_scopes import SCOPE_READ_USERS, SCOPE_WRITE_MEMBERS, SCOPE_WRITE_USERS, has_required_scope
@@ -60,10 +60,10 @@ def create_user(
         db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="email already exists") from exc
 
-    assigned_projects = 0
+    assignment_result: dict[str, object] = {"assigned_projects": 0, "skipped_projects": [], "partial": False}
     if payload.add_to_all_projects:
         _require_member_write_scope_if_token(auth)
-        assigned_projects = _assign_user_to_all_projects(db, user.id, payload.all_projects_role, overwrite_existing=False)
+        assignment_result = _assign_user_to_all_projects(db, user.id, payload.all_projects_role, overwrite_existing=False)
 
     write_audit_event(
         db,
@@ -79,7 +79,7 @@ def create_user(
             "is_approved": user.is_approved,
             "add_to_all_projects": payload.add_to_all_projects,
             "all_projects_role": payload.all_projects_role.value if payload.add_to_all_projects else None,
-            "assigned_projects": assigned_projects,
+            **assignment_result,
         },
     )
     db.commit()
@@ -91,6 +91,7 @@ def create_user(
 def list_users(
     search: str | None = None,
     include_pending_only: bool = False,
+    project_id: uuid.UUID | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     is_approved: bool | None = Query(default=None),
     is_sysadmin: bool | None = Query(default=None),
@@ -104,7 +105,17 @@ def list_users(
 
     stmt = select(User)
     if search:
-        stmt = stmt.where(User.email.ilike(f"%{search}%"))
+        pattern = f"%{search}%"
+        project_name_match = exists(
+            select(ProjectMember.user_id)
+            .join(Project, Project.id == ProjectMember.project_id)
+            .where(ProjectMember.user_id == User.id, Project.name.ilike(pattern))
+        )
+        stmt = stmt.where(or_(User.email.ilike(pattern), project_name_match))
+    if project_id is not None:
+        stmt = stmt.where(
+            exists(select(ProjectMember.user_id).where(ProjectMember.user_id == User.id, ProjectMember.project_id == project_id))
+        )
     if include_pending_only:
         stmt = stmt.where(User.is_approved.is_(False))
     if is_active is not None:
@@ -117,22 +128,23 @@ def list_users(
     stmt = apply_keyset_pagination(stmt, USER_LIST_CURSOR, cursor, limit)
     users, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), USER_LIST_CURSOR, limit)
     return {
-        "items": [
-            {
-                "id": str(u.id),
-                "email": u.email,
-                "is_active": u.is_active,
-                "is_sysadmin": u.is_sysadmin,
-                "is_approved": u.is_approved,
-                "approved_at": u.approved_at.isoformat() if u.approved_at else None,
-                "approved_by_user_id": str(u.approved_by_user_id) if u.approved_by_user_id else None,
-                "ui_theme": u.ui_theme,
-                "created_at": u.created_at.isoformat(),
-            }
-            for u in users
-        ],
+        "items": [_to_user_admin_out(u).model_dump(mode="json") for u in users],
         "next_cursor": next_cursor,
     }
+
+
+@router.get("/{user_id}", response_model=UserAdminOut)
+def get_user(
+    user_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_USERS)),
+    __: User = Depends(require_sysadmin),
+):
+    _ = __
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+    return _to_user_admin_out(user)
 
 
 @router.patch("/{user_id}", response_model=UserOut)
@@ -304,7 +316,7 @@ def assign_user_to_all_projects(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
 
     _require_member_write_scope_if_token(auth)
-    assigned = _assign_user_to_all_projects(db, user_id, payload.role, overwrite_existing=payload.overwrite_existing)
+    result = _assign_user_to_all_projects(db, user_id, payload.role, overwrite_existing=payload.overwrite_existing)
     write_audit_event(
         db,
         action="USER_ASSIGNED_TO_ALL_PROJECTS",
@@ -315,11 +327,11 @@ def assign_user_to_all_projects(
             **request_meta(request),
             "role": payload.role.value,
             "overwrite_existing": payload.overwrite_existing,
-            "assigned_projects": assigned,
+            **result,
         },
     )
     db.commit()
-    return {"ok": True, "assigned_projects": assigned}
+    return {"ok": True, **result}
 
 
 def _to_user_out(user: User) -> UserOut:
@@ -332,6 +344,20 @@ def _to_user_out(user: User) -> UserOut:
         approved_at=user.approved_at,
         approved_by_user_id=user.approved_by_user_id,
         ui_theme=user.ui_theme,
+    )
+
+
+def _to_user_admin_out(user: User) -> UserAdminOut:
+    return UserAdminOut(
+        id=user.id,
+        email=user.email,
+        is_active=user.is_active,
+        is_sysadmin=user.is_sysadmin,
+        is_approved=user.is_approved,
+        approved_at=user.approved_at,
+        approved_by_user_id=user.approved_by_user_id,
+        ui_theme=user.ui_theme,
+        created_at=user.created_at,
     )
 
 
@@ -382,16 +408,25 @@ def _require_member_write_scope_if_token(auth: AuthContext) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient token scope")
 
 
-def _assign_user_to_all_projects(db: Session, user_id: uuid.UUID, role: ProjectRole, overwrite_existing: bool) -> int:
-    projects = db.execute(select(Project.id)).all()
+def _assign_user_to_all_projects(db: Session, user_id: uuid.UUID, role: ProjectRole, overwrite_existing: bool) -> dict[str, object]:
+    projects = db.execute(select(Project.id, Project.name)).all()
     assigned = 0
+    skipped_projects: list[dict[str, str]] = []
     for row in projects:
         project_id = row.id
+        project_name = getattr(row, "name", str(project_id))
         membership = db.get(ProjectMember, {"project_id": project_id, "user_id": user_id})
         if membership:
             if overwrite_existing and membership.role != role:
                 if membership.role == ProjectRole.ADMIN and role != ProjectRole.ADMIN:
                     if _count_project_admins(db, project_id, exclude_user_id=user_id) < 1:
+                        skipped_projects.append(
+                            {
+                                "project_id": str(project_id),
+                                "project_name": str(project_name),
+                                "reason": "last project admin would be removed",
+                            }
+                        )
                         continue
                 membership.role = role
                 db.add(membership)
@@ -399,7 +434,11 @@ def _assign_user_to_all_projects(db: Session, user_id: uuid.UUID, role: ProjectR
             continue
         db.add(ProjectMember(project_id=project_id, user_id=user_id, role=role))
         assigned += 1
-    return assigned
+    return {
+        "assigned_projects": assigned,
+        "skipped_projects": skipped_projects,
+        "partial": bool(skipped_projects),
+    }
 
 
 def _count_project_admins(db: Session, project_id: uuid.UUID, exclude_user_id: uuid.UUID | None = None) -> int:

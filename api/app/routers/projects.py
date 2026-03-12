@@ -2,6 +2,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -33,7 +34,11 @@ def create_project(
 ):
     project = Project(name=payload.name)
     db.add(project)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="project name already exists") from exc
 
     membership = ProjectMember(project_id=project.id, user_id=admin.id, role=ProjectRole.ADMIN)
     db.add(membership)

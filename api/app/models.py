@@ -43,6 +43,9 @@ class Project(Base):
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
 
+Index("uq_projects_name_ci", sa.func.lower(Project.name), unique=True)
+
+
 class ProjectMember(Base):
     __tablename__ = "project_members"
 

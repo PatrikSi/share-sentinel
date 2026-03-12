@@ -1,15 +1,17 @@
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_sysadmin
 from app.enums import ProjectRole
 from app.main import app
-from app.models import ProjectMember, User
+from app.models import Project, ProjectMember, User
 
 
 class _ExecuteResult:
@@ -37,6 +39,7 @@ class _FakeDb:
     added: list[Any] = field(default_factory=list)
     deleted: list[Any] = field(default_factory=list)
     commit_count: int = 0
+    flush_error: Exception | None = None
 
     def execute(self, _statement):
         if not self.execute_queue:
@@ -54,6 +57,27 @@ class _FakeDb:
 
     def commit(self):
         self.commit_count += 1
+
+    def flush(self):
+        if self.flush_error is not None:
+            raise self.flush_error
+        for obj in self.added:
+            if getattr(obj, "id", None) is None:
+                try:
+                    obj.id = uuid.uuid4()
+                except Exception:  # noqa: BLE001
+                    pass
+            if getattr(obj, "created_at", None) is None:
+                try:
+                    obj.created_at = datetime.now(tz=UTC)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def rollback(self):
+        return None
+
+    def refresh(self, _obj):
+        return None
 
 
 def _normalize_key(key):
@@ -145,3 +169,16 @@ def test_projects_members_upsert_allows_demotion_when_other_admin_exists() -> No
     assert response.json() == {"ok": True}
     assert membership.role == ProjectRole.VIEWER
 
+
+def test_projects_create_rejects_duplicate_name_conflict() -> None:
+    fake_db = _FakeDb(flush_error=IntegrityError("insert", {}, Exception("duplicate project name")))
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.post("/projects", json={"name": "Core"})
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "project name already exists"
+    assert len([obj for obj in fake_db.added if isinstance(obj, Project)]) == 1

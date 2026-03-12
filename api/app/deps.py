@@ -6,11 +6,11 @@ from ipaddress import ip_address, ip_network
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.enums import ProjectRole
 from app.models import ApiToken, ProjectMember, User
 from app.security import decode_access_token, hash_external_token
@@ -102,9 +102,8 @@ def get_auth_context(
         raise _unauthorized("invalid api token")
 
     if _should_update_last_used(api_token.last_used_at, now):
+        _persist_api_token_last_used(api_token.id, now)
         api_token.last_used_at = now
-        db.add(api_token)
-        db.commit()
 
     token_scopes = normalize_token_scopes(api_token.scopes)
     request.state.token_scopes = token_scopes
@@ -244,6 +243,11 @@ def _should_update_last_used(last_used_at: datetime | None, now: datetime) -> bo
         return True
     elapsed = (now - _coerce_utc(last_used_at)).total_seconds()
     return elapsed >= get_settings().api_token_last_used_update_interval_seconds
+
+
+def _persist_api_token_last_used(token_id: uuid.UUID, last_used_at: datetime) -> None:
+    with SessionLocal.begin() as db:
+        db.execute(update(ApiToken).where(ApiToken.id == token_id).values(last_used_at=last_used_at))
 
 
 def _resolve_cookie_token(request: Request) -> str | None:

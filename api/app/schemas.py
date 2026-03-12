@@ -19,6 +19,10 @@ class UserOut(BaseModel):
     ui_theme: UITheme
 
 
+class UserAdminOut(UserOut):
+    created_at: datetime
+
+
 class LoginIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=1, max_length=256)
@@ -111,6 +115,14 @@ class ApiTokenCreateOut(BaseModel):
 
 class ProjectCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=255)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("name must not be blank")
+        return normalized
 
 
 class ProjectOut(BaseModel):

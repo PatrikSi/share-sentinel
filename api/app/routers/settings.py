@@ -29,8 +29,10 @@ from app.schemas import (
     ProjectMembershipOut,
     ProjectMembershipUpsertIn,
     ProjectOut,
+    SecuritySettingsOut,
     UserAssignAllProjectsIn,
 )
+from app.routers import users as users_router
 from app.security import hash_external_token, random_token
 from app.services.audit import write_audit_event
 from app.token_scopes import (
@@ -137,6 +139,78 @@ def list_all_projects(
     _ = __
     projects = db.execute(select(Project).order_by(Project.created_at.desc())).scalars().all()
     return [ProjectOut(id=project.id, name=project.name, created_at=project.created_at) for project in projects]
+
+
+@router.get("/overview", response_model=dict)
+def settings_overview(
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_MEMBERS, SCOPE_READ_TOKENS, SCOPE_READ_AUDIT)),
+    __: User = Depends(require_sysadmin),
+):
+    _ = __
+    settings = get_settings()
+
+    users_total = int(db.execute(select(func.count(User.id))).scalar() or 0)
+    users_active = int(db.execute(select(func.count(User.id)).where(User.is_active.is_(True))).scalar() or 0)
+    users_pending = int(db.execute(select(func.count(User.id)).where(User.is_approved.is_(False))).scalar() or 0)
+    users_sysadmins = int(db.execute(select(func.count(User.id)).where(User.is_sysadmin.is_(True))).scalar() or 0)
+
+    tokens_total = int(db.execute(select(func.count(ApiToken.id))).scalar() or 0)
+    tokens_active = int(db.execute(select(func.count(ApiToken.id)).where(ApiToken.revoked_at.is_(None))).scalar() or 0)
+    tokens_never_expires = int(
+        db.execute(
+            select(func.count(ApiToken.id)).where(ApiToken.revoked_at.is_(None), ApiToken.expires_at.is_(None))
+        ).scalar()
+        or 0
+    )
+    tokens_last_active_at = db.execute(
+        select(func.max(ApiToken.last_used_at)).where(ApiToken.revoked_at.is_(None))
+    ).scalar()
+    projects_total = int(db.execute(select(func.count(Project.id))).scalar() or 0)
+
+    recent_audit_rows = db.execute(
+        _global_audit_stmt(None).order_by(AuditEvent.ts.desc(), AuditEvent.id.desc()).limit(5)
+    ).all()
+
+    security = SecuritySettingsOut(
+        allow_self_registration=settings.allow_self_registration,
+        auth_require_csrf=settings.auth_require_csrf,
+        auth_cookie_secure=settings.auth_cookie_secure,
+        password_min_length=settings.password_min_length,
+        password_require_lowercase=settings.password_require_lowercase,
+        password_require_uppercase=settings.password_require_uppercase,
+        password_require_number=settings.password_require_number,
+        password_require_special=settings.password_require_special,
+        auth_login_max_attempts=settings.auth_login_max_attempts,
+        auth_login_window_seconds=settings.auth_login_window_seconds,
+        auth_login_lockout_seconds=settings.auth_login_lockout_seconds,
+        default_api_token_expiry_days=settings.default_api_token_expiry_days,
+        rbac_enabled=True,
+        mfa_enabled=False,
+        sso_enabled=False,
+        scim_enabled=False,
+        password_history_enforced=False,
+        session_idle_timeout_minutes=None,
+    )
+
+    return {
+        "security": security.model_dump(mode="json"),
+        "users": {
+            "total": users_total,
+            "active": users_active,
+            "pending": users_pending,
+            "sysadmins": users_sysadmins,
+        },
+        "tokens": {
+            "total": tokens_total,
+            "active": tokens_active,
+            "revoked": max(0, tokens_total - tokens_active),
+            "never_expires": tokens_never_expires,
+            "last_active_at": tokens_last_active_at.isoformat() if tokens_last_active_at else None,
+        },
+        "projects": {"total": projects_total},
+        "recent_audit": _serialize_audit_rows(recent_audit_rows),
+    }
 
 
 @router.get("/api-tokens", response_model=dict)
@@ -546,6 +620,8 @@ def export_global_audit(
 @router.get("/rbac/project-memberships", response_model=dict)
 def list_project_memberships(
     q: str | None = Query(default=None),
+    user_ids: list[uuid.UUID] | None = Query(default=None),
+    project_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -574,6 +650,10 @@ def list_project_memberships(
                 cast(ProjectMember.user_id, String).ilike(pattern),
             )
         )
+    if user_ids:
+        stmt = stmt.where(ProjectMember.user_id.in_(user_ids))
+    if project_id is not None:
+        stmt = stmt.where(ProjectMember.project_id == project_id)
 
     stmt = apply_keyset_pagination(stmt, SETTINGS_PROJECT_MEMBERSHIP_CURSOR, cursor, limit)
     rows, next_cursor = paginate_rows(db.execute(stmt).all(), SETTINGS_PROJECT_MEMBERSHIP_CURSOR, limit)
@@ -681,22 +761,7 @@ def assign_user_memberships_to_all_projects(
     role = payload.role
     overwrite_existing = payload.overwrite_existing
 
-    projects = db.execute(select(Project.id)).all()
-    assigned = 0
-    for row in projects:
-        project_id = row.id
-        membership = db.get(ProjectMember, {"project_id": project_id, "user_id": user_id})
-        if membership:
-            if overwrite_existing and membership.role != role:
-                if membership.role == ProjectRole.ADMIN and role != ProjectRole.ADMIN:
-                    if _count_project_admins(db, project_id, exclude_user_id=user_id) < 1:
-                        continue
-                membership.role = role
-                db.add(membership)
-                assigned += 1
-            continue
-        db.add(ProjectMember(project_id=project_id, user_id=user_id, role=role))
-        assigned += 1
+    result = users_router._assign_user_to_all_projects(db, user_id, role, overwrite_existing=overwrite_existing)
 
     write_audit_event(
         db,
@@ -708,11 +773,11 @@ def assign_user_memberships_to_all_projects(
             **request_meta(request),
             "role": role.value,
             "overwrite_existing": overwrite_existing,
-            "assigned_projects": assigned,
+            **result,
         },
     )
     db.commit()
-    return {"ok": True, "assigned_projects": assigned}
+    return {"ok": True, **result}
 
 
 def _count_project_admins(db: Session, project_id: uuid.UUID, exclude_user_id: uuid.UUID | None = None) -> int:

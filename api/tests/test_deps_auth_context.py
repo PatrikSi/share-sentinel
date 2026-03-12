@@ -27,7 +27,6 @@ class _FakeDb:
     token_row: Any | None
     get_map: dict[tuple[Any, Any], Any] = field(default_factory=dict)
     added: list[Any] = field(default_factory=list)
-    commit_count: int = 0
 
     def execute(self, _stmt):
         return _ExecuteResult(self.token_row)
@@ -39,9 +38,6 @@ class _FakeDb:
 
     def add(self, obj):
         self.added.append(obj)
-
-    def commit(self):
-        self.commit_count += 1
 
 
 def _request() -> Request:
@@ -107,7 +103,7 @@ def test_api_token_auth_rejects_token_role_above_membership() -> None:
     assert exc.value.status_code == 401
 
 
-def test_api_token_auth_accepts_membership_and_updates_last_used() -> None:
+def test_api_token_auth_accepts_membership_and_updates_last_used(monkeypatch) -> None:
     user_id = uuid.uuid4()
     project_id = uuid.uuid4()
     token = SimpleNamespace(
@@ -125,6 +121,8 @@ def test_api_token_auth_accepts_membership_and_updates_last_used() -> None:
     fake_db = _FakeDb(token_row=token)
     fake_db.get_map[(User, user_id)] = user
     fake_db.get_map[(ProjectMember, tuple(sorted({"project_id": project_id, "user_id": user_id}.items())))] = membership
+    persisted: list[tuple[uuid.UUID, datetime]] = []
+    monkeypatch.setattr("app.deps._persist_api_token_last_used", lambda token_id, last_used_at: persisted.append((token_id, last_used_at)))
 
     credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="test-token")
     auth = get_auth_context(_request(), credentials, fake_db)
@@ -135,5 +133,5 @@ def test_api_token_auth_accepts_membership_and_updates_last_used() -> None:
     assert auth.token_role == ProjectRole.OPERATOR
     assert auth.token_scopes == ["read:runs"]
     assert token.last_used_at is not None
-    assert fake_db.commit_count == 1
-    assert fake_db.added == [token]
+    assert persisted == [(token.id, token.last_used_at)]
+    assert fake_db.added == []

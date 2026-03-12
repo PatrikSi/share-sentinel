@@ -270,6 +270,58 @@ def test_settings_rbac_lists_memberships() -> None:
     assert payload["items"][0]["role"] == "viewer"
 
 
+def test_settings_overview_returns_aggregate_counts() -> None:
+    fake_db = _FakeDb()
+    fake_db.execute_queue.extend(
+        [
+            _ExecuteResult([7]),
+            _ExecuteResult([5]),
+            _ExecuteResult([2]),
+            _ExecuteResult([1]),
+            _ExecuteResult([9]),
+            _ExecuteResult([6]),
+            _ExecuteResult([3]),
+            _ExecuteResult([datetime(2026, 3, 12, tzinfo=UTC)]),
+            _ExecuteResult([4]),
+            _ExecuteResult(
+                [
+                    SimpleNamespace(
+                        AuditEvent=SimpleNamespace(
+                            id=11,
+                            ts=datetime.now(tz=UTC),
+                            actor_user_id=uuid.uuid4(),
+                            actor_token_id=None,
+                            project_id=uuid.uuid4(),
+                            action="LOGIN_SUCCESS",
+                            object_type="user",
+                            object_id="user-1",
+                            metadata_json={"ip": "127.0.0.1"},
+                        ),
+                        actor_email="admin@example.com",
+                        project_name="Core",
+                    )
+                ]
+            ),
+        ]
+    )
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get("/settings/overview")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["users"] == {"total": 7, "active": 5, "pending": 2, "sysadmins": 1}
+    assert payload["tokens"]["total"] == 9
+    assert payload["tokens"]["active"] == 6
+    assert payload["tokens"]["revoked"] == 3
+    assert payload["tokens"]["never_expires"] == 3
+    assert payload["projects"]["total"] == 4
+    assert payload["recent_audit"][0]["project_name"] == "Core"
+
+
 def test_settings_api_token_catalog_and_create_and_rotate() -> None:
     fake_db = _FakeDb()
     actor_id = uuid.uuid4()
@@ -367,7 +419,14 @@ def test_settings_assign_user_all_projects_endpoint() -> None:
     project_a = uuid.uuid4()
     project_b = uuid.uuid4()
     fake_db.get_map[(User, user_id)] = SimpleNamespace(id=user_id, email="user@example.com")
-    fake_db.execute_queue.append(_ExecuteResult([SimpleNamespace(id=project_a), SimpleNamespace(id=project_b)]))
+    fake_db.execute_queue.append(
+        _ExecuteResult(
+            [
+                SimpleNamespace(id=project_a, name="Core"),
+                SimpleNamespace(id=project_b, name="Infra"),
+            ]
+        )
+    )
 
     client = _client_for_db(fake_db)
     try:
@@ -382,6 +441,7 @@ def test_settings_assign_user_all_projects_endpoint() -> None:
     payload = response.json()
     assert payload["ok"] is True
     assert payload["assigned_projects"] == 2
+    assert payload["partial"] is False
 
 
 def test_users_assign_user_all_projects_preserves_last_project_admin() -> None:
@@ -391,7 +451,7 @@ def test_users_assign_user_all_projects_preserves_last_project_admin() -> None:
     fake_db.get_map[(User, user_id)] = SimpleNamespace(id=user_id, email="admin@example.com")
     existing = SimpleNamespace(project_id=project_id, user_id=user_id, role=ProjectRole.ADMIN)
     fake_db.get_map[(ProjectMember, _normalize_key({"project_id": project_id, "user_id": user_id}))] = existing
-    fake_db.execute_queue.append(_ExecuteResult([SimpleNamespace(id=project_id)]))
+    fake_db.execute_queue.append(_ExecuteResult([SimpleNamespace(id=project_id, name="Core")]))
     fake_db.execute_queue.append(_ExecuteResult([0]))
 
     client = _client_for_db(fake_db)
@@ -407,6 +467,14 @@ def test_users_assign_user_all_projects_preserves_last_project_admin() -> None:
     payload = response.json()
     assert payload["ok"] is True
     assert payload["assigned_projects"] == 0
+    assert payload["partial"] is True
+    assert payload["skipped_projects"] == [
+        {
+            "project_id": str(project_id),
+            "project_name": "Core",
+            "reason": "last project admin would be removed",
+        }
+    ]
     assert existing.role == ProjectRole.ADMIN
 
 

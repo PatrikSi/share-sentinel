@@ -25,7 +25,7 @@ class _FakeDb:
         self.added = []
 
     def execute(self, _stmt):
-        return _ExecuteResult([SimpleNamespace(id=project_id) for project_id in self.projects])
+        return _ExecuteResult([SimpleNamespace(id=project_id, name=f"Project {index}") for index, project_id in enumerate(self.projects, start=1)])
 
     def get(self, model, key):
         if model is ProjectMember and isinstance(key, dict):
@@ -45,7 +45,8 @@ def test_assign_user_to_all_projects_creates_missing_memberships() -> None:
 
     assigned = users_router._assign_user_to_all_projects(fake_db, user_id, ProjectRole.VIEWER, overwrite_existing=False)
 
-    assert assigned == 2
+    assert assigned["assigned_projects"] == 2
+    assert assigned["partial"] is False
     assert len(fake_db.added) == 2
     assert all(isinstance(row, ProjectMember) for row in fake_db.added)
 
@@ -58,7 +59,7 @@ def test_assign_user_to_all_projects_overwrite_updates_existing() -> None:
 
     assigned = users_router._assign_user_to_all_projects(fake_db, user_id, ProjectRole.ADMIN, overwrite_existing=True)
 
-    assert assigned == 1
+    assert assigned["assigned_projects"] == 1
     assert existing.role == ProjectRole.ADMIN
 
 
@@ -70,7 +71,7 @@ def test_assign_user_to_all_projects_without_overwrite_keeps_existing() -> None:
 
     assigned = users_router._assign_user_to_all_projects(fake_db, user_id, ProjectRole.ADMIN, overwrite_existing=False)
 
-    assert assigned == 0
+    assert assigned["assigned_projects"] == 0
     assert existing.role == ProjectRole.OPERATOR
 
 
@@ -83,7 +84,15 @@ def test_assign_user_to_all_projects_overwrite_keeps_last_project_admin(monkeypa
     monkeypatch.setattr(users_router, "_count_project_admins", lambda *_args, **_kwargs: 0)
     assigned = users_router._assign_user_to_all_projects(fake_db, user_id, ProjectRole.VIEWER, overwrite_existing=True)
 
-    assert assigned == 0
+    assert assigned["assigned_projects"] == 0
+    assert assigned["partial"] is True
+    assert assigned["skipped_projects"] == [
+        {
+            "project_id": str(project_id),
+            "project_name": "Project 1",
+            "reason": "last project admin would be removed",
+        }
+    ]
     assert existing.role == ProjectRole.ADMIN
 
 
@@ -96,7 +105,8 @@ def test_assign_user_to_all_projects_overwrite_demotes_admin_when_other_admin_ex
     monkeypatch.setattr(users_router, "_count_project_admins", lambda *_args, **_kwargs: 1)
     assigned = users_router._assign_user_to_all_projects(fake_db, user_id, ProjectRole.VIEWER, overwrite_existing=True)
 
-    assert assigned == 1
+    assert assigned["assigned_projects"] == 1
+    assert assigned["partial"] is False
     assert existing.role == ProjectRole.VIEWER
 
 
