@@ -1,12 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
-import { apiFetch, apiFetchAllPages } from "@/lib/api";
 import { StatePanel } from "@/components/state-panel";
+import { apiFetch } from "@/lib/api";
 
 type SecuritySettings = {
   allow_self_registration: boolean;
   auth_require_csrf: boolean;
-  auth_cookie_secure: bool;
+  auth_cookie_secure: boolean;
   password_min_length: number;
   password_require_lowercase: boolean;
   password_require_uppercase: boolean;
@@ -24,23 +24,6 @@ type SecuritySettings = {
   session_idle_timeout_minutes: number | null;
 };
 
-type UserRow = {
-  id: string;
-  email: string;
-  is_active: boolean;
-  is_sysadmin: boolean;
-  is_approved: boolean;
-};
-
-type ApiTokenRow = {
-  id: string;
-  name: string;
-  revoked_at: string | null;
-  expires_at: string | null;
-  last_used_at: string | null;
-  created_at: string;
-};
-
 type AuditEventRow = {
   id: number;
   ts: string;
@@ -51,7 +34,26 @@ type AuditEventRow = {
   project_name: string | null;
 };
 
-type ProjectRow = { id: string; name: string };
+type OverviewPayload = {
+  security: SecuritySettings;
+  users: {
+    total: number;
+    active: number;
+    pending: number;
+    sysadmins: number;
+  };
+  tokens: {
+    total: number;
+    active: number;
+    revoked: number;
+    never_expires: number;
+    last_active_at: string | null;
+  };
+  projects: {
+    total: number;
+  };
+  recent_audit: AuditEventRow[];
+};
 
 function formatTime(value: string | null): string {
   if (!value) return "N/A";
@@ -61,11 +63,7 @@ function formatTime(value: string | null): string {
 }
 
 export function SettingsOverviewPage() {
-  const [security, setSecurity] = useState<SecuritySettings | null>(null);
-  const [users, setUsers] = useState<UserRow[]>([]);
-  const [tokens, setTokens] = useState<ApiTokenRow[]>([]);
-  const [projects, setProjects] = useState<ProjectRow[]>([]);
-  const [recentAudit, setRecentAudit] = useState<AuditEventRow[]>([]);
+  const [overview, setOverview] = useState<OverviewPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -76,31 +74,14 @@ export function SettingsOverviewPage() {
       setLoading(true);
       setError(null);
       try {
-        const [securityData, userRows, tokenRows, projectRows, auditData] = await Promise.all([
-          apiFetch("/auth/security-settings"),
-          apiFetchAllPages<UserRow>((cursor) => {
-            const query = new URLSearchParams({ limit: "200" });
-            if (cursor) query.set("cursor", cursor);
-            return `/users?${query.toString()}`;
-          }),
-          apiFetchAllPages<ApiTokenRow>((cursor) => {
-            const query = new URLSearchParams({ limit: "200" });
-            if (cursor) query.set("cursor", cursor);
-            return `/settings/api-tokens?${query.toString()}`;
-          }),
-          apiFetch("/settings/projects"),
-          apiFetch("/settings/audit?limit=5"),
-        ]);
-
-        if (cancelled) return;
-        setSecurity(securityData as SecuritySettings);
-        setUsers(userRows);
-        setTokens(tokenRows);
-        setProjects((projectRows || []) as ProjectRow[]);
-        setRecentAudit(((auditData?.items as AuditEventRow[]) || []).slice(0, 5));
+        const data = (await apiFetch("/settings/overview")) as OverviewPayload;
+        if (!cancelled) {
+          setOverview(data);
+        }
       } catch (err) {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : "Failed to load settings overview");
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : "Failed to load settings overview");
+        }
       } finally {
         if (!cancelled) {
           setLoading(false);
@@ -114,29 +95,10 @@ export function SettingsOverviewPage() {
     };
   }, []);
 
-  const userStats = useMemo(() => {
-    const total = users.length;
-    const active = users.filter((user) => user.is_active).length;
-    const pending = users.filter((user) => !user.is_approved).length;
-    const sysadmins = users.filter((user) => user.is_sysadmin).length;
-    return { total, active, pending, sysadmins };
-  }, [users]);
-
-  const tokenStats = useMemo(() => {
-    const total = tokens.length;
-    const active = tokens.filter((token) => !token.revoked_at).length;
-    const revoked = total - active;
-    const neverExpires = tokens.filter((token) => !token.revoked_at && !token.expires_at).length;
-    return { total, active, revoked, neverExpires };
-  }, [tokens]);
-
   if (loading) {
     return (
       <div className="workspace-section">
-        <StatePanel
-          title="Loading Overview"
-          description="Pulling live security posture, token inventory, and recent audit activity."
-        />
+        <StatePanel title="Loading Overview" description="Pulling live security posture, token inventory, and recent audit activity." />
       </div>
     );
   }
@@ -149,13 +111,15 @@ export function SettingsOverviewPage() {
     );
   }
 
-  if (!security) {
+  if (!overview) {
     return (
       <div className="workspace-section">
         <StatePanel title="No Overview Data" description="Security posture data was not returned by the API." tone="warning" />
       </div>
     );
   }
+
+  const { security, users, tokens, projects, recent_audit: recentAudit } = overview;
 
   return (
     <div className="workspace-section space-y-4">
@@ -167,21 +131,21 @@ export function SettingsOverviewPage() {
         </section>
         <section className="workspace-card">
           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Identity Directory</p>
-          <p className="mt-2 text-3xl font-semibold">{userStats.total}</p>
+          <p className="mt-2 text-3xl font-semibold">{users.total}</p>
           <p className="mt-2 text-sm text-slate-500">
-            {userStats.active} active, {userStats.pending} pending, {userStats.sysadmins} sysadmins.
+            {users.active} active, {users.pending} pending, {users.sysadmins} sysadmins.
           </p>
         </section>
         <section className="workspace-card">
           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">API Tokens</p>
-          <p className="mt-2 text-3xl font-semibold">{tokenStats.active}</p>
+          <p className="mt-2 text-3xl font-semibold">{tokens.active}</p>
           <p className="mt-2 text-sm text-slate-500">
-            {tokenStats.revoked} revoked, {tokenStats.neverExpires} never expire.
+            {tokens.revoked} revoked, {tokens.never_expires} never expire.
           </p>
         </section>
         <section className="workspace-card">
           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Projects</p>
-          <p className="mt-2 text-3xl font-semibold">{projects.length}</p>
+          <p className="mt-2 text-3xl font-semibold">{projects.total}</p>
           <p className="mt-2 text-sm text-slate-500">Projects currently available for access control and token scoping.</p>
         </section>
       </div>
@@ -228,17 +192,11 @@ export function SettingsOverviewPage() {
             </div>
             <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Never-expiring tokens</p>
-              <p className="mt-1 text-sm font-semibold">{tokenStats.neverExpires}</p>
+              <p className="mt-1 text-sm font-semibold">{tokens.never_expires}</p>
             </div>
             <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Last active token use</p>
-              <p className="mt-1 text-sm font-semibold">
-                {formatTime(
-                  tokens
-                    .filter((token) => !token.revoked_at && token.last_used_at)
-                    .sort((a, b) => new Date(b.last_used_at || 0).getTime() - new Date(a.last_used_at || 0).getTime())[0]?.last_used_at || null,
-                )}
-              </p>
+              <p className="mt-1 text-sm font-semibold">{formatTime(tokens.last_active_at)}</p>
             </div>
           </div>
         </section>

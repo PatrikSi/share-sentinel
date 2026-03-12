@@ -15,6 +15,20 @@ type RegistrationSettings = {
   password_require_special: boolean;
 };
 
+async function responseErrorMessage(response: Response): Promise<string> {
+  const body = await response.text();
+  if (!body) return `Request failed (${response.status})`;
+  try {
+    const parsed = JSON.parse(body);
+    if (typeof parsed?.detail === "string") {
+      return parsed.detail;
+    }
+  } catch {
+    // Fall back to raw text when the API does not return JSON.
+  }
+  return body;
+}
+
 function resolveNextPath(raw: string | null): string {
   if (!raw || !raw.startsWith("/") || raw.startsWith("//")) {
     return "/projects";
@@ -82,7 +96,7 @@ export function LoginPage() {
           body: JSON.stringify({ email, password }),
         });
         if (!response.ok) {
-          throw new Error(await response.text());
+          throw new Error(await responseErrorMessage(response));
         }
         setInfo("Registration submitted. A system administrator must approve the account before sign-in.");
         setRegisterMode(false);
@@ -96,7 +110,7 @@ export function LoginPage() {
           body: JSON.stringify({ email, password }),
         });
         if (!response.ok) {
-          throw new Error(await response.text());
+          throw new Error(await responseErrorMessage(response));
         }
         const data = await response.json();
         setTokens(data.access_token, data.refresh_token);
