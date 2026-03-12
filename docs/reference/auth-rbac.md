@@ -1,67 +1,114 @@
 # Auth and RBAC
 
-## Identity Resolution
+This is the current access model used by the API and the UI.
 
-Request auth is resolved in this order:
+## How authentication is resolved
 
-1. Bearer JWT session token
-2. Cookie session token (with CSRF checks for unsafe methods)
-3. API token hash lookup
+Requests are checked in this order:
 
-## User Status Gates
+1. bearer access token
+2. cookie session token
+3. hashed API token
 
-All authenticated operations require user to be:
+Cookie-authenticated unsafe methods also go through CSRF checks when CSRF protection is enabled.
+
+## User state gates
+
+For user-based access, the account must be both:
 
 - active
 - approved
 
-## Authorization Layers
+That means self-registered users can exist in the system before they are allowed to sign in.
 
-### Sysadmin Gate
+## Registration and password policy
 
-System administration routes require sysadmin user status.
+Self-registration is optional and controlled by configuration.
 
-### Token Scope Gate
+Password rules are also configuration-driven and are enforced in the same way across:
 
-Token-authenticated requests must satisfy required scopes.
+- self-registration
+- admin-created users
+- password changes
+- seeded admin bootstrap
 
-### Project Role Gate
+If the seeded admin password does not meet the configured policy, bootstrap fails with a clear error instead of continuing with a broken setup.
 
-Project routes enforce minimum role:
+## Project roles
+
+Project access is based on three roles:
 
 - `viewer`
 - `operator`
 - `admin`
 
-## User Management Safety
+In practice:
 
-The platform blocks high-risk lockout patterns:
+- `viewer` can read dashboard, inventory, and run data
+- `operator` can create runs and upload artifacts
+- `admin` can manage project membership and create self-service project tokens
 
-- self-disable
-- self-unapprove
-- self-sysadmin-removal
-- removal of last active approved sysadmin
+## Sysadmin role
 
-## Project Membership Safety
+Sysadmin is separate from project roles. It unlocks the global settings surface and user administration APIs.
 
-RBAC mutation routes prevent removal/demotion of the last `admin` member in a project.
+Typical sysadmin-only actions:
 
-## API Token Policy
+- user lifecycle management
+- approvals
+- global token administration
+- global audit access
+- cross-project membership management
+- project creation
 
-### Creation Rules
+## API token scopes
 
-- Token owner must be active and approved.
-- Owner must be a member of target project.
-- Token role cannot exceed owner's membership role.
+API tokens are project-scoped and scope-checked.
 
-### Scope Policy
+Important rules:
 
-- Non-sysadmin token scopes must match default scopes for selected token role.
-- Sysadmin token owners can use full allowed scope catalog.
+- token scopes must satisfy the endpoint's required scopes
+- token role cannot exceed the owner's project role
+- non-sysadmin scope choices are constrained to the defaults allowed for that project role
+- token creation, rotation, and revocation are all audited
 
-### Lifecycle Controls
+## Safety rails
 
-- create
-- update metadata
-- rotate secret
-- revoke
+The API blocks several easy-to-make lockout mistakes.
+
+### User admin safety
+
+- you cannot disable your own account
+- you cannot unapprove your own account
+- you cannot remove your own sysadmin access
+- the last active approved sysadmin cannot be removed or demoted
+
+### Project admin safety
+
+- the last project admin cannot be removed or demoted
+
+### Token safety
+
+- self-service token creation requires a real user login
+- revoked tokens cannot be updated or rotated
+- token role cannot exceed the owner's current membership role
+
+### Session safety
+
+- password changes revoke active refresh sessions
+- disabling or unapproving a user revokes active refresh sessions
+
+## Rate limiting and guardrails
+
+There are a few extra protections around the auth surface:
+
+- login throttling with lockout
+- rate limits on login, refresh, registration, token creation, and artifact upload
+- request IDs attached to responses for tracing
+
+## Where the UI surfaces this
+
+- the login page reads `/auth/registration-settings`
+- the settings overview reads `/auth/security-settings`
+- the `Access` settings page reflects approval and role guardrails through dialogs and server error handling
+- the `Tokens` settings page exposes role and scope rules through the global token workflow
