@@ -4,7 +4,7 @@ import { Dialog } from "@/components/dialog";
 import { SecretReveal } from "@/components/secret-reveal";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
-import { apiFetch, apiFetchAllPages } from "@/lib/api";
+import { apiFetch } from "@/lib/api";
 
 type ApiTokenRow = {
   id: string;
@@ -56,9 +56,12 @@ function parseScopesCsv(raw: string): string[] {
 
 export function SettingsApiTokensPage() {
   const [tokens, setTokens] = useState<ApiTokenRow[]>([]);
-  const [users, setUsers] = useState<UserOption[]>([]);
+  const [ownerOptions, setOwnerOptions] = useState<UserOption[]>([]);
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [scopeCatalog, setScopeCatalog] = useState<ScopeCatalog | null>(null);
+  const [selectedOwner, setSelectedOwner] = useState<UserOption | null>(null);
+  const [ownerQuery, setOwnerQuery] = useState("");
+  const [ownerLoading, setOwnerLoading] = useState(false);
 
   const [searchDraft, setSearchDraft] = useState("");
   const [search, setSearch] = useState("");
@@ -68,7 +71,6 @@ export function SettingsApiTokensPage() {
   const [history, setHistory] = useState<Array<string | null>>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
 
-  const [createUserId, setCreateUserId] = useState("");
   const [createProjectId, setCreateProjectId] = useState("");
   const [createName, setCreateName] = useState("collector-token");
   const [createRole, setCreateRole] = useState("operator");
@@ -99,24 +101,28 @@ export function SettingsApiTokensPage() {
   }, [tokens]);
 
   async function loadReferenceData() {
-    const [userRows, projectsData, scopeData] = await Promise.all([
-      apiFetchAllPages<UserOption>((cursor) => {
-        const query = new URLSearchParams({ limit: "200" });
-        if (cursor) query.set("cursor", cursor);
-        return `/users?${query.toString()}`;
-      }),
-      apiFetch("/settings/projects"),
-      apiFetch("/settings/api-token-scopes"),
-    ]);
-    const sortedUsers = userRows.sort((a, b) => a.email.localeCompare(b.email));
+    const [projectsData, scopeData] = await Promise.all([apiFetch("/settings/projects"), apiFetch("/settings/api-token-scopes")]);
     const projectRows = (projectsData || []) as ProjectOption[];
 
-    setUsers(sortedUsers);
     setProjects(projectRows);
     setScopeCatalog(scopeData as ScopeCatalog);
-
-    if (!createUserId && sortedUsers.length > 0) setCreateUserId(sortedUsers[0].id);
     if (!createProjectId && projectRows.length > 0) setCreateProjectId(projectRows[0].id);
+  }
+
+  async function loadOwnerOptions(queryText: string) {
+    setOwnerLoading(true);
+    try {
+      const query = new URLSearchParams({ limit: "20", is_active: "true", is_approved: "true" });
+      if (queryText.trim()) query.set("search", queryText.trim());
+      const data = await apiFetch(`/users?${query.toString()}`);
+      const rows = (((data?.items as UserOption[]) || []) as UserOption[]).sort((a, b) => a.email.localeCompare(b.email));
+      setOwnerOptions(rows);
+      if (!selectedOwner && rows.length > 0) {
+        setSelectedOwner(rows[0]);
+      }
+    } finally {
+      setOwnerLoading(false);
+    }
   }
 
   async function loadTokens() {
@@ -139,6 +145,14 @@ export function SettingsApiTokensPage() {
   }, []);
 
   useEffect(() => {
+    const timer = window.setTimeout(() => {
+      loadOwnerOptions(ownerQuery).catch((err) => setError(err instanceof Error ? err.message : "Failed to search token owners"));
+    }, 200);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ownerQuery]);
+
+  useEffect(() => {
     loadTokens().catch((err) => setError(err instanceof Error ? err.message : "Failed to load API tokens"));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cursor, search]);
@@ -155,7 +169,10 @@ export function SettingsApiTokensPage() {
 
   async function createToken(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!createUserId || !createProjectId) return;
+    if (!selectedOwner || !createProjectId) {
+      setError("Select an active approved owner before creating a token.");
+      return;
+    }
     setError(null);
     setInfo(null);
     setSecretReveal(null);
@@ -167,7 +184,7 @@ export function SettingsApiTokensPage() {
       const data = (await apiFetch("/settings/api-tokens", {
         method: "POST",
         body: JSON.stringify({
-          user_id: createUserId,
+          user_id: selectedOwner.id,
           project_id: createProjectId,
           name: createName,
           role: createRole,
@@ -287,20 +304,49 @@ export function SettingsApiTokensPage() {
           </div>
 
           <form className="grid gap-4 md:grid-cols-2" onSubmit={createToken}>
-            <label className="block text-sm">
-              Owner
-              <select
-                className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-                value={createUserId}
-                onChange={(event) => setCreateUserId(event.target.value)}
-              >
-                {users.map((user) => (
-                  <option key={user.id} value={user.id}>
-                    {user.email}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="md:col-span-2">
+              <label className="block text-sm">
+                Owner search
+                <input
+                  className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  placeholder="Search active approved users by email"
+                  value={ownerQuery}
+                  onChange={(event) => setOwnerQuery(event.target.value)}
+                />
+              </label>
+              <div className="mt-3 rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Selected owner</p>
+                <p className="mt-1 text-sm font-semibold">{selectedOwner?.email || "Choose an owner below"}</p>
+                {ownerLoading ? <p className="mt-3 text-xs text-slate-500">Searching users…</p> : null}
+                {!ownerLoading && ownerOptions.length === 0 ? (
+                  <p className="mt-3 text-xs text-slate-500">No active approved users matched the current search.</p>
+                ) : null}
+                {ownerOptions.length > 0 ? (
+                  <div className="mt-3 flex max-h-36 flex-wrap gap-2 overflow-auto">
+                    {ownerOptions.map((user) => {
+                      const selected = selectedOwner?.id === user.id;
+                      return (
+                        <button
+                          className={`rounded-full border px-3 py-1 text-xs transition ${
+                            selected
+                              ? "border-emerald-500 bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200"
+                              : "border-slate-300 bg-white text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-800"
+                          }`}
+                          key={user.id}
+                          onClick={() => {
+                            setSelectedOwner(user);
+                            setOwnerQuery(user.email);
+                          }}
+                          type="button"
+                        >
+                          {user.email}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </div>
+            </div>
             <label className="block text-sm">
               Project
               <select

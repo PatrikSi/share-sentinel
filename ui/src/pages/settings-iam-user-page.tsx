@@ -32,7 +32,7 @@ export function SettingsIamUserPage() {
   const { me } = useOutletContext<SettingsOutletContext>();
   const { userId } = useParams<{ userId: string }>();
 
-  const [users, setUsers] = useState<UserRow[]>([]);
+  const [user, setUser] = useState<UserRow | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [loading, setLoading] = useState(true);
@@ -51,13 +51,13 @@ export function SettingsIamUserPage() {
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
-  const loadUsers = async () => {
-    const rows = await apiFetchAllPages<UserRow>((cursor) => {
-      const query = new URLSearchParams({ limit: "200" });
-      if (cursor) query.set("cursor", cursor);
-      return `/users?${query.toString()}`;
-    });
-    setUsers(rows);
+  const loadUser = async () => {
+    if (!userId) {
+      setUser(null);
+      return;
+    }
+    const data = await apiFetch(`/users/${userId}`);
+    setUser((data || null) as UserRow | null);
   };
 
   const loadProjects = async () => {
@@ -71,9 +71,14 @@ export function SettingsIamUserPage() {
   };
 
   const loadMemberships = async () => {
+    if (!userId) {
+      setMemberships([]);
+      return;
+    }
     const rows = await apiFetchAllPages<Membership>((cursor) => {
       const query = new URLSearchParams({ limit: "200" });
       if (cursor) query.set("cursor", cursor);
+      query.append("user_ids", userId);
       return `/settings/rbac/project-memberships?${query.toString()}`;
     });
     setMemberships(rows);
@@ -83,7 +88,7 @@ export function SettingsIamUserPage() {
     setLoading(true);
     setError(null);
     try {
-      await Promise.all([loadUsers(), loadProjects(), loadMemberships(), loadSecuritySettings()]);
+      await Promise.all([loadUser(), loadProjects(), loadMemberships(), loadSecuritySettings()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load identity details");
     } finally {
@@ -95,13 +100,11 @@ export function SettingsIamUserPage() {
     refreshPage().catch(() => undefined);
   }, [userId]);
 
-  const user = useMemo(() => users.find((entry) => entry.id === userId) || null, [userId, users]);
-
   const assigned = useMemo(() => {
-    const filtered = memberships.filter((membership) => membership.user_id === userId);
+    const filtered = [...memberships];
     filtered.sort((a, b) => a.project_name.localeCompare(b.project_name));
     return filtered;
-  }, [memberships, userId]);
+  }, [memberships]);
 
   const availableProjects = useMemo(() => {
     const assignedProjectIds = new Set(assigned.map((membership) => membership.project_id));
@@ -182,7 +185,12 @@ export function SettingsIamUserPage() {
         body: JSON.stringify({ role: baselineRole, overwrite_existing: baselineOverwrite }),
       });
       const updated = typeof data?.assigned_projects === "number" ? data.assigned_projects : 0;
-      setInfo(`Applied baseline for ${user.email}: ${updated} membership(s) updated.`);
+      const skipped = Array.isArray(data?.skipped_projects) ? data.skipped_projects.length : 0;
+      setInfo(
+        skipped > 0
+          ? `Applied baseline for ${user.email}: ${updated} membership(s) updated, ${skipped} project(s) skipped to preserve admin access.`
+          : `Applied baseline for ${user.email}: ${updated} membership(s) updated.`,
+      );
       await refreshPage();
       setPendingIdentityAction(null);
     } catch (err) {

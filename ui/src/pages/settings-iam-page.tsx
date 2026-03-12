@@ -16,10 +16,23 @@ function formatDate(value: string): string {
   return parsed.toLocaleDateString();
 }
 
+type DirectorySummary = {
+  users: {
+    total: number;
+    active: number;
+    pending: number;
+    sysadmins: number;
+  };
+  projects: {
+    total: number;
+  };
+};
+
 export function SettingsIamPage() {
   const [users, setUsers] = useState<UserRow[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [memberships, setMemberships] = useState<Membership[]>([]);
+  const [summary, setSummary] = useState<DirectorySummary | null>(null);
   const [loading, setLoading] = useState(true);
 
   const [userSearch, setUserSearch] = useState("");
@@ -27,6 +40,9 @@ export function SettingsIamPage() {
   const [userApprovalFilter, setUserApprovalFilter] = useState("all");
   const [userSysadminFilter, setUserSysadminFilter] = useState("all");
   const [assignedProjectFilter, setAssignedProjectFilter] = useState("all");
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [history, setHistory] = useState<Array<string | null>>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
 
   const [newUserEmail, setNewUserEmail] = useState("");
   const [newUserPassword, setNewUserPassword] = useState("");
@@ -38,34 +54,57 @@ export function SettingsIamPage() {
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
-  const loadUsers = async () => {
-    const rows = await apiFetchAllPages<UserRow>((cursor) => {
-      const query = new URLSearchParams({ limit: "200" });
-      if (cursor) query.set("cursor", cursor);
-      return `/users?${query.toString()}`;
-    });
-    setUsers(rows);
-  };
-
   const loadProjects = async () => {
     const data = await apiFetch("/settings/projects");
     setProjects((data || []) as Project[]);
   };
 
-  const loadMemberships = async () => {
-    const rows = await apiFetchAllPages<Membership>((cursor) => {
+  const loadSummary = async () => {
+    const data = await apiFetch("/settings/overview");
+    setSummary((data || null) as DirectorySummary | null);
+  };
+
+  const loadUsersPage = async () => {
+    const query = new URLSearchParams({ limit: "24" });
+    if (userSearch.trim()) query.set("search", userSearch.trim());
+    if (userActiveFilter !== "all") query.set("is_active", userActiveFilter);
+    if (userApprovalFilter !== "all") query.set("is_approved", userApprovalFilter);
+    if (userSysadminFilter !== "all") query.set("is_sysadmin", userSysadminFilter);
+    if (assignedProjectFilter !== "all") query.set("project_id", assignedProjectFilter);
+    if (cursor) query.set("cursor", cursor);
+
+    const data = await apiFetch(`/users?${query.toString()}`);
+    const rows = ((data?.items || []) as UserRow[]) || [];
+    setUsers(rows);
+    setNextCursor((data?.next_cursor as string | null) || null);
+    return rows;
+  };
+
+  const loadMembershipsForUsers = async (userIds: string[]) => {
+    if (userIds.length === 0) {
+      setMemberships([]);
+      return;
+    }
+    const rows = await apiFetchAllPages<Membership>((pageCursor) => {
       const query = new URLSearchParams({ limit: "200" });
-      if (cursor) query.set("cursor", cursor);
+      if (pageCursor) query.set("cursor", pageCursor);
+      for (const userId of userIds) {
+        query.append("user_ids", userId);
+      }
       return `/settings/rbac/project-memberships?${query.toString()}`;
     });
     setMemberships(rows);
   };
 
-  const refreshDirectory = async () => {
+  const refreshDirectory = async (includeMetadata = false) => {
     setLoading(true);
     setError(null);
     try {
-      await Promise.all([loadUsers(), loadProjects(), loadMemberships()]);
+      if (includeMetadata) {
+        await Promise.all([loadProjects(), loadSummary()]);
+      }
+      const rows = await loadUsersPage();
+      await loadMembershipsForUsers(rows.map((user) => user.id));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load IAM directory");
     } finally {
@@ -74,16 +113,14 @@ export function SettingsIamPage() {
   };
 
   useEffect(() => {
-    refreshDirectory().catch(() => undefined);
+    Promise.all([loadProjects(), loadSummary()]).catch((err) => {
+      setError(err instanceof Error ? err.message : "Failed to load IAM metadata");
+    });
   }, []);
 
-  const userStats = useMemo(() => {
-    const total = users.length;
-    const active = users.filter((user) => user.is_active).length;
-    const pending = users.filter((user) => !user.is_approved).length;
-    const sysadmins = users.filter((user) => user.is_sysadmin).length;
-    return { total, active, pending, sysadmins };
-  }, [users]);
+  useEffect(() => {
+    refreshDirectory().catch(() => undefined);
+  }, [assignedProjectFilter, cursor, userActiveFilter, userApprovalFilter, userSearch, userSysadminFilter]);
 
   const membershipsByUserId = useMemo(() => {
     const grouped = new Map<string, Membership[]>();
@@ -98,28 +135,10 @@ export function SettingsIamPage() {
     return grouped;
   }, [memberships]);
 
-  const visibleUsers = useMemo(() => {
-    const query = userSearch.trim().toLowerCase();
-    return users.filter((user) => {
-      const assigned = membershipsByUserId.get(user.id) || [];
-      const matchesSearch =
-        query.length === 0 ||
-        user.email.toLowerCase().includes(query) ||
-        assigned.some((membership) => membership.project_name.toLowerCase().includes(query));
-      const matchesActive =
-        userActiveFilter === "all" ||
-        (userActiveFilter === "true" ? user.is_active : !user.is_active);
-      const matchesApproval =
-        userApprovalFilter === "all" ||
-        (userApprovalFilter === "true" ? user.is_approved : !user.is_approved);
-      const matchesSysadmin =
-        userSysadminFilter === "all" ||
-        (userSysadminFilter === "true" ? user.is_sysadmin : !user.is_sysadmin);
-      const matchesProject =
-        assignedProjectFilter === "all" || assigned.some((membership) => membership.project_id === assignedProjectFilter);
-      return matchesSearch && matchesActive && matchesApproval && matchesSysadmin && matchesProject;
-    });
-  }, [assignedProjectFilter, membershipsByUserId, userActiveFilter, userApprovalFilter, userSearch, userSysadminFilter, users]);
+  useEffect(() => {
+    setCursor(null);
+    setHistory([]);
+  }, [assignedProjectFilter, userActiveFilter, userApprovalFilter, userSearch, userSysadminFilter]);
 
   async function createUser(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -145,10 +164,24 @@ export function SettingsIamPage() {
       setNewUserApproved(true);
       setNewUserAllProjects(false);
       setNewUserAllProjectsRole("viewer");
-      await refreshDirectory();
+      await Promise.all([loadSummary(), refreshDirectory()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create identity");
     }
+  }
+
+  function previousPage() {
+    if (history.length === 0) return;
+    const copy = [...history];
+    const previous = copy.pop() ?? null;
+    setHistory(copy);
+    setCursor(previous);
+  }
+
+  function nextPage() {
+    if (!nextCursor) return;
+    setHistory((prev) => [...prev, cursor]);
+    setCursor(nextCursor);
   }
 
   return (
@@ -163,23 +196,23 @@ export function SettingsIamPage() {
       <div className="workspace-section grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <section className="workspace-card">
           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Identities</p>
-          <p className="mt-2 text-3xl font-semibold">{userStats.total}</p>
+          <p className="mt-2 text-3xl font-semibold">{summary?.users.total ?? users.length}</p>
           <p className="mt-2 text-sm text-slate-500">Directory-wide user count.</p>
         </section>
         <section className="workspace-card">
           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">System Admins</p>
-          <p className="mt-2 text-3xl font-semibold">{userStats.sysadmins}</p>
+          <p className="mt-2 text-3xl font-semibold">{summary?.users.sysadmins ?? 0}</p>
           <p className="mt-2 text-sm text-slate-500">Platform-wide administrators.</p>
         </section>
         <section className="workspace-card">
           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Pending Approval</p>
-          <p className="mt-2 text-3xl font-semibold">{userStats.pending}</p>
+          <p className="mt-2 text-3xl font-semibold">{summary?.users.pending ?? 0}</p>
           <p className="mt-2 text-sm text-slate-500">Accounts waiting for approval.</p>
         </section>
         <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Project Assignments</p>
-          <p className="mt-2 text-3xl font-semibold">{memberships.length}</p>
-          <p className="mt-2 text-sm text-slate-500">Role bindings across all projects.</p>
+          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Projects</p>
+          <p className="mt-2 text-3xl font-semibold">{summary?.projects.total ?? projects.length}</p>
+          <p className="mt-2 text-sm text-slate-500">Projects currently represented in the access catalog.</p>
         </section>
       </div>
 
@@ -314,14 +347,14 @@ export function SettingsIamPage() {
 
           {loading ? <p className="text-sm text-slate-500">Loading IAM directory…</p> : null}
 
-          {!loading && visibleUsers.length === 0 ? (
+          {!loading && users.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-slate-300 px-4 py-8 text-center text-sm text-slate-500 dark:border-slate-700">
               No identities match the current filters.
             </div>
           ) : null}
 
           <div className="grid gap-3 2xl:grid-cols-2">
-            {visibleUsers.map((user) => {
+            {users.map((user) => {
               const assigned = membershipsByUserId.get(user.id) || [];
               const visibleTags = assigned.slice(0, 4);
               const hiddenCount = Math.max(0, assigned.length - visibleTags.length);
@@ -378,6 +411,28 @@ export function SettingsIamPage() {
                 </article>
               );
             })}
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--app-border)] pt-3">
+            <p className="text-xs text-slate-500">Membership tags are loaded only for users on the current page.</p>
+            <div className="flex gap-2">
+              <button
+                className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                disabled={history.length === 0}
+                onClick={previousPage}
+                type="button"
+              >
+                Previous
+              </button>
+              <button
+                className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                disabled={!nextCursor}
+                onClick={nextPage}
+                type="button"
+              >
+                Next
+              </button>
+            </div>
           </div>
         </section>
       </div>
