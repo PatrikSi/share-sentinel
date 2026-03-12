@@ -26,6 +26,14 @@ def test_selected_share_types_supports_both_and_defaults() -> None:
     assert collector._selected_share_types("unknown") == {"smb"}
 
 
+def test_iter_targets_streams_without_sorting_and_deduplicates() -> None:
+    collector = _load_collector_module()
+
+    targets = list(collector.iter_targets(["10.0.0.0/30"], ["10.0.0.2", "host-a", "host-a"]))
+
+    assert targets == ["10.0.0.1", "10.0.0.2", "host-a"]
+
+
 def test_parse_showmount_exports_extracts_unique_paths() -> None:
     collector = _load_collector_module()
     output = """

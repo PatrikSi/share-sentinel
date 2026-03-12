@@ -55,7 +55,7 @@ def test_main_does_not_persist_output_when_run_has_no_data(monkeypatch, tmp_path
     args = _base_args(str(output_path))
 
     monkeypatch.setattr(collector, "parse_args", lambda: args)
-    monkeypatch.setattr(collector, "parse_targets", lambda *_args, **_kwargs: ["10.0.0.5"])
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
     monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(collector, "scan_host", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(collector, "SMBConnection", object())
@@ -89,7 +89,7 @@ def test_main_persists_output_when_run_has_endpoint_data(monkeypatch, tmp_path) 
         return True
 
     monkeypatch.setattr(collector, "parse_args", lambda: args)
-    monkeypatch.setattr(collector, "parse_targets", lambda *_args, **_kwargs: ["10.0.0.5"])
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
     monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(collector, "scan_host", _scan_host)
     monkeypatch.setattr(collector, "SMBConnection", object())
@@ -190,7 +190,7 @@ def test_main_reports_output_write_errors_instead_of_traceback(monkeypatch, tmp_
         raise FileNotFoundError("No such file or directory")
 
     monkeypatch.setattr(collector, "parse_args", lambda: args)
-    monkeypatch.setattr(collector, "parse_targets", lambda *_args, **_kwargs: ["10.0.0.5"])
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
     monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(collector, "scan_host", _scan_host)
     monkeypatch.setattr(collector, "SMBConnection", object())
@@ -201,3 +201,76 @@ def test_main_reports_output_write_errors_instead_of_traceback(monkeypatch, tmp_
 
     assert rc == 2
     assert "output error: failed to write output" in stderr_capture.getvalue().lower()
+
+
+def test_main_persists_output_when_run_has_only_errors(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "errors-only.json"
+    args = _base_args(str(output_path))
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit(
+            {
+                "type": "error",
+                "run_id": run_id,
+                "severity": "error",
+                "code": "LIST_TIMEOUT",
+                "message": "Timed out reading host",
+            }
+        )
+        with lock:
+            stats.errors += 1
+        return False
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+
+    rc = collector.main()
+
+    assert rc == 1
+    assert output_path.exists()
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["summary"]["errors"] == 1
+    assert payload["issue_summary"][0]["code"] == "LIST_TIMEOUT"
+
+
+def test_main_returns_partial_success_when_artifact_is_kept(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "partial.json"
+    args = _base_args(str(output_path))
+
+    def _scan_host(host, _args, run_id, writer, stats, lock):
+        if host == "10.0.0.5":
+            writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+            writer.emit(
+                {
+                    "type": "resource",
+                    "run_id": run_id,
+                    "endpoint_key": "10.0.0.5:445",
+                    "share_type": "smb",
+                    "resource_type": "smb_share",
+                    "name": "Public",
+                }
+            )
+            with lock:
+                stats.endpoints += 1
+                stats.resources += 1
+            return True
+        return False
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5", "10.0.0.6"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+
+    rc = collector.main()
+
+    assert rc == 1
+    assert output_path.exists()
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["summary"]["resources"] == 1
+    assert payload["summary"]["errors"] == 0

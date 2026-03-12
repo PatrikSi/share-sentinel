@@ -7,6 +7,7 @@ import concurrent.futures
 from contextlib import contextmanager
 import gzip
 import ipaddress
+import itertools
 import json
 import os
 import re
@@ -42,6 +43,9 @@ except ImportError:
 
 TOOL_VERSION = "0.2.0"
 SENSITIVE_ARGUMENT_FLAGS = {"--password", "--hashes", "--api-token"}
+EXIT_SUCCESS = 0
+EXIT_PARTIAL = 1
+EXIT_FAILURE = 2
 
 
 @dataclass
@@ -407,20 +411,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return _build_parser().parse_args(argv)
 
 
-def parse_targets(cidrs: list[str], hosts_file: str | None) -> list[str]:
-    targets: set[str] = set()
+def iter_targets(cidrs: list[str], host_inputs: list[str] | None = None):
+    seen: set[str] = set()
     for cidr in cidrs:
         network = ipaddress.ip_network(cidr, strict=False)
         for host in network.hosts():
-            targets.add(str(host))
+            target = str(host)
+            if target in seen:
+                continue
+            seen.add(target)
+            yield target
 
-    if hosts_file:
-        for line in Path(hosts_file).read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                targets.add(line)
+    for host in host_inputs or []:
+        if host in seen:
+            continue
+        seen.add(host)
+        yield host
 
-    return sorted(targets)
+
+def parse_targets(cidrs: list[str], hosts_file: str | None) -> list[str]:
+    return list(iter_targets(cidrs, parse_hosts_file(hosts_file)))
 
 
 def parse_hosts_file(hosts_file: str | None) -> list[str]:
@@ -822,7 +832,7 @@ def _session_error_hint(raw_error: str, auth_method: str) -> str | None:
 
 
 def _is_successful_run(stats: Stats) -> bool:
-    return stats.endpoints > 0 or stats.resources > 0 or stats.items > 0
+    return stats.endpoints > 0 or stats.resources > 0 or stats.items > 0 or stats.errors > 0
 
 
 def _print_scan_failure_summary(
@@ -1404,32 +1414,76 @@ def _collect_scan_results(
     host_failures = 0
     for future in concurrent.futures.as_completed(futures_by_host):
         host = futures_by_host[future]
-        try:
-            exc = future.exception()
-        except concurrent.futures.CancelledError as cancelled_error:
-            exc = cancelled_error
-
-        if exc is not None:
-            message = f"scan worker failed for host {host}: {_error_detail(exc)}"
-            code = _scan_thread_error_code(exc)
-            endpoint_key = _scan_thread_endpoint_key(host, args)
-            _emit_error(
-                writer,
-                run_id,
-                severity="error",
-                code=code,
-                message=message,
-                endpoint_key=endpoint_key,
-                hint="Unhandled worker exception; inspect traceback/logs for root cause.",
-            )
-            _record_error(stats, lock, code, message)
-            host_failures += 1
-            continue
-
-        ok = bool(future.result())
-        if not ok:
-            host_failures += 1
+        host_failures += _handle_scan_result(future, host, run_id, writer, stats, lock, args=args)
     return host_failures
+
+
+def _handle_scan_result(
+    future: concurrent.futures.Future,
+    host: str,
+    run_id: str,
+    writer: NDJSONWriter,
+    stats: Stats,
+    lock: threading.Lock,
+    *,
+    args: argparse.Namespace | None = None,
+) -> int:
+    try:
+        exc = future.exception()
+    except concurrent.futures.CancelledError as cancelled_error:
+        exc = cancelled_error
+
+    if exc is not None:
+        message = f"scan worker failed for host {host}: {_error_detail(exc)}"
+        code = _scan_thread_error_code(exc)
+        endpoint_key = _scan_thread_endpoint_key(host, args)
+        _emit_error(
+            writer,
+            run_id,
+            severity="error",
+            code=code,
+            message=message,
+            endpoint_key=endpoint_key,
+            hint="Unhandled worker exception; inspect traceback/logs for root cause.",
+        )
+        _record_error(stats, lock, code, message)
+        return 1
+
+    return 0 if bool(future.result()) else 1
+
+
+def _scan_targets(
+    targets,
+    args: argparse.Namespace,
+    run_id: str,
+    writer: NDJSONWriter,
+    stats: Stats,
+    lock: threading.Lock,
+) -> tuple[int, int]:
+    max_workers = max(1, args.workers)
+    max_pending = max_workers * 2
+    submitted = 0
+    host_failures = 0
+    pending: dict[concurrent.futures.Future, str] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for host in targets:
+            future = executor.submit(scan_host, host, args, run_id, writer, stats, lock)
+            pending[future] = host
+            submitted += 1
+
+            if len(pending) < max_pending:
+                continue
+
+            done, _ = concurrent.futures.wait(tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                host = pending.pop(future)
+                host_failures += _handle_scan_result(future, host, run_id, writer, stats, lock, args=args)
+
+        if pending:
+            host_failures += _collect_scan_results(pending, run_id, writer, stats, lock, args=args)
+
+    return submitted, host_failures
 
 
 def _scan_thread_error_code(exc: BaseException) -> str:
@@ -1478,7 +1532,7 @@ def main() -> int:
                     "pass --username with --kerberos, or provide a valid --ccache/KRB5CCNAME with a default principal.",
                     file=sys.stderr,
                 )
-                return 2
+                return EXIT_FAILURE
             if username:
                 args.username = username
             if not getattr(args, "domain", "") and domain:
@@ -1487,7 +1541,7 @@ def main() -> int:
         _validate_args(args)
     except SystemExit as exc:
         print(f"configuration error: {_error_detail(exc)}", file=sys.stderr)
-        return 2
+        return EXIT_FAILURE
 
     args.ccache_env_value = preflight_ccache
     if getattr(args, "use_session_creds", False):
@@ -1498,7 +1552,7 @@ def main() -> int:
                 "set KRB5CCNAME or pass --ccache pointing to a valid Kerberos ticket cache, or provide explicit SMB credentials.",
                 file=sys.stderr,
             )
-            return 2
+            return EXIT_FAILURE
         args.username = str(getattr(args, "username", "") or username or "")
         if not getattr(args, "domain", "") and domain:
             args.domain = domain
@@ -1512,19 +1566,23 @@ def main() -> int:
     if dependency_fatals:
         for message in dependency_fatals:
             print(f"configuration error: {message}", file=sys.stderr)
-        return 2
+        return EXIT_FAILURE
 
     try:
-        targets = parse_targets(args.cidr, args.hosts)
         host_inputs = parse_hosts_file(args.hosts)
+        targets = iter_targets(args.cidr, host_inputs)
     except (OSError, ValueError) as exc:
         print(f"input error: {_error_detail(exc)}", file=sys.stderr)
         print("fix target inputs and retry (--hosts file and/or --cidr values).", file=sys.stderr)
-        return 2
+        return EXIT_FAILURE
 
-    if not targets:
+    targets = iter(targets)
+    try:
+        first_target = next(targets)
+    except StopIteration:
         print("input error: no targets resolved from --hosts/--cidr.", file=sys.stderr)
-        return 2
+        return EXIT_FAILURE
+    targets = itertools.chain([first_target], targets)
 
     run_id = str(uuid.uuid4())
     started_at = datetime.now(tz=UTC)
@@ -1542,48 +1600,47 @@ def main() -> int:
     stats = Stats()
     lock = threading.Lock()
 
-    writer.emit(
-        {
-            "type": "run_meta",
-            "schema_version": 1,
-            "tool": "share-sentinel-collector",
-            "tool_version": TOOL_VERSION,
-            "run_id": run_id,
-            "started_at": started_at.isoformat(),
-            "operator_label": args.operator_label,
-            "collection": {
-                "command": Path(__file__).name,
-                "arguments": _redact_cli_arguments(sys.argv[1:]),
-                "target_scope": {
-                    "cidrs": args.cidr,
-                    "hosts": host_inputs,
-                    "target_count": len(targets),
-                    "share_types": selected_share_types,
-                    "disabled_share_types": sorted(disabled_share_types),
-                },
-                "enumeration": {
-                    "workers": args.workers,
-                    "timeout_seconds": args.timeout,
-                    "max_depth": args.max_depth,
-                    "max_entries_per_share": args.max_entries_per_share,
-                    "include_share": list(getattr(args, "include_share", []) or []),
-                    "exclude_share": list(getattr(args, "exclude_share", []) or []),
-                    "exclude_path_regex": args.exclude_path_regex or None,
-                    "extensions_only": args.extensions_only or None,
-                },
+    run_meta_record = {
+        "type": "run_meta",
+        "schema_version": 1,
+        "tool": "share-sentinel-collector",
+        "tool_version": TOOL_VERSION,
+        "run_id": run_id,
+        "started_at": started_at.isoformat(),
+        "operator_label": args.operator_label,
+        "collection": {
+            "command": Path(__file__).name,
+            "arguments": _redact_cli_arguments(sys.argv[1:]),
+            "target_scope": {
+                "cidrs": args.cidr,
+                "hosts": host_inputs,
+                "target_count": None,
+                "share_types": selected_share_types,
+                "disabled_share_types": sorted(disabled_share_types),
             },
-            "auth": {
-                "mode": (
-                    ("local" if args.local_auth else "domain")
-                    if smb_auth_method in {"ntlm", "kerberos"}
-                    else "none"
-                ),
-                "domain": (args.domain or None) if smb_auth_method in {"ntlm", "kerberos"} else None,
-                "username": (args.username or None) if smb_auth_method in {"ntlm", "kerberos"} else None,
-                "method": smb_auth_method,
+            "enumeration": {
+                "workers": args.workers,
+                "timeout_seconds": args.timeout,
+                "max_depth": args.max_depth,
+                "max_entries_per_share": args.max_entries_per_share,
+                "include_share": list(getattr(args, "include_share", []) or []),
+                "exclude_share": list(getattr(args, "exclude_share", []) or []),
+                "exclude_path_regex": args.exclude_path_regex or None,
+                "extensions_only": args.extensions_only or None,
             },
-        }
-    )
+        },
+        "auth": {
+            "mode": (
+                ("local" if args.local_auth else "domain")
+                if smb_auth_method in {"ntlm", "kerberos"}
+                else "none"
+            ),
+            "domain": (args.domain or None) if smb_auth_method in {"ntlm", "kerberos"} else None,
+            "username": (args.username or None) if smb_auth_method in {"ntlm", "kerberos"} else None,
+            "method": smb_auth_method,
+        },
+    }
+    writer.emit(run_meta_record)
 
     for warning in dependency_warnings:
         _emit_error(
@@ -1596,13 +1653,12 @@ def main() -> int:
         )
         _record_error(stats, lock, "SCAN_DEPENDENCY_WARNING", warning)
 
-    host_failures = 0
-
     run_ccache = args.ccache_env_value if smb_auth_method == "kerberos" else None
     with _run_scoped_kerberos_cache(run_ccache):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-            futures_by_host = {executor.submit(scan_host, host, args, run_id, writer, stats, lock): host for host in targets}
-            host_failures = _collect_scan_results(futures_by_host, run_id, writer, stats, lock, args=args)
+        targets_scanned, host_failures = _scan_targets(targets, args, run_id, writer, stats, lock)
+
+    run_meta_record["collection"]["target_scope"]["target_count"] = targets_scanned
+    writer.emit(run_meta_record)
 
     writer.emit(
         {
@@ -1610,7 +1666,7 @@ def main() -> int:
             "run_id": run_id,
                 "finished_at": datetime.now(tz=UTC).isoformat(),
                 "stats": {
-                    "targets_scanned": len(targets),
+                    "targets_scanned": targets_scanned,
                     "host_failures": host_failures,
                     "endpoints": stats.endpoints,
                     "resources": stats.resources,
@@ -1641,19 +1697,19 @@ def main() -> int:
             f"output error: failed to write output to {destination}: {_error_detail(writer_close_error)}",
             file=sys.stderr,
         )
-        return 2
+        return EXIT_FAILURE
 
     if not keep_output:
         _print_scan_failure_summary(
             stats,
             host_failures,
-            reason="scan did not collect any endpoint/resource/item records.",
+            reason="scan did not collect any endpoint/resource/item/error records.",
             output_path=args.output,
         )
-        return 2
+        return EXIT_FAILURE
     if host_failures > 0:
-        return 2
-    return 0
+        return EXIT_PARTIAL
+    return EXIT_SUCCESS
 
 
 if __name__ == "__main__":
