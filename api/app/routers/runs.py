@@ -16,8 +16,8 @@ from starlette.concurrency import run_in_threadpool
 from app.config import get_settings
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_token_scopes
-from app.enums import ProjectRole, RunStatus
-from app.models import Endpoint, Item, Resource, ScanRun
+from app.enums import ErrorSeverity, ProjectRole, RunStatus
+from app.models import Endpoint, IngestError, Item, Resource, ScanRun
 from app.pagination import (
     KeysetColumn,
     apply_keyset_pagination,
@@ -27,7 +27,7 @@ from app.pagination import (
     parse_uuid_cursor_value,
 )
 from app.rate_limit import RateLimiter
-from app.schemas import RunCreateIn, RunOut
+from app.schemas import IngestErrorOut, RunCreateIn, RunOut
 from app.share_types import share_type_from_resource_type
 from app.services.audit import write_audit_event
 from app.services.queue import enqueue_ingest_job
@@ -56,6 +56,7 @@ RUN_LIST_CURSOR = (
 )
 RUN_ENDPOINT_CURSOR = (KeysetColumn("id", Endpoint.id, parser=parse_int_cursor_value),)
 RUN_ITEM_CURSOR = (KeysetColumn("id", Item.id, parser=parse_int_cursor_value),)
+RUN_ERROR_CURSOR = (KeysetColumn("id", IngestError.id, parser=parse_int_cursor_value),)
 
 
 def _get_run(db: Session, project_id: uuid.UUID, run_id: uuid.UUID) -> ScanRun:
@@ -76,6 +77,7 @@ def _to_run_out(run: ScanRun) -> RunOut:
         created_at=run.created_at,
         status=run.status,
         artifact_size=run.artifact_size,
+        ingest_progress=run.ingest_progress,
         summary=run.summary,
     )
 
@@ -706,6 +708,64 @@ def get_run(
     )
     db.commit()
     return _to_run_out(run)
+
+
+@router.get("/{run_id}/errors", response_model=dict)
+def list_run_errors(
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+    request: Request,
+    severity: ErrorSeverity | None = Query(default=None),
+    search: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    cursor: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    _get_run(db, project_id, run_id)
+
+    stmt = select(IngestError).where(IngestError.run_id == run_id).order_by(IngestError.id.asc())
+    if severity is not None:
+        stmt = stmt.where(IngestError.severity == severity)
+    if search:
+        pattern = f"%{search}%"
+        stmt = stmt.where(
+            or_(
+                IngestError.code.ilike(pattern),
+                IngestError.message.ilike(pattern),
+                IngestError.endpoint_key.ilike(pattern),
+                IngestError.resource_name.ilike(pattern),
+                cast(IngestError.path, String).ilike(pattern),
+            )
+        )
+
+    stmt = apply_keyset_pagination(stmt, RUN_ERROR_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), RUN_ERROR_CURSOR, limit)
+
+    _write_read_audit(
+        db,
+        request,
+        auth,
+        project_id,
+        action="RUN_ERRORS_LISTED",
+        object_type="scan_run",
+        object_id=str(run_id),
+        metadata={
+            "severity": severity.value if severity else None,
+            "search": search,
+            "limit": limit,
+            "cursor": cursor,
+            "result_count": len(rows),
+        },
+    )
+    db.commit()
+
+    return {
+        "items": [IngestErrorOut.model_validate(row, from_attributes=True).model_dump(mode="json") for row in rows],
+        "next_cursor": next_cursor,
+    }
 
 
 @router.get("/{run_id}/diff", response_model=dict)

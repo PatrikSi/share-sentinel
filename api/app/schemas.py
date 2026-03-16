@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-from app.enums import ProjectRole, RunStatus, UITheme
+from app.enums import ErrorSeverity, ProjectRole, RunStatus, UITheme
 from app.token_scopes import is_scope_allowed, normalize_token_scopes
 
 
@@ -157,7 +157,19 @@ class RunOut(BaseModel):
     created_at: datetime
     status: RunStatus
     artifact_size: int | None
+    ingest_progress: dict[str, Any]
     summary: dict[str, Any]
+
+
+class IngestErrorOut(BaseModel):
+    id: int
+    severity: ErrorSeverity
+    code: str
+    message: str
+    endpoint_key: str | None
+    resource_name: str | None
+    path: str | None
+    created_at: datetime
 
 
 class ThemeUpdateIn(BaseModel):
