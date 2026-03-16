@@ -17,10 +17,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://share_sentinel:share_sentinel@db:5432/share_sentinel"
     redis_url: str = "redis://redis:6379/0"
 
-    s3_endpoint: str = "http://minio:9000"
-    s3_access_key: str = "minioadmin"
-    s3_secret_key: str = "minioadmin"
-    s3_bucket: str = "share-sentinel-artifacts"
+    artifact_storage_path: str = "/artifacts"
 
     jwt_secret: str = "dev-secret"
     jwt_issuer: str = "share-sentinel"

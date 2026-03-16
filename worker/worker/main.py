@@ -8,14 +8,12 @@ import tempfile
 import time
 import uuid
 from datetime import UTC, datetime
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-import boto3
 import ijson
 import psycopg
 import redis
-from botocore.exceptions import BotoCoreError, ClientError
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -42,10 +40,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://share_sentinel:share_sentinel@db:5432/share_sentinel").replace(
     "postgresql+psycopg://", "postgresql://"
 )
-S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
-S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
-S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
-S3_BUCKET = os.getenv("S3_BUCKET", "share-sentinel-artifacts")
+ARTIFACT_STORAGE_PATH = os.getenv("ARTIFACT_STORAGE_PATH", "/artifacts")
 
 STREAM_NAME = "ingest_jobs"
 GROUP_NAME = "ingest_workers"
@@ -59,17 +54,8 @@ JSON_COMPAT_MAX_BYTES = _read_int_env("INGEST_JSON_COMPAT_MAX_BYTES", 50 * 1024 
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-s3 = boto3.client(
-    "s3",
-    endpoint_url=S3_ENDPOINT,
-    aws_access_key_id=S3_ACCESS_KEY,
-    aws_secret_access_key=S3_SECRET_KEY,
-)
-
 INGEST_OPERATION_EXCEPTIONS = (
     psycopg.Error,
-    BotoCoreError,
-    ClientError,
     OSError,
     RuntimeError,
     ValueError,
@@ -128,6 +114,20 @@ def now_iso() -> str:
 
 def advisory_lock_key(run_id: str) -> int:
     return uuid.UUID(run_id).int % (2**63 - 1)
+
+
+def _artifact_key_to_path(key: str) -> Path:
+    pure_path = PurePosixPath(str(key or ""))
+    if pure_path.is_absolute():
+        raise ValueError("artifact key must be relative")
+    parts = tuple(part for part in pure_path.parts if part not in {"", "."})
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError("artifact key must remain inside artifact storage")
+    return Path(ARTIFACT_STORAGE_PATH).joinpath(*parts)
+
+
+def open_artifact_stream(key: str):
+    return open(_artifact_key_to_path(key), "rb")
 
 
 def write_audit(conn: psycopg.Connection, project_id: str, action: str, object_type: str, object_id: str, metadata: dict[str, Any]):
@@ -727,8 +727,6 @@ def process_job(fields: dict[str, str]) -> None:
             item_batch: list[tuple] = []
             error_batch: list[tuple] = []
 
-            obj = s3.get_object(Bucket=S3_BUCKET, Key=artifact_key)
-            body = obj["Body"]
             def process_record(rec: dict[str, Any]) -> None:
                 nonlocal counts
                 rec = _bind_record_to_ingest_run(rec, run_id)
@@ -850,6 +848,7 @@ def process_job(fields: dict[str, str]) -> None:
             content_type = str(artifact_content_type or "").lower()
             json_candidate = _is_json_artifact(artifact_key, content_type)
             json_temp_path: str | None = None
+            body = open_artifact_stream(artifact_key)
 
             try:
                 if json_candidate:
@@ -868,7 +867,7 @@ def process_job(fields: dict[str, str]) -> None:
                 elif artifact_key.endswith(".gz"):
                     reader = gzip.GzipFile(fileobj=body)
                 else:
-                    reader = body.iter_lines()
+                    reader = body
 
                 if json_records is not None:
                     process_record_iter(json_records)
@@ -905,6 +904,7 @@ def process_job(fields: dict[str, str]) -> None:
                             last_line_offset = line_offset
                             last_counts = counts.copy()
             finally:
+                body.close()
                 if json_temp_path and os.path.exists(json_temp_path):
                     os.unlink(json_temp_path)
 

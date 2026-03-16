@@ -67,11 +67,7 @@ def test_process_job_skips_failed_runs_without_touching_s3(monkeypatch) -> None:
     fake_conn = _FakeConn(run_row)
 
     monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
-    monkeypatch.setattr(
-        main.s3,
-        "get_object",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed runs must not fetch artifacts")),
-    )
+    monkeypatch.setattr(main, "open_artifact_stream", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed runs must not fetch artifacts")))
 
     main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact-key"})
     assert fake_conn._unlocked is True
@@ -81,9 +77,12 @@ class _FakeBody:
     def __init__(self, lines: list[str]):
         self._lines = [line.encode("utf-8") for line in lines]
 
-    def iter_lines(self):
+    def __iter__(self):
         for line in self._lines:
             yield line
+
+    def close(self):
+        return None
 
 
 def test_process_job_rolls_back_before_marking_failed(monkeypatch) -> None:
@@ -108,15 +107,13 @@ def test_process_job_rolls_back_before_marking_failed(monkeypatch) -> None:
     monkeypatch.setattr(main, "upsert_endpoint", lambda *_args, **_kwargs: 7)
     monkeypatch.setattr(main, "upsert_resource", lambda *_args, **_kwargs: (_ for _ in ()).throw(psycopg.DataError("bad access level")))
     monkeypatch.setattr(
-        main.s3,
-        "get_object",
-        lambda *_args, **_kwargs: {
-            "Body": _FakeBody(
-                [
-                    '{"type":"resource","run_id":"11111111-1111-1111-1111-111111111111","endpoint_key":"host:445","name":"Finance","access_level":"read_write"}'
-                ]
-            )
-        },
+        main,
+        "open_artifact_stream",
+        lambda *_args, **_kwargs: _FakeBody(
+            [
+                '{"type":"resource","run_id":"11111111-1111-1111-1111-111111111111","endpoint_key":"host:445","name":"Finance","access_level":"read_write"}'
+            ]
+        ),
     )
 
     with pytest.raises(psycopg.DataError):
