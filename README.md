@@ -9,7 +9,7 @@ Share Sentinel ingests SMB collection artifacts and gives you a project-scoped w
 - Optional self-registration with admin approval
 - Configurable password policy enforced at startup and at password change / registration time
 - A React UI with a dashboard, import flow, compact inventory review, run diffing, and admin settings
-- An async worker that ingests artifacts from object storage into Postgres
+- An async worker that ingests artifacts from a shared filesystem into Postgres
 - A Python collector that can write artifacts locally or upload them directly
 
 ## Quick start
@@ -36,6 +36,8 @@ docker compose up --build
 ```bash
 ./scripts/smoke-routes.sh
 ```
+
+The Docker stack mounts a shared artifact volume at `/artifacts` so the API can persist uploads and the worker can ingest them without a separate object-storage service.
 
 ## Seed admin and password policy
 

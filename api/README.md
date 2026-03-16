@@ -26,6 +26,8 @@ alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
+If you also run the worker outside Docker, point both processes at the same `ARTIFACT_STORAGE_PATH` so uploaded artifacts and ingestion reads use the same shared directory.
+
 Password policy is controlled through environment variables:
 
 - `PASSWORD_MIN_LENGTH`

@@ -1,6 +1,6 @@
 # Ingestion Worker
 
-Consumes `ingest_jobs` from Redis Streams and ingests NDJSON artifacts from S3/MinIO into Postgres.
+Consumes `ingest_jobs` from Redis Streams and ingests NDJSON artifacts from a shared filesystem into Postgres.
 
 ## Behavior
 
@@ -10,3 +10,5 @@ Consumes `ingest_jobs` from Redis Streams and ingests NDJSON artifacts from S3/M
 - Status transitions: `INGESTING` -> `COMPLETE` / `FAILED`
 - Writes audit events (`INGEST_STARTED`, `INGEST_COMPLETED`, `INGEST_FAILED`)
 - Recovers stale Redis stream messages and scans `UPLOADED` runs as fallback
+
+Set `ARTIFACT_STORAGE_PATH` to the same directory used by the API service so the worker can open uploaded artifacts directly.
