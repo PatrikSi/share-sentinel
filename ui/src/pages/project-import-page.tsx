@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiUploadFormData } from "@/lib/api";
 
 type Project = { id: string; name: string };
 
@@ -39,6 +39,9 @@ export function ProjectImportPage() {
   const [dragActive, setDragActive] = useState(false);
   const [importing, setImporting] = useState(false);
   const [uploadStage, setUploadStage] = useState<"idle" | "creating-run" | "uploading" | "queueing">("idle");
+  const [currentRunId, setCurrentRunId] = useState<string | null>(null);
+  const [uploadTransferredBytes, setUploadTransferredBytes] = useState(0);
+  const [uploadTotalBytes, setUploadTotalBytes] = useState(0);
 
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
@@ -57,11 +60,13 @@ export function ProjectImportPage() {
   const fileValidationError = useMemo(() => validateArtifactFile(artifactFile), [artifactFile]);
   const artifactName = artifactFile?.name || "No file selected";
   const artifactDetectedType = artifactFile ? ACCEPTED_ARTIFACT_SUFFIXES.find((suffix) => artifactFile.name.toLowerCase().endsWith(suffix)) || "custom" : null;
+  const uploadProgressPercent =
+    uploadStage === "uploading" && uploadTotalBytes > 0 ? Math.min(100, Math.round((uploadTransferredBytes / uploadTotalBytes) * 100)) : 0;
 
   function stageLabel(): string {
-    if (uploadStage === "creating-run") return "Creating the run record.";
-    if (uploadStage === "uploading") return "Uploading the artifact.";
-    if (uploadStage === "queueing") return "Redirecting to the run explorer while ingest queues.";
+    if (uploadStage === "creating-run") return "Creating the run record and reserving the run ID.";
+    if (uploadStage === "uploading") return "Uploading the artifact to the API. Large artifacts can take a while.";
+    if (uploadStage === "queueing") return "Artifact stored. Redirecting to the run explorer while the worker picks it up.";
     return "Ready to create a run and upload the artifact.";
   }
 
@@ -69,6 +74,8 @@ export function ProjectImportPage() {
     setArtifactFile(file);
     setError(null);
     setInfo(null);
+    setUploadTransferredBytes(0);
+    setUploadTotalBytes(file?.size || 0);
   }
 
   function onDrop(event: DragEvent<HTMLLabelElement>) {
@@ -97,6 +104,9 @@ export function ProjectImportPage() {
     setUploadStage("creating-run");
     setError(null);
     setInfo(null);
+    setCurrentRunId(null);
+    setUploadTransferredBytes(0);
+    setUploadTotalBytes(artifactFile.size);
 
     try {
       const run = (await apiFetch(`/projects/${projectId}/runs`, {
@@ -106,17 +116,20 @@ export function ProjectImportPage() {
           description: runDescription.trim() || null,
         }),
       })) as { id: string };
+      setCurrentRunId(run.id);
 
       setUploadStage("uploading");
       const formData = new FormData();
       formData.append("file", artifactFile);
-      await apiFetch(`/projects/${projectId}/runs/${run.id}/artifact`, {
-        method: "POST",
-        body: formData,
+      await apiUploadFormData(`/projects/${projectId}/runs/${run.id}/artifact`, formData, {
+        onProgress: (loaded, total) => {
+          setUploadTransferredBytes(loaded);
+          setUploadTotalBytes(total || artifactFile.size);
+        },
       });
 
       setUploadStage("queueing");
-      setInfo(`Run ${run.id} created. Redirecting to the run explorer while ingest queues.`);
+      setInfo(`Run ${run.id} created and uploaded. Redirecting to the run explorer for worker status and ingest progress.`);
       navigate(`/projects/${projectId}/runs/${run.id}`, { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Import failed");
@@ -156,6 +169,31 @@ export function ProjectImportPage() {
             <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Upload Status</p>
             <h2 className="mt-2 text-xl font-semibold">{importing ? "In progress" : "Preflight"}</h2>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{stageLabel()}</p>
+            <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+              <div
+                className={`h-full rounded-full transition-all ${
+                  uploadStage === "uploading"
+                    ? "bg-sky-500"
+                    : uploadStage === "queueing"
+                      ? "bg-emerald-500"
+                      : uploadStage === "creating-run"
+                        ? "bg-amber-500"
+                        : "bg-slate-400"
+                }`}
+                style={{
+                  width:
+                    uploadStage === "uploading"
+                      ? `${Math.max(uploadProgressPercent, artifactFile ? 6 : 0)}%`
+                      : uploadStage === "queueing"
+                        ? "100%"
+                        : uploadStage === "creating-run"
+                          ? "12%"
+                          : artifactFile
+                            ? "4%"
+                            : "0%",
+                }}
+              />
+            </div>
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
               <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Selected file</p>
@@ -165,6 +203,56 @@ export function ProjectImportPage() {
                 <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Access</p>
                 <p className="mt-1 text-sm font-semibold">{projectRole || "Role unavailable"}</p>
               </div>
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Transfer</p>
+                <p className="mt-1 text-sm font-semibold">
+                  {uploadStage === "uploading" ? `${uploadProgressPercent}%` : artifactFile ? "Armed" : "Waiting"}
+                </p>
+                {uploadStage === "uploading" ? (
+                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                    {formatFileSize(uploadTransferredBytes)} of {formatFileSize(uploadTotalBytes || artifactFile?.size || 0)}
+                  </p>
+                ) : null}
+              </div>
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Run ID</p>
+                <p className="mt-1 text-sm font-semibold">{currentRunId || "Allocated after step 1"}</p>
+              </div>
+            </div>
+            <div className="mt-4 grid gap-2">
+              {[
+                { key: "creating-run", label: "Create run", detail: currentRunId || "Reserve the run ID in the control plane." },
+                {
+                  key: "uploading",
+                  label: "Transfer artifact",
+                  detail:
+                    uploadStage === "uploading"
+                      ? `${formatFileSize(uploadTransferredBytes)} transferred so far.`
+                      : "Stream the collector output into the API.",
+                },
+                { key: "queueing", label: "Hand off to worker", detail: "Open the run explorer and watch ingest counters update." },
+              ].map((stage) => {
+                const order = { idle: 0, "creating-run": 1, uploading: 2, queueing: 3 }[uploadStage];
+                const stageOrder = { "creating-run": 1, uploading: 2, queueing: 3 }[stage.key as "creating-run" | "uploading" | "queueing"];
+                const active = order === stageOrder;
+                const done = order > stageOrder;
+                return (
+                  <div
+                    className={`rounded-2xl border px-4 py-3 ${
+                      done
+                        ? "border-emerald-300 bg-emerald-50 dark:border-emerald-900/40 dark:bg-emerald-900/20"
+                        : active
+                          ? "border-sky-300 bg-sky-50 dark:border-sky-900/40 dark:bg-sky-900/20"
+                          : "border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-900/80"
+                    }`}
+                    key={stage.key}
+                  >
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{stage.label}</p>
+                    <p className="mt-1 text-sm font-semibold">{done ? "Done" : active ? "Active" : "Waiting"}</p>
+                    <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{stage.detail}</p>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -197,7 +285,7 @@ export function ProjectImportPage() {
               </div>
               <div className="rounded-2xl border border-white/70 bg-white/70 p-4 dark:border-slate-800 dark:bg-slate-950/40">
                 <p className="font-semibold text-slate-900 dark:text-slate-100">3. Monitor ingest</p>
-                <p className="mt-1">The app redirects directly to the run explorer so you can watch queue and ingest status.</p>
+                <p className="mt-1">The app redirects directly to the run explorer so you can watch queue state, ingest counters, and recorded issues.</p>
               </div>
             </div>
           </aside>

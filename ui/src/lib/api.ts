@@ -24,16 +24,20 @@ function toErrorMessage(body: string, status: number): string {
   return body;
 }
 
-function parseResponseBody(response: Response, body: string) {
+function parseResponseText(contentType: string, body: string) {
   if (!body) return null;
-  const contentType = (response.headers.get("content-type") || "").toLowerCase();
-  if (contentType.includes("application/json")) {
+  const normalizedContentType = contentType.toLowerCase();
+  if (normalizedContentType.includes("application/json")) {
     return JSON.parse(body);
   }
   if (body.trimStart().startsWith("<")) {
     throw new Error("API returned HTML instead of JSON. Check API routing and service health.");
   }
-  throw new Error(`Unexpected API response type (${contentType || "unknown"}).`);
+  throw new Error(`Unexpected API response type (${normalizedContentType || "unknown"}).`);
+}
+
+function parseResponseBody(response: Response, body: string) {
+  return parseResponseText(response.headers.get("content-type") || "", body);
 }
 
 function contentDispositionFilename(response: Response): string | null {
@@ -175,6 +179,74 @@ export async function apiFetchAllPages<T>(buildPath: (cursor: string | null) => 
   }
 
   return items;
+}
+
+export async function apiUploadFormData(
+  path: string,
+  formData: FormData,
+  options: {
+    method?: "POST" | "PUT" | "PATCH";
+    onProgress?: (loaded: number, total: number) => void;
+  } = {},
+) {
+  const method = options.method || "POST";
+
+  async function uploadOnce(allowRefresh: boolean): Promise<unknown> {
+    const token = getAccessToken();
+    const csrfToken = UNSAFE_METHODS.has(method) ? getCookieValue(CSRF_COOKIE_NAME) : null;
+
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open(method, `${API_BASE}${path}`);
+      xhr.withCredentials = true;
+      if (token) {
+        xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+      }
+      if (csrfToken) {
+        xhr.setRequestHeader(CSRF_HEADER_NAME, csrfToken);
+      }
+
+      xhr.upload.onprogress = (event) => {
+        options.onProgress?.(event.loaded, event.lengthComputable ? event.total : 0);
+      };
+
+      xhr.onerror = () => reject(new Error("Network error during upload."));
+      xhr.onload = async () => {
+        if (xhr.status === 401) {
+          if (allowRefresh) {
+            const refreshed = await refreshAccessToken();
+            if (refreshed) {
+              try {
+                resolve(await uploadOnce(false));
+              } catch (error) {
+                reject(error);
+              }
+              return;
+            }
+          }
+          clearTokens();
+          window.location.href = loginRedirectPath();
+          reject(new Error("Unauthorized"));
+          return;
+        }
+
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject(new Error(toErrorMessage(xhr.responseText || "", xhr.status)));
+          return;
+        }
+
+        try {
+          resolve(parseResponseText(xhr.getResponseHeader("content-type") || "", xhr.responseText || ""));
+        } catch (error) {
+          reject(error);
+        }
+      };
+
+      xhr.send(formData);
+    });
+  }
+
+  return uploadOnce(true);
 }
 
 function getCookieValue(name: string): string | null {
