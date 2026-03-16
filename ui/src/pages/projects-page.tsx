@@ -5,6 +5,12 @@ import { Dialog } from "@/components/dialog";
 import { apiFetch } from "@/lib/api";
 import { useDashboardWorkspace } from "@/lib/dashboard-workspace";
 
+type RunProgress = {
+  line_offset?: number;
+  last_error?: string;
+  [key: string]: unknown;
+};
+
 type Run = {
   id: string;
   name: string;
@@ -12,6 +18,7 @@ type Run = {
   status: string;
   created_at: string;
   artifact_size: number | null;
+  ingest_progress: RunProgress;
   summary: { endpoints?: number; resources?: number; items?: number; errors?: number };
 };
 
@@ -42,6 +49,55 @@ const RUN_STATUS_COLORS: Record<string, string> = {
   COMPLETE: "bg-emerald-200 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-200",
   FAILED: "bg-rose-200 text-rose-900 dark:bg-rose-900/40 dark:text-rose-200",
 };
+
+function parseLineOffset(progress: RunProgress | null | undefined): number {
+  const raw = progress?.line_offset;
+  const parsed = typeof raw === "number" ? raw : Number.parseInt(String(raw ?? "0"), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function describeRunCardStatus(run: Run) {
+  const lineOffset = parseLineOffset(run.ingest_progress);
+  const lastError = typeof run.ingest_progress?.last_error === "string" ? run.ingest_progress.last_error : null;
+
+  if (run.status === "UPLOADED") {
+    return {
+      title: "Artifact uploaded, waiting for worker pickup",
+      detail: "The file is stored and queued. No worker checkpoint has been recorded yet.",
+      tone: "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-200",
+      progressTone: "bg-amber-500",
+      progressWidth: "32%",
+      pulse: true,
+    };
+  }
+
+  if (run.status === "INGESTING") {
+    return {
+      title: "Ingest in progress",
+      detail:
+        lineOffset > 0
+          ? `Worker checkpoint confirmed at line ${lineOffset.toLocaleString()}. Counts below reflect committed records.`
+          : "Worker started, but no checkpoint line has been written yet.",
+      tone: "border-sky-300 bg-sky-50 text-sky-900 dark:border-sky-900/40 dark:bg-sky-900/20 dark:text-sky-200",
+      progressTone: "bg-sky-500",
+      progressWidth: "72%",
+      pulse: true,
+    };
+  }
+
+  if (run.status === "FAILED") {
+    return {
+      title: "Ingest failed",
+      detail: lastError || "The worker reported a failure before the run completed.",
+      tone: "border-rose-300 bg-rose-50 text-rose-900 dark:border-rose-900/40 dark:bg-rose-900/20 dark:text-rose-200",
+      progressTone: "bg-rose-500",
+      progressWidth: "100%",
+      pulse: false,
+    };
+  }
+
+  return null;
+}
 
 function StatTile({ label, value, detail }: { label: string; value: string; detail: string }) {
   return (
@@ -138,7 +194,7 @@ export function ProjectsPage() {
     const timer = window.setInterval(() => {
       loadRuns(selectedProject, cursor).catch(() => undefined);
       loadProjectInsights(selectedProject).catch(() => undefined);
-    }, 8000);
+    }, 4000);
     return () => window.clearInterval(timer);
   }, [selectedProject, runs, cursor]);
 
@@ -440,7 +496,7 @@ export function ProjectsPage() {
                   </div>
                   <div>
                     <p className="text-sm font-semibold">Auto-refresh while ingesting</p>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">Polling every 8 seconds when uploads are active.</p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">Polling every 4 seconds when uploads are active.</p>
                   </div>
                 </div>
               </div>
@@ -466,6 +522,8 @@ export function ProjectsPage() {
               {visibleRuns.length > 0 ? (
                 visibleRuns.map((run) => {
                   const isLatest = latestRun?.id === run.id;
+                  const runStatusNote = describeRunCardStatus(run);
+                  const issueCount = run.summary?.errors || 0;
                   return (
                     <article
                       key={run.id}
@@ -505,6 +563,48 @@ export function ProjectsPage() {
                           ) : null}
                         </div>
                       </div>
+
+                      {runStatusNote ? (
+                        <div className={`mt-4 rounded-2xl border px-4 py-3 ${runStatusNote.tone}`}>
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                              <p className="text-[11px] font-semibold uppercase tracking-[0.18em]">Pipeline status</p>
+                              <p className="mt-1 text-sm font-semibold">{runStatusNote.title}</p>
+                            </div>
+                            {parseLineOffset(run.ingest_progress) > 0 ? (
+                              <span className="rounded-full border border-current/20 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em]">
+                                Line {parseLineOffset(run.ingest_progress).toLocaleString()}
+                              </span>
+                            ) : null}
+                          </div>
+                          <p className="mt-2 text-sm opacity-90">{runStatusNote.detail}</p>
+                          <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/50 dark:bg-slate-950/40">
+                            <div
+                              className={`h-full rounded-full ${runStatusNote.progressTone} ${runStatusNote.pulse ? "animate-pulse" : ""}`}
+                              style={{ width: runStatusNote.progressWidth }}
+                            />
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {issueCount > 0 ? (
+                        <div className="mt-3 rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-amber-900 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-200">
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                              <p className="text-[11px] font-semibold uppercase tracking-[0.18em]">Recorded issues</p>
+                              <p className="mt-1 text-sm font-semibold">
+                                {issueCount.toLocaleString()} warning or error record{issueCount === 1 ? "" : "s"} need review.
+                              </p>
+                            </div>
+                            <Link
+                              className="rounded-2xl border border-amber-400/60 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-amber-100 dark:border-amber-700 dark:hover:bg-amber-900/30"
+                              to={`/projects/${selectedProject}/runs/${run.id}`}
+                            >
+                              Review Issues
+                            </Link>
+                          </div>
+                        </div>
+                      ) : null}
 
                       <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
                         <RunMetric label="Endpoints" value={run.summary?.endpoints} />

@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
+import { StatePanel } from "@/components/state-panel";
+import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
+
+type RunProgress = {
+  line_offset?: number;
+  last_error?: string;
+  [key: string]: unknown;
+};
 
 type RunInfo = {
   id: string;
@@ -9,7 +17,9 @@ type RunInfo = {
   description: string | null;
   status: string;
   created_at: string;
+  artifact_size: number | null;
   target_scope: Record<string, unknown>;
+  ingest_progress: RunProgress;
   summary: { endpoints?: number; resources?: number; items?: number; errors?: number };
 };
 type RunCompareOption = {
@@ -58,7 +68,18 @@ type RunDiffResult = {
   disappeared_shares: RunDiffShare[];
   item_churn: RunDiffChurn[];
 };
-type RunDetailTab = "overview" | "diff" | "explore" | "search";
+type RunIssueSeverity = "all" | "error" | "warn";
+type RunIssue = {
+  id: number;
+  severity: Exclude<RunIssueSeverity, "all">;
+  code: string;
+  message: string;
+  endpoint_key: string | null;
+  resource_name: string | null;
+  path: string | null;
+  created_at: string;
+};
+type RunDetailTab = "overview" | "issues" | "diff" | "explore" | "search";
 
 const RUN_STATUS_COLORS: Record<string, string> = {
   PENDING_UPLOAD: "bg-slate-200 text-slate-900 dark:bg-slate-800 dark:text-slate-200",
@@ -73,6 +94,10 @@ const RUN_DETAIL_TAB_COPY: Record<RunDetailTab, { label: string; description: st
     label: "Overview",
     description: "Status, baseline context, and next actions for this collector run.",
   },
+  issues: {
+    label: "Issues",
+    description: "Inspect ingest warnings and errors with host, share, and path context.",
+  },
   diff: {
     label: "Diff",
     description: "Compare this run to the chosen baseline and review churn.",
@@ -86,6 +111,117 @@ const RUN_DETAIL_TAB_COPY: Record<RunDetailTab, { label: string; description: st
     description: "Run-scoped item search with reusable saved queries.",
   },
 };
+
+function parseLineOffset(progress: RunProgress | null | undefined): number {
+  const raw = progress?.line_offset;
+  const parsed = typeof raw === "number" ? raw : Number.parseInt(String(raw ?? "0"), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function issueSeverityTone(severity: Exclude<RunIssueSeverity, "all">): string {
+  if (severity === "warn") {
+    return "border-amber-300 bg-amber-100 text-amber-800 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-200";
+  }
+  return "border-rose-300 bg-rose-100 text-rose-700 dark:border-rose-900/40 dark:bg-rose-900/20 dark:text-rose-200";
+}
+
+function describeRunStatus(run: RunInfo | null) {
+  if (!run) {
+    return {
+      headline: "Loading run status",
+      detail: "Fetching current queue state, ingest checkpoint, and summary counters.",
+      progressTone: "bg-slate-400",
+      progressWidth: "8%",
+      animate: true,
+      metaLabel: "Checkpoint",
+      metaValue: "Waiting for run metadata",
+      lastError: null as string | null,
+    };
+  }
+
+  const lineOffset = parseLineOffset(run.ingest_progress);
+  const issueCount = run.summary?.errors || 0;
+  const lastError = typeof run.ingest_progress?.last_error === "string" ? run.ingest_progress.last_error : null;
+
+  if (run.status === "PENDING_UPLOAD") {
+    return {
+      headline: "Waiting for artifact upload",
+      detail: "The run record exists, but no artifact has been attached yet.",
+      progressTone: "bg-slate-400",
+      progressWidth: "10%",
+      animate: false,
+      metaLabel: "Artifact",
+      metaValue: "Upload not started",
+      lastError,
+    };
+  }
+
+  if (run.status === "UPLOADED") {
+    return {
+      headline: "Artifact queued for worker pickup",
+      detail: "Upload finished. The worker has not started parsing the artifact yet.",
+      progressTone: "bg-amber-500",
+      progressWidth: "32%",
+      animate: true,
+      metaLabel: "Checkpoint",
+      metaValue: lineOffset > 0 ? `Line ${lineOffset.toLocaleString()}` : "Waiting for first checkpoint",
+      lastError,
+    };
+  }
+
+  if (run.status === "INGESTING") {
+    return {
+      headline: "Worker is ingesting collector output",
+      detail:
+        lineOffset > 0
+          ? `The worker has confirmed progress through line ${lineOffset.toLocaleString()}. Counts below update as records are committed.`
+          : "The worker has started, but no progress checkpoint has been written yet.",
+      progressTone: "bg-sky-500",
+      progressWidth: "72%",
+      animate: true,
+      metaLabel: "Checkpoint",
+      metaValue: lineOffset > 0 ? `Line ${lineOffset.toLocaleString()}` : "Starting parse",
+      lastError,
+    };
+  }
+
+  if (run.status === "FAILED") {
+    return {
+      headline: "Ingest failed before completion",
+      detail: lastError || "The worker reported a failure. Review the recorded issues and the last checkpoint below.",
+      progressTone: "bg-rose-500",
+      progressWidth: "100%",
+      animate: false,
+      metaLabel: "Last checkpoint",
+      metaValue: lineOffset > 0 ? `Line ${lineOffset.toLocaleString()}` : "No checkpoint recorded",
+      lastError,
+    };
+  }
+
+  if (issueCount > 0) {
+    return {
+      headline: "Ingest completed with recorded issues",
+      detail: `The ingest finished, but ${issueCount.toLocaleString()} warning or error record${issueCount === 1 ? "" : "s"} were stored for operator review.`,
+      progressTone: "bg-amber-500",
+      progressWidth: "100%",
+      animate: false,
+      metaLabel: "Checkpoint",
+      metaValue: lineOffset > 0 ? `Line ${lineOffset.toLocaleString()}` : "Completed",
+      lastError,
+    };
+  }
+
+  return {
+    headline: "Ingest completed cleanly",
+    detail: "The worker finished parsing the artifact and no ingest issues were recorded.",
+    progressTone: "bg-emerald-500",
+    progressWidth: "100%",
+    animate: false,
+    metaLabel: "Checkpoint",
+    metaValue: lineOffset > 0 ? `Line ${lineOffset.toLocaleString()}` : "Completed",
+    lastError,
+  };
+}
 
 export function RunDetailPage() {
   const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
@@ -124,6 +260,15 @@ export function RunDetailPage() {
   const [globalCursor, setGlobalCursor] = useState<string | null>(null);
   const [globalHistory, setGlobalHistory] = useState<Array<string | null>>([]);
   const [globalNext, setGlobalNext] = useState<string | null>(null);
+  const [issues, setIssues] = useState<RunIssue[]>([]);
+  const [issuesLoading, setIssuesLoading] = useState(false);
+  const [issuesError, setIssuesError] = useState<string | null>(null);
+  const [issueSearch, setIssueSearch] = useState("");
+  const [issueSeverity, setIssueSeverity] = useState<RunIssueSeverity>("all");
+  const [issueCursor, setIssueCursor] = useState<string | null>(null);
+  const [issueHistory, setIssueHistory] = useState<Array<string | null>>([]);
+  const [issueNext, setIssueNext] = useState<string | null>(null);
+  const [selectedIssueId, setSelectedIssueId] = useState<number | null>(null);
 
   const savedQueriesKey = useMemo(() => `share_sentinel_saved_queries_${runId || "default"}`, [runId]);
   const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
@@ -180,6 +325,14 @@ export function RunDetailPage() {
     setSelectedBaselineRunId("");
     setRunDiff(null);
     setDiffError(null);
+    setIssueSearch("");
+    setIssueSeverity("all");
+    setIssueCursor(null);
+    setIssueHistory([]);
+    setIssueNext(null);
+    setIssues([]);
+    setIssuesError(null);
+    setSelectedIssueId(null);
     setActiveTab("overview");
   }, [runId]);
 
@@ -210,9 +363,47 @@ export function RunDetailPage() {
       apiFetch(`/projects/${projectId}/runs/${runId}`)
         .then((data) => setRun(data as RunInfo))
         .catch(() => undefined);
-    }, 8000);
+    }, 4000);
     return () => window.clearInterval(timer);
   }, [projectId, runId, run]);
+
+  useEffect(() => {
+    setIssueCursor(null);
+    setIssueHistory([]);
+  }, [issueSearch, issueSeverity, projectId, runId]);
+
+  useEffect(() => {
+    if (!projectId || !runId) return;
+    if ((run?.summary?.errors || 0) === 0 && activeTab !== "issues") {
+      setIssues([]);
+      setIssueNext(null);
+      setIssuesError(null);
+      setSelectedIssueId(null);
+      return;
+    }
+
+    const query = new URLSearchParams({ limit: "50" });
+    if (issueSearch.trim()) query.set("search", issueSearch.trim());
+    if (issueSeverity !== "all") query.set("severity", issueSeverity);
+    if (issueCursor) query.set("cursor", issueCursor);
+
+    setIssuesLoading(true);
+    setIssuesError(null);
+    apiFetch(`/projects/${projectId}/runs/${runId}/errors?${query.toString()}`)
+      .then((data) => {
+        const rows = (data?.items || []) as RunIssue[];
+        setIssues(rows);
+        setIssueNext((data?.next_cursor as string | null) || null);
+        setSelectedIssueId((current) => {
+          if (current && rows.some((issue) => issue.id === current)) {
+            return current;
+          }
+          return rows[0]?.id || null;
+        });
+      })
+      .catch((err) => setIssuesError(err.message))
+      .finally(() => setIssuesLoading(false));
+  }, [projectId, runId, issueSearch, issueSeverity, issueCursor, activeTab, run?.summary?.errors, run?.status]);
 
   useEffect(() => {
     setEndpointCursor(null);
@@ -346,12 +537,26 @@ export function RunDetailPage() {
     persistSavedQueries(savedQueries.filter((query) => query.id !== id));
   }
 
+  function openIssueInSearch(issue: RunIssue) {
+    setGlobalQuery(issue.path || issue.resource_name || issue.endpoint_key || issue.code);
+    setGlobalExt("");
+    setActiveTab("search");
+  }
+
+  function focusIssueEndpoint(issue: RunIssue) {
+    setEndpointSearch(issue.endpoint_key || "");
+    setActiveTab("explore");
+  }
+
   function formatScopeValue(value: unknown): string {
     if (Array.isArray(value)) return value.join(", ");
     if (value && typeof value === "object") return JSON.stringify(value);
     return String(value);
   }
 
+  const runStatus = useMemo(() => describeRunStatus(run), [run]);
+  const selectedIssue = useMemo(() => issues.find((issue) => issue.id === selectedIssueId) || null, [issues, selectedIssueId]);
+  const issuePreview = useMemo(() => issues.slice(0, 3), [issues]);
   const targetScopeEntries = Object.entries(run?.target_scope || {}).filter(([, value]) => {
     if (Array.isArray(value)) return value.length > 0;
     return value !== null && value !== undefined && value !== "";
@@ -414,8 +619,31 @@ export function RunDetailPage() {
                   </span>
                   <span className="text-sm text-slate-500">Created {new Date(run.created_at).toLocaleString()}</span>
                 </div>
-                <p className="mt-4 text-sm text-slate-600 dark:text-slate-300">{RUN_DETAIL_TAB_COPY[activeTab].description}</p>
+                <p className="mt-4 text-base font-semibold">{runStatus.headline}</p>
+                <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{runStatus.detail}</p>
+                <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+                  <div
+                    className={`h-full rounded-full ${runStatus.progressTone} ${runStatus.animate ? "animate-pulse" : ""}`}
+                    style={{ width: runStatus.progressWidth }}
+                  />
+                </div>
                 <div className="mt-4 space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{runStatus.metaLabel}</p>
+                      <p className="mt-1 text-sm font-semibold">{runStatus.metaValue}</p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Issue count</p>
+                      <p className="mt-1 text-sm font-semibold">{(run.summary?.errors || 0).toLocaleString()}</p>
+                    </div>
+                  </div>
+                  {runStatus.lastError ? (
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Last worker error</p>
+                      <p className="mt-1 text-sm text-rose-700 dark:text-rose-300">{runStatus.lastError}</p>
+                    </div>
+                  ) : null}
                   <div>
                     <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Baseline</p>
                     <p className="mt-1 text-sm font-semibold">
@@ -442,8 +670,8 @@ export function RunDetailPage() {
           </div>
         </div>
 
-        <div className="grid gap-3 lg:grid-cols-4">
-          {(["overview", "diff", "explore", "search"] as RunDetailTab[]).map((tab) => (
+        <div className="grid gap-3 lg:grid-cols-5">
+          {(["overview", "issues", "diff", "explore", "search"] as RunDetailTab[]).map((tab) => (
             <button
               className={`rounded-3xl border p-4 text-left transition ${
                 activeTab === tab
@@ -472,9 +700,44 @@ export function RunDetailPage() {
               <div>
                 <h2 className="text-lg font-semibold">Run Summary</h2>
                 <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-                  Use the tabs below to move between diff review, hierarchical exploration, and targeted search without keeping every surface visible at once.
+                  Use the tabs below to move between issue review, diff analysis, hierarchical exploration, and targeted search without losing operational context.
                 </p>
               </div>
+              {(run?.summary?.errors || 0) > 0 ? (
+                <StatusBanner tone="warning" title="Recorded Ingest Issues">
+                  <div className="space-y-3">
+                    <p>
+                      {(run?.summary?.errors || 0).toLocaleString()} warning or error record{(run?.summary?.errors || 0) === 1 ? "" : "s"} were captured during ingest.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
+                        onClick={() => setActiveTab("issues")}
+                        type="button"
+                      >
+                        Review Issues
+                      </button>
+                      {issuePreview.map((issue) => (
+                        <button
+                          className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] ${issueSeverityTone(issue.severity)}`}
+                          key={issue.id}
+                          onClick={() => {
+                            setSelectedIssueId(issue.id);
+                            setActiveTab("issues");
+                          }}
+                          type="button"
+                        >
+                          {issue.code}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </StatusBanner>
+              ) : run?.status === "INGESTING" ? (
+                <StatusBanner tone="info" title="Live Ingest Status">
+                  <p>The worker is actively parsing this artifact. Re-open the Issues tab if you want to watch new warnings and errors arrive.</p>
+                </StatusBanner>
+              ) : null}
               {targetScopeEntries.length > 0 ? (
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Target Scope</p>
@@ -504,6 +767,13 @@ export function RunDetailPage() {
                 </button>
                 <button
                   className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                  onClick={() => setActiveTab("issues")}
+                  type="button"
+                >
+                  Open Issues
+                </button>
+                <button
+                  className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
                   onClick={() => setActiveTab("search")}
                   type="button"
                 >
@@ -514,10 +784,24 @@ export function RunDetailPage() {
 
             <div className="workspace-card space-y-4">
               <div>
-                <h2 className="text-lg font-semibold">Diff Snapshot</h2>
+                <h2 className="text-lg font-semibold">Operational Snapshot</h2>
                 <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-                  A concise baseline summary so you can decide whether to dive into detailed churn review.
+                  Queue state, worker checkpoint, and run-to-run context in one place for triage.
                 </p>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Artifact size</p>
+                  <p className="mt-1 text-sm font-semibold">
+                    {run?.artifact_size ? `${(run.artifact_size / (1024 * 1024)).toFixed(run.artifact_size < 1024 * 1024 ? 2 : 1)} MB` : "Not uploaded"}
+                  </p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Worker checkpoint</p>
+                  <p className="mt-1 text-sm font-semibold">
+                    {parseLineOffset(run?.ingest_progress) > 0 ? `Line ${parseLineOffset(run?.ingest_progress).toLocaleString()}` : "No checkpoint yet"}
+                  </p>
+                </div>
               </div>
               {diffLoading ? <p className="text-sm text-slate-500">Loading baseline comparison.</p> : null}
               {diffError ? <p className="rounded-2xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/20 dark:text-rose-200">{diffError}</p> : null}
@@ -545,6 +829,195 @@ export function RunDetailPage() {
                 !diffLoading && <p className="text-sm text-slate-500">No earlier complete run is available for comparison yet.</p>
               )}
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {activeTab === "issues" ? (
+        <div className="workspace-section grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
+          <div className="workspace-card">
+            <div>
+              <h2 className="text-lg font-semibold">Issue Log</h2>
+              <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+                Filter ingest warnings and errors, then open an entry to inspect the exact host, share, and path context.
+              </p>
+            </div>
+
+            <div className="mt-4 grid gap-3">
+              <label className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                Search issue text
+                <input
+                  className="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  placeholder="Code, message, endpoint, share, or path"
+                  value={issueSearch}
+                  onChange={(event) => setIssueSearch(event.target.value)}
+                />
+              </label>
+              <label className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                Severity
+                <select
+                  className="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  value={issueSeverity}
+                  onChange={(event) => setIssueSeverity(event.target.value as RunIssueSeverity)}
+                >
+                  <option value="all">All severities</option>
+                  <option value="error">Errors only</option>
+                  <option value="warn">Warnings only</option>
+                </select>
+              </label>
+            </div>
+
+            <div className="mt-4 flex items-center gap-2">
+              <button
+                className="rounded-2xl border border-slate-300 px-3 py-2 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
+                onClick={() => moveBack(setIssueCursor, setIssueHistory)}
+                disabled={issueHistory.length === 0}
+                type="button"
+              >
+                Prev
+              </button>
+              <button
+                className="rounded-2xl border border-slate-300 px-3 py-2 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
+                onClick={() => moveCursor(issueNext, issueCursor, setIssueCursor, setIssueHistory)}
+                disabled={!issueNext}
+                type="button"
+              >
+                Next
+              </button>
+            </div>
+
+            {issuesError ? (
+              <div className="mt-4">
+                <StatusBanner tone="error" title="Issue Log Unavailable">
+                  <p>{issuesError}</p>
+                </StatusBanner>
+              </div>
+            ) : null}
+
+            {issuesLoading ? <p className="mt-4 text-sm text-slate-500">Loading recorded issues.</p> : null}
+            {!issuesLoading && issues.length === 0 ? (
+              <div className="mt-4">
+                <StatePanel
+                  title="No Issues In View"
+                  description={
+                    (run?.summary?.errors || 0) > 0
+                      ? "No issues match the current filter. Clear the search or severity filter to broaden the view."
+                      : run?.status === "INGESTING"
+                        ? "The worker is still ingesting, but no warnings or errors have been recorded yet."
+                        : "No warnings or errors were recorded for this run."
+                  }
+                />
+              </div>
+            ) : null}
+
+            <ul className="mt-4 max-h-[560px] space-y-2 overflow-auto">
+              {issues.map((issue) => (
+                <li key={issue.id}>
+                  <button
+                    className={`w-full rounded-2xl border px-4 py-3 text-left transition ${
+                      selectedIssueId === issue.id
+                        ? "border-emerald-600 bg-emerald-50 dark:bg-emerald-900/20"
+                        : "border-slate-300 bg-white hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950/40 dark:hover:bg-slate-900/80"
+                    }`}
+                    onClick={() => setSelectedIssueId(issue.id)}
+                    type="button"
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className={`rounded-full border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] ${issueSeverityTone(issue.severity)}`}>
+                        {issue.severity}
+                      </span>
+                      <span className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">{issue.code}</span>
+                    </div>
+                    <p className="mt-2 text-sm font-semibold">{issue.message}</p>
+                    <div className="mt-2 space-y-1 text-xs text-slate-500">
+                      {issue.endpoint_key ? <p>Host: {issue.endpoint_key}</p> : null}
+                      {issue.resource_name ? <p>Share: {issue.resource_name}</p> : null}
+                      {issue.path ? <p className="font-mono">{issue.path}</p> : null}
+                    </div>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div className="workspace-card">
+            {selectedIssue ? (
+              <div className="space-y-5">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Selected Issue</p>
+                    <h2 className="mt-2 text-2xl font-semibold tracking-tight">{selectedIssue.code}</h2>
+                  </div>
+                  <span className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] ${issueSeverityTone(selectedIssue.severity)}`}>
+                    {selectedIssue.severity}
+                  </span>
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Message</p>
+                  <p className="mt-2 text-sm text-slate-700 dark:text-slate-200">{selectedIssue.message}</p>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Host</p>
+                    <p className="mt-1 text-sm font-semibold">{selectedIssue.endpoint_key || "Unavailable"}</p>
+                  </div>
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Share</p>
+                    <p className="mt-1 text-sm font-semibold">{selectedIssue.resource_name || "Unavailable"}</p>
+                  </div>
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Recorded</p>
+                    <p className="mt-1 text-sm font-semibold">{new Date(selectedIssue.created_at).toLocaleString()}</p>
+                  </div>
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Issue ID</p>
+                    <p className="mt-1 text-sm font-semibold">{selectedIssue.id}</p>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Path</p>
+                  <p className="mt-2 break-all font-mono text-xs text-slate-600 dark:text-slate-300">{selectedIssue.path || "No path recorded"}</p>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  {selectedIssue.endpoint_key ? (
+                    <button
+                      className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
+                      onClick={() => focusIssueEndpoint(selectedIssue)}
+                      type="button"
+                    >
+                      Focus Host
+                    </button>
+                  ) : null}
+                  <button
+                    className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                    onClick={() => openIssueInSearch(selectedIssue)}
+                    type="button"
+                  >
+                    Search Related Items
+                  </button>
+                  <button
+                    className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                    onClick={() => setActiveTab("diff")}
+                    type="button"
+                  >
+                    Compare With Baseline
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <StatePanel
+                title="Select An Issue"
+                description={
+                  (run?.summary?.errors || 0) > 0
+                    ? "Choose an issue from the list to inspect the recorded message and pivot into host or item review."
+                    : "No ingest warnings or errors are currently available for this run."
+                }
+              />
+            )}
           </div>
         </div>
       ) : null}
