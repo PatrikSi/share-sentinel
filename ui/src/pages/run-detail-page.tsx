@@ -79,6 +79,14 @@ type RunIssue = {
   path: string | null;
   created_at: string;
 };
+type RunActivityEvent = {
+  id: number;
+  ts: string;
+  action: string;
+  object_type: string;
+  object_id: string;
+  metadata: Record<string, unknown>;
+};
 type RunDetailTab = "overview" | "issues" | "diff" | "explore" | "search";
 
 const RUN_STATUS_COLORS: Record<string, string> = {
@@ -123,6 +131,69 @@ function issueSeverityTone(severity: Exclude<RunIssueSeverity, "all">): string {
     return "border-amber-300 bg-amber-100 text-amber-800 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-200";
   }
   return "border-rose-300 bg-rose-100 text-rose-700 dark:border-rose-900/40 dark:bg-rose-900/20 dark:text-rose-200";
+}
+
+function formatBytes(value: number | null | undefined): string {
+  if (!value || value <= 0) return "0 B";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function activityTitle(action: string): string {
+  switch (action) {
+    case "RUN_CREATED":
+      return "Run created";
+    case "ARTIFACT_UPLOADED":
+      return "Artifact uploaded";
+    case "INGEST_QUEUED":
+      return "Ingest queued";
+    case "INGEST_QUEUE_FALLBACK":
+      return "Ingest queued via fallback";
+    case "INGEST_STARTED":
+      return "Worker started ingest";
+    case "INGEST_COMPLETED":
+      return "Worker completed ingest";
+    case "INGEST_FAILED":
+      return "Worker failed ingest";
+    default:
+      return action.replaceAll("_", " ").toLowerCase();
+  }
+}
+
+function activityDetail(event: RunActivityEvent): string {
+  if (event.action === "ARTIFACT_UPLOADED") {
+    const size = typeof event.metadata.size === "number" ? event.metadata.size : Number(event.metadata.size || 0);
+    const contentType = typeof event.metadata.content_type === "string" ? event.metadata.content_type : "unknown type";
+    return `Stored ${formatBytes(size)} as ${contentType}.`;
+  }
+
+  if (event.action === "INGEST_STARTED") {
+    const resumeFromLine = Number(event.metadata.resume_from_line || 0);
+    const worker = typeof event.metadata.worker === "string" ? event.metadata.worker : "worker";
+    return `${worker} started from line ${resumeFromLine.toLocaleString()}.`;
+  }
+
+  if (event.action === "INGEST_COMPLETED") {
+    const counts = (event.metadata.counts || {}) as Record<string, unknown>;
+    const lineOffset = Number(event.metadata.line_offset || 0);
+    return `Finished at line ${lineOffset.toLocaleString()} with ${Number(counts.endpoints || 0).toLocaleString()} endpoints, ${Number(counts.resources || 0).toLocaleString()} shares, ${Number(counts.items || 0).toLocaleString()} items, and ${Number(counts.errors || 0).toLocaleString()} issues.`;
+  }
+
+  if (event.action === "INGEST_FAILED") {
+    return typeof event.metadata.error === "string" ? event.metadata.error : "The worker reported a failure.";
+  }
+
+  if (event.action === "INGEST_QUEUED" || event.action === "INGEST_QUEUE_FALLBACK") {
+    return "The artifact has been handed off to the background worker queue.";
+  }
+
+  if (event.action === "RUN_CREATED") {
+    return "The run record was created and is ready for artifact upload.";
+  }
+
+  return "Recorded run activity.";
 }
 
 function describeRunStatus(run: RunInfo | null) {
@@ -201,7 +272,7 @@ function describeRunStatus(run: RunInfo | null) {
   if (issueCount > 0) {
     return {
       headline: "Ingest completed with recorded issues",
-      detail: `The ingest finished, but ${issueCount.toLocaleString()} warning or error record${issueCount === 1 ? "" : "s"} were stored for operator review.`,
+      detail: `The ingest finished, but ${issueCount.toLocaleString()} warning or error record${issueCount === 1 ? "" : "s"} ${issueCount === 1 ? "was" : "were"} stored for operator review.`,
       progressTone: "bg-amber-500",
       progressWidth: "100%",
       animate: false,
@@ -269,6 +340,9 @@ export function RunDetailPage() {
   const [issueHistory, setIssueHistory] = useState<Array<string | null>>([]);
   const [issueNext, setIssueNext] = useState<string | null>(null);
   const [selectedIssueId, setSelectedIssueId] = useState<number | null>(null);
+  const [activityEvents, setActivityEvents] = useState<RunActivityEvent[]>([]);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityError, setActivityError] = useState<string | null>(null);
 
   const savedQueriesKey = useMemo(() => `share_sentinel_saved_queries_${runId || "default"}`, [runId]);
   const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
@@ -333,6 +407,8 @@ export function RunDetailPage() {
     setIssues([]);
     setIssuesError(null);
     setSelectedIssueId(null);
+    setActivityEvents([]);
+    setActivityError(null);
     setActiveTab("overview");
   }, [runId]);
 
@@ -404,6 +480,16 @@ export function RunDetailPage() {
       .catch((err) => setIssuesError(err.message))
       .finally(() => setIssuesLoading(false));
   }, [projectId, runId, issueSearch, issueSeverity, issueCursor, activeTab, run?.summary?.errors, run?.status]);
+
+  useEffect(() => {
+    if (!projectId || !runId) return;
+    setActivityLoading(true);
+    setActivityError(null);
+    apiFetch(`/projects/${projectId}/runs/${runId}/activity?limit=12`)
+      .then((data) => setActivityEvents((data?.items || []) as RunActivityEvent[]))
+      .catch((err) => setActivityError(err.message))
+      .finally(() => setActivityLoading(false));
+  }, [projectId, runId, run?.status, run?.summary?.errors]);
 
   useEffect(() => {
     setEndpointCursor(null);
@@ -707,7 +793,7 @@ export function RunDetailPage() {
                 <StatusBanner tone="warning" title="Recorded Ingest Issues">
                   <div className="space-y-3">
                     <p>
-                      {(run?.summary?.errors || 0).toLocaleString()} warning or error record{(run?.summary?.errors || 0) === 1 ? "" : "s"} were captured during ingest.
+                      {(run?.summary?.errors || 0).toLocaleString()} warning or error record{(run?.summary?.errors || 0) === 1 ? "" : "s"} {((run?.summary?.errors || 0) === 1) ? "was" : "were"} captured during ingest.
                     </p>
                     <div className="flex flex-wrap gap-2">
                       <button
@@ -731,6 +817,34 @@ export function RunDetailPage() {
                         </button>
                       ))}
                     </div>
+                    {issuePreview.length > 0 ? (
+                      <div className="grid gap-3">
+                        {issuePreview.map((issue) => (
+                          <button
+                            className="rounded-2xl border border-amber-300/80 bg-white/60 px-4 py-3 text-left transition hover:bg-white/90 dark:border-amber-900/40 dark:bg-slate-950/30 dark:hover:bg-slate-950/50"
+                            key={`preview:${issue.id}`}
+                            onClick={() => {
+                              setSelectedIssueId(issue.id);
+                              setActiveTab("issues");
+                            }}
+                            type="button"
+                          >
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className={`rounded-full border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] ${issueSeverityTone(issue.severity)}`}>
+                                {issue.severity}
+                              </span>
+                              <span className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-600 dark:text-slate-300">{issue.code}</span>
+                            </div>
+                            <p className="mt-2 text-sm font-semibold text-slate-900 dark:text-slate-100">{issue.message}</p>
+                            <div className="mt-2 space-y-1 text-xs text-slate-600 dark:text-slate-300">
+                              {issue.endpoint_key ? <p>Host: {issue.endpoint_key}</p> : null}
+                              {issue.resource_name ? <p>Share: {issue.resource_name}</p> : null}
+                              {issue.path ? <p className="font-mono break-all">{issue.path}</p> : null}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
                 </StatusBanner>
               ) : run?.status === "INGESTING" ? (
@@ -828,6 +942,31 @@ export function RunDetailPage() {
               ) : (
                 !diffLoading && <p className="text-sm text-slate-500">No earlier complete run is available for comparison yet.</p>
               )}
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Run Activity</p>
+                    <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">Collector lifecycle and worker checkpoints for this run.</p>
+                  </div>
+                  {activityLoading ? <span className="text-xs text-slate-500">Refreshing...</span> : null}
+                </div>
+                {activityError ? <p className="mt-3 text-sm text-rose-700 dark:text-rose-300">{activityError}</p> : null}
+                {activityEvents.length > 0 ? (
+                  <ol className="mt-4 space-y-3">
+                    {activityEvents.map((event) => (
+                      <li className="border-l-2 border-slate-300 pl-4 dark:border-slate-700" key={event.id}>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="text-sm font-semibold">{activityTitle(event.action)}</p>
+                          <span className="text-xs text-slate-500">{new Date(event.ts).toLocaleString()}</span>
+                        </div>
+                        <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">{activityDetail(event)}</p>
+                      </li>
+                    ))}
+                  </ol>
+                ) : !activityLoading ? (
+                  <p className="mt-3 text-sm text-slate-500">No run activity is available yet.</p>
+                ) : null}
+              </div>
             </div>
           </div>
         </div>

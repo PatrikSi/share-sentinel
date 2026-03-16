@@ -117,3 +117,42 @@ def test_list_run_errors_returns_issue_rows(monkeypatch) -> None:
         }
     ]
     assert fake_db.commit_count == 1
+
+
+def test_list_run_activity_returns_timeline_rows(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    fake_run = SimpleNamespace(id=run_id, project_id=project_id)
+    event_ts = datetime.now(tz=UTC)
+    fake_event = SimpleNamespace(
+        id=11,
+        ts=event_ts,
+        action="INGEST_COMPLETED",
+        object_type="scan_run",
+        object_id=str(run_id),
+        metadata_json={"line_offset": 26, "counts": {"errors": 1}},
+    )
+    fake_db = _FakeDb(execute_queue=[_ExecuteResult([fake_run]), _ExecuteResult([fake_event])])
+    monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runs_router, "write_audit_event", lambda *_args, **_kwargs: None)
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get(f"/projects/{project_id}/runs/{run_id}/activity?limit=25")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["next_cursor"] is None
+    assert payload["items"] == [
+        {
+            "id": 11,
+            "ts": event_ts.isoformat().replace("+00:00", "Z"),
+            "action": "INGEST_COMPLETED",
+            "object_type": "scan_run",
+            "object_id": str(run_id),
+            "metadata": {"line_offset": 26, "counts": {"errors": 1}},
+        }
+    ]
+    assert fake_db.commit_count == 1

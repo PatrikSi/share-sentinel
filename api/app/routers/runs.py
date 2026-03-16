@@ -17,7 +17,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_token_scopes
 from app.enums import ErrorSeverity, ProjectRole, RunStatus
-from app.models import Endpoint, IngestError, Item, Resource, ScanRun
+from app.models import AuditEvent, Endpoint, IngestError, Item, Resource, ScanRun
 from app.pagination import (
     KeysetColumn,
     apply_keyset_pagination,
@@ -27,7 +27,7 @@ from app.pagination import (
     parse_uuid_cursor_value,
 )
 from app.rate_limit import RateLimiter
-from app.schemas import IngestErrorOut, RunCreateIn, RunOut
+from app.schemas import IngestErrorOut, RunActivityEventOut, RunCreateIn, RunOut
 from app.share_types import share_type_from_resource_type
 from app.services.audit import write_audit_event
 from app.services.queue import enqueue_ingest_job
@@ -57,6 +57,19 @@ RUN_LIST_CURSOR = (
 RUN_ENDPOINT_CURSOR = (KeysetColumn("id", Endpoint.id, parser=parse_int_cursor_value),)
 RUN_ITEM_CURSOR = (KeysetColumn("id", Item.id, parser=parse_int_cursor_value),)
 RUN_ERROR_CURSOR = (KeysetColumn("id", IngestError.id, parser=parse_int_cursor_value),)
+RUN_ACTIVITY_CURSOR = (
+    KeysetColumn("ts", AuditEvent.ts, direction="desc", parser=parse_datetime_cursor_value),
+    KeysetColumn("id", AuditEvent.id, direction="desc"),
+)
+RUN_ACTIVITY_ACTIONS = {
+    "RUN_CREATED",
+    "ARTIFACT_UPLOADED",
+    "INGEST_QUEUED",
+    "INGEST_QUEUE_FALLBACK",
+    "INGEST_STARTED",
+    "INGEST_COMPLETED",
+    "INGEST_FAILED",
+}
 
 
 def _get_run(db: Session, project_id: uuid.UUID, run_id: uuid.UUID) -> ScanRun:
@@ -764,6 +777,61 @@ def list_run_errors(
 
     return {
         "items": [IngestErrorOut.model_validate(row, from_attributes=True).model_dump(mode="json") for row in rows],
+        "next_cursor": next_cursor,
+    }
+
+
+@router.get("/{run_id}/activity", response_model=dict)
+def list_run_activity(
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    _get_run(db, project_id, run_id)
+
+    stmt = (
+        select(AuditEvent)
+        .where(
+            AuditEvent.project_id == project_id,
+            AuditEvent.object_type == "scan_run",
+            AuditEvent.object_id == str(run_id),
+            AuditEvent.action.in_(RUN_ACTIVITY_ACTIONS),
+        )
+        .order_by(AuditEvent.ts.desc(), AuditEvent.id.desc())
+    )
+    stmt = apply_keyset_pagination(stmt, RUN_ACTIVITY_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), RUN_ACTIVITY_CURSOR, limit)
+
+    write_audit_event(
+        db,
+        action="RUN_ACTIVITY_LISTED",
+        object_type="scan_run",
+        object_id=str(run_id),
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata={**request_meta(request), "limit": limit, "cursor": cursor, "result_count": len(rows)},
+    )
+    db.commit()
+
+    return {
+        "items": [
+            RunActivityEventOut(
+                id=row.id,
+                ts=row.ts,
+                action=row.action,
+                object_type=row.object_type,
+                object_id=row.object_id,
+                metadata=row.metadata_json,
+            ).model_dump(mode="json")
+            for row in rows
+        ],
         "next_cursor": next_cursor,
     }
 

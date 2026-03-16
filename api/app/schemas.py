@@ -172,6 +172,15 @@ class IngestErrorOut(BaseModel):
     created_at: datetime
 
 
+class RunActivityEventOut(BaseModel):
+    id: int
+    ts: datetime
+    action: str
+    object_type: str
+    object_id: str
+    metadata: dict[str, Any]
+
+
 class ThemeUpdateIn(BaseModel):
     ui_theme: UITheme
 
