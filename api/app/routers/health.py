@@ -25,14 +25,14 @@ def healthz_deep(db: Session = Depends(get_db)):
     try:
         db.execute(text("SELECT 1"))
         checks["database"] = "ok"
-    except Exception as exc:  # noqa: BLE001
-        checks["database"] = f"error:{type(exc).__name__}"
+    except Exception:  # noqa: BLE001
+        checks["database"] = "error"
 
     try:
         redis_client.ping()
         checks["redis"] = "ok"
-    except redis.RedisError as exc:
-        checks["redis"] = f"error:{type(exc).__name__}"
+    except redis.RedisError:
+        checks["redis"] = "error"
 
     ok = all(value == "ok" for value in checks.values())
     status_code = 200 if ok else 503

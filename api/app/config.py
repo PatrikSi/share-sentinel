@@ -7,7 +7,7 @@ from app.password_policy import password_policy_kwargs, validate_password_streng
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(extra="ignore")
 
     app_env: str = "development"
     app_name: str = "share-sentinel-api"
@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     auth_cookie_samesite: str = "lax"
     auth_csrf_cookie_name: str = "share_sentinel_csrf"
     auth_csrf_header_name: str = "x-csrf-token"
+    auth_refresh_cookie_name: str = "share_sentinel_refresh"
     auth_require_csrf: bool = True
 
     cors_origins: str = "http://localhost"
@@ -56,6 +57,15 @@ class Settings(BaseSettings):
     password_require_special: bool = False
     seed_admin_email: str | None = None
     seed_admin_password: str | None = None
+
+    @field_validator("app_env", mode="before")
+    @classmethod
+    def _normalize_app_env(cls, value: str) -> str:
+        normalized = str(value).strip().lower() or "development"
+        allowed = {"development", "dev", "testing", "test", "staging", "stage", "production", "prod"}
+        if normalized not in allowed:
+            raise ValueError("app_env must be one of: development, dev, testing, test, staging, stage, production, prod")
+        return normalized
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -104,6 +114,10 @@ class Settings(BaseSettings):
                 raise ValueError("jwt_secret must be set and at least 32 characters in production")
             if self.token_pepper == "dev-pepper" or len(self.token_pepper) < 32:
                 raise ValueError("token_pepper must be set and at least 32 characters in production")
+            if not self.auth_require_csrf:
+                raise ValueError("auth_require_csrf must be true in production")
+            if self.allow_legacy_unscoped_tokens:
+                raise ValueError("allow_legacy_unscoped_tokens must be false in production")
             if not self.seed_admin_email or not self.seed_admin_password:
                 raise ValueError("SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD must both be set in production")
             if self.seed_admin_password in {"ChangeMe123456", "change-me-please-12-plus"}:
@@ -115,4 +129,4 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    return Settings(_env_file=".env")

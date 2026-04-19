@@ -58,6 +58,8 @@ def hash_external_token(raw_token: str) -> str:
     digest.update(settings.token_pepper.encode("utf-8"))
     digest.update(raw_token.encode("utf-8"))
     return digest.hexdigest()
+
+
 def generate_csrf_token() -> str:
     return secrets.token_urlsafe(32)
 
@@ -67,6 +69,7 @@ def set_auth_cookies(response: Response, access_token: str, csrf_token: str) -> 
     cookie_common = {
         "domain": settings.auth_cookie_domain,
         "path": settings.auth_cookie_path,
+        "max_age": settings.access_token_minutes * 60,
         "secure": settings.auth_cookie_secure,
         "samesite": settings.auth_cookie_samesite,
     }
@@ -84,6 +87,20 @@ def set_auth_cookies(response: Response, access_token: str, csrf_token: str) -> 
     )
 
 
+def set_refresh_cookie(response: Response, refresh_token: str) -> None:
+    settings = get_settings()
+    response.set_cookie(
+        key=settings.auth_refresh_cookie_name,
+        value=refresh_token,
+        domain=settings.auth_cookie_domain,
+        path=settings.auth_cookie_path,
+        max_age=settings.refresh_token_days * 24 * 60 * 60,
+        secure=settings.auth_cookie_secure,
+        samesite=settings.auth_cookie_samesite,
+        httponly=True,
+    )
+
+
 def clear_auth_cookies(response: Response) -> None:
     settings = get_settings()
     cookie_common = {
@@ -92,3 +109,4 @@ def clear_auth_cookies(response: Response) -> None:
     }
     response.delete_cookie(settings.auth_cookie_name, **cookie_common)
     response.delete_cookie(settings.auth_csrf_cookie_name, **cookie_common)
+    response.delete_cookie(settings.auth_refresh_cookie_name, **cookie_common)

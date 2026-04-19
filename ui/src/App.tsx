@@ -1,8 +1,9 @@
 import { useEffect } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 
+import { StatePanel } from "@/components/state-panel";
 import { TopNav } from "@/components/top-nav";
-import { getAccessToken } from "@/lib/auth";
+import { bootstrapSession, useSession } from "@/lib/auth";
 import { DashboardWorkspaceProvider } from "@/lib/dashboard-workspace";
 import { AccountPage } from "@/pages/account-page";
 import { LoginPage } from "@/pages/login-page";
@@ -19,8 +20,17 @@ import { SettingsOverviewPage } from "@/pages/settings-overview-page";
 
 function RequireAuth({ children }: { children: JSX.Element }) {
   const location = useLocation();
-  const token = getAccessToken();
-  if (!token) {
+  const session = useSession();
+
+  if (session.status === "unknown") {
+    return (
+      <section className="mx-auto mt-16 max-w-md">
+        <StatePanel title="Checking Session" description="Validating the current browser session." />
+      </section>
+    );
+  }
+
+  if (session.status !== "authenticated") {
     const next = `${location.pathname}${location.search}${location.hash}`;
     return <Navigate to={`/?next=${encodeURIComponent(next)}`} replace />;
   }
@@ -29,7 +39,14 @@ function RequireAuth({ children }: { children: JSX.Element }) {
 
 export function App() {
   const location = useLocation();
-  const showNav = location.pathname !== "/" && !!getAccessToken();
+  const session = useSession();
+  const showNav = location.pathname !== "/" && session.status === "authenticated";
+
+  useEffect(() => {
+    if (session.status === "unknown") {
+      void bootstrapSession();
+    }
+  }, [session.status]);
 
   useEffect(() => {
     const saved = localStorage.getItem("share_sentinel_theme") || "system";

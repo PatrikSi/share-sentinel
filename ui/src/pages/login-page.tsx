@@ -2,7 +2,8 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Navigate, useLocation, useNavigate } from "react-router-dom";
 
 import { StatusBanner } from "@/components/status-banner";
-import { getAccessToken, setTokens } from "@/lib/auth";
+import { responseErrorMessage } from "@/lib/api";
+import { markSessionAuthenticated, SessionUser, useSession } from "@/lib/auth";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "/api";
 
@@ -15,20 +16,6 @@ type RegistrationSettings = {
   password_require_special: boolean;
 };
 
-async function responseErrorMessage(response: Response): Promise<string> {
-  const body = await response.text();
-  if (!body) return `Request failed (${response.status})`;
-  try {
-    const parsed = JSON.parse(body);
-    if (typeof parsed?.detail === "string") {
-      return parsed.detail;
-    }
-  } catch {
-    // Fall back to raw text when the API does not return JSON.
-  }
-  return body;
-}
-
 function resolveNextPath(raw: string | null): string {
   if (!raw || !raw.startsWith("/") || raw.startsWith("//")) {
     return "/projects";
@@ -37,9 +24,9 @@ function resolveNextPath(raw: string | null): string {
 }
 
 export function LoginPage() {
+  const session = useSession();
   const location = useLocation();
   const navigate = useNavigate();
-  const authenticated = !!getAccessToken();
   const next = new URLSearchParams(location.search).get("next");
   const nextPath = resolveNextPath(next);
   const [email, setEmail] = useState("");
@@ -48,22 +35,28 @@ export function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [registerMode, setRegisterMode] = useState(false);
   const [registrationSettings, setRegistrationSettings] = useState<RegistrationSettings | null>(null);
+  const [registrationWarning, setRegistrationWarning] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
-  if (authenticated) {
+  if (session.status === "authenticated") {
     return <Navigate to={nextPath} replace />;
   }
 
   useEffect(() => {
     fetch(`${API_BASE}/auth/registration-settings`)
       .then(async (response) => {
-        if (!response.ok) return;
+        if (!response.ok) {
+          setRegistrationWarning(await responseErrorMessage(response));
+          return;
+        }
         const data = await response.json();
         setRegistrationSettings(data as RegistrationSettings);
+        setRegistrationWarning(null);
       })
       .catch(() => {
         setRegistrationSettings(null);
+        setRegistrationWarning("Registration options could not be loaded. Sign-in is still available.");
       });
   }, []);
 
@@ -113,8 +106,9 @@ export function LoginPage() {
           throw new Error(await responseErrorMessage(response));
         }
         const data = await response.json();
-        setTokens(data.access_token, data.refresh_token);
-        localStorage.setItem("share_sentinel_theme", data.user.ui_theme);
+        const user = data.user as SessionUser;
+        markSessionAuthenticated(user);
+        localStorage.setItem("share_sentinel_theme", user.ui_theme);
         navigate(nextPath, { replace: true });
       }
     } catch (err) {
@@ -152,6 +146,11 @@ export function LoginPage() {
           {info ? (
             <StatusBanner tone="success" title="Request Accepted">
               <p>{info}</p>
+            </StatusBanner>
+          ) : null}
+          {registrationWarning ? (
+            <StatusBanner tone="warning" title="Registration Settings Unavailable">
+              <p>{registrationWarning}</p>
             </StatusBanner>
           ) : null}
           {registerMode ? (

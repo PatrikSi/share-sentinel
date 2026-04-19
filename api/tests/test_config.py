@@ -42,6 +42,35 @@ def test_production_requires_secure_auth_cookie() -> None:
         )
 
 
+def test_production_requires_csrf_and_disallows_legacy_unscoped_tokens() -> None:
+    with pytest.raises(ValueError, match="auth_require_csrf must be true in production"):
+        Settings(
+            app_env="production",
+            jwt_secret="x" * 64,
+            token_pepper="y" * 64,
+            seed_admin_email="admin@example.com",
+            seed_admin_password="StrongPassword123",
+            auth_cookie_secure=True,
+            auth_require_csrf=False,
+        )
+
+    with pytest.raises(ValueError, match="allow_legacy_unscoped_tokens must be false in production"):
+        Settings(
+            app_env="production",
+            jwt_secret="x" * 64,
+            token_pepper="y" * 64,
+            seed_admin_email="admin@example.com",
+            seed_admin_password="StrongPassword123",
+            auth_cookie_secure=True,
+            allow_legacy_unscoped_tokens=True,
+        )
+
+
+def test_app_env_rejects_unknown_values() -> None:
+    with pytest.raises(ValueError, match="app_env must be one of"):
+        Settings(app_env="prodution")
+
+
 def test_seed_admin_password_must_match_policy() -> None:
     with pytest.raises(ValueError, match="SEED_ADMIN_PASSWORD must satisfy the configured password policy"):
         Settings(

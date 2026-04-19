@@ -128,7 +128,21 @@ def get_current_user(auth: AuthContext = Depends(get_auth_context), db: Session 
     return user
 
 
-def require_sysadmin(user: User = Depends(get_current_user)) -> User:
+def require_session_user(
+    auth: AuthContext = Depends(get_auth_context),
+    user: User = Depends(get_current_user),
+) -> User:
+    if auth.token_id is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user login required")
+    return user
+
+
+def require_sysadmin(
+    auth: AuthContext = Depends(get_auth_context),
+    user: User = Depends(get_current_user),
+) -> User:
+    if auth.token_id is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user login required")
     if not user.is_sysadmin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="sysadmin required")
     return user

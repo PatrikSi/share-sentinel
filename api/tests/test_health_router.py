@@ -58,5 +58,5 @@ def test_healthz_deep_unhealthy(monkeypatch) -> None:
     assert response.status_code == 503
     payload = response.json()
     assert payload["ok"] is False
-    assert payload["checks"]["database"].startswith("error:")
-    assert payload["checks"]["redis"].startswith("error:")
+    assert payload["checks"]["database"] == "error"
+    assert payload["checks"]["redis"] == "error"

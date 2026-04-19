@@ -68,15 +68,16 @@ class ChangePasswordIn(BaseModel):
     new_password: str = Field(min_length=1, max_length=256)
 
 
-class TokenPairOut(BaseModel):
-    access_token: str
-    refresh_token: str
-    csrf_token: str | None = None
+class SessionOut(BaseModel):
     user: UserOut
 
 
 class RefreshIn(BaseModel):
-    refresh_token: str
+    refresh_token: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+class RefreshOut(BaseModel):
+    ok: bool = True
 
 
 class ApiTokenCreateIn(BaseModel):

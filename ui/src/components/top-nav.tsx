@@ -1,14 +1,14 @@
 import { FormEvent, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
-import { clearTokens, getRefreshToken } from "@/lib/auth";
+import { apiFetch } from "@/lib/api";
+import { markSessionAnonymous } from "@/lib/auth";
 import { useDashboardWorkspace } from "@/lib/dashboard-workspace";
 import { ThemeToggle } from "@/components/theme-toggle";
 
 export function TopNav() {
   const location = useLocation();
   const navigate = useNavigate();
-  const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "/api";
   const {
     canCreateProject,
     createProject,
@@ -28,27 +28,19 @@ export function TopNav() {
   const [showCreateProjectForm, setShowCreateProjectForm] = useState(false);
 
   async function logout() {
-    const refreshToken = getRefreshToken();
-    if (refreshToken) {
-      try {
-        await fetch(`${API_BASE}/auth/logout`, {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ refresh_token: refreshToken }),
-        });
-      } catch {
-        // Local cleanup still proceeds.
-      }
+    try {
+      await apiFetch("/auth/logout", { method: "POST" });
+    } catch {
+      // Local cleanup still proceeds.
     }
-    clearTokens();
+    markSessionAnonymous();
     navigate("/");
   }
 
   const navItems = [
     { to: "/projects", label: "Dashboard", match: "/projects" },
     { to: "/account", label: "Account", match: "/account" },
-    { to: "/settings/users", label: "Settings", match: "/settings" },
+    { to: "/settings/iam", label: "Settings", match: "/settings" },
   ];
   const showDashboardControls = inProjectArea;
 
@@ -110,6 +102,7 @@ export function TopNav() {
               ) : null}
             </div>
             <select
+              aria-label="Select active project"
               className="min-w-[220px] rounded-xl border border-slate-300 bg-white/90 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
               disabled={!projectsReady || projects.length === 0}
               value={selectedProject}
@@ -167,7 +160,7 @@ export function TopNav() {
 
         <div className="app-nav-actions">
           <ThemeToggle />
-          <button className="app-logout-btn" onClick={logout}>
+          <button className="app-logout-btn" onClick={logout} type="button">
             Logout
           </button>
         </div>

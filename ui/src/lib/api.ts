@@ -1,4 +1,4 @@
-import { clearTokens, getAccessToken, getRefreshToken, setTokens } from "@/lib/auth";
+import { markSessionAnonymous, refreshSession } from "@/lib/auth";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "/api";
 const CSRF_COOKIE_NAME = (import.meta.env.VITE_CSRF_COOKIE_NAME as string) || "share_sentinel_csrf";
@@ -13,15 +13,30 @@ function loginRedirectPath(): string {
   return `/?next=${encodeURIComponent(next)}`;
 }
 
-function toErrorMessage(body: string, status: number): string {
-  if (!body) return `Request failed (${status})`;
+function appendRequestId(message: string, requestId: string | null): string {
+  if (!requestId || message.includes(requestId)) {
+    return message;
+  }
+  return `${message} (Request ID: ${requestId})`;
+}
+
+function toErrorMessage(body: string, status: number, requestId: string | null = null): string {
+  if (!body) return appendRequestId(`Request failed (${status}).`, requestId);
+  if (body.trimStart().startsWith("<")) {
+    return appendRequestId("API returned HTML instead of JSON. Check API routing and service health.", requestId);
+  }
   try {
     const parsed = JSON.parse(body);
-    if (typeof parsed?.detail === "string") return parsed.detail;
+    if (typeof parsed?.detail === "string") return appendRequestId(parsed.detail, requestId);
   } catch {
     // fall through
   }
-  return body;
+  return appendRequestId(body, requestId);
+}
+
+export async function responseErrorMessage(response: Pick<Response, "status" | "text" | "headers">): Promise<string> {
+  const body = await response.text();
+  return toErrorMessage(body, response.status, response.headers.get("x-request-id"));
 }
 
 function parseResponseText(contentType: string, body: string) {
@@ -49,35 +64,14 @@ function contentDispositionFilename(response: Response): string | null {
   return null;
 }
 
-async function refreshAccessToken(): Promise<string | null> {
-  const refreshToken = getRefreshToken();
-  if (!refreshToken) return null;
-
-  const response = await fetch(`${API_BASE}/auth/refresh`, {
-    method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refresh_token: refreshToken }),
-  });
-  if (!response.ok) {
-    return null;
-  }
-
-  const data = await response.json();
-  const access = data.access_token as string;
-  const nextRefresh = (data.refresh_token as string | undefined) || refreshToken;
-  setTokens(access, nextRefresh);
-  return access;
+async function refreshAccessToken(): Promise<boolean> {
+  return refreshSession();
 }
 
 export async function apiFetch(path: string, init: RequestInit = {}, allowRefresh = true) {
-  const token = getAccessToken();
   const headers = new Headers(init.headers || {});
   const method = (init.method || "GET").toUpperCase();
 
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
   const shouldSetJsonContentType =
     !!init.body &&
     !headers.has("Content-Type") &&
@@ -101,13 +95,12 @@ export async function apiFetch(path: string, init: RequestInit = {}, allowRefres
         return apiFetch(path, init, false);
       }
     }
-    clearTokens();
+    markSessionAnonymous();
     window.location.href = loginRedirectPath();
     throw new Error("Unauthorized");
   }
   if (!response.ok) {
-    const body = await response.text();
-    throw new Error(toErrorMessage(body, response.status));
+    throw new Error(await responseErrorMessage(response));
   }
 
   const body = await response.text();
@@ -119,13 +112,9 @@ export async function apiFetchBlob(
   init: RequestInit = {},
   allowRefresh = true,
 ): Promise<{ blob: Blob; filename: string | null; contentType: string }> {
-  const token = getAccessToken();
   const headers = new Headers(init.headers || {});
   const method = (init.method || "GET").toUpperCase();
 
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
   if (UNSAFE_METHODS.has(method) && !headers.has(CSRF_HEADER_NAME)) {
     const csrfToken = getCookieValue(CSRF_COOKIE_NAME);
     if (csrfToken) {
@@ -141,13 +130,12 @@ export async function apiFetchBlob(
         return apiFetchBlob(path, init, false);
       }
     }
-    clearTokens();
+    markSessionAnonymous();
     window.location.href = loginRedirectPath();
     throw new Error("Unauthorized");
   }
   if (!response.ok) {
-    const body = await response.text();
-    throw new Error(toErrorMessage(body, response.status));
+    throw new Error(await responseErrorMessage(response));
   }
 
   return {
@@ -192,16 +180,12 @@ export async function apiUploadFormData(
   const method = options.method || "POST";
 
   async function uploadOnce(allowRefresh: boolean): Promise<unknown> {
-    const token = getAccessToken();
     const csrfToken = UNSAFE_METHODS.has(method) ? getCookieValue(CSRF_COOKIE_NAME) : null;
 
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open(method, `${API_BASE}${path}`);
       xhr.withCredentials = true;
-      if (token) {
-        xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-      }
       if (csrfToken) {
         xhr.setRequestHeader(CSRF_HEADER_NAME, csrfToken);
       }
@@ -224,14 +208,14 @@ export async function apiUploadFormData(
               return;
             }
           }
-          clearTokens();
+          markSessionAnonymous();
           window.location.href = loginRedirectPath();
           reject(new Error("Unauthorized"));
           return;
         }
 
         if (xhr.status < 200 || xhr.status >= 300) {
-          reject(new Error(toErrorMessage(xhr.responseText || "", xhr.status)));
+          reject(new Error(toErrorMessage(xhr.responseText || "", xhr.status, xhr.getResponseHeader("x-request-id"))));
           return;
         }
 

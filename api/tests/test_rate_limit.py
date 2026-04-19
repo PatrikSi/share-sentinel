@@ -76,3 +76,4 @@ def test_rate_limiter_rejects_when_count_exceeds_limit(monkeypatch) -> None:
     with pytest.raises(HTTPException) as exc:
         limiter.check(_request(), "auth_login", limit=10, window_seconds=60, actor_key="u", fail_open=False)
     assert exc.value.status_code == 429
+    assert exc.value.headers == {"Retry-After": "60"}

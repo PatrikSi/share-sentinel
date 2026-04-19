@@ -32,22 +32,15 @@ Creates a new unapproved user when self-registration is enabled.
 
 ### `POST /auth/login`
 
-Returns:
-
-- access token
-- refresh token
-- CSRF token
-- current user payload
-
-Also sets auth cookies for cookie-based sessions.
+Starts a browser session by setting auth, refresh, and CSRF cookies, then returns the current user payload.
 
 ### `POST /auth/refresh`
 
-Rotates the refresh token and returns a fresh access token.
+Rotates the refresh cookie and renews the access cookie. Browser clients use the refresh cookie; request-body refresh tokens are legacy compatibility input only.
 
 ### `POST /auth/logout`
 
-Clears auth cookies and optionally revokes the supplied refresh token.
+Clears auth cookies and revokes the active refresh session when a refresh cookie or refresh token is present.
 
 ### `POST /auth/logout-all`
 

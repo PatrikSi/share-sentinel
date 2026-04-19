@@ -21,6 +21,9 @@ class _ExecuteResult:
     def first(self):
         return self._row
 
+    def scalar_one_or_none(self):
+        return self._row
+
 
 @dataclass
 class _FakeDb:
@@ -42,12 +45,30 @@ class _FakeDb:
         self.commit_count += 1
 
 
-def _request() -> Request:
+def _settings(**overrides):
+    values = {
+        "auth_cookie_name": "share_sentinel_session",
+        "auth_csrf_cookie_name": "share_sentinel_csrf",
+        "auth_csrf_header_name": "x-csrf-token",
+        "auth_refresh_cookie_name": "share_sentinel_refresh",
+        "refresh_token_days": 14,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _request(cookie_header: str | None = None, csrf_header: str | None = None) -> Request:
+    settings = auth_router.get_settings()
+    headers: list[tuple[bytes, bytes]] = []
+    if cookie_header is not None:
+        headers.append((b"cookie", cookie_header.encode("utf-8")))
+    if csrf_header is not None:
+        headers.append((settings.auth_csrf_header_name.encode("utf-8"), csrf_header.encode("utf-8")))
     scope = {
         "type": "http",
         "method": "POST",
         "path": "/auth/refresh",
-        "headers": [],
+        "headers": headers,
         "query_string": b"",
         "client": ("127.0.0.1", 5000),
         "scheme": "http",
@@ -96,21 +117,177 @@ def test_refresh_allows_single_use_and_rejects_replay(monkeypatch) -> None:
     monkeypatch.setattr(auth_router, "make_access_token", lambda *_args, **_kwargs: "new-access")
     monkeypatch.setattr(auth_router, "generate_csrf_token", lambda: "csrf-token")
     monkeypatch.setattr(auth_router, "set_auth_cookies", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router, "set_refresh_cookie", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(auth_router, "write_audit_event", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(auth_router, "get_settings", lambda: SimpleNamespace(refresh_token_days=14))
+    monkeypatch.setattr(auth_router, "get_settings", lambda: _settings())
 
     payload = RefreshIn(refresh_token="old-refresh")
-    first = auth_router.refresh(payload, _request(), Response(), fake_db)
-    assert first["access_token"] == "new-access"
-    assert first["refresh_token"] == "new-refresh"
-    assert first["csrf_token"] == "csrf-token"
+    first = auth_router.refresh(_request(), Response(), payload, fake_db)
+    assert first.ok is True
     assert fake_db.commit_count == 1
     assert len(fake_db.added) == 1
     assert isinstance(fake_db.added[0], RefreshToken)
 
     with pytest.raises(HTTPException) as exc:
-        auth_router.refresh(payload, _request(), Response(), fake_db)
+        auth_router.refresh(_request(), Response(), payload, fake_db)
     assert exc.value.status_code == 401
     assert fake_db.commit_count == 1
     assert any(call["actor_key"] == "refresh" for call in rate_limit_calls)
     assert any(call["actor_key"] == "refresh:hash:old-refresh" for call in rate_limit_calls)
+
+
+def test_refresh_accepts_refresh_cookie_when_csrf_matches(monkeypatch) -> None:
+    user_id = uuid.uuid4()
+    consumed = SimpleNamespace(id=uuid.uuid4(), user_id=user_id)
+    fake_db = _FakeDb()
+    fake_db.get_map[(User, user_id)] = SimpleNamespace(id=user_id, is_active=True, is_approved=True)
+    monkeypatch.setattr(auth_router, "get_settings", lambda: _settings())
+    settings = auth_router.get_settings()
+    cookie_header = (
+        f"{settings.auth_refresh_cookie_name}=cookie-refresh; "
+        f"{settings.auth_csrf_cookie_name}=csrf-token"
+    )
+
+    monkeypatch.setattr(auth_router, "_consume_refresh_token", lambda *_args, **_kwargs: consumed)
+    monkeypatch.setattr(auth_router, "hash_external_token", lambda value: f"hash:{value}")
+    monkeypatch.setattr(auth_router, "random_token", lambda *_args, **_kwargs: "next-refresh")
+    monkeypatch.setattr(auth_router, "make_access_token", lambda *_args, **_kwargs: "next-access")
+    monkeypatch.setattr(auth_router, "generate_csrf_token", lambda: "next-csrf")
+    monkeypatch.setattr(auth_router, "set_auth_cookies", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router, "set_refresh_cookie", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router, "write_audit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router.rate_limiter, "check", lambda *_args, **_kwargs: None)
+
+    result = auth_router.refresh(
+        _request(cookie_header=cookie_header, csrf_header="csrf-token"),
+        Response(),
+        None,
+        fake_db,
+    )
+
+    assert result.ok is True
+
+
+def test_refresh_requires_csrf_when_using_refresh_cookie() -> None:
+    settings = auth_router.get_settings()
+    cookie_header = (
+        f"{settings.auth_refresh_cookie_name}=cookie-refresh; "
+        f"{settings.auth_csrf_cookie_name}=csrf-token"
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        auth_router.refresh(_request(cookie_header=cookie_header), Response(), None, _FakeDb())
+
+    assert exc.value.status_code == 403
+
+
+def test_logout_requires_csrf_when_auth_cookie_present() -> None:
+    auth_router.get_settings.cache_clear()
+    settings = auth_router.get_settings()
+    cookie_header = f"{settings.auth_cookie_name}=session-token; {settings.auth_csrf_cookie_name}=csrf-token"
+
+    with pytest.raises(HTTPException) as exc:
+        auth_router.logout(_request(cookie_header=cookie_header), Response(), None, _FakeDb())
+
+    assert exc.value.status_code == 403
+
+
+def test_logout_allows_cookie_session_when_csrf_matches() -> None:
+    auth_router.get_settings.cache_clear()
+    settings = auth_router.get_settings()
+    cookie_header = f"{settings.auth_cookie_name}=session-token; {settings.auth_csrf_cookie_name}=csrf-token"
+
+    result = auth_router.logout(
+        _request(cookie_header=cookie_header, csrf_header="csrf-token"),
+        Response(),
+        None,
+        _FakeDb(),
+    )
+
+    assert result == {"ok": True}
+
+
+def test_refresh_requires_csrf_when_refresh_cookie_present(monkeypatch) -> None:
+    monkeypatch.setattr(auth_router, "get_settings", lambda: _settings())
+    settings = auth_router.get_settings()
+    cookie_header = (
+        f"{settings.auth_refresh_cookie_name}=cookie-refresh; "
+        f"{settings.auth_csrf_cookie_name}=csrf-token"
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        auth_router.refresh(_request(cookie_header=cookie_header), Response(), None, _FakeDb())
+
+    assert exc.value.status_code == 403
+
+
+def test_refresh_prefers_cookie_token_over_body_token(monkeypatch) -> None:
+    captured: list[str] = []
+    user_id = uuid.uuid4()
+    consumed = SimpleNamespace(id=uuid.uuid4(), user_id=user_id)
+    fake_db = _FakeDb()
+    monkeypatch.setattr(auth_router, "get_settings", lambda: _settings())
+    settings = auth_router.get_settings()
+    cookie_header = (
+        f"{settings.auth_refresh_cookie_name}=cookie-refresh; "
+        f"{settings.auth_csrf_cookie_name}=csrf-token"
+    )
+    fake_db.get_map[(User, user_id)] = SimpleNamespace(id=user_id, is_active=True, is_approved=True)
+
+    monkeypatch.setattr(auth_router, "_consume_refresh_token", lambda *_args, **_kwargs: consumed)
+    monkeypatch.setattr(auth_router, "hash_external_token", lambda value: captured.append(value) or f"hash:{value}")
+    monkeypatch.setattr(auth_router, "random_token", lambda *_args, **_kwargs: "next-refresh")
+    monkeypatch.setattr(auth_router, "make_access_token", lambda *_args, **_kwargs: "next-access")
+    monkeypatch.setattr(auth_router, "generate_csrf_token", lambda: "next-csrf")
+    monkeypatch.setattr(auth_router, "set_auth_cookies", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router, "set_refresh_cookie", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router, "write_audit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router.rate_limiter, "check", lambda *_args, **_kwargs: None)
+
+    auth_router.refresh(
+        _request(cookie_header=cookie_header, csrf_header="csrf-token"),
+        Response(),
+        RefreshIn(refresh_token="body-refresh"),
+        fake_db,
+    )
+
+    assert captured[0] == "cookie-refresh"
+
+
+def test_logout_requires_csrf_when_refresh_cookie_present(monkeypatch) -> None:
+    monkeypatch.setattr(auth_router, "get_settings", lambda: _settings())
+    settings = auth_router.get_settings()
+    cookie_header = (
+        f"{settings.auth_refresh_cookie_name}=cookie-refresh; "
+        f"{settings.auth_csrf_cookie_name}=csrf-token"
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        auth_router.logout(_request(cookie_header=cookie_header), Response(), None, _FakeDb())
+
+    assert exc.value.status_code == 403
+
+
+def test_logout_revokes_refresh_cookie_when_present(monkeypatch) -> None:
+    monkeypatch.setattr(auth_router, "get_settings", lambda: _settings())
+    settings = auth_router.get_settings()
+    refresh_token = SimpleNamespace(id=uuid.uuid4(), user_id=uuid.uuid4(), revoked_at=None)
+    fake_db = _FakeDb(execute_row=refresh_token)
+    cookie_header = (
+        f"{settings.auth_refresh_cookie_name}=refresh-cookie; "
+        f"{settings.auth_csrf_cookie_name}=csrf-token"
+    )
+
+    monkeypatch.setattr(auth_router, "write_audit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router, "hash_external_token", lambda value: f"hash:{value}")
+
+    result = auth_router.logout(
+        _request(cookie_header=cookie_header, csrf_header="csrf-token"),
+        Response(),
+        None,
+        fake_db,
+    )
+
+    assert result == {"ok": True}
+    assert refresh_token.revoked_at is not None
+    assert fake_db.commit_count == 1

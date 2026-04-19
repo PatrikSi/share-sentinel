@@ -7,6 +7,7 @@ from app.security import (
     hash_external_token,
     hash_password,
     set_auth_cookies,
+    set_refresh_cookie,
     validate_password_strength,
     verify_password,
 )
@@ -51,10 +52,10 @@ def test_auth_cookie_helpers() -> None:
     assert csrf_token
 
     set_auth_cookies(response, "access-token", csrf_token)
+    set_refresh_cookie(response, "refresh-token")
+    clear_auth_cookies(response)
     raw_headers = [value.decode("latin-1") for key, value in response.raw_headers if key.lower() == b"set-cookie"]
     assert any("share_sentinel_session=" in header for header in raw_headers)
     assert any("share_sentinel_csrf=" in header for header in raw_headers)
-
-    clear_auth_cookies(response)
-    raw_headers = [value.decode("latin-1") for key, value in response.raw_headers if key.lower() == b"set-cookie"]
+    assert any("share_sentinel_refresh=" in header for header in raw_headers)
     assert any("Max-Age=0" in header for header in raw_headers)

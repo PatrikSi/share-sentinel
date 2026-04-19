@@ -49,7 +49,11 @@ class RateLimiter:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="rate limit backend unavailable")
 
         if count > limit:
-            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="rate limit exceeded")
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="rate limit exceeded",
+                headers={"Retry-After": str(window_seconds)},
+            )
 
 
 def _resolve_rate_limit_ip(request: Request) -> str:

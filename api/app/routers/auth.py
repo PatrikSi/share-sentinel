@@ -8,7 +8,18 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
-from app.deps import AuthContext, get_auth_context, get_current_user, get_project_role, request_meta, require_token_scopes, resolve_client_ip
+from app.deps import (
+    _enforce_csrf_if_needed,
+    AuthContext,
+    get_auth_context,
+    get_current_user,
+    get_project_role,
+    require_session_user,
+    require_sysadmin,
+    request_meta,
+    require_token_scopes,
+    resolve_client_ip,
+)
 from app.enums import ProjectRole
 from app.models import ApiToken, RefreshToken, User
 from app.password_policy import password_policy_kwargs
@@ -19,12 +30,13 @@ from app.schemas import (
     ApiTokenOut,
     ChangePasswordIn,
     LoginIn,
+    RefreshOut,
     RefreshIn,
     RegisterIn,
     RegistrationSettingsOut,
     SecuritySettingsOut,
+    SessionOut,
     ThemeUpdateIn,
-    TokenPairOut,
     UserOut,
 )
 from app.security import (
@@ -35,6 +47,7 @@ from app.security import (
     make_access_token,
     random_token,
     set_auth_cookies,
+    set_refresh_cookie,
     validate_password_strength,
     verify_password,
 )
@@ -60,10 +73,7 @@ def registration_settings():
 
 
 @router.get("/security-settings", response_model=SecuritySettingsOut)
-def security_settings(user: User = Depends(get_current_user)):
-    if not user.is_sysadmin:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="sysadmin required")
-
+def security_settings(_admin: User = Depends(require_sysadmin)):
     settings = get_settings()
     return SecuritySettingsOut(
         allow_self_registration=settings.allow_self_registration,
@@ -142,7 +152,7 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     return _to_user_out(user)
 
 
-@router.post("/login", response_model=TokenPairOut)
+@router.post("/login", response_model=SessionOut)
 def login(payload: LoginIn, request: Request, response: Response, db: Session = Depends(get_db)):
     email = payload.email.lower()
     client_ip = resolve_client_ip(request)
@@ -215,6 +225,7 @@ def login(payload: LoginIn, request: Request, response: Response, db: Session = 
         expires_at=datetime.now(tz=UTC) + timedelta(days=settings.refresh_token_days),
     )
     db.add(refresh)
+    set_refresh_cookie(response, refresh_raw)
 
     write_audit_event(
         db,
@@ -226,17 +237,15 @@ def login(payload: LoginIn, request: Request, response: Response, db: Session = 
     )
     db.commit()
 
-    return TokenPairOut(
-        access_token=access_token,
-        refresh_token=refresh_raw,
-        csrf_token=csrf_token,
-        user=_to_user_out(user),
-    )
+    return SessionOut(user=_to_user_out(user))
 
 
-@router.post("/refresh")
-def refresh(payload: RefreshIn, request: Request, response: Response, db: Session = Depends(get_db)):
-    token_hash = hash_external_token(payload.refresh_token)
+@router.post("/refresh", response_model=RefreshOut)
+def refresh(request: Request, response: Response, payload: RefreshIn | None = None, db: Session = Depends(get_db)):
+    refresh_raw, refresh_source = _resolve_refresh_token_raw(request, payload)
+    if refresh_source == "cookie":
+        _enforce_csrf_if_needed(request)
+    token_hash = hash_external_token(refresh_raw)
     # Apply both per-client and per-token throttles. Per-token alone is bypassable with random tokens.
     rate_limiter.check(
         request,
@@ -277,6 +286,7 @@ def refresh(payload: RefreshIn, request: Request, response: Response, db: Sessio
     access_token = make_access_token(str(refresh_token.user_id))
     csrf_token = generate_csrf_token()
     set_auth_cookies(response, access_token, csrf_token)
+    set_refresh_cookie(response, new_refresh_raw)
     write_audit_event(
         db,
         action="TOKEN_REFRESHED",
@@ -286,13 +296,17 @@ def refresh(payload: RefreshIn, request: Request, response: Response, db: Sessio
         metadata=request_meta(request),
     )
     db.commit()
-    return {"access_token": access_token, "refresh_token": new_refresh_raw, "csrf_token": csrf_token}
+    return RefreshOut()
 
 
 @router.post("/logout")
 def logout(request: Request, response: Response, payload: RefreshIn | None = None, db: Session = Depends(get_db)):
-    if payload is not None:
-        token_hash = hash_external_token(payload.refresh_token)
+    settings = get_settings()
+    if request.cookies.get(settings.auth_cookie_name) or request.cookies.get(settings.auth_refresh_cookie_name):
+        _enforce_csrf_if_needed(request)
+    refresh_raw, _ = _resolve_refresh_token_raw(request, payload, raise_when_missing=False)
+    if refresh_raw:
+        token_hash = hash_external_token(refresh_raw)
         stmt = select(RefreshToken).where(RefreshToken.token_hash == token_hash, RefreshToken.revoked_at.is_(None))
         refresh_token = db.execute(stmt).scalar_one_or_none()
         if refresh_token is not None:
@@ -312,7 +326,7 @@ def logout(request: Request, response: Response, payload: RefreshIn | None = Non
 
 
 @router.post("/logout-all")
-def logout_all(request: Request, response: Response, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def logout_all(request: Request, response: Response, db: Session = Depends(get_db), user: User = Depends(require_session_user)):
     stmt = select(RefreshToken).where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
     active_tokens = db.execute(stmt).scalars().all()
     revoked = 0
@@ -341,7 +355,7 @@ def me(user: User = Depends(get_current_user)):
 
 
 @router.patch("/me/theme", response_model=UserOut)
-def update_theme(payload: ThemeUpdateIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def update_theme(payload: ThemeUpdateIn, db: Session = Depends(get_db), user: User = Depends(require_session_user)):
     user.ui_theme = payload.ui_theme
     db.add(user)
     db.commit()
@@ -354,7 +368,7 @@ def change_password(
     payload: ChangePasswordIn,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_session_user),
 ):
     if not verify_password(payload.current_password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="current password is incorrect")
@@ -544,6 +558,20 @@ def _enforce_scope_policy_for_owner(owner: User, role: ProjectRole, scopes: list
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"non-sysadmin token scopes must match role defaults: {', '.join(disallowed)}",
         )
+
+
+def _resolve_refresh_token_raw(request: Request, payload: RefreshIn | None, *, raise_when_missing: bool = True) -> tuple[str | None, str | None]:
+    settings = get_settings()
+    refresh_cookie = request.cookies.get(settings.auth_refresh_cookie_name)
+    if refresh_cookie:
+        return refresh_cookie, "cookie"
+
+    if payload is not None and payload.refresh_token:
+        return payload.refresh_token, "body"
+
+    if raise_when_missing:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid refresh token")
+    return None, None
 
 
 def _consume_refresh_token(db: Session, token_hash: str, now: datetime) -> RefreshToken | None:

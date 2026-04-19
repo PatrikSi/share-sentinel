@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from starlette.requests import Request
 
-from app.deps import get_auth_context
+from app.deps import get_auth_context, require_session_user, require_sysadmin
 from app.enums import ProjectRole
 from app.models import ProjectMember, User
 
@@ -135,3 +135,25 @@ def test_api_token_auth_accepts_membership_and_updates_last_used(monkeypatch) ->
     assert token.last_used_at is not None
     assert persisted == [(token.id, token.last_used_at)]
     assert fake_db.added == []
+
+
+def test_require_session_user_rejects_api_token_auth() -> None:
+    auth = SimpleNamespace(token_id=uuid.uuid4())
+    user = SimpleNamespace(id=uuid.uuid4(), is_sysadmin=False)
+
+    with pytest.raises(HTTPException) as exc:
+        require_session_user(auth, user)
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "user login required"
+
+
+def test_require_sysadmin_rejects_api_token_auth() -> None:
+    auth = SimpleNamespace(token_id=uuid.uuid4())
+    user = SimpleNamespace(id=uuid.uuid4(), is_sysadmin=True)
+
+    with pytest.raises(HTTPException) as exc:
+        require_sysadmin(auth, user)
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "user login required"
