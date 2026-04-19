@@ -124,3 +124,29 @@ def test_upload_artifact_raises_for_non_idempotent_create_conflict(monkeypatch, 
     except requests.HTTPError:
         return
     raise AssertionError("expected HTTPError for non-idempotent create conflict")
+
+
+def test_upload_artifact_warns_when_queue_fallback_is_used(monkeypatch, tmp_path, capsys) -> None:
+    collector = _load_collector_module()
+    artifact = tmp_path / "artifact.ndjson"
+    artifact.write_text('{"type":"run_meta"}\n', encoding="utf-8")
+
+    args = SimpleNamespace(
+        upload=True,
+        api_base="http://api",
+        project_id="project-id",
+        api_token="token-value",
+        run_name="run-name",
+        cidr=[],
+    )
+
+    create_resp = _FakeResponse(200, {})
+    upload_resp = _FakeResponse(200, {"ok": True, "queued": False})
+    responses = [create_resp, upload_resp]
+
+    monkeypatch.setattr(collector, "_post_with_retries", lambda request_fn, **_kwargs: responses.pop(0))
+
+    collector.upload_artifact(args, "run-id", str(artifact), hosts=[])
+
+    captured = capsys.readouterr()
+    assert "upload warning: artifact stored" in captured.err

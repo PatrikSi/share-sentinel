@@ -477,9 +477,11 @@ def test_scan_host_smb_reports_share_enumeration_denied_with_anonymous_hint(monk
     ok = collector.scan_host_smb("10.0.0.6", args, "run-1", writer, stats, threading.Lock())
 
     assert ok is True
-    assert stats.endpoints == 0
+    assert stats.endpoints == 1
     assert stats.resources == 0
     assert stats.errors == 1
+    endpoint_record = next(row for row in writer.records if row.get("type") == "endpoint")
+    assert endpoint_record["endpoint_key"] == "10.0.0.6:445"
     error_record = next(row for row in writer.records if row.get("type") == "error")
     assert error_record["code"] == "LIST_SHARES_DENIED"
     assert "--include-share" in error_record["hint"]
@@ -632,6 +634,98 @@ def test_scan_host_smb_handles_share_info_objects_without_get(monkeypatch) -> No
     resource = next(row for row in writer.records if row.get("type") == "resource")
     assert resource["name"] == "General"
     assert resource["remark"] == "open-share"
+
+
+def test_scan_host_smb_preserves_empty_endpoint_when_shares_are_filtered_out(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _Conn:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def getDialect(self):
+            return "768"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            return [{"shi1_netname": "Hidden$\x00", "shi1_remark": "admin\x00"}]
+
+        def logoff(self):
+            return None
+
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: _Conn())
+
+    class _Writer:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=True,
+        username="",
+        password="",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=[],
+        exclude_share=["Hidden$"],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=10,
+    )
+    writer = _Writer()
+    stats = collector.Stats()
+
+    ok = collector.scan_host_smb("10.0.0.9", args, "run-empty", writer, stats, threading.Lock())
+
+    assert ok is True
+    assert stats.endpoints == 1
+    assert stats.resources == 0
+    assert [row["type"] for row in writer.records] == ["endpoint"]
+
+
+def test_scan_host_nfs_preserves_empty_endpoint_when_no_exports_found(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _SocketConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class _Writer:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    monkeypatch.setattr(collector.socket, "create_connection", lambda *_args, **_kwargs: _SocketConn())
+    monkeypatch.setattr(collector, "_discover_nfs_exports", lambda *_args, **_kwargs: ([], None))
+
+    args = SimpleNamespace(timeout=1.0, domain="")
+    writer = _Writer()
+    stats = collector.Stats()
+
+    ok = collector.scan_host_nfs("10.0.0.10", args, "run-nfs-empty", writer, stats, threading.Lock())
+
+    assert ok is True
+    assert stats.endpoints == 1
+    assert stats.resources == 0
+    assert [row["type"] for row in writer.records] == ["endpoint"]
 
 
 def test_scan_host_smb_auth_failure_includes_actionable_hint(monkeypatch) -> None:

@@ -4,7 +4,6 @@ import logging
 import os
 import socket
 import sys
-import tempfile
 import time
 import uuid
 from datetime import UTC, datetime
@@ -51,6 +50,7 @@ PROGRESS_EVERY_LINES = _read_int_env("INGEST_PROGRESS_EVERY_LINES", 2000, min_va
 RECOVERY_SCAN_SECONDS = _read_int_env("INGEST_RECOVERY_SCAN_SECONDS", 8, min_value=1)
 PENDING_IDLE_MS = _read_int_env("INGEST_PENDING_IDLE_MS", 60000, min_value=1)
 JSON_COMPAT_MAX_BYTES = _read_int_env("INGEST_JSON_COMPAT_MAX_BYTES", 50 * 1024 * 1024, min_value=1024)
+STALE_INGESTING_SECONDS = _read_int_env("INGEST_STALE_RUN_SECONDS", 300, min_value=30)
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -229,7 +229,7 @@ def update_run_status(
     summary: dict[str, Any],
     last_error: str | None = None,
 ):
-    ingest_progress = {"line_offset": line_offset}
+    ingest_progress = {"line_offset": line_offset, "heartbeat_at": now_iso()}
     if last_error:
         ingest_progress["last_error"] = last_error
     conn.execute(
@@ -618,42 +618,66 @@ def _iter_records_from_streamable_json_file(fp, run_id: str):
         raise ValueError("unsupported JSON artifact format")
 
 
-def _materialize_json_artifact(body, gzip_input: bool) -> str:
-    fd, temp_path = tempfile.mkstemp(prefix="share-sentinel-json-", suffix=".json")
-    os.close(fd)
+def _read_json_compat_bytes(body, gzip_input: bool, max_bytes: int) -> bytes:
+    reader = gzip.GzipFile(fileobj=body) if gzip_input else body
+    total = 0
+    buffer = bytearray()
     try:
-        with open(temp_path, "wb") as temp_fp:
-            if gzip_input:
-                with gzip.GzipFile(fileobj=body) as gzip_reader:
-                    while True:
-                        chunk = gzip_reader.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        temp_fp.write(chunk)
-            else:
-                while True:
-                    chunk = body.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    temp_fp.write(chunk)
-        return temp_path
-    except Exception:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-        raise
+        while True:
+            chunk = reader.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("JSON artifact exceeds non-streamable compatibility limit")
+            buffer.extend(chunk)
+    finally:
+        if gzip_input:
+            reader.close()
+
+    return bytes(buffer)
 
 
-def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
+def _public_ingest_error(exc: BaseException) -> str:
+    if isinstance(exc, psycopg.Error):
+        return "database operation failed during ingest"
+    if isinstance(exc, OSError):
+        return "artifact storage read failed during ingest"
+    if isinstance(exc, TypeError):
+        return "artifact contained an unexpected record shape"
+    if isinstance(exc, ValueError):
+        detail = str(exc).strip()
+        if detail in {
+            "missing artifact key",
+            "unsupported JSON artifact format",
+            "JSON artifact exceeds non-streamable compatibility limit",
+        }:
+            return detail
+        return "artifact validation failed during ingest"
+    return "unexpected ingest failure"
+
+
+def discover_recoverable_runs(limit: int = 8) -> list[dict[str, str]]:
     with psycopg.connect(DATABASE_URL) as conn:
         rows = conn.execute(
             """
             SELECT id::text, project_id::text, artifact_key
             FROM scan_runs
-            WHERE status = 'UPLOADED' AND artifact_key IS NOT NULL
+            WHERE artifact_key IS NOT NULL
+              AND (
+                  status = 'UPLOADED'
+                  OR (
+                      status = 'INGESTING'
+                      AND COALESCE(
+                          NULLIF(ingest_progress->>'heartbeat_at', '')::timestamptz,
+                          created_at
+                      ) <= NOW() - (%s * INTERVAL '1 second')
+                  )
+              )
             ORDER BY created_at ASC
             LIMIT %s
             """,
-            (limit,),
+            (STALE_INGESTING_SECONDS, limit),
         ).fetchall()
     return [
         {
@@ -663,6 +687,10 @@ def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
         }
         for row in rows
     ]
+
+
+def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
+    return discover_recoverable_runs(limit=limit)
 
 
 def process_job(fields: dict[str, str]) -> None:
@@ -847,31 +875,34 @@ def process_job(fields: dict[str, str]) -> None:
             json_records: list[dict[str, Any]] | None = None
             content_type = str(artifact_content_type or "").lower()
             json_candidate = _is_json_artifact(artifact_key, content_type)
-            json_temp_path: str | None = None
-            body = open_artifact_stream(artifact_key)
+            gzip_input = artifact_key.endswith(".gz")
 
-            try:
-                if json_candidate:
-                    json_temp_path = _materialize_json_artifact(body, gzip_input=artifact_key.endswith(".gz"))
-                    try:
-                        with open(json_temp_path, "rb") as json_fp:
-                            process_record_iter(_iter_records_from_streamable_json_file(json_fp, run_id))
-                    except ValueError:
-                        if os.path.getsize(json_temp_path) > JSON_COMPAT_MAX_BYTES:
-                            raise ValueError("JSON artifact exceeds non-streamable compatibility limit")
-                        with open(json_temp_path, "rb") as fallback_fp:
-                            raw_json = fallback_fp.read()
-                        json_records = _load_json_records_from_bytes(raw_json, run_id)
-                        if json_records is None:
-                            raise ValueError("unsupported JSON artifact format")
-                elif artifact_key.endswith(".gz"):
-                    reader = gzip.GzipFile(fileobj=body)
-                else:
-                    reader = body
+            if json_candidate:
+                try:
+                    with open_artifact_stream(artifact_key) as body:
+                        if gzip_input:
+                            with gzip.GzipFile(fileobj=body) as json_reader:
+                                process_record_iter(_iter_records_from_streamable_json_file(json_reader, run_id))
+                        else:
+                            process_record_iter(_iter_records_from_streamable_json_file(body, run_id))
+                except ValueError:
+                    with open_artifact_stream(artifact_key) as compat_body:
+                        raw_json = _read_json_compat_bytes(
+                            compat_body,
+                            gzip_input=gzip_input,
+                            max_bytes=JSON_COMPAT_MAX_BYTES,
+                        )
+                    json_records = _load_json_records_from_bytes(raw_json, run_id)
+                    if json_records is None:
+                        raise ValueError("unsupported JSON artifact format")
+            else:
+                body = open_artifact_stream(artifact_key)
+                try:
+                    if gzip_input:
+                        reader = gzip.GzipFile(fileobj=body)
+                    else:
+                        reader = body
 
-                if json_records is not None:
-                    process_record_iter(json_records)
-                elif not json_candidate:
                     current_line = 0
                     for raw_line in reader:
                         current_line += 1
@@ -903,10 +934,11 @@ def process_job(fields: dict[str, str]) -> None:
                             conn.commit()
                             last_line_offset = line_offset
                             last_counts = counts.copy()
-            finally:
-                body.close()
-                if json_temp_path and os.path.exists(json_temp_path):
-                    os.unlink(json_temp_path)
+                finally:
+                    body.close()
+
+            if json_records is not None:
+                process_record_iter(json_records)
 
             flush_item_batch(conn, item_batch)
             flush_error_batch(conn, error_batch)
@@ -925,12 +957,13 @@ def process_job(fields: dict[str, str]) -> None:
             last_counts = counts.copy()
         except INGEST_OPERATION_EXCEPTIONS as exc:
             logger.exception("job failed run_id=%s", run_id)
+            public_error = _public_ingest_error(exc)
             try:
                 conn.rollback()
             except psycopg.Error:
                 logger.exception("failed to rollback aborted ingest transaction run_id=%s", run_id)
             try:
-                update_run_status(conn, run_id, "FAILED", last_line_offset, last_counts, last_error=str(exc))
+                update_run_status(conn, run_id, "FAILED", last_line_offset, last_counts, last_error=public_error)
                 if project_id:
                     write_audit(
                         conn,
@@ -938,7 +971,7 @@ def process_job(fields: dict[str, str]) -> None:
                         "INGEST_FAILED",
                         "scan_run",
                         run_id,
-                        {"worker": CONSUMER_NAME, "error": str(exc)},
+                        {"worker": CONSUMER_NAME, "error": public_error},
                     )
                 conn.commit()
             except psycopg.Error:
@@ -1036,7 +1069,7 @@ def main() -> int:
                 time.sleep(1)
 
         if time.time() - last_recovery_scan >= RECOVERY_SCAN_SECONDS:
-            for recovered in discover_uploaded_runs(limit=5):
+            for recovered in discover_recoverable_runs(limit=5):
                 try:
                     process_job(recovered)
                 except STREAM_MESSAGE_RETRYABLE_EXCEPTIONS:

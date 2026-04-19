@@ -1,6 +1,8 @@
+import gzip
 import io
 import json
 from pathlib import Path
+import pytest
 import sys
 import uuid
 
@@ -54,6 +56,40 @@ def test_is_json_artifact_supports_json_and_json_gz() -> None:
     assert main._is_json_artifact("artifact.json", "application/json") is True
     assert main._is_json_artifact("artifact.json.gz", "application/gzip") is True
     assert main._is_json_artifact("artifact.ndjson", "application/x-ndjson") is False
+
+
+def test_read_json_compat_bytes_rejects_payloads_over_limit() -> None:
+    with pytest.raises(ValueError, match="compatibility limit"):
+        main._read_json_compat_bytes(io.BytesIO(b"x" * 11), gzip_input=False, max_bytes=10)
+
+
+def test_public_ingest_error_redacts_internal_failure_types() -> None:
+    assert main._public_ingest_error(ValueError("unsupported JSON artifact format")) == "unsupported JSON artifact format"
+    assert main._public_ingest_error(TypeError("bad shape")) == "artifact contained an unexpected record shape"
+    assert main._public_ingest_error(RuntimeError("oops")) == "unexpected ingest failure"
+
+
+def test_update_run_status_persists_heartbeat_timestamp() -> None:
+    captured: dict[str, object] = {}
+
+    class _Conn:
+        def execute(self, query, params):
+            captured["query"] = query
+            captured["params"] = params
+
+    main.update_run_status(_Conn(), "run-1", "INGESTING", 12, {"items": 3}, last_error="broken")
+
+    ingest_progress = json.loads(captured["params"][1])
+    assert ingest_progress["line_offset"] == 12
+    assert ingest_progress["last_error"] == "broken"
+    assert "heartbeat_at" in ingest_progress
+
+
+def test_read_json_compat_bytes_rejects_gzip_payloads_over_limit() -> None:
+    payload = gzip.compress(b'{"hello":"' + (b"a" * 32) + b'"}')
+
+    with pytest.raises(ValueError, match="JSON artifact exceeds non-streamable compatibility limit"):
+        main._read_json_compat_bytes(io.BytesIO(payload), gzip_input=True, max_bytes=16)
 
 
 def test_parse_offset_returns_zero_for_non_numeric_values() -> None:
@@ -241,6 +277,20 @@ def test_records_from_compact_json_includes_run_meta_issue_summary_and_run_end()
     assert run_end["stats"]["errors"] == 3
 
 
+def test_read_json_compat_bytes_rejects_oversized_input() -> None:
+    try:
+        main._read_json_compat_bytes(io.BytesIO(b"abcdef"), gzip_input=False, max_bytes=5)
+    except ValueError as exc:
+        assert str(exc) == "JSON artifact exceeds non-streamable compatibility limit"
+    else:
+        raise AssertionError("expected compatibility limit failure")
+
+
+def test_public_ingest_error_redacts_storage_and_database_details() -> None:
+    assert main._public_ingest_error(main.psycopg.DataError("bad access level")) == "database operation failed during ingest"
+    assert main._public_ingest_error(OSError("disk missing")) == "artifact storage read failed during ingest"
+
+
 def test_iter_records_from_streamable_json_file_streams_compact_json() -> None:
     run_id = str(uuid.uuid4())
     payload = {
@@ -279,3 +329,32 @@ def test_iter_records_from_streamable_json_file_streams_compact_json() -> None:
     assert any(record.get("type") == "endpoint" for record in records)
     assert any(record.get("type") == "resource" for record in records)
     assert records[-1]["type"] == "run_end"
+
+
+def test_discover_recoverable_runs_scans_uploaded_and_stale_ingesting(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _Result:
+        def fetchall(self):
+            return [("run-1", "project-1", "artifact-1")]
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params):
+            captured["query"] = query
+            captured["params"] = params
+            return _Result()
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: _Conn())
+
+    runs = main.discover_recoverable_runs(limit=3)
+
+    assert runs == [{"run_id": "run-1", "project_id": "project-1", "artifact_key": "artifact-1"}]
+    assert "status = 'UPLOADED'" in captured["query"]
+    assert "status = 'INGESTING'" in captured["query"]
+    assert captured["params"] == (main.STALE_INGESTING_SECONDS, 3)

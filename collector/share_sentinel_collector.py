@@ -213,7 +213,7 @@ class NDJSONWriter:
                         share_order.append(share_key)
                     self._insert_item(share_state, record)
 
-        if endpoint is None or not share_order:
+        if endpoint is None:
             return None
 
         endpoint["shares"] = [share_states[key]["doc"] for key in share_order]
@@ -937,6 +937,10 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             },
         }
 
+        writer.emit(endpoint_record)
+        with lock:
+            stats.endpoints += 1
+
         excluded_shares = {s.upper() for s in args.exclude_share}
         include_shares = [str(share).strip() for share in getattr(args, "include_share", []) if str(share).strip()]
         exclude_path_regex = getattr(args, "exclude_path_pattern", None)
@@ -988,10 +992,6 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             except (SessionError, OSError):
                 pass
             return True
-
-        writer.emit(endpoint_record)
-        with lock:
-            stats.endpoints += 1
 
         def _handle_list_error(share_name: str, denied_path: str, exc: BaseException) -> None:
             detail = _error_detail(exc)
@@ -1238,23 +1238,6 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
         _record_error(stats, lock, "NFS_CONNECT_FAILED", message)
         return False
 
-    exports, export_error = _discover_nfs_exports(host, args.timeout)
-    if export_error:
-        message = f"Failed to enumerate NFS exports on {host}: {export_error}"
-        _emit_error(
-            writer,
-            run_id,
-            severity="warn",
-            code="NFS_EXPORT_ENUM_FAILED",
-            message=message,
-            endpoint_key=endpoint_key,
-            hint="Install and verify `showmount`, and ensure rpcbind/mountd access from this host.",
-        )
-        _record_error(stats, lock, "NFS_EXPORT_ENUM_FAILED", message)
-
-    if not exports:
-        return True
-
     writer.emit(
         {
             "type": "endpoint",
@@ -1274,6 +1257,23 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
     )
     with lock:
         stats.endpoints += 1
+
+    exports, export_error = _discover_nfs_exports(host, args.timeout)
+    if export_error:
+        message = f"Failed to enumerate NFS exports on {host}: {export_error}"
+        _emit_error(
+            writer,
+            run_id,
+            severity="warn",
+            code="NFS_EXPORT_ENUM_FAILED",
+            message=message,
+            endpoint_key=endpoint_key,
+            hint="Install and verify `showmount`, and ensure rpcbind/mountd access from this host.",
+        )
+        _record_error(stats, lock, "NFS_EXPORT_ENUM_FAILED", message)
+
+    if not exports:
+        return True
 
     for export_path in exports:
         writer.emit(
@@ -1356,6 +1356,16 @@ def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str, h
     upload_detail = _response_detail(upload_resp)
     if upload_resp.status_code != 409 or upload_detail != "run state does not accept upload":
         upload_resp.raise_for_status()
+    try:
+        upload_payload = upload_resp.json()
+    except ValueError:
+        upload_payload = None
+    queued = upload_payload.get("queued") if isinstance(upload_payload, dict) else None
+    if queued is False:
+        print(
+            "upload warning: artifact stored, but ingest queue handoff fell back to asynchronous recovery; monitor the run until ingestion starts.",
+            file=sys.stderr,
+        )
 
     print(f"run_id={run_id}")
     print(f"api_run_url={base}/projects/{args.project_id}/runs/{run_id}")
@@ -1684,11 +1694,16 @@ def main() -> int:
     except OSError as exc:
         writer_close_error = exc
 
+    upload_error: BaseException | None = None
+    keep_local_artifact = False
     try:
         if writer_close_error is None and args.upload and keep_output and output_path is not None:
             upload_artifact(args, run_id, output_path, host_inputs)
+    except (requests.RequestException, RuntimeError) as exc:
+        upload_error = exc
+        keep_local_artifact = output_path is not None and os.path.exists(output_path)
     finally:
-        if temp_artifact and os.path.exists(temp_artifact):
+        if temp_artifact and os.path.exists(temp_artifact) and not keep_local_artifact:
             os.unlink(temp_artifact)
 
     if writer_close_error is not None:
@@ -1697,6 +1712,17 @@ def main() -> int:
             f"output error: failed to write output to {destination}: {_error_detail(writer_close_error)}",
             file=sys.stderr,
         )
+        return EXIT_FAILURE
+
+    if upload_error is not None:
+        print(
+            f"upload error: failed to send artifact to Share Sentinel: {_error_detail(upload_error)}",
+            file=sys.stderr,
+        )
+        if keep_local_artifact and output_path:
+            print(f"artifact kept at {output_path}", file=sys.stderr)
+            return EXIT_PARTIAL
+        print("rerun with --output if you want to keep a local artifact copy for retry.", file=sys.stderr)
         return EXIT_FAILURE
 
     if not keep_output:

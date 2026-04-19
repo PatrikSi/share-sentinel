@@ -1,6 +1,8 @@
 import importlib.util
 import io
 import json
+import os
+import requests
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -103,6 +105,33 @@ def test_main_persists_output_when_run_has_endpoint_data(monkeypatch, tmp_path) 
     assert payload["endpoints"][0]["shares"][0]["name"] == "Public"
 
 
+def test_main_persists_output_when_run_has_only_empty_endpoint(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "endpoint-only.json"
+    args = _base_args(str(output_path))
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445", "ip": "10.0.0.5"})
+        with lock:
+            stats.endpoints += 1
+        return True
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+
+    rc = collector.main()
+
+    assert rc == 0
+    assert output_path.exists()
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["summary"]["endpoints"] == 1
+    assert payload["endpoints"][0]["endpoint_key"] == "10.0.0.5:445"
+    assert payload["endpoints"][0]["shares"] == []
+
+
 def test_main_reports_dependency_error_without_writing_output(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
     output_path = tmp_path / "missing-dep.json"
@@ -203,6 +232,103 @@ def test_main_reports_output_write_errors_instead_of_traceback(monkeypatch, tmp_
     assert "output error: failed to write output" in stderr_capture.getvalue().lower()
 
 
+def test_main_reports_upload_errors_without_traceback_returns_partial(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "upload.json"
+    args = _base_args(str(output_path))
+    args.upload = True
+    args.api_base = "http://api"
+    args.project_id = "project-id"
+    args.api_token = "token-value"
+    stderr_capture = io.StringIO()
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        writer.emit(
+            {
+                "type": "resource",
+                "run_id": run_id,
+                "endpoint_key": "10.0.0.5:445",
+                "share_type": "smb",
+                "resource_type": "smb_share",
+                "name": "Public",
+            }
+        )
+        with lock:
+            stats.endpoints += 1
+            stats.resources += 1
+        return True
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+    monkeypatch.setattr(
+        collector,
+        "upload_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.HTTPError("status 503")),
+    )
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == collector.EXIT_PARTIAL
+    assert "upload error: failed to send artifact" in stderr_capture.getvalue().lower()
+    assert "artifact kept at" in stderr_capture.getvalue().lower()
+
+
+def test_main_keeps_generated_temp_artifact_when_upload_fails_returns_partial(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    temp_output = tmp_path / "generated-upload.json"
+    args = _base_args(None)
+    args.upload = True
+    args.api_base = "http://api"
+    args.project_id = "project-id"
+    args.api_token = "token-value"
+    stderr_capture = io.StringIO()
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        writer.emit(
+            {
+                "type": "resource",
+                "run_id": run_id,
+                "endpoint_key": "10.0.0.5:445",
+                "share_type": "smb",
+                "resource_type": "smb_share",
+                "name": "Public",
+            }
+        )
+        with lock:
+            stats.endpoints += 1
+            stats.resources += 1
+        return True
+
+    def _fake_mkstemp(*_args, **_kwargs):
+        fd = os.open(temp_output, os.O_CREAT | os.O_RDWR)
+        return fd, str(temp_output)
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+    monkeypatch.setattr(collector.tempfile, "mkstemp", _fake_mkstemp)
+    monkeypatch.setattr(
+        collector,
+        "upload_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.HTTPError("status 503")),
+    )
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == collector.EXIT_PARTIAL
+    assert temp_output.exists()
+    assert f"artifact kept at {temp_output}" in stderr_capture.getvalue()
+
+
 def test_main_persists_output_when_run_has_only_errors(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
     output_path = tmp_path / "errors-only.json"
@@ -274,3 +400,96 @@ def test_main_returns_partial_success_when_artifact_is_kept(monkeypatch, tmp_pat
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["summary"]["resources"] == 1
     assert payload["summary"]["errors"] == 0
+
+
+def test_main_reports_upload_errors_without_traceback_returns_failure(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "upload-failed.json"
+    args = _base_args(str(output_path))
+    args.upload = True
+    args.api_base = "http://api"
+    args.project_id = "project-id"
+    args.api_token = "token-value"
+    stderr_capture = io.StringIO()
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        writer.emit(
+            {
+                "type": "resource",
+                "run_id": run_id,
+                "endpoint_key": "10.0.0.5:445",
+                "share_type": "smb",
+                "resource_type": "smb_share",
+                "name": "Public",
+            }
+        )
+        with lock:
+            stats.endpoints += 1
+            stats.resources += 1
+        return True
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(collector, "upload_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.HTTPError("status 503")))
+    monkeypatch.setattr(collector, "SMBConnection", object())
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == 1
+    assert output_path.exists()
+    stderr_value = stderr_capture.getvalue().lower()
+    assert "upload error: failed to send artifact" in stderr_value
+    assert "artifact kept at" in stderr_value
+
+
+def test_main_keeps_generated_temp_artifact_on_upload_error_returns_partial(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "generated-upload-failed.json"
+    args = _base_args(None)
+    args.upload = True
+    args.api_base = "http://api"
+    args.project_id = "project-id"
+    args.api_token = "token-value"
+    stderr_capture = io.StringIO()
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        writer.emit(
+            {
+                "type": "resource",
+                "run_id": run_id,
+                "endpoint_key": "10.0.0.5:445",
+                "share_type": "smb",
+                "resource_type": "smb_share",
+                "name": "Public",
+            }
+        )
+        with lock:
+            stats.endpoints += 1
+            stats.resources += 1
+        return True
+
+    def _fake_mkstemp(*_args, **_kwargs):
+        fd = collector.os.open(output_path, collector.os.O_RDWR | collector.os.O_CREAT | collector.os.O_TRUNC)
+        return fd, str(output_path)
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(collector, "upload_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.ConnectionError("status 503")))
+    monkeypatch.setattr(collector.tempfile, "mkstemp", _fake_mkstemp)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == collector.EXIT_PARTIAL
+    assert output_path.exists()
+    stderr_value = stderr_capture.getvalue().lower()
+    assert "upload error: failed to send artifact" in stderr_value
+    assert "artifact kept at" in stderr_value
