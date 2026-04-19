@@ -87,7 +87,7 @@ export async function bootstrapSession(): Promise<SessionSnapshot> {
   if (snapshot.status !== "unknown") return snapshot;
   if (bootstrapPromise) return bootstrapPromise;
 
-  bootstrapPromise = (async () => {
+  const promise = (async () => {
     try {
       let user = await fetchCurrentUser();
       if (!user && getCookieValue(CSRF_COOKIE_NAME)) {
@@ -107,9 +107,10 @@ export async function bootstrapSession(): Promise<SessionSnapshot> {
     return snapshot;
   })().finally(() => {
     bootstrapPromise = null;
-  })();
+  });
 
-  return bootstrapPromise;
+  bootstrapPromise = promise;
+  return promise;
 }
 
 export function useSession(): SessionSnapshot {
