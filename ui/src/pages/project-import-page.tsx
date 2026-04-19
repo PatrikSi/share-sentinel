@@ -44,7 +44,6 @@ export function ProjectImportPage() {
   const [uploadTotalBytes, setUploadTotalBytes] = useState(0);
 
   const [error, setError] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
 
   useEffect(() => {
     if (!projectId) return;
@@ -73,7 +72,6 @@ export function ProjectImportPage() {
   function handleFileSelection(file: File | null) {
     setArtifactFile(file);
     setError(null);
-    setInfo(null);
     setUploadTransferredBytes(0);
     setUploadTotalBytes(file?.size || 0);
   }
@@ -103,7 +101,6 @@ export function ProjectImportPage() {
     setImporting(true);
     setUploadStage("creating-run");
     setError(null);
-    setInfo(null);
     setCurrentRunId(null);
     setUploadTransferredBytes(0);
     setUploadTotalBytes(artifactFile.size);
@@ -129,7 +126,6 @@ export function ProjectImportPage() {
       });
 
       setUploadStage("queueing");
-      setInfo(`Run ${run.id} created and uploaded. Redirecting to the run explorer for worker status and ingest progress.`);
       navigate(`/projects/${projectId}/runs/${run.id}`, { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Import failed");
@@ -260,11 +256,6 @@ export function ProjectImportPage() {
         {error ? (
           <StatusBanner tone="error" title="Import Failed">
             <p>{error}</p>
-          </StatusBanner>
-        ) : null}
-        {info ? (
-          <StatusBanner tone="success" title="Import Status">
-            <p>{info}</p>
           </StatusBanner>
         ) : null}
       </div>

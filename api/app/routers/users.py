@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db import get_db
+from app.db import escape_like, get_db
 from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
 from app.enums import ProjectRole
 from app.models import Project, ProjectMember, RefreshToken, User
@@ -105,13 +105,13 @@ def list_users(
 
     stmt = select(User)
     if search:
-        pattern = f"%{search}%"
+        pattern = f"%{escape_like(search)}%"
         project_name_match = exists(
             select(ProjectMember.user_id)
             .join(Project, Project.id == ProjectMember.project_id)
-            .where(ProjectMember.user_id == User.id, Project.name.ilike(pattern))
+            .where(ProjectMember.user_id == User.id, Project.name.ilike(pattern, escape="\\"))
         )
-        stmt = stmt.where(or_(User.email.ilike(pattern), project_name_match))
+        stmt = stmt.where(or_(User.email.ilike(pattern, escape="\\"), project_name_match))
     if project_id is not None:
         stmt = stmt.where(
             exists(select(ProjectMember.user_id).where(ProjectMember.user_id == User.id, ProjectMember.project_id == project_id))

@@ -4,6 +4,7 @@ import { Link, useParams } from "react-router-dom";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
+import { useSession } from "@/lib/auth";
 
 type RunProgress = {
   line_offset?: number;
@@ -296,6 +297,7 @@ function describeRunStatus(run: RunInfo | null) {
 
 export function RunDetailPage() {
   const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
+  const session = useSession();
 
   const [run, setRun] = useState<RunInfo | null>(null);
   const [projectRuns, setProjectRuns] = useState<RunCompareOption[]>([]);
@@ -344,7 +346,11 @@ export function RunDetailPage() {
   const [activityLoading, setActivityLoading] = useState(false);
   const [activityError, setActivityError] = useState<string | null>(null);
 
-  const savedQueriesKey = useMemo(() => `share_sentinel_saved_queries_${runId || "default"}`, [runId]);
+  const savedQueriesKey = useMemo(() => {
+    const userId = session.user?.id || "anonymous";
+    const scopedProjectId = projectId || "no-project";
+    return `share_sentinel_saved_queries_${userId}_${scopedProjectId}_${runId || "default"}`;
+  }, [projectId, runId, session.user?.id]);
   const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
   const [savedQueryLabel, setSavedQueryLabel] = useState("");
 

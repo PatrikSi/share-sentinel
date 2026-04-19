@@ -88,6 +88,9 @@ export function SettingsApiTokensPage() {
 
   const [secretReveal, setSecretReveal] = useState<{ label: string; secret: string } | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingTokenAction>(null);
+  const [createSubmitting, setCreateSubmitting] = useState(false);
+  const [editSubmitting, setEditSubmitting] = useState(false);
+  const [pendingActionSubmitting, setPendingActionSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
@@ -169,6 +172,7 @@ export function SettingsApiTokensPage() {
 
   async function createToken(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (createSubmitting) return;
     if (!selectedOwner || !createProjectId) {
       setError("Select an active approved owner before creating a token.");
       return;
@@ -176,6 +180,7 @@ export function SettingsApiTokensPage() {
     setError(null);
     setInfo(null);
     setSecretReveal(null);
+    setCreateSubmitting(true);
 
     const expiryDays = createExpiryDays.trim() ? Number.parseInt(createExpiryDays.trim(), 10) : Number.NaN;
     const scopes = createUseDefaults ? [] : parseScopesCsv(createScopesCsv);
@@ -197,14 +202,18 @@ export function SettingsApiTokensPage() {
       setTokens((prev) => [data.token_meta, ...prev]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create token");
+    } finally {
+      setCreateSubmitting(false);
     }
   }
 
   async function saveTokenUpdates(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (editSubmitting) return;
     if (!editToken) return;
     setError(null);
     setInfo(null);
+    setEditSubmitting(true);
 
     const expiryDays = editExpiryDays.trim() ? Number.parseInt(editExpiryDays.trim(), 10) : Number.NaN;
     const scopes = editUseDefaults ? [] : parseScopesCsv(editScopesCsv);
@@ -225,13 +234,17 @@ export function SettingsApiTokensPage() {
       setEditTokenId("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to update token");
+    } finally {
+      setEditSubmitting(false);
     }
   }
 
   async function confirmPendingAction() {
+    if (pendingActionSubmitting) return;
     if (!pendingAction) return;
     setError(null);
     setInfo(null);
+    setPendingActionSubmitting(true);
 
     try {
       if (pendingAction.kind === "rotate") {
@@ -249,6 +262,8 @@ export function SettingsApiTokensPage() {
       setPendingAction(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : `Failed to ${pendingAction.kind} token`);
+    } finally {
+      setPendingActionSubmitting(false);
     }
   }
 
@@ -332,6 +347,7 @@ export function SettingsApiTokensPage() {
                               ? "border-emerald-500 bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200"
                               : "border-slate-300 bg-white text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-800"
                           }`}
+                          disabled={createSubmitting}
                           key={user.id}
                           onClick={() => {
                             setSelectedOwner(user);
@@ -351,6 +367,7 @@ export function SettingsApiTokensPage() {
               Project
               <select
                 className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                disabled={createSubmitting}
                 value={createProjectId}
                 onChange={(event) => setCreateProjectId(event.target.value)}
               >
@@ -365,6 +382,7 @@ export function SettingsApiTokensPage() {
               Token name
               <input
                 className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                disabled={createSubmitting}
                 value={createName}
                 onChange={(event) => setCreateName(event.target.value)}
                 minLength={1}
@@ -376,6 +394,7 @@ export function SettingsApiTokensPage() {
               Role
               <select
                 className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                disabled={createSubmitting}
                 value={createRole}
                 onChange={(event) => setCreateRole(event.target.value)}
               >
@@ -390,6 +409,7 @@ export function SettingsApiTokensPage() {
               Expiry days
               <input
                 className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                disabled={createSubmitting}
                 value={createExpiryDays}
                 onChange={(event) => setCreateExpiryDays(event.target.value)}
                 placeholder="90"
@@ -401,7 +421,7 @@ export function SettingsApiTokensPage() {
               <p className="mt-1 text-xs text-slate-500">{scopeCatalog?.defaults_by_role?.[createRole]?.join(", ") || "Loading defaults"}</p>
             </div>
             <label className="flex items-center gap-2 text-sm md:col-span-2">
-              <input checked={createUseDefaults} type="checkbox" onChange={(event) => setCreateUseDefaults(event.target.checked)} />
+              <input checked={createUseDefaults} disabled={createSubmitting} type="checkbox" onChange={(event) => setCreateUseDefaults(event.target.checked)} />
               Use the role defaults instead of custom scopes
             </label>
             {!createUseDefaults ? (
@@ -409,6 +429,7 @@ export function SettingsApiTokensPage() {
                 Custom scopes
                 <input
                   className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  disabled={createSubmitting}
                   value={createScopesCsv}
                   onChange={(event) => setCreateScopesCsv(event.target.value)}
                   placeholder="read:projects, read:runs"
@@ -416,8 +437,12 @@ export function SettingsApiTokensPage() {
               </label>
             ) : null}
             <div className="md:col-span-2">
-              <button className="rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white" type="submit">
-                Create token
+              <button
+                className="rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
+                disabled={createSubmitting}
+                type="submit"
+              >
+                {createSubmitting ? "Creating token..." : "Create token"}
               </button>
             </div>
           </form>
@@ -513,6 +538,7 @@ export function SettingsApiTokensPage() {
                 <div className="flex flex-wrap gap-2">
                   <button
                     className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700"
+                    disabled={pendingActionSubmitting}
                     onClick={() => setEditTokenId(token.id)}
                     type="button"
                   >
@@ -520,16 +546,22 @@ export function SettingsApiTokensPage() {
                   </button>
                   <button
                     className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700 disabled:opacity-50"
-                    disabled={!!token.revoked_at}
-                    onClick={() => setPendingAction({ kind: "rotate", token })}
+                    disabled={!!token.revoked_at || pendingActionSubmitting}
+                    onClick={() => {
+                      if (pendingActionSubmitting) return;
+                      setPendingAction({ kind: "rotate", token });
+                    }}
                     type="button"
                   >
                     Rotate
                   </button>
                   <button
                     className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700 disabled:opacity-50"
-                    disabled={!!token.revoked_at}
-                    onClick={() => setPendingAction({ kind: "revoke", token })}
+                    disabled={!!token.revoked_at || pendingActionSubmitting}
+                    onClick={() => {
+                      if (pendingActionSubmitting) return;
+                      setPendingAction({ kind: "revoke", token });
+                    }}
                     type="button"
                   >
                     Revoke
@@ -621,6 +653,7 @@ export function SettingsApiTokensPage() {
               Name
               <input
                 className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                disabled={editSubmitting}
                 value={editName}
                 onChange={(event) => setEditName(event.target.value)}
                 minLength={1}
@@ -632,6 +665,7 @@ export function SettingsApiTokensPage() {
               Role
               <select
                 className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                disabled={editSubmitting}
                 value={editRole}
                 onChange={(event) => setEditRole(event.target.value)}
               >
@@ -649,15 +683,15 @@ export function SettingsApiTokensPage() {
                 value={editExpiryDays}
                 onChange={(event) => setEditExpiryDays(event.target.value)}
                 placeholder="180"
-                disabled={editNeverExpires}
+                disabled={editSubmitting || editNeverExpires}
               />
             </label>
             <label className="flex items-center gap-2 text-sm md:mt-8">
-              <input checked={editNeverExpires} type="checkbox" onChange={(event) => setEditNeverExpires(event.target.checked)} />
+              <input checked={editNeverExpires} disabled={editSubmitting} type="checkbox" onChange={(event) => setEditNeverExpires(event.target.checked)} />
               Never expire
             </label>
             <label className="flex items-center gap-2 text-sm md:col-span-2">
-              <input checked={editUseDefaults} type="checkbox" onChange={(event) => setEditUseDefaults(event.target.checked)} />
+              <input checked={editUseDefaults} disabled={editSubmitting} type="checkbox" onChange={(event) => setEditUseDefaults(event.target.checked)} />
               Reset scopes to the selected role defaults
             </label>
             {!editUseDefaults ? (
@@ -665,6 +699,7 @@ export function SettingsApiTokensPage() {
                 Scopes
                 <input
                   className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  disabled={editSubmitting}
                   value={editScopesCsv}
                   onChange={(event) => setEditScopesCsv(event.target.value)}
                 />
@@ -673,13 +708,18 @@ export function SettingsApiTokensPage() {
             <div className="md:col-span-2 flex justify-end gap-3">
               <button
                 className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700"
+                disabled={editSubmitting}
                 onClick={() => setEditTokenId("")}
                 type="button"
               >
                 Cancel
               </button>
-              <button className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white dark:bg-slate-100 dark:text-slate-900" type="submit">
-                Save token changes
+              <button
+                className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900"
+                disabled={editSubmitting}
+                type="submit"
+              >
+                {editSubmitting ? "Saving..." : "Save token changes"}
               </button>
             </div>
           </form>
@@ -701,17 +741,19 @@ export function SettingsApiTokensPage() {
           <>
             <button
               className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] dark:border-slate-700"
+              disabled={pendingActionSubmitting}
               onClick={() => setPendingAction(null)}
               type="button"
             >
               Cancel
             </button>
             <button
-              className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white dark:bg-slate-100 dark:text-slate-900"
+              className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900"
+              disabled={pendingActionSubmitting}
               onClick={confirmPendingAction}
               type="button"
             >
-              {pendingAction?.kind === "rotate" ? "Rotate secret" : "Revoke token"}
+              {pendingActionSubmitting ? "Working..." : pendingAction?.kind === "rotate" ? "Rotate secret" : "Revoke token"}
             </button>
           </>
         }

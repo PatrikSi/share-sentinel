@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
-from app.db import get_db
+from app.db import escape_like, get_db
 from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_token_scopes
 from app.enums import ErrorSeverity, ProjectRole, RunStatus
 from app.models import AuditEvent, Endpoint, IngestError, Item, Resource, ScanRun
@@ -743,14 +743,15 @@ def list_run_errors(
     if severity is not None:
         stmt = stmt.where(IngestError.severity == severity)
     if search:
-        pattern = f"%{search}%"
+        escaped = escape_like(search)
+        pattern = f"%{escaped}%"
         stmt = stmt.where(
             or_(
-                IngestError.code.ilike(pattern),
-                IngestError.message.ilike(pattern),
-                IngestError.endpoint_key.ilike(pattern),
-                IngestError.resource_name.ilike(pattern),
-                cast(IngestError.path, String).ilike(pattern),
+                IngestError.code.ilike(pattern, escape="\\"),
+                IngestError.message.ilike(pattern, escape="\\"),
+                IngestError.endpoint_key.ilike(pattern, escape="\\"),
+                IngestError.resource_name.ilike(pattern, escape="\\"),
+                cast(IngestError.path, String).ilike(pattern, escape="\\"),
             )
         )
 
@@ -1027,13 +1028,14 @@ def list_endpoints(
 
     stmt = select(Endpoint).where(Endpoint.run_id == run_id)
     if search:
-        pattern = f"%{search}%"
+        escaped = escape_like(search)
+        pattern = f"%{escaped}%"
         stmt = stmt.where(
             or_(
-                Endpoint.endpoint_key.ilike(pattern),
-                Endpoint.ip.ilike(pattern),
-                Endpoint.hostname.ilike(pattern),
-                Endpoint.domain.ilike(pattern),
+                Endpoint.endpoint_key.ilike(pattern, escape="\\"),
+                Endpoint.ip.ilike(pattern, escape="\\"),
+                Endpoint.hostname.ilike(pattern, escape="\\"),
+                Endpoint.domain.ilike(pattern, escape="\\"),
             )
         )
 
@@ -1136,9 +1138,11 @@ def resource_items(
 
     stmt = select(Item).where(Item.run_id == run_id, Item.resource_id == resource_id)
     if search:
-        stmt = stmt.where(Item.name.ilike(f"%{search}%"))
+        escaped = escape_like(search)
+        stmt = stmt.where(Item.name.ilike(f"%{escaped}%", escape="\\"))
     if path_prefix:
-        stmt = stmt.where(Item.path.ilike(f"{path_prefix}%"))
+        escaped = escape_like(path_prefix)
+        stmt = stmt.where(Item.path.ilike(f"{escaped}%", escape="\\"))
 
     stmt = apply_keyset_pagination(stmt, RUN_ITEM_CURSOR, cursor, limit)
     items, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), RUN_ITEM_CURSOR, limit)
@@ -1196,10 +1200,11 @@ def search_items(
 
     stmt = select(Item).where(Item.run_id == run_id)
     if q:
-        stmt = stmt.where(or_(Item.name.ilike(f"%{q}%"), cast(Item.path, String).ilike(f"%{q}%")))
+        escaped = escape_like(q)
+        stmt = stmt.where(or_(Item.name.ilike(f"%{escaped}%", escape="\\"), cast(Item.path, String).ilike(f"%{escaped}%", escape="\\")))
     if ext:
         ext = ext if ext.startswith(".") else f".{ext}"
-        stmt = stmt.where(func.lower(Item.name).like(f"%{ext.lower()}"))
+        stmt = stmt.where(func.lower(Item.name).like(f"%{escape_like(ext.lower())}", escape="\\"))
 
     stmt = apply_keyset_pagination(stmt, RUN_ITEM_CURSOR, cursor, limit)
     items, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), RUN_ITEM_CURSOR, limit)

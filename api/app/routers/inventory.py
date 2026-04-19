@@ -4,10 +4,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import String, and_, cast, func, not_, or_, select
 from sqlalchemy.orm import Session
 
-from app.db import get_db
-from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_token_scopes
+from app.db import escape_like, get_db
+from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_session_user, require_token_scopes
 from app.enums import ProjectRole, RunStatus
-from app.models import Endpoint, Item, Resource, SavedInvestigation, ScanRun
+from app.models import Endpoint, Item, Resource, SavedInvestigation, ScanRun, User
 from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_int_cursor_value
 from app.schemas import SavedInvestigationIn, SavedInvestigationOut
 from app.share_types import share_type_from_resource_type
@@ -97,7 +97,7 @@ ACCESS_LEVEL_ALIASES = {
 
 
 def _escape_like(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escape_like(value)
 
 
 def _normalize_access_query_value(value: str) -> str:
@@ -304,9 +304,11 @@ def create_saved_investigation(
     payload: SavedInvestigationIn,
     request: Request,
     db: Session = Depends(get_db),
+    _user: User = Depends(require_session_user),
     _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
     auth: AuthContext = Depends(get_auth_context),
 ):
+    _ = _user
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     investigation = SavedInvestigation(
         project_id=project_id,
@@ -341,9 +343,11 @@ def delete_saved_investigation(
     investigation_id: uuid.UUID,
     request: Request,
     db: Session = Depends(get_db),
+    _user: User = Depends(require_session_user),
     _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
     auth: AuthContext = Depends(get_auth_context),
 ):
+    _ = _user
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     investigation = db.get(SavedInvestigation, investigation_id)
     if investigation is None or investigation.project_id != project_id:
@@ -544,22 +548,26 @@ def inventory_items(
     if is_dir is not None:
         stmt = stmt.where(Item.is_dir.is_(is_dir))
     if path_prefix:
-        stmt = stmt.where(Item.path.ilike(f"{path_prefix.strip()}%"))
+        escaped = _escape_like(path_prefix.strip())
+        stmt = stmt.where(Item.path.ilike(f"{escaped}%", escape="\\"))
     if share:
-        stmt = stmt.where(Resource.name.ilike(f"%{share.strip()}%"))
+        escaped = _escape_like(share.strip())
+        stmt = stmt.where(Resource.name.ilike(f"%{escaped}%", escape="\\"))
     if endpoint:
-        pattern = f"%{endpoint.strip()}%"
-        stmt = stmt.where(or_(Endpoint.endpoint_key.ilike(pattern), Endpoint.hostname.ilike(pattern), Endpoint.ip.ilike(pattern)))
+        escaped = _escape_like(endpoint.strip())
+        pattern = f"%{escaped}%"
+        stmt = stmt.where(or_(Endpoint.endpoint_key.ilike(pattern, escape="\\"), Endpoint.hostname.ilike(pattern, escape="\\"), Endpoint.ip.ilike(pattern, escape="\\")))
     if q:
-        pattern = f"%{q.strip()}%"
+        escaped = _escape_like(q.strip())
+        pattern = f"%{escaped}%"
         stmt = stmt.where(
             or_(
-                Item.name.ilike(pattern),
-                Item.path.ilike(pattern),
-                Resource.name.ilike(pattern),
-                Endpoint.endpoint_key.ilike(pattern),
-                Endpoint.hostname.ilike(pattern),
-                Endpoint.ip.ilike(pattern),
+                Item.name.ilike(pattern, escape="\\"),
+                Item.path.ilike(pattern, escape="\\"),
+                Resource.name.ilike(pattern, escape="\\"),
+                Endpoint.endpoint_key.ilike(pattern, escape="\\"),
+                Endpoint.hostname.ilike(pattern, escape="\\"),
+                Endpoint.ip.ilike(pattern, escape="\\"),
             )
         )
     if ext:
@@ -670,11 +678,13 @@ def inventory_resources(
             raise HTTPException(status_code=400, detail="invalid access_level")
         stmt = stmt.where(Resource.access_level == normalized_access_level)
     if endpoint:
-        pattern = f"%{endpoint.strip()}%"
-        stmt = stmt.where(or_(Endpoint.endpoint_key.ilike(pattern), Endpoint.hostname.ilike(pattern)))
+        escaped = _escape_like(endpoint.strip())
+        pattern = f"%{escaped}%"
+        stmt = stmt.where(or_(Endpoint.endpoint_key.ilike(pattern, escape="\\"), Endpoint.hostname.ilike(pattern, escape="\\")))
     if q:
-        pattern = f"%{q.strip()}%"
-        stmt = stmt.where(or_(Resource.name.ilike(pattern), Resource.remark.ilike(pattern), Endpoint.endpoint_key.ilike(pattern)))
+        escaped = _escape_like(q.strip())
+        pattern = f"%{escaped}%"
+        stmt = stmt.where(or_(Resource.name.ilike(pattern, escape="\\"), Resource.remark.ilike(pattern, escape="\\"), Endpoint.endpoint_key.ilike(pattern, escape="\\")))
     if query_groups:
         stmt = _apply_inventory_query_groups(stmt, query_groups, _resource_inventory_clause_expression)
 
@@ -765,13 +775,14 @@ def inventory_endpoints(
     if run_id_list:
         stmt = stmt.where(Endpoint.run_id.in_(run_id_list))
     if q:
-        pattern = f"%{q.strip()}%"
+        escaped = _escape_like(q.strip())
+        pattern = f"%{escaped}%"
         stmt = stmt.where(
             or_(
-                Endpoint.endpoint_key.ilike(pattern),
-                Endpoint.ip.ilike(pattern),
-                Endpoint.hostname.ilike(pattern),
-                Endpoint.domain.ilike(pattern),
+                Endpoint.endpoint_key.ilike(pattern, escape="\\"),
+                Endpoint.ip.ilike(pattern, escape="\\"),
+                Endpoint.hostname.ilike(pattern, escape="\\"),
+                Endpoint.domain.ilike(pattern, escape="\\"),
             )
         )
     if query_groups:

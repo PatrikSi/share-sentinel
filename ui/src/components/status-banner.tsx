@@ -16,8 +16,13 @@ type StatusBannerProps = {
 };
 
 export function StatusBanner({ title, tone = "info", children }: StatusBannerProps) {
+  const liveProps =
+    tone === "error"
+      ? { role: "alert", "aria-live": "assertive" as const }
+      : { role: "status", "aria-live": "polite" as const };
+
   return (
-    <div className={`rounded-2xl border p-3 text-sm ${TONE_CLASSES[tone]}`}>
+    <div className={`rounded-2xl border p-3 text-sm ${TONE_CLASSES[tone]}`} {...liveProps}>
       {title ? <p className="text-[11px] font-semibold uppercase tracking-[0.18em]">{title}</p> : null}
       <div className={title ? "mt-2" : ""}>{children}</div>
     </div>

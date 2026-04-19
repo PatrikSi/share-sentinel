@@ -9,7 +9,7 @@ from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db import get_db
+from app.db import escape_like, get_db
 from app.enums import ProjectRole
 from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
 from app.models import ApiToken, AuditEvent, Project, ProjectMember, User
@@ -98,14 +98,15 @@ def _global_audit_stmt(q: str | None):
         .outerjoin(Project, Project.id == AuditEvent.project_id)
     )
     if q:
-        pattern = f"%{q.strip()}%"
+        escaped = escape_like(q.strip())
+        pattern = f"%{escaped}%"
         stmt = stmt.where(
             or_(
-                AuditEvent.action.ilike(pattern),
-                AuditEvent.object_type.ilike(pattern),
-                AuditEvent.object_id.ilike(pattern),
-                User.email.ilike(pattern),
-                Project.name.ilike(pattern),
+                AuditEvent.action.ilike(pattern, escape="\\"),
+                AuditEvent.object_type.ilike(pattern, escape="\\"),
+                AuditEvent.object_id.ilike(pattern, escape="\\"),
+                User.email.ilike(pattern, escape="\\"),
+                Project.name.ilike(pattern, escape="\\"),
             )
         )
     return stmt
@@ -232,13 +233,14 @@ def list_all_api_tokens(
         .join(Project, Project.id == ApiToken.project_id)
     )
     if q:
-        pattern = f"%{q.strip()}%"
+        escaped = escape_like(q.strip())
+        pattern = f"%{escaped}%"
         stmt = stmt.where(
             or_(
-                ApiToken.name.ilike(pattern),
-                User.email.ilike(pattern),
-                Project.name.ilike(pattern),
-                cast(ApiToken.id, String).ilike(pattern),
+                ApiToken.name.ilike(pattern, escape="\\"),
+                User.email.ilike(pattern, escape="\\"),
+                Project.name.ilike(pattern, escape="\\"),
+                cast(ApiToken.id, String).ilike(pattern, escape="\\"),
             )
         )
 
@@ -641,13 +643,14 @@ def list_project_memberships(
         .join(User, User.id == ProjectMember.user_id)
     )
     if q:
-        pattern = f"%{q.strip()}%"
+        escaped = escape_like(q.strip())
+        pattern = f"%{escaped}%"
         stmt = stmt.where(
             or_(
-                Project.name.ilike(pattern),
-                User.email.ilike(pattern),
-                cast(ProjectMember.project_id, String).ilike(pattern),
-                cast(ProjectMember.user_id, String).ilike(pattern),
+                Project.name.ilike(pattern, escape="\\"),
+                User.email.ilike(pattern, escape="\\"),
+                cast(ProjectMember.project_id, String).ilike(pattern, escape="\\"),
+                cast(ProjectMember.user_id, String).ilike(pattern, escape="\\"),
             )
         )
     if user_ids:

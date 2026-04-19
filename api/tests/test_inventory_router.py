@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from fastapi.testclient import TestClient
 
 from app.db import get_db
-from app.deps import AuthContext, get_auth_context
+from app.deps import AuthContext, get_auth_context, require_session_user
 from app.main import app
 from app.models import SavedInvestigation
 from app.routers import inventory as inventory_router
@@ -74,6 +74,7 @@ def _client_for_db(fake_db: _FakeDb) -> TestClient:
 
     app.dependency_overrides[get_db] = lambda: fake_db
     app.dependency_overrides[get_auth_context] = _override_auth
+    app.dependency_overrides[require_session_user] = lambda: object()
     return TestClient(app)
 
 
