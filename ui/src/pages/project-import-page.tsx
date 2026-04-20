@@ -6,6 +6,7 @@ import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiUploadFormData } from "@/lib/api";
 
 type Project = { id: string; name: string };
+type ProjectRoleStatus = "loading" | "ready" | "error";
 
 const ACCEPTED_ARTIFACT_SUFFIXES = [".json", ".json.gz", ".ndjson", ".jsonl", ".ndjson.gz", ".jsonl.gz", ".gz"];
 
@@ -32,6 +33,7 @@ export function ProjectImportPage() {
 
   const [project, setProject] = useState<Project | null>(null);
   const [projectRole, setProjectRole] = useState<string | null>(null);
+  const [projectRoleStatus, setProjectRoleStatus] = useState<ProjectRoleStatus>(projectId ? "loading" : "error");
 
   const [runName, setRunName] = useState("");
   const [runDescription, setRunDescription] = useState("");
@@ -50,9 +52,16 @@ export function ProjectImportPage() {
     apiFetch(`/projects/${projectId}`)
       .then((data) => setProject(data as Project))
       .catch((err) => setError(err.message));
+    setProjectRoleStatus("loading");
     apiFetch(`/projects/${projectId}/my-role`)
-      .then((data) => setProjectRole((data?.role as string) || null))
-      .catch(() => setProjectRole(null));
+      .then((data) => {
+        setProjectRole((data?.role as string) || null);
+        setProjectRoleStatus("ready");
+      })
+      .catch(() => {
+        setProjectRole(null);
+        setProjectRoleStatus("error");
+      });
   }, [projectId]);
 
   const canImport = projectRole === "operator" || projectRole === "admin";
@@ -61,6 +70,12 @@ export function ProjectImportPage() {
   const artifactDetectedType = artifactFile ? ACCEPTED_ARTIFACT_SUFFIXES.find((suffix) => artifactFile.name.toLowerCase().endsWith(suffix)) || "custom" : null;
   const uploadProgressPercent =
     uploadStage === "uploading" && uploadTotalBytes > 0 ? Math.min(100, Math.round((uploadTransferredBytes / uploadTotalBytes) * 100)) : 0;
+
+  function accessLabel(): string {
+    if (projectRoleStatus === "loading") return "Checking access";
+    if (projectRoleStatus === "error") return "Access check failed";
+    return projectRole || "No project access";
+  }
 
   function stageLabel(): string {
     if (uploadStage === "creating-run") return "Creating the run record and reserving the run ID.";
@@ -195,10 +210,10 @@ export function ProjectImportPage() {
                 <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Selected file</p>
                 <p className="mt-1 text-sm font-semibold">{artifactFile ? "Ready" : "Waiting"}</p>
               </div>
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Access</p>
-                <p className="mt-1 text-sm font-semibold">{projectRole || "Role unavailable"}</p>
-              </div>
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Access</p>
+                  <p className="mt-1 text-sm font-semibold">{accessLabel()}</p>
+                </div>
               <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Transfer</p>
                 <p className="mt-1 text-sm font-semibold">
@@ -388,11 +403,19 @@ export function ProjectImportPage() {
                 <button
                   className="rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
                   type="submit"
-                  disabled={!canImport || importing || !!fileValidationError}
+                  disabled={projectRoleStatus !== "ready" || !canImport || importing || !!fileValidationError}
                 >
                   {importing ? "Uploading artifact..." : "Create run and upload"}
                 </button>
-                {!canImport ? <p className="text-sm text-amber-700 dark:text-amber-300">Operator or admin access is required for ingestion.</p> : null}
+                {projectRoleStatus === "loading" ? (
+                  <p className="text-sm text-slate-500 dark:text-slate-400">Checking project access before enabling upload.</p>
+                ) : null}
+                {projectRoleStatus === "error" ? (
+                  <p className="text-sm text-amber-700 dark:text-amber-300">Project access could not be confirmed. Refresh or return to the dashboard.</p>
+                ) : null}
+                {projectRoleStatus === "ready" && !canImport ? (
+                  <p className="text-sm text-amber-700 dark:text-amber-300">Operator or admin access is required for ingestion.</p>
+                ) : null}
               </div>
             </div>
           </form>

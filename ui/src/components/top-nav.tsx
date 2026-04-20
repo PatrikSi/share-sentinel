@@ -2,13 +2,14 @@ import { FormEvent, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import { apiFetch } from "@/lib/api";
-import { markSessionAnonymous } from "@/lib/auth";
+import { markSessionAnonymous, useSession } from "@/lib/auth";
 import { useDashboardWorkspace } from "@/lib/dashboard-workspace";
 import { ThemeToggle } from "@/components/theme-toggle";
 
 export function TopNav() {
   const location = useLocation();
   const navigate = useNavigate();
+  const session = useSession();
   const {
     canCreateProject,
     createProject,
@@ -40,8 +41,10 @@ export function TopNav() {
   const navItems = [
     { to: "/projects", label: "Dashboard", match: "/projects" },
     { to: "/account", label: "Account", match: "/account" },
-    { to: "/settings/iam", label: "Settings", match: "/settings" },
   ];
+  if (session.user?.is_sysadmin) {
+    navItems.push({ to: "/settings/iam", label: "Settings", match: "/settings" });
+  }
   const showDashboardControls = inProjectArea;
 
   async function onCreateProject(event: FormEvent<HTMLFormElement>) {

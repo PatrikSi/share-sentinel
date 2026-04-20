@@ -7,6 +7,7 @@ import { parseInventoryQuery, type InventoryQueryClause, type InventoryQueryFiel
 type Project = { id: string; name: string };
 type RunOption = { id: string; name: string; status: string; created_at: string };
 type ExtensionFacet = { ext: string; count: number };
+type ProjectRoleStatus = "loading" | "ready" | "error";
 
 type InventoryItem = {
   id: number;
@@ -245,6 +246,8 @@ export function ProjectInventoryPage() {
   const { projectId } = useParams<{ projectId: string }>();
 
   const [project, setProject] = useState<Project | null>(null);
+  const [projectRole, setProjectRole] = useState<string | null>(null);
+  const [projectRoleStatus, setProjectRoleStatus] = useState<ProjectRoleStatus>(projectId ? "loading" : "error");
   const [runs, setRuns] = useState<RunOption[]>([]);
   const [selectedRunIds, setSelectedRunIds] = useState<string[]>([]);
 
@@ -296,6 +299,7 @@ export function ProjectInventoryPage() {
   const runIdsParam = useMemo(() => selectedRunIds.join(","), [selectedRunIds]);
   const endpointQuery = useMemo(() => [query.trim(), endpointFilter.trim()].filter(Boolean).join(" "), [query, endpointFilter]);
   const queryModeActive = appliedInventoryQuery.trim().length > 0;
+  const canImport = projectRole === "operator" || projectRole === "admin";
   const queryFilterReflections = useMemo(() => {
     if (!queryModeActive) return blankQueryFilterReflections();
     const reflections = blankQueryFilterReflections();
@@ -548,6 +552,17 @@ export function ProjectInventoryPage() {
 
   useEffect(() => {
     if (!projectId) return;
+    setProjectRoleStatus("loading");
+    apiFetch(`/projects/${projectId}/my-role`)
+      .then((data) => {
+        setProjectRole((data?.role as string) || null);
+        setProjectRoleStatus("ready");
+      })
+      .catch(() => {
+        setProjectRole(null);
+        setProjectRoleStatus("error");
+      });
+
     apiFetch(`/projects/${projectId}`)
       .then((data) => setProject(data as Project))
       .catch((err) => setError(err.message));
@@ -755,13 +770,18 @@ export function ProjectInventoryPage() {
             >
               Open Dashboard
             </Link>
-            {projectId ? (
+            {projectId && canImport ? (
               <Link
                 className="rounded-2xl bg-emerald-600 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-emerald-500"
                 to={`/projects/${projectId}/import`}
               >
                 Import Scan
               </Link>
+            ) : null}
+            {projectId && projectRoleStatus === "loading" ? (
+              <span className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-slate-500 dark:border-slate-700 dark:text-slate-300">
+                Checking import access
+              </span>
             ) : null}
             <button
               className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
