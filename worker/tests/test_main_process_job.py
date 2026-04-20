@@ -18,8 +18,9 @@ def test_process_job_returns_early_for_invalid_run_id(monkeypatch) -> None:
         raise AssertionError("process_job should not connect for invalid run_id")
 
     monkeypatch.setattr(main.psycopg, "connect", _unexpected_connect)
-    main.process_job({"run_id": "not-a-uuid", "project_id": "also-not-a-uuid"})
+    result = main.process_job({"run_id": "not-a-uuid", "project_id": "also-not-a-uuid"})
     assert calls == []
+    assert result == "ignored"
 
 
 class _FakeResult:
@@ -69,13 +70,20 @@ def test_process_job_skips_failed_runs_without_touching_s3(monkeypatch) -> None:
     monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
     monkeypatch.setattr(main, "open_artifact_stream", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed runs must not fetch artifacts")))
 
-    main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact-key"})
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact-key"})
     assert fake_conn._unlocked is True
+    assert result == "ignored"
 
 
 class _FakeBody:
     def __init__(self, lines: list[str]):
         self._lines = [line.encode("utf-8") for line in lines]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
 
     def __iter__(self):
         for line in self._lines:
@@ -120,9 +128,9 @@ def test_process_job_rolls_back_before_marking_failed(monkeypatch) -> None:
         ),
     )
 
-    with pytest.raises(psycopg.DataError):
-        main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
 
+    assert result == "failed"
     assert fake_conn.rollback_calls == 1
     assert fake_conn._unlocked is True
     assert status_updates == ["INGESTING", "FAILED"]
@@ -162,8 +170,56 @@ def test_process_job_persists_public_error_message_when_ingest_fails(monkeypatch
         ),
     )
 
-    with pytest.raises(psycopg.DataError):
-        main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
 
+    assert result == "failed"
     assert captured["last_error"] == "database operation failed during ingest"
     assert captured["audit_error"] == "database operation failed during ingest"
+
+
+def test_process_job_schedules_retry_for_retryable_ingest_error(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (project_id, "artifact.ndjson", "UPLOADED", {}, {"line_offset": 0}, "application/x-ndjson", 64)
+    fake_conn = _FakeConn(run_row)
+    status_updates: list[str] = []
+    retry_metadata: dict[str, Any] = {}
+    audit_actions: list[str] = []
+
+    def _fake_update_run_status(conn, _run_id, status, *_args, **kwargs):
+        status_updates.append(status)
+        if status == "UPLOADED":
+            assert conn.rollback_calls >= 1
+            retry_metadata["last_error"] = kwargs.get("last_error")
+            retry_metadata["extra_progress"] = kwargs.get("extra_progress", {})
+
+    def _fake_write_audit(_conn, _project_id, action, *_args, **_kwargs):
+        audit_actions.append(action)
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "update_run_status", _fake_update_run_status)
+    monkeypatch.setattr(main, "write_audit", _fake_write_audit)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "upsert_endpoint", lambda *_args, **_kwargs: 7)
+    monkeypatch.setattr(main, "upsert_resource", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("artifact read failed")))
+    monkeypatch.setattr(
+        main,
+        "open_artifact_stream",
+        lambda *_args, **_kwargs: _FakeBody(
+            [
+                '{"type":"resource","run_id":"11111111-1111-1111-1111-111111111111","endpoint_key":"host:445","name":"Finance","access_level":"read_write"}'
+            ]
+        ),
+    )
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+
+    assert result == "retry_scheduled"
+    assert fake_conn.rollback_calls == 1
+    assert fake_conn.commit_calls == 2
+    assert fake_conn._unlocked is True
+    assert status_updates == ["INGESTING", "UPLOADED"]
+    assert retry_metadata["last_error"] == "artifact storage read failed during ingest"
+    assert retry_metadata["extra_progress"]["attempt_count"] == 1
+    assert "next_retry_at" in retry_metadata["extra_progress"]
+    assert "INGEST_RETRY_SCHEDULED" in audit_actions

@@ -35,6 +35,7 @@ from app.services.storage import (
     abort_multipart_upload,
     complete_multipart_upload,
     create_multipart_upload,
+    delete_object,
     upload_part,
 )
 from app.token_scopes import SCOPE_READ_RUNS, SCOPE_WRITE_RUNS
@@ -70,6 +71,7 @@ RUN_ACTIVITY_ACTIONS = {
     "INGEST_COMPLETED",
     "INGEST_FAILED",
 }
+EMPTY_RUN_SUMMARY = {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
 
 
 def _get_run(db: Session, project_id: uuid.UUID, run_id: uuid.UUID) -> ScanRun:
@@ -102,6 +104,26 @@ def _run_summary_payload(run: ScanRun) -> dict:
         "created_at": run.created_at.isoformat() if run.created_at else None,
         "status": run.status.value if hasattr(run.status, "value") else run.status,
     }
+
+
+def _clear_run_ingest_data(db: Session, run: ScanRun) -> None:
+    db.execute(delete(Item).where(Item.run_id == run.id))
+    db.execute(delete(Resource).where(Resource.run_id == run.id))
+    db.execute(delete(Endpoint).where(Endpoint.run_id == run.id))
+    db.execute(delete(IngestError).where(IngestError.run_id == run.id))
+    run.summary = dict(EMPTY_RUN_SUMMARY)
+    run.ingest_progress = {"line_offset": 0}
+
+
+def _delete_artifact_quietly(key: str | None) -> None:
+    if not key:
+        return
+    try:
+        delete_object(key)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        logger.warning("failed to delete artifact key=%s", key, exc_info=True)
 
 
 def _resource_identity(endpoint_key: str, resource_type: str, share_name: str) -> tuple[str, str, str]:
@@ -904,6 +926,7 @@ def delete_run(
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
     run = _get_run(db, project_id, run_id)
+    artifact_key = run.artifact_key
     db.execute(delete(ScanRun).where(ScanRun.id == run.id))
     write_audit_event(
         db,
@@ -916,6 +939,7 @@ def delete_run(
         metadata=request_meta(request),
     )
     db.commit()
+    _delete_artifact_quietly(artifact_key)
     return {"ok": True}
 
 
@@ -931,12 +955,14 @@ async def upload_artifact(
 ):
     require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
     actor_key = str(auth.token_id or auth.user_id or "anon")
-    rate_limiter.check(request, "artifact_upload", limit=30, window_seconds=60, actor_key=f"upload:{actor_key}", fail_open=False)
+    rate_limiter.check(request, "artifact_upload", limit=30, window_seconds=60, actor_key=f"upload:{actor_key}", fail_open=True)
 
     settings = get_settings()
     run = _get_run(db, project_id, run_id)
     if run.status not in {RunStatus.PENDING_UPLOAD, RunStatus.UPLOADED, RunStatus.FAILED}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run state does not accept upload")
+    previous_status = run.status
+    previous_artifact_key = run.artifact_key
 
     content_type = _normalize_content_type(file.content_type if file else request.headers.get("content-type", "application/octet-stream"))
     _validate_artifact_upload_headers(content_type, file.filename if file else None)
@@ -945,6 +971,9 @@ async def upload_artifact(
 
     started = time.perf_counter()
     size, digest = await _upload_artifact_stream(request, file, key, content_type)
+
+    if previous_status == RunStatus.FAILED:
+        _clear_run_ingest_data(db, run)
 
     run.artifact_key = key
     run.artifact_size = size
@@ -970,6 +999,8 @@ async def upload_artifact(
         },
     )
     db.commit()
+    if previous_status == RunStatus.FAILED and previous_artifact_key != key:
+        _delete_artifact_quietly(previous_artifact_key)
 
     payload = {
         "run_id": str(run.id),

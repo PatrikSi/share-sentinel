@@ -9,7 +9,7 @@ services:
       - "--providers.docker.exposedbydefault=false"
       - "--entrypoints.web.address=:80"
     ports:
-      - "80:80"
+      - "127.0.0.1:80:80"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
     depends_on:
@@ -45,6 +45,7 @@ services:
     build: ./api
     command: ["sh", "-lc", "alembic upgrade head && python -m app.bootstrap"]
     environment:
+      APP_ENV: ${APP_ENV:-development}
       DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:-change-me}@db:5432/share_sentinel
       ARTIFACT_STORAGE_PATH: /artifacts
       PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-12}
@@ -65,6 +66,7 @@ services:
   api:
     build: ./api
     environment:
+      APP_ENV: ${APP_ENV:-development}
       DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:-change-me}@db:5432/share_sentinel
       REDIS_URL: redis://redis:6379/0
       ARTIFACT_STORAGE_PATH: /artifacts
@@ -79,6 +81,10 @@ services:
       PASSWORD_REQUIRE_UPPERCASE: ${PASSWORD_REQUIRE_UPPERCASE:-true}
       PASSWORD_REQUIRE_NUMBER: ${PASSWORD_REQUIRE_NUMBER:-true}
       PASSWORD_REQUIRE_SPECIAL: ${PASSWORD_REQUIRE_SPECIAL:-false}
+      AUTH_LOGIN_MAX_ATTEMPTS: ${AUTH_LOGIN_MAX_ATTEMPTS:-8}
+      AUTH_LOGIN_WINDOW_SECONDS: ${AUTH_LOGIN_WINDOW_SECONDS:-300}
+      AUTH_LOGIN_LOCKOUT_SECONDS: ${AUTH_LOGIN_LOCKOUT_SECONDS:-900}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-250000}
     depends_on:
       db:
         condition: service_healthy
@@ -89,7 +95,7 @@ services:
     volumes:
       - artifacts:/artifacts
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs', timeout=2)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -109,6 +115,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       ARTIFACT_STORAGE_PATH: /artifacts
       LOG_LEVEL: INFO
+      WORKER_HEARTBEAT_PATH: /tmp/share-sentinel-worker-heartbeat.json
+      WORKER_HEALTH_TIMEOUT_SECONDS: ${WORKER_HEALTH_TIMEOUT_SECONDS:-45}
     depends_on:
       db:
         condition: service_healthy
@@ -118,6 +126,19 @@ services:
         condition: service_completed_successfully
     volumes:
       - artifacts:/artifacts
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json, os, sys; from datetime import datetime, timezone; path = os.getenv('WORKER_HEARTBEAT_PATH', '/tmp/share-sentinel-worker-heartbeat.json'); timeout = int(os.getenv('WORKER_HEALTH_TIMEOUT_SECONDS', '45')); data = json.load(open(path)); ts = datetime.fromisoformat(data['ts']); age = (datetime.now(timezone.utc) - ts).total_seconds(); sys.exit(0 if age <= timeout else 1)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   ui:
     build:

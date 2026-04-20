@@ -6,7 +6,7 @@ import socket
 import sys
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -48,9 +48,18 @@ CONSUMER_NAME = f"{socket.gethostname()}-{os.getpid()}"
 BATCH_SIZE = _read_int_env("INGEST_BATCH_SIZE", 5000, min_value=1)
 PROGRESS_EVERY_LINES = _read_int_env("INGEST_PROGRESS_EVERY_LINES", 2000, min_value=1)
 RECOVERY_SCAN_SECONDS = _read_int_env("INGEST_RECOVERY_SCAN_SECONDS", 8, min_value=1)
+RECOVERY_SCAN_LIMIT = _read_int_env("INGEST_RECOVERY_SCAN_LIMIT", 8, min_value=1)
 PENDING_IDLE_MS = _read_int_env("INGEST_PENDING_IDLE_MS", 60000, min_value=1)
 JSON_COMPAT_MAX_BYTES = _read_int_env("INGEST_JSON_COMPAT_MAX_BYTES", 50 * 1024 * 1024, min_value=1024)
+GZIP_DECOMPRESSED_MAX_BYTES = _read_int_env("INGEST_GZIP_MAX_BYTES", 4 * 1024 * 1024 * 1024, min_value=1024)
+GZIP_DECOMPRESSED_MAX_RATIO = _read_int_env("INGEST_GZIP_MAX_EXPANSION_RATIO", 200, min_value=1)
 STALE_INGESTING_SECONDS = _read_int_env("INGEST_STALE_RUN_SECONDS", 300, min_value=30)
+INGEST_MAX_RETRIES = _read_int_env("INGEST_MAX_RETRIES", 4, min_value=0)
+INGEST_RETRY_BASE_SECONDS = _read_int_env("INGEST_RETRY_BASE_SECONDS", 30, min_value=1)
+INGEST_RETRY_MAX_SECONDS = _read_int_env("INGEST_RETRY_MAX_SECONDS", 900, min_value=1)
+WORKER_HEARTBEAT_PATH = os.getenv("WORKER_HEARTBEAT_PATH", "/tmp/share-sentinel-worker-heartbeat.json")
+WORKER_HEARTBEAT_INTERVAL_SECONDS = _read_int_env("WORKER_HEARTBEAT_INTERVAL_SECONDS", 15, min_value=1)
+WORKER_HEALTH_TIMEOUT_SECONDS = _read_int_env("WORKER_HEALTH_TIMEOUT_SECONDS", 45, min_value=5)
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -87,6 +96,7 @@ ACCESS_LEVEL_ALIASES = {
     "full_control": "readable",
     "rw": "readable",
 }
+GZIP_DECOMPRESSED_LIMIT_ERROR = "gzip artifact exceeds decompressed size limit"
 
 
 def _safe_run_id(fields: dict[str, str] | None) -> str | None:
@@ -228,10 +238,13 @@ def update_run_status(
     line_offset: int,
     summary: dict[str, Any],
     last_error: str | None = None,
+    extra_progress: dict[str, Any] | None = None,
 ):
     ingest_progress = {"line_offset": line_offset, "heartbeat_at": now_iso()}
     if last_error:
         ingest_progress["last_error"] = last_error
+    if extra_progress:
+        ingest_progress.update(extra_progress)
     conn.execute(
         """
         UPDATE scan_runs
@@ -259,6 +272,16 @@ def parse_offset(raw: Any) -> int:
     if not isinstance(raw, dict):
         return 0
     value = raw.get("line_offset", 0)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_attempt_count(raw: Any) -> int:
+    if not isinstance(raw, dict):
+        return 0
+    value = raw.get("attempt_count", 0)
     try:
         return max(0, int(value))
     except (TypeError, ValueError):
@@ -638,6 +661,71 @@ def _read_json_compat_bytes(body, gzip_input: bool, max_bytes: int) -> bytes:
     return bytes(buffer)
 
 
+def _gzip_decompressed_limit(artifact_size: int | None) -> int:
+    if isinstance(artifact_size, int) and artifact_size > 0:
+        return min(GZIP_DECOMPRESSED_MAX_BYTES, max(JSON_COMPAT_MAX_BYTES, artifact_size * GZIP_DECOMPRESSED_MAX_RATIO))
+    return GZIP_DECOMPRESSED_MAX_BYTES
+
+
+class _LimitedReader:
+    def __init__(self, reader, max_bytes: int, error_message: str):
+        self._reader = reader
+        self._max_bytes = max_bytes
+        self._error_message = error_message
+        self._total = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def _track(self, size: int) -> None:
+        self._total += max(0, size)
+        if self._total > self._max_bytes:
+            raise ValueError(self._error_message)
+
+    def read(self, size: int = -1):
+        chunk = self._reader.read(size)
+        self._track(len(chunk or b""))
+        return chunk
+
+    def read1(self, size: int = -1):
+        if hasattr(self._reader, "read1"):
+            chunk = self._reader.read1(size)
+        else:
+            chunk = self._reader.read(size)
+        self._track(len(chunk or b""))
+        return chunk
+
+    def readline(self, size: int = -1):
+        line = self._reader.readline(size)
+        self._track(len(line or b""))
+        return line
+
+    def readinto(self, b):
+        count = self._reader.readinto(b)
+        if count is not None:
+            self._track(count)
+        return count
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if line in {b"", ""}:
+            raise StopIteration
+        return line
+
+    def close(self):
+        return self._reader.close()
+
+    def __getattr__(self, name: str):
+        return getattr(self._reader, name)
+
+
 def _public_ingest_error(exc: BaseException) -> str:
     if isinstance(exc, psycopg.Error):
         return "database operation failed during ingest"
@@ -651,10 +739,44 @@ def _public_ingest_error(exc: BaseException) -> str:
             "missing artifact key",
             "unsupported JSON artifact format",
             "JSON artifact exceeds non-streamable compatibility limit",
+            GZIP_DECOMPRESSED_LIMIT_ERROR,
         }:
             return detail
         return "artifact validation failed during ingest"
     return "unexpected ingest failure"
+
+
+def _is_retryable_ingest_error(exc: BaseException) -> bool:
+    return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError, OSError, RuntimeError))
+
+
+def _retry_backoff_seconds(attempt_count: int) -> int:
+    bounded_attempt = max(1, attempt_count)
+    delay = INGEST_RETRY_BASE_SECONDS * (2 ** (bounded_attempt - 1))
+    return min(INGEST_RETRY_MAX_SECONDS, delay)
+
+
+def _write_worker_heartbeat(status: str, run_id: str | None = None, line_offset: int | None = None) -> None:
+    heartbeat_path = Path(WORKER_HEARTBEAT_PATH)
+    payload = {
+        "ts": now_iso(),
+        "consumer": CONSUMER_NAME,
+        "pid": os.getpid(),
+        "hostname": socket.gethostname(),
+        "status": status,
+    }
+    if run_id:
+        payload["run_id"] = run_id
+    if line_offset is not None:
+        payload["line_offset"] = line_offset
+
+    try:
+        heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = heartbeat_path.with_suffix(heartbeat_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        tmp_path.replace(heartbeat_path)
+    except OSError:
+        logger.exception("failed writing worker heartbeat path=%s", heartbeat_path)
 
 
 def discover_recoverable_runs(limit: int = 8) -> list[dict[str, str]]:
@@ -665,7 +787,13 @@ def discover_recoverable_runs(limit: int = 8) -> list[dict[str, str]]:
             FROM scan_runs
             WHERE artifact_key IS NOT NULL
               AND (
-                  status = 'UPLOADED'
+                  (
+                      status = 'UPLOADED'
+                      AND COALESCE(
+                          NULLIF(ingest_progress->>'next_retry_at', '')::timestamptz,
+                          TO_TIMESTAMP(0)
+                      ) <= NOW()
+                  )
                   OR (
                       status = 'INGESTING'
                       AND COALESCE(
@@ -693,7 +821,7 @@ def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
     return discover_recoverable_runs(limit=limit)
 
 
-def process_job(fields: dict[str, str]) -> None:
+def process_job(fields: dict[str, str]) -> str:
     run_id = _normalize_uuid_str(fields.get("run_id"))
     project_id = _normalize_uuid_str(fields.get("project_id"))
     artifact_key = fields.get("artifact_key")
@@ -702,14 +830,14 @@ def process_job(fields: dict[str, str]) -> None:
 
     if not run_id:
         logger.error("invalid job payload missing or invalid run_id: %s", fields)
-        return
+        return "ignored"
 
     with psycopg.connect(DATABASE_URL) as conn:
         lock_key = advisory_lock_key(run_id)
         locked = conn.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]
         if not locked:
             logger.info("run is already being processed run_id=%s", run_id)
-            return
+            return "ignored"
 
         try:
             row = conn.execute(
@@ -722,7 +850,7 @@ def process_job(fields: dict[str, str]) -> None:
             ).fetchone()
             if row is None:
                 logger.warning("run not found run_id=%s", run_id)
-                return
+                return "ignored"
 
             db_project_id, db_artifact_key, status, summary_raw, progress_raw, artifact_content_type, artifact_size = row
             project_id = project_id or db_project_id
@@ -730,16 +858,26 @@ def process_job(fields: dict[str, str]) -> None:
             if not artifact_key:
                 update_run_status(conn, run_id, "FAILED", parse_offset(progress_raw), parse_summary(summary_raw), "missing artifact key")
                 conn.commit()
-                return
+                return "failed"
             if status in {"COMPLETE", "FAILED"}:
-                return
+                return "ignored"
 
             counts = parse_summary(summary_raw)
             line_offset = parse_offset(progress_raw)
+            attempt_count = parse_attempt_count(progress_raw)
             last_line_offset = line_offset
             last_counts = counts.copy()
+            last_worker_heartbeat = 0.0
 
-            update_run_status(conn, run_id, "INGESTING", line_offset, counts)
+            def emit_processing_heartbeat(force: bool = False) -> None:
+                nonlocal last_worker_heartbeat
+                now = time.time()
+                if force or now - last_worker_heartbeat >= WORKER_HEARTBEAT_INTERVAL_SECONDS:
+                    _write_worker_heartbeat("processing", run_id=run_id, line_offset=line_offset)
+                    last_worker_heartbeat = now
+
+            emit_processing_heartbeat(force=True)
+            update_run_status(conn, run_id, "INGESTING", line_offset, counts, extra_progress={"attempt_count": attempt_count})
             write_audit(
                 conn,
                 project_id,
@@ -861,16 +999,66 @@ def process_job(fields: dict[str, str]) -> None:
                     if current_line <= line_offset:
                         continue
                     line_offset = current_line
+                    emit_processing_heartbeat()
                     process_record(rec)
 
                     if line_offset % PROGRESS_EVERY_LINES == 0:
                         flush_item_batch(conn, item_batch)
                         flush_error_batch(conn, error_batch)
-                        update_run_status(conn, run_id, "INGESTING", line_offset, counts)
+                        update_run_status(
+                            conn,
+                            run_id,
+                            "INGESTING",
+                            line_offset,
+                            counts,
+                            extra_progress={"attempt_count": attempt_count},
+                        )
                         conn.commit()
                         last_line_offset = line_offset
                         last_counts = counts.copy()
                 return current_line
+
+            def process_ndjson_lines(reader) -> None:
+                nonlocal line_offset, last_line_offset, last_counts
+                current_line = 0
+                for raw_line in reader:
+                    current_line += 1
+                    if current_line <= line_offset:
+                        continue
+
+                    line_offset = current_line
+                    if isinstance(raw_line, bytes):
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                    else:
+                        line = str(raw_line).strip()
+                    emit_processing_heartbeat()
+                    if not line:
+                        continue
+
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        error_batch.append((run_id, "error", "JSON_DECODE_ERROR", str(exc), None, None, None))
+                        counts["errors"] += 1
+                        if len(error_batch) >= BATCH_SIZE:
+                            flush_error_batch(conn, error_batch)
+                        continue
+
+                    process_record(rec)
+                    if line_offset % PROGRESS_EVERY_LINES == 0:
+                        flush_item_batch(conn, item_batch)
+                        flush_error_batch(conn, error_batch)
+                        update_run_status(
+                            conn,
+                            run_id,
+                            "INGESTING",
+                            line_offset,
+                            counts,
+                            extra_progress={"attempt_count": attempt_count},
+                        )
+                        conn.commit()
+                        last_line_offset = line_offset
+                        last_counts = counts.copy()
 
             json_records: list[dict[str, Any]] | None = None
             content_type = str(artifact_content_type or "").lower()
@@ -881,7 +1069,11 @@ def process_job(fields: dict[str, str]) -> None:
                 try:
                     with open_artifact_stream(artifact_key) as body:
                         if gzip_input:
-                            with gzip.GzipFile(fileobj=body) as json_reader:
+                            with gzip.GzipFile(fileobj=body) as gzip_reader, _LimitedReader(
+                                gzip_reader,
+                                _gzip_decompressed_limit(artifact_size),
+                                GZIP_DECOMPRESSED_LIMIT_ERROR,
+                            ) as json_reader:
                                 process_record_iter(_iter_records_from_streamable_json_file(json_reader, run_id))
                         else:
                             process_record_iter(_iter_records_from_streamable_json_file(body, run_id))
@@ -896,46 +1088,16 @@ def process_job(fields: dict[str, str]) -> None:
                     if json_records is None:
                         raise ValueError("unsupported JSON artifact format")
             else:
-                body = open_artifact_stream(artifact_key)
-                try:
+                with open_artifact_stream(artifact_key) as body:
                     if gzip_input:
-                        reader = gzip.GzipFile(fileobj=body)
+                        with gzip.GzipFile(fileobj=body) as gzip_reader, _LimitedReader(
+                            gzip_reader,
+                            _gzip_decompressed_limit(artifact_size),
+                            GZIP_DECOMPRESSED_LIMIT_ERROR,
+                        ) as reader:
+                            process_ndjson_lines(reader)
                     else:
-                        reader = body
-
-                    current_line = 0
-                    for raw_line in reader:
-                        current_line += 1
-                        if current_line <= line_offset:
-                            continue
-
-                        line_offset = current_line
-                        if isinstance(raw_line, bytes):
-                            line = raw_line.decode("utf-8", errors="replace").strip()
-                        else:
-                            line = str(raw_line).strip()
-                        if not line:
-                            continue
-
-                        try:
-                            rec = json.loads(line)
-                        except json.JSONDecodeError as exc:
-                            error_batch.append((run_id, "error", "JSON_DECODE_ERROR", str(exc), None, None, None))
-                            counts["errors"] += 1
-                            if len(error_batch) >= BATCH_SIZE:
-                                flush_error_batch(conn, error_batch)
-                            continue
-
-                        process_record(rec)
-                        if line_offset % PROGRESS_EVERY_LINES == 0:
-                            flush_item_batch(conn, item_batch)
-                            flush_error_batch(conn, error_batch)
-                            update_run_status(conn, run_id, "INGESTING", line_offset, counts)
-                            conn.commit()
-                            last_line_offset = line_offset
-                            last_counts = counts.copy()
-                finally:
-                    body.close()
+                        process_ndjson_lines(body)
 
             if json_records is not None:
                 process_record_iter(json_records)
@@ -955,15 +1117,60 @@ def process_job(fields: dict[str, str]) -> None:
             conn.commit()
             last_line_offset = line_offset
             last_counts = counts.copy()
+            _write_worker_heartbeat("idle")
+            return "complete"
         except INGEST_OPERATION_EXCEPTIONS as exc:
             logger.exception("job failed run_id=%s", run_id)
             public_error = _public_ingest_error(exc)
+            retryable = _is_retryable_ingest_error(exc)
+            attempt_count = parse_attempt_count(progress_raw) + 1
             try:
                 conn.rollback()
             except psycopg.Error:
                 logger.exception("failed to rollback aborted ingest transaction run_id=%s", run_id)
             try:
-                update_run_status(conn, run_id, "FAILED", last_line_offset, last_counts, last_error=public_error)
+                if retryable and attempt_count <= INGEST_MAX_RETRIES:
+                    next_retry_at = datetime.now(tz=UTC) + timedelta(seconds=_retry_backoff_seconds(attempt_count))
+                    update_run_status(
+                        conn,
+                        run_id,
+                        "UPLOADED",
+                        last_line_offset,
+                        last_counts,
+                        last_error=public_error,
+                        extra_progress={
+                            "attempt_count": attempt_count,
+                            "last_attempt_at": now_iso(),
+                            "next_retry_at": next_retry_at.isoformat(),
+                        },
+                    )
+                    if project_id:
+                        write_audit(
+                            conn,
+                            project_id,
+                            "INGEST_RETRY_SCHEDULED",
+                            "scan_run",
+                            run_id,
+                            {
+                                "worker": CONSUMER_NAME,
+                                "error": public_error,
+                                "attempt_count": attempt_count,
+                                "next_retry_at": next_retry_at.isoformat(),
+                            },
+                        )
+                    conn.commit()
+                    _write_worker_heartbeat("idle")
+                    return "retry_scheduled"
+
+                update_run_status(
+                    conn,
+                    run_id,
+                    "FAILED",
+                    last_line_offset,
+                    last_counts,
+                    last_error=public_error,
+                    extra_progress={"attempt_count": attempt_count, "last_attempt_at": now_iso()},
+                )
                 if project_id:
                     write_audit(
                         conn,
@@ -971,9 +1178,11 @@ def process_job(fields: dict[str, str]) -> None:
                         "INGEST_FAILED",
                         "scan_run",
                         run_id,
-                        {"worker": CONSUMER_NAME, "error": public_error},
+                        {"worker": CONSUMER_NAME, "error": public_error, "attempt_count": attempt_count},
                     )
                 conn.commit()
+                _write_worker_heartbeat("idle")
+                return "failed"
             except psycopg.Error:
                 logger.exception("failed to persist ingest failure state run_id=%s", run_id)
                 try:
@@ -996,33 +1205,52 @@ def ensure_group() -> None:
             raise
 
 
-def claim_stale_messages() -> list[tuple[str, dict[str, str]]]:
+def ensure_group_with_retry() -> None:
+    last_logged_at = 0.0
+    while True:
+        try:
+            ensure_group()
+            return
+        except redis.RedisError as exc:
+            now = time.time()
+            if _should_log_redis_error(last_logged_at, now, interval_seconds=10.0):
+                logger.warning("redis stream group setup failed, retrying: %s", exc)
+                last_logged_at = now
+            _write_worker_heartbeat("waiting_for_redis")
+            time.sleep(1)
+
+
+def claim_stale_messages(start_id: str = "0-0") -> tuple[str, list[tuple[str, dict[str, str]]]]:
     try:
         result = redis_client.xautoclaim(
             STREAM_NAME,
             GROUP_NAME,
             CONSUMER_NAME,
             min_idle_time=PENDING_IDLE_MS,
-            start_id="0-0",
+            start_id=start_id,
             count=10,
         )
     except redis.RedisError:
-        return []
+        return start_id, []
 
     if not result:
-        return []
+        return start_id, []
 
     # redis-py returns (next_start_id, [(id, fields), ...], [deleted_ids])
+    next_start_id = result[0] if len(result) > 0 else start_id
     messages = result[1] if len(result) > 1 else []
-    return messages or []
+    return next_start_id, messages or []
 
 
 def main() -> int:
-    ensure_group()
+    ensure_group_with_retry()
     logger.info("worker started consumer=%s", CONSUMER_NAME)
+    _write_worker_heartbeat("idle")
 
     last_recovery_scan = 0.0
     last_redis_error_log = 0.0
+    last_idle_heartbeat = time.time()
+    next_claim_start_id = "0-0"
 
     while True:
         messages = []
@@ -1039,6 +1267,7 @@ def main() -> int:
             if _should_log_redis_error(last_redis_error_log, now):
                 logger.warning("redis stream read failed, retrying: %s", exc)
                 last_redis_error_log = now
+            _write_worker_heartbeat("redis_retry")
             time.sleep(1)
 
         if messages:
@@ -1047,7 +1276,7 @@ def main() -> int:
                     try:
                         process_job(fields)
                         redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
-                    except STREAM_MESSAGE_RETRYABLE_EXCEPTIONS:
+                    except Exception:
                         logger.exception(
                             "failed processing stream message message_id=%s run_id=%s",
                             message_id,
@@ -1055,12 +1284,12 @@ def main() -> int:
                         )
                         time.sleep(1)
 
-        stale_jobs = claim_stale_messages()
+        next_claim_start_id, stale_jobs = claim_stale_messages(next_claim_start_id)
         for message_id, fields in stale_jobs:
             try:
                 process_job(fields)
                 redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
-            except STREAM_MESSAGE_RETRYABLE_EXCEPTIONS:
+            except Exception:
                 logger.exception(
                     "failed processing claimed stream message message_id=%s run_id=%s",
                     message_id,
@@ -1069,13 +1298,18 @@ def main() -> int:
                 time.sleep(1)
 
         if time.time() - last_recovery_scan >= RECOVERY_SCAN_SECONDS:
-            for recovered in discover_recoverable_runs(limit=5):
+            for recovered in discover_recoverable_runs(limit=RECOVERY_SCAN_LIMIT):
                 try:
                     process_job(recovered)
-                except STREAM_MESSAGE_RETRYABLE_EXCEPTIONS:
+                except Exception:
                     logger.exception("failed processing recovered uploaded run run_id=%s", _safe_run_id(recovered))
                     time.sleep(1)
             last_recovery_scan = time.time()
+
+        now = time.time()
+        if now - last_idle_heartbeat >= WORKER_HEARTBEAT_INTERVAL_SECONDS:
+            _write_worker_heartbeat("idle")
+            last_idle_heartbeat = now
 
 
 if __name__ == "__main__":

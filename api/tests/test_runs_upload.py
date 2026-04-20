@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -94,3 +95,31 @@ def test_validate_artifact_signature_rejects_invalid_gzip_magic() -> None:
         runs_router._validate_artifact_signature("gzip", b"not-gzip", final=True)
 
     assert exc.value.status_code == 415
+
+
+def test_clear_run_ingest_data_resets_summary_and_progress() -> None:
+    class _FakeDb:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        def execute(self, statement):
+            self.calls.append(statement)
+
+    run = SimpleNamespace(
+        id=uuid.uuid4(),
+        summary={"endpoints": 2, "resources": 3, "items": 5, "errors": 1},
+        ingest_progress={"line_offset": 42, "last_error": "boom"},
+    )
+    fake_db = _FakeDb()
+
+    runs_router._clear_run_ingest_data(fake_db, run)
+
+    assert len(fake_db.calls) == 4
+    assert run.summary == runs_router.EMPTY_RUN_SUMMARY
+    assert run.ingest_progress == {"line_offset": 0}
+
+
+def test_delete_artifact_quietly_ignores_missing_files(monkeypatch) -> None:
+    monkeypatch.setattr(runs_router, "delete_object", lambda _key: (_ for _ in ()).throw(FileNotFoundError("gone")))
+
+    runs_router._delete_artifact_quietly("projects/p/runs/r/artifact.ndjson")

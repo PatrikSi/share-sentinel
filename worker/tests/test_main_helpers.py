@@ -65,6 +65,7 @@ def test_read_json_compat_bytes_rejects_payloads_over_limit() -> None:
 
 def test_public_ingest_error_redacts_internal_failure_types() -> None:
     assert main._public_ingest_error(ValueError("unsupported JSON artifact format")) == "unsupported JSON artifact format"
+    assert main._public_ingest_error(ValueError(main.GZIP_DECOMPRESSED_LIMIT_ERROR)) == main.GZIP_DECOMPRESSED_LIMIT_ERROR
     assert main._public_ingest_error(TypeError("bad shape")) == "artifact contained an unexpected record shape"
     assert main._public_ingest_error(RuntimeError("oops")) == "unexpected ingest failure"
 
@@ -92,11 +93,53 @@ def test_read_json_compat_bytes_rejects_gzip_payloads_over_limit() -> None:
         main._read_json_compat_bytes(io.BytesIO(payload), gzip_input=True, max_bytes=16)
 
 
+def test_limited_reader_rejects_gzip_payloads_over_limit() -> None:
+    payload = gzip.compress(b"a" * 33)
+
+    with gzip.GzipFile(fileobj=io.BytesIO(payload)) as gzip_reader, main._LimitedReader(
+        gzip_reader,
+        max_bytes=32,
+        error_message=main.GZIP_DECOMPRESSED_LIMIT_ERROR,
+    ) as limited_reader:
+        with pytest.raises(ValueError, match=main.GZIP_DECOMPRESSED_LIMIT_ERROR):
+            limited_reader.read()
+
+
+def test_gzip_decompressed_limit_scales_from_artifact_size() -> None:
+    assert main._gzip_decompressed_limit(1024) == max(main.JSON_COMPAT_MAX_BYTES, 1024 * main.GZIP_DECOMPRESSED_MAX_RATIO)
+
+
 def test_parse_offset_returns_zero_for_non_numeric_values() -> None:
     assert main.parse_offset({"line_offset": "12"}) == 12
     assert main.parse_offset({"line_offset": -7}) == 0
     assert main.parse_offset({"line_offset": "nan"}) == 0
     assert main.parse_offset({"line_offset": None}) == 0
+
+
+def test_parse_attempt_count_returns_zero_for_non_numeric_values() -> None:
+    assert main.parse_attempt_count({"attempt_count": "3"}) == 3
+    assert main.parse_attempt_count({"attempt_count": -1}) == 0
+    assert main.parse_attempt_count({"attempt_count": "nan"}) == 0
+    assert main.parse_attempt_count({"attempt_count": None}) == 0
+
+
+def test_retry_backoff_seconds_grows_and_caps() -> None:
+    assert main._retry_backoff_seconds(1) == main.INGEST_RETRY_BASE_SECONDS
+    assert main._retry_backoff_seconds(2) == min(main.INGEST_RETRY_MAX_SECONDS, main.INGEST_RETRY_BASE_SECONDS * 2)
+    assert main._retry_backoff_seconds(99) == main.INGEST_RETRY_MAX_SECONDS
+
+
+def test_write_worker_heartbeat_persists_status_payload(tmp_path: Path, monkeypatch) -> None:
+    heartbeat_path = tmp_path / "worker-heartbeat.json"
+    monkeypatch.setattr(main, "WORKER_HEARTBEAT_PATH", str(heartbeat_path))
+
+    main._write_worker_heartbeat("processing", run_id="run-1", line_offset=42)
+
+    payload = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "processing"
+    assert payload["run_id"] == "run-1"
+    assert payload["line_offset"] == 42
+    assert "ts" in payload
 
 
 def test_validate_record_requires_numeric_schema_version_for_run_meta() -> None:
