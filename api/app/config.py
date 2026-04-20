@@ -6,6 +6,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from app.password_policy import password_policy_kwargs, validate_password_strength
 
 
+PLACEHOLDER_PREFIXES = ("change-me", "changeme", "replace-", "replace_", "example-", "your-")
+
+
+def looks_like_placeholder(value: str | None) -> bool:
+    normalized = str(value or "").strip().lower()
+    return any(normalized.startswith(prefix) for prefix in PLACEHOLDER_PREFIXES)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
 
@@ -19,11 +27,11 @@ class Settings(BaseSettings):
 
     artifact_storage_path: str = "/artifacts"
 
-    jwt_secret: str = "dev-secret"
+    jwt_secret: str = "dev-secret-not-for-production-0123456789"
     jwt_issuer: str = "share-sentinel"
     access_token_minutes: int = 15
     refresh_token_days: int = 14
-    token_pepper: str = "dev-pepper"
+    token_pepper: str = "dev-token-pepper-not-for-production-012345"
     require_user_for_api_token_create: bool = True
     allow_legacy_unscoped_tokens: bool = False
     default_api_token_expiry_days: int = 90
@@ -95,6 +103,14 @@ class Settings(BaseSettings):
             raise ValueError("password_min_length must be 256 or less")
         return value
 
+    @field_validator("jwt_secret", "token_pepper")
+    @classmethod
+    def _validate_secret_length(cls, value: str, info) -> str:
+        normalized = str(value).strip()
+        if len(normalized) < 32:
+            raise ValueError(f"{info.field_name} must be at least 32 characters")
+        return normalized
+
     @field_validator("default_api_token_expiry_days")
     @classmethod
     def _validate_default_api_token_expiry_days(cls, value: int) -> int:
@@ -110,6 +126,8 @@ class Settings(BaseSettings):
         has_seed_password = bool(self.seed_admin_password)
         if has_seed_email != has_seed_password:
             raise ValueError("SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD must either both be set or both be unset")
+        if self.seed_admin_password and looks_like_placeholder(self.seed_admin_password):
+            raise ValueError("SEED_ADMIN_PASSWORD must be replaced before startup")
         if self.seed_admin_password:
             try:
                 validate_password_strength(self.seed_admin_password, **password_policy_kwargs(self))
@@ -118,24 +136,28 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _validate_non_testing_secret_placeholders(self):
+        if self.app_env.lower() in {"testing", "test"}:
+            return self
+        if looks_like_placeholder(self.jwt_secret):
+            raise ValueError("jwt_secret must be replaced before startup")
+        if looks_like_placeholder(self.token_pepper):
+            raise ValueError("token_pepper must be replaced before startup")
+        return self
+
+    @model_validator(mode="after")
     def _validate_production_settings(self):
         if self.default_api_token_expiry_days == 0 and not self.allow_never_expiring_api_tokens:
             raise ValueError(
                 "default_api_token_expiry_days must be at least 1 when allow_never_expiring_api_tokens is false"
             )
-        if self.app_env.lower() in {"production", "prod"}:
-            if self.jwt_secret == "dev-secret" or len(self.jwt_secret) < 32:
-                raise ValueError("jwt_secret must be set and at least 32 characters in production")
-            if self.token_pepper == "dev-pepper" or len(self.token_pepper) < 32:
-                raise ValueError("token_pepper must be set and at least 32 characters in production")
+        if self.app_env.lower() in {"production", "prod", "staging", "stage"}:
             if not self.auth_require_csrf:
                 raise ValueError("auth_require_csrf must be true in production")
             if self.allow_legacy_unscoped_tokens:
                 raise ValueError("allow_legacy_unscoped_tokens must be false in production")
             if not self.seed_admin_email or not self.seed_admin_password:
                 raise ValueError("SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD must both be set in production")
-            if self.seed_admin_password in {"ChangeMe123456", "change-me-please-12-plus"}:
-                raise ValueError("SEED_ADMIN_PASSWORD must not use the default value in production")
             if not self.auth_cookie_secure:
                 raise ValueError("auth_cookie_secure must be true in production")
             if self.allow_never_expiring_api_tokens:

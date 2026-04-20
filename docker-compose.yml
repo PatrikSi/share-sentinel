@@ -21,7 +21,7 @@ services:
     environment:
       POSTGRES_DB: share_sentinel
       POSTGRES_USER: share_sentinel
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -46,7 +46,7 @@ services:
     command: ["sh", "-lc", "alembic upgrade head && python -m app.bootstrap"]
     environment:
       APP_ENV: ${APP_ENV:-development}
-      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:-change-me}@db:5432/share_sentinel
+      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/share_sentinel
       ARTIFACT_STORAGE_PATH: /artifacts
       PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-12}
       PASSWORD_REQUIRE_LOWERCASE: ${PASSWORD_REQUIRE_LOWERCASE:-true}
@@ -54,8 +54,8 @@ services:
       PASSWORD_REQUIRE_NUMBER: ${PASSWORD_REQUIRE_NUMBER:-true}
       PASSWORD_REQUIRE_SPECIAL: ${PASSWORD_REQUIRE_SPECIAL:-false}
       SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@example.com}
-      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-ChangeMe123456}
-      TOKEN_PEPPER: ${TOKEN_PEPPER:-change-me-long-random-string}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:?set SEED_ADMIN_PASSWORD in .env}
+      TOKEN_PEPPER: ${TOKEN_PEPPER:?set TOKEN_PEPPER in .env}
     volumes:
       - artifacts:/artifacts
     depends_on:
@@ -67,12 +67,12 @@ services:
     build: ./api
     environment:
       APP_ENV: ${APP_ENV:-development}
-      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:-change-me}@db:5432/share_sentinel
+      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/share_sentinel
       REDIS_URL: redis://redis:6379/0
       ARTIFACT_STORAGE_PATH: /artifacts
-      JWT_SECRET: ${JWT_SECRET:-change-me-super-long-random-string}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       JWT_ISSUER: share-sentinel
-      TOKEN_PEPPER: ${TOKEN_PEPPER:-change-me-long-random-string}
+      TOKEN_PEPPER: ${TOKEN_PEPPER:?set TOKEN_PEPPER in .env}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
       API_ROOT_PATH: /api
       LOG_LEVEL: INFO
@@ -111,7 +111,7 @@ services:
   worker:
     build: ./worker
     environment:
-      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:-change-me}@db:5432/share_sentinel
+      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/share_sentinel
       REDIS_URL: redis://redis:6379/0
       ARTIFACT_STORAGE_PATH: /artifacts
       LOG_LEVEL: INFO

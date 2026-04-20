@@ -25,12 +25,14 @@ It is built around one loop:
 cp .env.example .env
 ```
 
-2. Replace the default secrets before using the stack outside a throwaway local environment:
+2. Edit `.env` and replace the required placeholder values before starting the stack:
 
 - `POSTGRES_PASSWORD`
 - `JWT_SECRET`
 - `TOKEN_PEPPER`
 - `SEED_ADMIN_PASSWORD`
+
+The example file intentionally uses placeholder values that fail fast until you replace them.
 
 3. Build and start the stack:
 

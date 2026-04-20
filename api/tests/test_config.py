@@ -30,6 +30,24 @@ def test_production_rejects_default_seed_password() -> None:
         )
 
 
+def test_non_testing_env_rejects_placeholder_secrets() -> None:
+    with pytest.raises(ValueError, match="jwt_secret must be replaced before startup"):
+        Settings(jwt_secret="replace-before-running-secret-value-0123456789", token_pepper="y" * 64)
+
+    with pytest.raises(ValueError, match="token_pepper must be replaced before startup"):
+        Settings(jwt_secret="x" * 64, token_pepper="change-me-token-pepper-value-0123456789")
+
+    with pytest.raises(ValueError, match="SEED_ADMIN_PASSWORD must be replaced before startup"):
+        Settings(
+            seed_admin_email="admin@example.com",
+            seed_admin_password="change-me-password",
+            password_min_length=3,
+            password_require_lowercase=False,
+            password_require_uppercase=False,
+            password_require_number=False,
+        )
+
+
 def test_production_requires_secure_auth_cookie() -> None:
     with pytest.raises(ValueError):
         Settings(
@@ -74,6 +92,18 @@ def test_production_requires_csrf_and_disallows_legacy_unscoped_tokens() -> None
             seed_admin_password="StrongPassword123",
             auth_cookie_secure=True,
             allow_never_expiring_api_tokens=True,
+        )
+
+
+def test_staging_requires_production_security_posture() -> None:
+    with pytest.raises(ValueError, match="auth_cookie_secure must be true in production"):
+        Settings(
+            app_env="staging",
+            jwt_secret="x" * 64,
+            token_pepper="y" * 64,
+            seed_admin_email="admin@example.com",
+            seed_admin_password="StrongPassword123",
+            auth_cookie_secure=False,
         )
 
 

@@ -9,7 +9,7 @@ from app.routers import audit, auth, health, inventory, projects, runs, settings
 
 app_settings = get_settings()
 app_env = app_settings.app_env.lower()
-docs_enabled = app_env in {"development", "dev", "testing", "test", "staging", "stage"}
+docs_enabled = app_env in {"development", "dev", "testing", "test"}
 
 logging.basicConfig(
     level=getattr(logging, app_settings.log_level.upper(), logging.INFO),
