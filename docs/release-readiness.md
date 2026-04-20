@@ -21,8 +21,8 @@ Use this checklist before publishing a public release of the current tree. It is
 - [ ] Run API tests: `docker compose exec -T api bash -lc "pip install -q -r requirements-dev.txt && pytest -q"`
 - [ ] Run worker tests: `cd worker && pip install -r requirements-dev.txt && pytest -q`
 - [ ] Run collector tests: `cd collector && pip install -r requirements-dev.txt && pytest -q`
-- [ ] Run UI validation: `cd ui && npm install && npm run typecheck && npm run build`
-- [ ] Perform one live end-to-end ingest using a synthetic artifact such as `dummy-scan-data.json`
+- [ ] Run UI validation: `cd ui && npm ci && npm run typecheck && npm run build`
+- [ ] Perform one live end-to-end ingest using a tracked synthetic artifact such as `./dummy-scan-data.json`
 
 ## Security and deployment checks
 
@@ -37,7 +37,7 @@ Use this checklist before publishing a public release of the current tree. It is
 ## Open source release checks
 
 - [ ] Confirm the repository host has a private security reporting path enabled
-- [ ] Prepare release notes summarizing user-visible behavior changes, migrations, and new env vars
+- [ ] Draft release notes in `CHANGELOG.md`, including user-visible behavior changes, migrations, and new env vars
 - [ ] Publish or verify the tagged source release artifact for the selected commit
 - [ ] If you publish Docker images, confirm they map clearly to the same tagged source release
 - [ ] Confirm issue tracker, default branch, and support expectations match `SUPPORT.md`

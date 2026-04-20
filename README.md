@@ -146,3 +146,4 @@ For a fuller component and trust-boundary walkthrough, see [docs/architecture.md
 - [Contributing guide](./CONTRIBUTING.md)
 - [Support guide](./SUPPORT.md)
 - [Code of conduct](./CODE_OF_CONDUCT.md)
+- [Changelog](./CHANGELOG.md)

@@ -52,7 +52,7 @@ Examples:
 cd api && pip install -r requirements-dev.txt && pytest -q
 cd worker && pip install -r requirements-dev.txt && pytest -q
 cd collector && pip install -r requirements-dev.txt && pytest -q
-cd ui && npm install && npm run typecheck && npm run build
+cd ui && npm ci && npm run typecheck && npm run build
 ```
 
 If you prefer to stay inside the running stack:
