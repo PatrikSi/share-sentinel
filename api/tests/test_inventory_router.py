@@ -134,3 +134,47 @@ def test_inventory_saved_investigations_create_list_and_delete(monkeypatch) -> N
     assert delete_response.status_code == 200
     assert delete_response.json() == {"ok": True}
     assert fake_db.deleted == [created]
+
+
+def test_inventory_saved_investigations_update(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    investigation_id = uuid.uuid4()
+    fake_db = _FakeDb()
+    monkeypatch.setattr(inventory_router, "require_project_role", lambda *_args, **_kwargs: None)
+
+    existing = SavedInvestigation(
+        project_id=project_id,
+        created_by_user_id=uuid.uuid4(),
+        name="Existing search",
+        description="Old investigation",
+        target_tab="items",
+        query_text="ext:.xlsx endpoint:fs-01",
+        definition_json={"active_tab": "items", "ext": ".xlsx"},
+    )
+    existing.id = investigation_id
+    existing.created_at = datetime.now(tz=UTC)
+    existing.updated_at = existing.created_at
+    fake_db.get_map[(SavedInvestigation, investigation_id)] = existing
+
+    client = _client_for_db(fake_db)
+    try:
+        update_response = client.patch(
+            f"/projects/{project_id}/inventory/investigations/{investigation_id}",
+            json={
+                "name": "Finance view",
+                "description": "Updated investigation",
+                "target_tab": "resources",
+                "query_text": "access = readable",
+                "definition": {"active_tab": "resources", "resource_access": "readable"},
+            },
+        )
+    finally:
+        _clear_overrides()
+
+    assert update_response.status_code == 200
+    payload = update_response.json()
+    assert payload["name"] == "Finance view"
+    assert payload["target_tab"] == "resources"
+    assert payload["definition"]["resource_access"] == "readable"
+    assert existing.name == "Finance view"
+    assert existing.query_text == "access = readable"

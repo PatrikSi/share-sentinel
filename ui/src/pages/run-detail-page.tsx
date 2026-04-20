@@ -1471,7 +1471,7 @@ export function RunDetailPage() {
               <div>
                 <h2 className="text-lg font-semibold">Run-Scoped Search</h2>
                 <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-                  Search items across the full run and save commonly reused query/ext combinations.
+                  Search items across the full run and keep browser-local query/ext combinations for quick recall.
                 </p>
               </div>
               <div className="flex flex-wrap items-end gap-2">
@@ -1494,7 +1494,7 @@ export function RunDetailPage() {
                 <div className="flex items-center gap-2">
                   <input
                     className="w-36 rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
-                    placeholder="Save as..."
+                    placeholder="Save local preset..."
                     value={savedQueryLabel}
                     onChange={(event) => setSavedQueryLabel(event.target.value)}
                   />
@@ -1503,31 +1503,34 @@ export function RunDetailPage() {
                     onClick={saveCurrentQuery}
                     type="button"
                   >
-                    Save
+                    Save Local
                   </button>
                 </div>
               </div>
             </div>
 
             {savedQueries.length > 0 ? (
-              <div className="mb-4 flex flex-wrap gap-2">
-                {savedQueries.map((saved) => (
-                  <div key={saved.id} className="flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-xs dark:bg-slate-800">
-                    <button
-                      className="font-semibold"
-                      onClick={() => {
-                        setGlobalQuery(saved.q);
-                        setGlobalExt(saved.ext);
-                      }}
-                      type="button"
-                    >
-                      {saved.label}
-                    </button>
-                    <button className="text-slate-500" onClick={() => removeSavedQuery(saved.id)} type="button">
-                      Remove
-                    </button>
-                  </div>
-                ))}
+              <div className="mb-4">
+                <p className="mb-2 text-xs text-slate-500 dark:text-slate-400">Stored in this browser for this run only.</p>
+                <div className="flex flex-wrap gap-2">
+                  {savedQueries.map((saved) => (
+                    <div key={saved.id} className="flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-xs dark:bg-slate-800">
+                      <button
+                        className="font-semibold"
+                        onClick={() => {
+                          setGlobalQuery(saved.q);
+                          setGlobalExt(saved.ext);
+                        }}
+                        type="button"
+                      >
+                        {saved.label}
+                      </button>
+                      <button className="text-slate-500" onClick={() => removeSavedQuery(saved.id)} type="button">
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
               </div>
             ) : null}
 

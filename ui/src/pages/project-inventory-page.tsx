@@ -50,6 +50,32 @@ type InventoryEndpoint = {
 };
 
 type Tab = "items" | "resources" | "endpoints";
+type SavedInvestigationDefinition = {
+  active_tab?: Tab;
+  selected_run_ids?: string[];
+  filters?: {
+    query?: string;
+    endpoint_filter?: string;
+    share_filter?: string;
+    path_prefix?: string;
+    ext_filter?: string;
+    resource_access?: string;
+  };
+  applied_query?: string;
+  draft_query?: string;
+};
+type SavedInvestigation = {
+  id: string;
+  project_id: string;
+  created_by_user_id: string | null;
+  name: string;
+  description: string | null;
+  target_tab: Tab;
+  query_text: string;
+  definition: SavedInvestigationDefinition;
+  created_at: string;
+  updated_at: string;
+};
 type ItemColumnKey =
   | "path"
   | "name"
@@ -175,6 +201,10 @@ function blankQueryFilterReflections(): Record<InventoryQueryField, QueryFilterR
   };
 }
 
+function isTab(value: string): value is Tab {
+  return value === "items" || value === "resources" || value === "endpoints";
+}
+
 const INVENTORY_TAB_COPY: Record<Tab, { label: string; description: string; emptyTitle: string; emptyBody: string }> = {
   items: {
     label: "Files & Folders",
@@ -240,6 +270,12 @@ export function ProjectInventoryPage() {
 
   const [error, setError] = useState<string | null>(null);
   const [queryError, setQueryError] = useState<string | null>(null);
+  const [savedInvestigations, setSavedInvestigations] = useState<SavedInvestigation[]>([]);
+  const [selectedInvestigationId, setSelectedInvestigationId] = useState<string | null>(null);
+  const [investigationName, setInvestigationName] = useState("");
+  const [investigationDescription, setInvestigationDescription] = useState("");
+  const [savingInvestigation, setSavingInvestigation] = useState(false);
+  const [deletingInvestigationId, setDeletingInvestigationId] = useState<string | null>(null);
   const [itemColumns, setItemColumns] = useState<ItemColumnKey[]>(["path", "name", "resource_name", "share_type", "hostname", "run_name", "is_dir"]);
   const [resourceColumns, setResourceColumns] = useState<ResourceColumnKey[]>([
     "name",
@@ -334,6 +370,176 @@ export function ProjectInventoryPage() {
     clearAppliedInventoryQuery();
   }
 
+  function currentInvestigationSummary(): string {
+    if (appliedInventoryQuery.trim()) return appliedInventoryQuery.trim();
+    return [
+      query.trim() ? `search:${query.trim()}` : null,
+      endpointFilter.trim() ? `endpoint:${endpointFilter.trim()}` : null,
+      shareFilter.trim() ? `share:${shareFilter.trim()}` : null,
+      pathPrefix.trim() ? `path:${pathPrefix.trim()}` : null,
+      extFilter.trim() ? `ext:${extFilter.trim()}` : null,
+      resourceAccess.trim() ? `access:${resourceAccess.trim()}` : null,
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  function currentInvestigationDefinition(): SavedInvestigationDefinition {
+    return {
+      active_tab: activeTab,
+      selected_run_ids: selectedRunIds,
+      filters: {
+        query,
+        endpoint_filter: endpointFilter,
+        share_filter: shareFilter,
+        path_prefix: pathPrefix,
+        ext_filter: extFilter,
+        resource_access: resourceAccess,
+      },
+      applied_query: appliedInventoryQuery.trim(),
+      draft_query: inventoryQueryInput.trim(),
+    };
+  }
+
+  async function refreshSavedInvestigations(nextSelectedId?: string | null) {
+    if (!projectId) return;
+    const data = await apiFetch(`/projects/${projectId}/inventory/investigations`);
+    const items = ((data?.items || []) as SavedInvestigation[]).map((item) => ({
+      ...item,
+      target_tab: isTab(item.target_tab) ? item.target_tab : "items",
+      definition: typeof item.definition === "object" && item.definition ? item.definition : {},
+    }));
+    setSavedInvestigations(items);
+    if (nextSelectedId !== undefined) {
+      setSelectedInvestigationId(items.some((item) => item.id === nextSelectedId) ? nextSelectedId : null);
+      return;
+    }
+    setSelectedInvestigationId((current) => (current && items.some((item) => item.id === current) ? current : null));
+  }
+
+  function applySavedInvestigation(investigation: SavedInvestigation) {
+    const definition = investigation.definition || {};
+    const targetTab: Tab = isTab(definition.active_tab || "") ? definition.active_tab || investigation.target_tab : investigation.target_tab;
+    const filters = typeof definition.filters === "object" && definition.filters ? definition.filters : {};
+    const appliedQuery = typeof definition.applied_query === "string" ? definition.applied_query.trim() : "";
+    const draftQuery =
+      typeof definition.draft_query === "string" && definition.draft_query.trim().length > 0
+        ? definition.draft_query
+        : appliedQuery;
+    const selectedRuns = Array.isArray(definition.selected_run_ids)
+      ? definition.selected_run_ids.filter((value): value is string => typeof value === "string")
+      : [];
+
+    setActiveTab(targetTab);
+    setSelectedRunIds(selectedRuns);
+    setQuery(typeof filters.query === "string" ? filters.query : "");
+    setEndpointFilter(typeof filters.endpoint_filter === "string" ? filters.endpoint_filter : "");
+    setShareFilter(typeof filters.share_filter === "string" ? filters.share_filter : "");
+    setPathPrefix(typeof filters.path_prefix === "string" ? filters.path_prefix : "");
+    setExtFilter(typeof filters.ext_filter === "string" ? filters.ext_filter : "");
+    setResourceAccess(typeof filters.resource_access === "string" ? filters.resource_access : "");
+    setInventoryQueryInput(draftQuery);
+    setSelectedInvestigationId(investigation.id);
+    setInvestigationName(investigation.name);
+    setInvestigationDescription(investigation.description || "");
+    setError(null);
+
+    if (!appliedQuery) {
+      clearAppliedInventoryQuery();
+      return;
+    }
+    try {
+      const groups = parseInventoryQuery(appliedQuery);
+      applyParsedInventoryQuery(groups, appliedQuery);
+    } catch (err) {
+      clearAppliedInventoryQuery();
+      setQueryError(err instanceof Error ? err.message : "Saved investigation query is invalid.");
+    }
+  }
+
+  async function saveInvestigation() {
+    if (!projectId) return;
+    const name = investigationName.trim();
+    if (!name) {
+      setError("Name the shared investigation before saving it.");
+      return;
+    }
+
+    setSavingInvestigation(true);
+    setError(null);
+    try {
+      const created = (await apiFetch(`/projects/${projectId}/inventory/investigations`, {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          description: investigationDescription.trim() || null,
+          target_tab: activeTab,
+          query_text: currentInvestigationSummary(),
+          definition: currentInvestigationDefinition(),
+        }),
+      })) as SavedInvestigation;
+      await refreshSavedInvestigations(created.id);
+      setSelectedInvestigationId(created.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save investigation.");
+    } finally {
+      setSavingInvestigation(false);
+    }
+  }
+
+  async function updateInvestigation() {
+    if (!projectId || !selectedInvestigationId) return;
+    const name = investigationName.trim();
+    if (!name) {
+      setError("Name the shared investigation before updating it.");
+      return;
+    }
+
+    setSavingInvestigation(true);
+    setError(null);
+    try {
+      await apiFetch(`/projects/${projectId}/inventory/investigations/${selectedInvestigationId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name,
+          description: investigationDescription.trim() || null,
+          target_tab: activeTab,
+          query_text: currentInvestigationSummary(),
+          definition: currentInvestigationDefinition(),
+        }),
+      });
+      await refreshSavedInvestigations(selectedInvestigationId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update investigation.");
+    } finally {
+      setSavingInvestigation(false);
+    }
+  }
+
+  async function deleteInvestigation(investigation: SavedInvestigation) {
+    if (!projectId) return;
+    if (!window.confirm(`Delete shared investigation "${investigation.name}"?`)) {
+      return;
+    }
+
+    setDeletingInvestigationId(investigation.id);
+    setError(null);
+    try {
+      await apiFetch(`/projects/${projectId}/inventory/investigations/${investigation.id}`, {
+        method: "DELETE",
+      });
+      await refreshSavedInvestigations(investigation.id === selectedInvestigationId ? null : undefined);
+      if (investigation.id === selectedInvestigationId) {
+        setInvestigationName("");
+        setInvestigationDescription("");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete investigation.");
+    } finally {
+      setDeletingInvestigationId(null);
+    }
+  }
+
   useEffect(() => {
     if (queryModeActive || queryError) {
       setShowAdvancedQuery(true);
@@ -353,6 +559,8 @@ export function ProjectInventoryPage() {
     })
       .then((data) => setRuns(data))
       .catch((err) => setError(err.message));
+
+    refreshSavedInvestigations().catch((err) => setError(err instanceof Error ? err.message : "Failed to load investigations."));
   }, [projectId]);
 
   useEffect(() => {
@@ -886,6 +1094,134 @@ export function ProjectInventoryPage() {
                     </div>
                   </>
                 ) : null}
+              </div>
+
+              <div className="rounded-3xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/40">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Shared Investigations</p>
+                    <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+                      Save the current inventory view so other project members can reopen the same scope and filters.
+                    </p>
+                  </div>
+                  <button
+                    className="rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                    onClick={() => {
+                      setSelectedInvestigationId(null);
+                      setInvestigationName("");
+                      setInvestigationDescription("");
+                    }}
+                    type="button"
+                  >
+                    New
+                  </button>
+                </div>
+
+                <div className="mt-3 grid gap-3">
+                  <label className={FILTER_LABEL_CLASS}>
+                    Investigation Name
+                    <input
+                      className={FILTER_INPUT_CLASS}
+                      placeholder="Readable finance exposure"
+                      value={investigationName}
+                      onChange={(event) => setInvestigationName(event.target.value)}
+                    />
+                  </label>
+                  <label className={FILTER_LABEL_CLASS}>
+                    Notes
+                    <textarea
+                      className="mt-1 min-h-[84px] w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
+                      placeholder="What makes this view useful for the team?"
+                      value={investigationDescription}
+                      onChange={(event) => setInvestigationDescription(event.target.value)}
+                    />
+                  </label>
+                </div>
+
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    className="rounded-2xl bg-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
+                    onClick={saveInvestigation}
+                    disabled={savingInvestigation}
+                    type="button"
+                  >
+                    {savingInvestigation ? "Saving..." : "Save As New"}
+                  </button>
+                  <button
+                    className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:hover:bg-slate-800"
+                    onClick={updateInvestigation}
+                    disabled={!selectedInvestigationId || savingInvestigation}
+                    type="button"
+                  >
+                    Update Current
+                  </button>
+                </div>
+
+                <div className="mt-4 space-y-3">
+                  {savedInvestigations.length === 0 ? (
+                    <p className="rounded-2xl border border-dashed border-slate-300 px-4 py-3 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-400">
+                      No shared investigations yet. Save the current view to create the first team-ready shortcut.
+                    </p>
+                  ) : (
+                    savedInvestigations.map((investigation) => {
+                      const isSelected = investigation.id === selectedInvestigationId;
+                      return (
+                        <div
+                          key={investigation.id}
+                          className={`rounded-2xl border px-4 py-3 ${
+                            isSelected
+                              ? "border-emerald-500 bg-emerald-50/80 dark:border-emerald-700 dark:bg-emerald-900/20"
+                              : "border-slate-200 bg-white/80 dark:border-slate-800 dark:bg-slate-950/50"
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <p className="text-sm font-semibold">{investigation.name}</p>
+                                <span className="rounded-full border border-slate-300 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500 dark:border-slate-700">
+                                  {INVENTORY_TAB_COPY[investigation.target_tab].label}
+                                </span>
+                                {isSelected ? (
+                                  <span className="rounded-full border border-emerald-400 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-emerald-700 dark:border-emerald-700 dark:text-emerald-300">
+                                    Selected
+                                  </span>
+                                ) : null}
+                              </div>
+                              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                Updated {new Date(investigation.updated_at).toLocaleString()}
+                              </p>
+                              {investigation.description ? (
+                                <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{investigation.description}</p>
+                              ) : null}
+                              {investigation.query_text ? (
+                                <p className="mt-2 rounded-xl bg-slate-100 px-3 py-2 text-xs text-slate-600 dark:bg-slate-900 dark:text-slate-300">
+                                  {investigation.query_text}
+                                </p>
+                              ) : null}
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                className="rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                                onClick={() => applySavedInvestigation(investigation)}
+                                type="button"
+                              >
+                                Use
+                              </button>
+                              <button
+                                className="rounded-xl border border-rose-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-rose-700 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-rose-800 dark:text-rose-200 dark:hover:bg-rose-900/20"
+                                onClick={() => deleteInvestigation(investigation)}
+                                disabled={deletingInvestigationId === investigation.id}
+                                type="button"
+                              >
+                                {deletingInvestigationId === investigation.id ? "Deleting..." : "Delete"}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
               </div>
             </div>
           </div>

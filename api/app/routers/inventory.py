@@ -9,7 +9,7 @@ from app.deps import AuthContext, get_auth_context, require_project_role, reques
 from app.enums import ProjectRole, RunStatus
 from app.models import Endpoint, Item, Resource, SavedInvestigation, ScanRun, User
 from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_int_cursor_value
-from app.schemas import SavedInvestigationIn, SavedInvestigationOut
+from app.schemas import SavedInvestigationIn, SavedInvestigationOut, SavedInvestigationUpdateIn
 from app.share_types import share_type_from_resource_type
 from app.services.inventory_query import InventoryQueryClause, parse_inventory_query
 from app.services.audit import write_audit_event
@@ -327,6 +327,49 @@ def create_saved_investigation(
         action="PROJECT_INVESTIGATION_CREATED",
         object_type="project_inventory",
         object_id=str(investigation.id),
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata={**request_meta(request), "name": investigation.name, "target_tab": investigation.target_tab},
+    )
+    db.commit()
+    db.refresh(investigation)
+    return _saved_investigation_out(investigation)
+
+@router.patch("/investigations/{investigation_id}", response_model=SavedInvestigationOut)
+def update_saved_investigation(
+    project_id: uuid.UUID,
+    investigation_id: uuid.UUID,
+    payload: SavedInvestigationUpdateIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_session_user),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    _ = _user
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    investigation = db.get(SavedInvestigation, investigation_id)
+    if investigation is None or investigation.project_id != project_id:
+        raise HTTPException(status_code=404, detail="investigation not found")
+
+    if payload.name is not None:
+        investigation.name = payload.name
+    if payload.description is not None:
+        investigation.description = payload.description
+    if payload.target_tab is not None:
+        investigation.target_tab = payload.target_tab
+    if payload.query_text is not None:
+        investigation.query_text = payload.query_text
+    if payload.definition is not None:
+        investigation.definition_json = payload.definition
+
+    db.add(investigation)
+    write_audit_event(
+        db,
+        action="PROJECT_INVESTIGATION_UPDATED",
+        object_type="project_inventory",
+        object_id=str(investigation_id),
         actor_user_id=auth.user_id,
         actor_token_id=auth.token_id,
         project_id=project_id,
