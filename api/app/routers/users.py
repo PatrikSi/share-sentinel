@@ -10,6 +10,7 @@ from app.config import get_settings
 from app.db import escape_like, get_db
 from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
 from app.enums import ProjectRole
+from app.locking import lock_project_admin_guard, lock_sysadmin_guard
 from app.models import Project, ProjectMember, RefreshToken, User
 from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_datetime_cursor_value, parse_uuid_cursor_value
 from app.password_policy import password_policy_kwargs
@@ -401,6 +402,7 @@ def _enforce_admin_safety(
     target_is_active_admin = target_user.is_sysadmin and target_user.is_active and target_user.is_approved
     target_will_remain_active_admin = next_is_sysadmin and next_is_active and next_is_approved
     if target_is_active_admin and not target_will_remain_active_admin:
+        lock_sysadmin_guard(db)
         remaining = _count_active_approved_sysadmins(db, exclude_user_id=target_user.id)
         if remaining < 1:
             raise HTTPException(
@@ -462,6 +464,7 @@ def _assign_user_to_all_projects(db: Session, user_id: uuid.UUID, role: ProjectR
 
 
 def _count_project_admins(db: Session, project_id: uuid.UUID, exclude_user_id: uuid.UUID | None = None) -> int:
+    lock_project_admin_guard(db, project_id)
     stmt = select(func.count(ProjectMember.user_id)).where(
         ProjectMember.project_id == project_id,
         ProjectMember.role == ProjectRole.ADMIN,

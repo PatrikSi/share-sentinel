@@ -16,6 +16,7 @@ from app.deps import (
     require_token_scopes,
 )
 from app.enums import ProjectRole
+from app.locking import lock_project_admin_guard
 from app.models import Project, ProjectMember, User
 from app.schemas import MemberAddByEmailIn, MemberAddIn, ProjectCreateIn, ProjectOut
 from app.services.audit import write_audit_event
@@ -300,6 +301,7 @@ def remove_member(
 
 
 def _count_project_admins(db: Session, project_id: uuid.UUID, exclude_user_id: uuid.UUID | None = None) -> int:
+    lock_project_admin_guard(db, project_id)
     stmt = select(func.count(ProjectMember.user_id)).where(
         ProjectMember.project_id == project_id,
         ProjectMember.role == ProjectRole.ADMIN,

@@ -955,7 +955,7 @@ async def upload_artifact(
 ):
     require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
     actor_key = str(auth.token_id or auth.user_id or "anon")
-    rate_limiter.check(request, "artifact_upload", limit=30, window_seconds=60, actor_key=f"upload:{actor_key}", fail_open=True)
+    rate_limiter.check(request, "artifact_upload", limit=30, window_seconds=60, actor_key=f"upload:{actor_key}")
 
     settings = get_settings()
     run = _get_run(db, project_id, run_id)

@@ -34,4 +34,20 @@ def test_resolve_client_ip_uses_forwarded_for_when_proxy_is_trusted(monkeypatch)
     monkeypatch.setattr(settings, "trusted_proxy_cidrs", "10.0.0.0/8")
 
     request = _make_request("10.1.1.20", x_forwarded_for="203.0.113.11, 198.51.100.2")
+    assert resolve_client_ip(request) == "198.51.100.2"
+
+
+def test_resolve_client_ip_skips_trusted_proxy_chain_from_right(monkeypatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "trusted_proxy_cidrs", "10.0.0.0/8,198.51.100.0/24")
+
+    request = _make_request("10.1.1.20", x_forwarded_for="203.0.113.11, 198.51.100.2")
     assert resolve_client_ip(request) == "203.0.113.11"
+
+
+def test_resolve_client_ip_rejects_invalid_forwarded_chain(monkeypatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "trusted_proxy_cidrs", "10.0.0.0/8")
+
+    request = _make_request("10.1.1.20", x_forwarded_for="not-an-ip, 198.51.100.2")
+    assert resolve_client_ip(request) == "10.1.1.20"

@@ -13,6 +13,7 @@ from app.db import escape_like, get_db
 from app.enums import ProjectRole
 from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
 from app.models import ApiToken, AuditEvent, Project, ProjectMember, User
+from app.locking import lock_project_admin_guard
 from app.pagination import (
     KeysetColumn,
     apply_keyset_pagination,
@@ -790,6 +791,7 @@ def assign_user_memberships_to_all_projects(
 
 
 def _count_project_admins(db: Session, project_id: uuid.UUID, exclude_user_id: uuid.UUID | None = None) -> int:
+    lock_project_admin_guard(db, project_id)
     stmt = select(func.count(ProjectMember.user_id)).where(
         ProjectMember.project_id == project_id,
         ProjectMember.role == ProjectRole.ADMIN,

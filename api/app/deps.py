@@ -229,15 +229,24 @@ def resolve_client_ip(request: Request) -> str:
     if not forwarded_for:
         return remote_ip
 
-    first_hop = forwarded_for.split(",")[0].strip()
-    if not first_hop:
+    forwarded_chain = [hop.strip() for hop in forwarded_for.split(",") if hop.strip()]
+    if not forwarded_chain:
         return remote_ip
 
-    try:
-        ip_address(first_hop)
-    except ValueError:
-        return remote_ip
-    return first_hop
+    parsed_hops: list[str] = []
+    for hop in forwarded_chain:
+        try:
+            ip_address(hop)
+        except ValueError:
+            return remote_ip
+        parsed_hops.append(hop)
+
+    client_ip = remote_ip
+    for hop in reversed(parsed_hops):
+        if not _is_trusted_proxy(client_ip, trusted_proxy_cidrs):
+            break
+        client_ip = hop
+    return client_ip
 
 
 def _is_trusted_proxy(remote_ip: str, trusted_proxy_cidrs: list[str]) -> bool:
