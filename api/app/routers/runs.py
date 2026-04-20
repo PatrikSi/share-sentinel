@@ -969,6 +969,9 @@ async def upload_artifact(
 
     settings = get_settings()
     run = _get_run(db, project_id, run_id)
+    if not _try_lock_run_for_mutation(db, run.id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run is currently ingesting")
+    db.refresh(run)
     if run.status not in {RunStatus.PENDING_UPLOAD, RunStatus.UPLOADED, RunStatus.FAILED}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run state does not accept upload")
     previous_status = run.status

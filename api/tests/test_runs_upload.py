@@ -172,3 +172,89 @@ def test_delete_run_rejects_locked_ingesting_run(monkeypatch) -> None:
 
     assert exc.value.status_code == 409
     assert exc.value.detail == "run is currently ingesting"
+
+
+def test_upload_artifact_rejects_locked_run(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
+    run = SimpleNamespace(
+        id=run_id,
+        status=runs_router.RunStatus.PENDING_UPLOAD,
+        artifact_key=None,
+        artifact_size=None,
+        artifact_sha256=None,
+        artifact_content_type=None,
+        ingest_progress={"line_offset": 0},
+    )
+
+    monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runs_router, "_get_run", lambda *_args, **_kwargs: run)
+    monkeypatch.setattr(runs_router, "_try_lock_run_for_mutation", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(runs_router, "rate_limiter", SimpleNamespace(check=lambda *_args, **_kwargs: None))
+
+    class _Db:
+        def refresh(self, *_args, **_kwargs):
+            raise AssertionError("refresh should not happen when the run lock is unavailable")
+
+    with pytest.raises(runs_router.HTTPException) as exc:
+        asyncio.run(
+            runs_router.upload_artifact(
+                project_id=project_id,
+                run_id=run_id,
+                request=SimpleNamespace(headers={}),
+                file=None,
+                db=_Db(),
+                _=auth,
+                auth=auth,
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "run is currently ingesting"
+
+
+def test_upload_artifact_rechecks_status_after_lock(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
+    run = SimpleNamespace(
+        id=run_id,
+        status=runs_router.RunStatus.PENDING_UPLOAD,
+        artifact_key=None,
+        artifact_size=None,
+        artifact_sha256=None,
+        artifact_content_type=None,
+        ingest_progress={"line_offset": 0},
+    )
+
+    monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runs_router, "_get_run", lambda *_args, **_kwargs: run)
+    monkeypatch.setattr(runs_router, "_try_lock_run_for_mutation", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runs_router, "rate_limiter", SimpleNamespace(check=lambda *_args, **_kwargs: None))
+    monkeypatch.setattr(runs_router, "get_settings", lambda: SimpleNamespace(redis_stream_retries=1))
+    monkeypatch.setattr(
+        runs_router,
+        "_upload_artifact_stream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("upload should not start after status changes")),
+    )
+
+    class _Db:
+        def refresh(self, refreshed_run):
+            refreshed_run.status = runs_router.RunStatus.INGESTING
+
+    with pytest.raises(runs_router.HTTPException) as exc:
+        asyncio.run(
+            runs_router.upload_artifact(
+                project_id=project_id,
+                run_id=run_id,
+                request=SimpleNamespace(headers={}),
+                file=None,
+                db=_Db(),
+                _=auth,
+                auth=auth,
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "run state does not accept upload"
