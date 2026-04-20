@@ -154,10 +154,32 @@ def test_register_handles_integrity_error_as_conflict(monkeypatch) -> None:
     monkeypatch.setattr(auth_router.rate_limiter, "check", lambda *_args, **_kwargs: None)
 
     payload = RegisterIn(email="user@example.com", password="StrongPassword12345")
-    with pytest.raises(HTTPException) as exc:
-        auth_router.register(payload, _request(), fake_db)
+    result = auth_router.register(payload, _request(), fake_db)
 
-    assert exc.value.status_code == 409
-    assert "email already exists" in exc.value.detail
+    assert result.email == "user@example.com"
+    assert result.is_approved is False
     assert fake_db.rollback_count == 1
-    assert fake_db.commit_count == 0
+    assert fake_db.commit_count == 1
+
+
+def test_register_existing_email_returns_generic_acknowledgement(monkeypatch) -> None:
+    existing = SimpleNamespace(id=uuid.uuid4())
+    fake_db = _FakeDb(execute_row=existing)
+
+    monkeypatch.setattr(
+        auth_router,
+        "get_settings",
+        lambda: SimpleNamespace(allow_self_registration=True, password_min_length=12),
+    )
+    monkeypatch.setattr(auth_router, "validate_password_strength", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router, "write_audit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router.rate_limiter, "check", lambda *_args, **_kwargs: None)
+
+    payload = RegisterIn(email="user@example.com", password="StrongPassword12345")
+    result = auth_router.register(payload, _request(), fake_db)
+
+    assert result.email == "user@example.com"
+    assert result.is_active is True
+    assert result.is_approved is False
+    assert fake_db.commit_count == 1
+    assert fake_db.added == []

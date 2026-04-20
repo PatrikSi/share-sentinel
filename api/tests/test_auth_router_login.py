@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -103,3 +104,65 @@ def test_login_sets_session_and_refresh_cookies(monkeypatch) -> None:
     assert auth_cookie_calls == [("access-token", "csrf-token")]
     assert refresh_cookie_calls == ["refresh-token"]
     assert access_token_calls == [(str(user.id), 4, str(fake_db.added[0].id))]
+
+
+def test_login_returns_generic_error_for_unapproved_user(monkeypatch) -> None:
+    user = SimpleNamespace(
+        id=uuid.uuid4(),
+        email="user@example.com",
+        password_hash="stored-hash",
+        session_version=1,
+        is_active=True,
+        is_sysadmin=False,
+        is_approved=False,
+        approved_at=None,
+        approved_by_user_id=None,
+        ui_theme=UITheme.SYSTEM,
+    )
+    fake_db = _FakeDb(execute_row=user)
+    recorded_failures: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(auth_router, "check_login_throttle", lambda *_args, **_kwargs: SimpleNamespace(blocked=False, retry_after_seconds=None))
+    monkeypatch.setattr(auth_router.rate_limiter, "check", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router, "verify_password", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(auth_router, "record_login_failure", lambda email, client_ip: recorded_failures.append((email, client_ip)))
+    monkeypatch.setattr(auth_router, "write_audit_event", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(auth_router.HTTPException) as exc:
+        auth_router.login(LoginIn(email="User@Example.com", password="secret"), _request(), Response(), fake_db)
+
+    assert exc.value.status_code == 401
+    assert exc.value.detail == "invalid credentials"
+    assert recorded_failures == [("user@example.com", "127.0.0.1")]
+    assert fake_db.commit_count == 1
+
+
+def test_login_returns_generic_error_for_disabled_user(monkeypatch) -> None:
+    user = SimpleNamespace(
+        id=uuid.uuid4(),
+        email="user@example.com",
+        password_hash="stored-hash",
+        session_version=1,
+        is_active=False,
+        is_sysadmin=False,
+        is_approved=True,
+        approved_at=None,
+        approved_by_user_id=None,
+        ui_theme=UITheme.SYSTEM,
+    )
+    fake_db = _FakeDb(execute_row=user)
+    recorded_failures: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(auth_router, "check_login_throttle", lambda *_args, **_kwargs: SimpleNamespace(blocked=False, retry_after_seconds=None))
+    monkeypatch.setattr(auth_router.rate_limiter, "check", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auth_router, "verify_password", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(auth_router, "record_login_failure", lambda email, client_ip: recorded_failures.append((email, client_ip)))
+    monkeypatch.setattr(auth_router, "write_audit_event", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(auth_router.HTTPException) as exc:
+        auth_router.login(LoginIn(email="User@Example.com", password="secret"), _request(), Response(), fake_db)
+
+    assert exc.value.status_code == 401
+    assert exc.value.detail == "invalid credentials"
+    assert recorded_failures == [("user@example.com", "127.0.0.1")]
+    assert fake_db.commit_count == 1

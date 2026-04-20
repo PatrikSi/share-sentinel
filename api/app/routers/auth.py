@@ -20,7 +20,7 @@ from app.deps import (
     require_token_scopes,
     resolve_client_ip,
 )
-from app.enums import ProjectRole
+from app.enums import ProjectRole, UITheme
 from app.models import ApiToken, RefreshToken, User
 from app.password_policy import password_policy_kwargs
 from app.rate_limit import RateLimiter
@@ -58,6 +58,19 @@ from app.token_scopes import SCOPE_READ_TOKENS, SCOPE_WRITE_TOKENS, default_scop
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 rate_limiter = RateLimiter()
+
+
+def _registration_acknowledgement(email: str) -> UserOut:
+    return UserOut(
+        id=uuid.uuid4(),
+        email=email,
+        is_active=True,
+        is_sysadmin=False,
+        is_approved=False,
+        approved_at=None,
+        approved_by_user_id=None,
+        ui_theme=UITheme.SYSTEM,
+    )
 
 
 @router.get("/registration-settings", response_model=RegistrationSettingsOut)
@@ -123,7 +136,15 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     stmt = select(User).where(func.lower(User.email) == email)
     existing = db.execute(stmt).scalar_one_or_none()
     if existing is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="email already exists")
+        write_audit_event(
+            db,
+            action="USER_SELF_REGISTER_DUPLICATE",
+            object_type="user",
+            object_id=str(existing.id),
+            metadata={**request_meta(request), "email": email},
+        )
+        db.commit()
+        return _registration_acknowledgement(email)
 
     user = User(
         email=email,
@@ -139,7 +160,15 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
         db.flush()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="email already exists") from exc
+        write_audit_event(
+            db,
+            action="USER_SELF_REGISTER_DUPLICATE",
+            object_type="user",
+            object_id=email,
+            metadata={**request_meta(request), "email": email, "reason": "integrity_error"},
+        )
+        db.commit()
+        return _registration_acknowledgement(email)
 
     write_audit_event(
         db,
@@ -189,6 +218,7 @@ def login(payload: LoginIn, request: Request, response: Response, db: Session = 
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
 
     if not user.is_approved:
+        record_login_failure(email, client_ip)
         write_audit_event(
             db,
             action="LOGIN_BLOCKED_UNAPPROVED",
@@ -198,9 +228,10 @@ def login(payload: LoginIn, request: Request, response: Response, db: Session = 
             metadata=request_meta(request),
         )
         db.commit()
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account pending admin approval")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
 
     if not user.is_active:
+        record_login_failure(email, client_ip)
         write_audit_event(
             db,
             action="LOGIN_BLOCKED_DISABLED",
@@ -210,7 +241,7 @@ def login(payload: LoginIn, request: Request, response: Response, db: Session = 
             metadata=request_meta(request),
         )
         db.commit()
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user disabled")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
 
     clear_login_failures(email, client_ip)
 
