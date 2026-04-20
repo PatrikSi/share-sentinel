@@ -162,6 +162,8 @@ class Settings(BaseSettings):
                 raise ValueError("auth_cookie_secure must be true in production")
             if self.allow_never_expiring_api_tokens:
                 raise ValueError("allow_never_expiring_api_tokens must be false in production")
+            if not str(self.trusted_proxy_cidrs or "").strip():
+                raise ValueError("trusted_proxy_cidrs must be set in production")
         return self
 
 

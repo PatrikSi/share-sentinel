@@ -107,6 +107,19 @@ def test_staging_requires_production_security_posture() -> None:
         )
 
 
+def test_production_requires_trusted_proxy_cidrs() -> None:
+    with pytest.raises(ValueError, match="trusted_proxy_cidrs must be set in production"):
+        Settings(
+            app_env="production",
+            jwt_secret="x" * 64,
+            token_pepper="y" * 64,
+            seed_admin_email="admin@example.com",
+            seed_admin_password="StrongPassword123",
+            auth_cookie_secure=True,
+            trusted_proxy_cidrs="",
+        )
+
+
 def test_app_env_rejects_unknown_values() -> None:
     with pytest.raises(ValueError, match="app_env must be one of"):
         Settings(app_env="prodution")
