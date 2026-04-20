@@ -1,10 +1,12 @@
 # Share Sentinel docs
 
-This folder covers the parts of the product people usually need once the stack is already running: what the UI does, what the API exposes, and how the admin surface is organized.
+This folder is the long-form companion to the top-level [README](../README.md). Use it when you already know what the project is and need a more specific map of the API, UI, settings model, or architecture.
 
 ## Start here
 
 - [Project README](../README.md)
+- [Architecture overview](./architecture.md)
+- [Release readiness checklist](./release-readiness.md)
 - [Settings guide](./pages/settings.md)
 
 ## Reference

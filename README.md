@@ -1,16 +1,21 @@
 # share-sentinel
 
-Share Sentinel ingests SMB collection artifacts and gives you a project-scoped workspace for review. It is built for a simple loop: upload a collector artifact, watch the ingest, compare runs, and drill into hosts, shares, and paths without losing project context.
+Share Sentinel is a self-hostable workspace for ingesting SMB and NFS collection artifacts, tracking project-scoped inventory, and reviewing run-to-run changes without losing analyst context.
 
-## What it includes
+It is built around one loop:
 
-- A FastAPI control plane with JWT sessions, cookie auth with CSRF protection, and scoped API tokens
-- Project-scoped RBAC with `viewer`, `operator`, and `admin` roles
-- Optional self-registration with admin approval
-- Configurable password policy enforced at startup and at password change / registration time
-- A React UI with a dashboard, import flow, compact inventory review, run diffing, and admin settings
-- An async worker that ingests artifacts from a shared filesystem into Postgres
-- A Python collector that can write artifacts locally or upload them directly
+1. collect data with the bundled collector or another compatible producer
+2. upload the artifact into a project
+3. let the worker ingest it into Postgres
+4. review inventory, issues, diffs, and saved investigations in the UI
+
+## What is included
+
+- `api/` FastAPI control plane for auth, RBAC, projects, runs, inventory, settings, and audit
+- `worker/` background ingestion worker fed by Redis Streams
+- `ui/` React + Vite single-page app
+- `collector/` Python CLI for SMB and NFS collection plus optional direct upload
+- `docker-compose.yml` for a local all-in-one stack with Traefik, Postgres, Redis, API, worker, and UI
 
 ## Quick start
 
@@ -20,106 +25,111 @@ Share Sentinel ingests SMB collection artifacts and gives you a project-scoped w
 cp .env.example .env
 ```
 
-2. Build and start the stack:
+2. Replace the default secrets before using the stack outside a throwaway local environment:
+
+- `POSTGRES_PASSWORD`
+- `JWT_SECRET`
+- `TOKEN_PEPPER`
+- `SEED_ADMIN_PASSWORD`
+
+3. Build and start the stack:
 
 ```bash
 docker compose up --build
 ```
 
-3. Open the app and API docs:
+4. Open the app:
 
 - `http://localhost`
-- `http://localhost/api/docs`
 
-4. If you want a quick routing check after startup:
+5. Optional local routing smoke test:
 
 ```bash
-./scripts/smoke-routes.sh
+./scripts/smoke-routes.sh http://localhost
 ```
 
-The Docker stack mounts a shared artifact volume at `/artifacts` so the API can persist uploads and the worker can ingest them without a separate object-storage service.
+The bundled Compose file keeps the gateway on `127.0.0.1:80` by default. That is intentional. If you expose the stack on a real network, put it behind TLS and review [SECURITY.md](./SECURITY.md) first.
 
-## Seed admin and password policy
-
-The bootstrap container seeds the first admin account from these environment variables:
-
-- `SEED_ADMIN_EMAIL`
-- `SEED_ADMIN_PASSWORD`
-
-Password rules are also driven from the environment:
-
-- `PASSWORD_MIN_LENGTH`
-- `PASSWORD_REQUIRE_LOWERCASE`
-- `PASSWORD_REQUIRE_UPPERCASE`
-- `PASSWORD_REQUIRE_NUMBER`
-- `PASSWORD_REQUIRE_SPECIAL`
-
-If `SEED_ADMIN_PASSWORD` does not satisfy the active policy, bootstrap fails immediately with a clear configuration error. That makes bad env combinations obvious in container logs instead of quietly skipping the seed account.
+The checked-in Compose stack is for local evaluation and development. Do not expose it as-is with placeholder secrets, default admin credentials, or plain HTTP.
 
 ## Main workflows
 
 ### Dashboard
 
-The dashboard is the landing area after login. Pick a project in the top bar, review recent runs, check high-level inventory counts, and jump straight into inventory or the latest run.
+The dashboard stays project-scoped. It surfaces recent runs, project inventory totals, and shortcuts into inventory, import, and run review.
 
 ### Import
 
-Operators and admins can create a run, attach a collector artifact, and upload it from the browser. The import page does basic preflight checks, shows the detected file type and size, and redirects into the run explorer once ingest starts.
+Operators and admins can create a run, upload a JSON, NDJSON, JSONL, or gzip-compressed artifact, and land directly in the run explorer while ingest starts.
 
 ### Inventory
 
-Inventory stays scoped to the current project and supports three views:
+Project inventory supports three working views:
 
 - files and folders
 - shares
 - endpoints
 
-The page is guided first. Most work can be done with compact filters and extension chips, while the query DSL is still available for more specific searches.
+The page supports guided filters, an optional query DSL, run scoping, and project-shared saved investigations.
 
 ### Run explorer
 
-Each run has four focused views:
+Each run is split into five focused tabs:
 
 - `Overview`
+- `Issues`
 - `Diff`
 - `Explore`
 - `Search`
 
-That split keeps baseline comparison, tree exploration, and item search from fighting for space on one screen.
+Run-scoped saved searches remain browser-local. Project-wide shared investigations live on the project inventory page.
 
 ### Settings
 
 Sysadmins get four settings areas:
 
-- `Overview` for live posture, password policy, token hygiene, and recent audit events
-- `Access` for users, approvals, sysadmin status, and project membership management
-- `Tokens` for global API token administration, including one-time secret reveal on create or rotate
+- `Overview` for security posture, token hygiene, and recent audit activity
+- `Access` for users, approvals, password resets, and project memberships
+- `Tokens` for global API token administration
 - `Audit` for global event review and export
 
-## Repo layout
+## Architecture at a glance
 
-- `api/` FastAPI service, auth, RBAC, project APIs, and settings APIs
-- `worker/` ingestion worker for queued artifact processing
-- `collector/` SMB collector CLI
-- `ui/` React single-page app
-- `docs/` product and reference documentation
+- The API stores uploaded artifacts on the shared `/artifacts` volume.
+- The API enqueues ingest work into the `ingest_jobs` Redis stream.
+- The worker reads the artifact from the same shared storage and writes normalized inventory into Postgres.
+- The UI reads only through the API.
+- The bootstrap container applies Alembic migrations and seeds the initial admin account.
+
+For a fuller component and trust-boundary walkthrough, see [docs/architecture.md](./docs/architecture.md).
+
+## Security and deployment notes
+
+- Browser auth uses cookie-backed JWT sessions with CSRF protection.
+- API automation uses hashed, project-scoped API tokens with role and scope checks.
+- `GET /api/healthz` is public, while deep health and Prometheus metrics are sysadmin-only routes.
+- OpenAPI and Swagger docs are intended for development-style environments and are hidden in production-style `APP_ENV` values.
+- The default Docker deployment is local-first, not internet-ready. Replace secrets, enable TLS, and review the reverse-proxy posture before exposing it.
+
+## Current limitations
+
+- Ingest is asynchronous. Runs can stay in `UPLOADED` or `INGESTING` while the worker is catching up.
+- Retryable ingest failures are rescheduled with backoff, but terminal parser or data-shape failures still land the run in `FAILED`.
+- MFA, SSO, and SCIM are not implemented.
+- The project is best treated as actively evolving rather than as a locked compatibility surface.
 
 ## Documentation
 
 - [Docs index](./docs/README.md)
-- [API service notes](./api/README.md)
-- [Collector notes](./collector/README.md)
-- [Worker notes](./worker/README.md)
-
-## Useful endpoints
-
-- `GET /api/healthz`
-- `GET /api/healthz/deep`
-- `GET /api/metrics`
-
-## Notes
-
-- Ingestion is async and idempotent.
-- The worker can resume interrupted ingestion and reconcile runs left in `UPLOADED`.
-- Every API response includes an `X-Request-ID`.
-- Auth and upload endpoints are rate-limited.
+- [Architecture overview](./docs/architecture.md)
+- [API reference](./docs/reference/api.md)
+- [Frontend reference](./docs/reference/frontend.md)
+- [Release readiness checklist](./docs/release-readiness.md)
+- [Settings guide](./docs/pages/settings.md)
+- [API service README](./api/README.md)
+- [Collector README](./collector/README.md)
+- [Worker README](./worker/README.md)
+- [Security policy](./SECURITY.md)
+- [Contributing guide](./CONTRIBUTING.md)
+- [Support guide](./SUPPORT.md)
+- [Code of conduct](./CODE_OF_CONDUCT.md)

@@ -1,6 +1,6 @@
 # Frontend reference
 
-The UI is a single-page app built with React and Vite. It keeps most work centered around one active project so people can move between the dashboard, inventory, import flow, and run explorer without reselecting context on every page.
+The UI is a single-page app built with React and Vite. It keeps most work centered around one active project so people can move between the dashboard, inventory, import flow, and run review without reselecting context on every page.
 
 ## Route map
 
@@ -26,36 +26,29 @@ Legacy redirects that still exist:
 
 - The brand in the top nav returns to the dashboard.
 - Project context stays visible across `/projects/*`.
-- The dashboard project picker and project creation flow live in the top nav instead of inside the page body.
+- Project creation and project switching live in the top nav.
 - Settings uses a dedicated tab bar with `Overview`, `Access`, `Tokens`, and `Audit`.
 
 ## Login and account entry
 
-The login screen is intentionally minimal again:
-
-- sign in form first
+- sign-in form first
 - optional registration toggle when self-registration is enabled
-- password policy hints only when registration is active
-
-Successful login lands the user on the dashboard. Deep links are preserved through the `next` query parameter.
+- password policy hints shown during registration
+- successful login lands on the dashboard
+- deep links are preserved through the `next` query parameter
 
 ## Dashboard
 
-The dashboard is meant to answer three questions quickly:
-
-1. Which project am I in?
-2. What is the newest run worth looking at?
-3. Where should I go next?
+The dashboard is the project landing page after login.
 
 Key pieces:
 
 - project-scoped stat tiles
 - latest run summary
 - next-action card
-- run queue with search, status filters, and paging
-- top file-type chips
-
-From there, users can jump directly into inventory, import, or the latest run.
+- run queue with search and status filters
+- file-type chips
+- quick links into inventory, import, run review, and issue review
 
 ## Import flow
 
@@ -67,7 +60,7 @@ The import page is a three-step workflow:
 
 Current behavior:
 
-- drag and drop upload area
+- drag-and-drop upload area
 - basic file preflight with detected type and size
 - status messaging while upload and ingest begin
 - redirect into the run explorer after upload starts
@@ -87,27 +80,36 @@ Main UX patterns:
 - compact guided filters first
 - clear active filter state
 - extension chips for the item view
-- optional advanced query builder for the DSL
+- collapsible free-text DSL editor with examples and apply/clear actions
 - collapsible run scope selector
 - column picker for the result table
 
-The point is to make the common filters easy without removing the more expressive search path.
+Project collaboration happens here through shared investigations:
+
+- save the current inventory state as a project investigation
+- update an existing shared investigation
+- apply a saved investigation back into the page state
+- delete no-longer-useful saved investigations
 
 ## Run explorer
 
 The run page is split into focused tabs instead of one long mixed screen:
 
 - `Overview`
+- `Issues`
 - `Diff`
 - `Explore`
 - `Search`
 
 What each tab is for:
 
-- `Overview` gives quick run context and a baseline summary
+- `Overview` gives quick run context and baseline hints
+- `Issues` reviews ingest warnings and errors and links back into search
 - `Diff` compares the run with a baseline run
 - `Explore` walks endpoints -> shares -> items
 - `Search` finds items inside the run without browsing the hierarchy
+
+Run-scoped saved search presets are browser-local and separate from project-shared inventory investigations.
 
 ## Settings
 
@@ -120,29 +122,27 @@ Shows live counts and posture data:
 - registration state
 - user counts
 - token counts
+- project count
 - password policy
+- login lockout settings
 - token hygiene
 - recent audit activity
 
 ### Access
 
-Combines user administration and project access management:
+The IAM workflow is two-step:
 
-- approvals
-- activation
-- sysadmin role changes
-- password resets
-- per-project access
-- bulk all-project assignment
+- the main `Access` page is a directory and creation surface
+- the per-user detail page handles approvals, activation, sysadmin state, password resets, membership edits, and bulk all-project assignment
 
 ### Tokens
 
 Global API token administration with:
 
-- search and filters
-- create, update, rotate, revoke
+- free-text search
+- pagination
+- create, update, rotate, and revoke flows
 - one-time secret reveal on create or rotate
-- safer confirmation dialogs instead of browser prompts
 
 ### Audit
 
@@ -154,5 +154,3 @@ Global audit search and export.
 - `StatusBanner` for inline workflow feedback
 - `Dialog` for destructive or sensitive admin actions
 - `SecretReveal` for one-time token display
-
-These components keep admin workflows more consistent than the older mix of ad hoc messages and browser prompts.

@@ -1,6 +1,6 @@
 # Settings
 
-The settings area is the sysadmin control surface for Share Sentinel. It is where global administration happens once projects and users are already in motion.
+The settings area is the sysadmin control surface for Share Sentinel. It is where global administration happens once projects and users are already active.
 
 ## Who can use it
 
@@ -21,7 +21,7 @@ Older links such as `/settings/users` and `/settings/rbac` still redirect into t
 
 ## Overview
 
-The overview page is a live snapshot, not a checklist page.
+The overview page is a live posture snapshot, not a checklist page.
 
 It shows:
 
@@ -31,26 +31,32 @@ It shows:
 - project count
 - the current password policy
 - login guardrails such as lockout windows
-- token hygiene details like default expiry and never-expiring token count
+- token hygiene details like default expiry, whether never-expiring issuance is allowed, and how many legacy never-expiring tokens still exist
 - recent global audit events
-
-This page is meant to answer "what is the current posture right now?" without forcing an admin to click through every tab.
 
 ## Access
 
-`Access` combines the older user and RBAC views into one workflow.
+`Access` is now a two-screen workflow.
 
-What admins can do here:
+### Directory page
 
-- search and filter the user directory
-- create users
-- approve or unapprove accounts
-- enable or disable accounts
-- grant or remove sysadmin status
-- set passwords
-- assign project roles
+The main page supports:
+
+- searching and filtering the user directory
+- creating users
+- browsing summary membership tags
+- opening a specific user detail page
+
+### Per-user detail page
+
+The detail page handles the sensitive lifecycle work:
+
+- approve or unapprove
+- enable or disable
+- grant or remove sysadmin
+- reset password
+- assign or remove project roles
 - apply one role across all projects
-- review the global membership directory
 
 Important guardrails enforced by the API:
 
@@ -71,16 +77,8 @@ Main workflows:
 - rotate a token secret
 - revoke a token
 
-The UI now treats secrets as sensitive values:
-
-- newly created or rotated secrets are shown in a dedicated reveal component
-- destructive actions use real dialogs instead of browser prompts
-
-Key policy rules:
-
-- token role cannot exceed the user's project membership role
-- the target user must already be a project member
-- the target user must be active and approved
+The UI shows secrets only at create or rotate time through a dedicated reveal component.
+Never-expiring token issuance is disabled by default and requires explicit configuration.
 
 ## Audit
 
@@ -93,8 +91,6 @@ It supports:
 - CSV export
 - JSON export
 
-This is the right place to review changes across users, tokens, memberships, runs, and other admin actions without dropping into the database.
-
 ## Related APIs
 
 The settings area depends mostly on these routes:
@@ -102,10 +98,9 @@ The settings area depends mostly on these routes:
 - `GET /auth/security-settings`
 - `GET /users`
 - `POST /users`
+- `GET /users/{user_id}`
 - `PATCH /users/{user_id}`
-- `PATCH /users/{user_id}/status`
-- `PATCH /users/{user_id}/approval`
-- `POST /users/{user_id}/assign-all-projects`
+- `GET /settings/overview`
 - `GET /settings/projects`
 - `GET /settings/api-token-scopes`
 - `GET /settings/api-tokens`

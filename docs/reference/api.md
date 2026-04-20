@@ -1,6 +1,6 @@
 # API reference
 
-This is a practical map of the API surface in `main`. It is grouped by workflow rather than by file so it is easier to line up with the UI and automation use cases.
+This is a practical map of the API surface exposed by the current application. It is grouped by workflow so it lines up with the UI and collector behavior.
 
 ## Health and diagnostics
 
@@ -10,21 +10,25 @@ Lightweight liveness check.
 
 ### `GET /healthz/deep`
 
-Readiness-style check for Postgres and Redis.
+Sysadmin-only readiness check for Postgres and Redis.
 
 ### `GET /metrics`
 
-Prometheus-compatible metrics output. This endpoint is not shown in the OpenAPI schema.
+Sysadmin-only Prometheus output for API HTTP metrics. This route is intentionally excluded from OpenAPI.
 
 ## Authentication and session management
 
 ### `GET /auth/registration-settings`
 
-Returns whether self-registration is enabled and the active password policy. The login page uses this to decide whether to show the registration flow and which password hints to show.
+Returns whether self-registration is enabled plus the active password policy.
 
 ### `GET /auth/security-settings`
 
-Sysadmin-only snapshot of security-related settings used by the settings overview.
+Sysadmin-only snapshot of security settings used by the settings overview page.
+
+Important note:
+
+- includes the default API token expiry and whether never-expiring token issuance is enabled
 
 ### `POST /auth/register`
 
@@ -32,19 +36,27 @@ Creates a new unapproved user when self-registration is enabled.
 
 ### `POST /auth/login`
 
-Starts a browser session by setting auth, refresh, and CSRF cookies, then returns the current user payload.
+Starts a browser session by setting access, refresh, and CSRF cookies, then returns the current user payload.
 
 ### `POST /auth/refresh`
 
-Rotates the refresh cookie and renews the access cookie. Browser clients use the refresh cookie; request-body refresh tokens are legacy compatibility input only.
+Rotates the refresh cookie and renews the access cookie. Browser clients normally use the refresh cookie; request-body refresh tokens are compatibility input only.
+
+Important note:
+
+- refresh tokens are single-use and replay is rejected after rotation
 
 ### `POST /auth/logout`
 
-Clears auth cookies and revokes the active refresh session when a refresh cookie or refresh token is present.
+Clears auth cookies and revokes the active browser session when a refresh session is present.
 
 ### `POST /auth/logout-all`
 
-Revokes all active refresh tokens for the current user.
+Revokes all active browser sessions for the current user.
+
+Important note:
+
+- this route requires a browser session user and does not accept API-token-only auth
 
 ### `GET /auth/me`
 
@@ -54,9 +66,17 @@ Returns the current authenticated user.
 
 Updates the current user's UI theme.
 
+Important note:
+
+- this route requires a browser session user and does not accept API-token-only auth
+
 ### `POST /auth/change-password`
 
-Changes the current user's password and revokes active sessions.
+Changes the current user's password and invalidates active browser sessions.
+
+Important note:
+
+- this route requires a browser session user and does not accept API-token-only auth
 
 ## Self-service API tokens
 
@@ -71,6 +91,12 @@ Rules:
 - user login is required
 - current user must be `admin` on the target project
 - token role cannot exceed the user's project role
+- omitted `expires_in_days` falls back to the configured default expiry
+
+## Browser auth request notes
+
+- Unsafe requests authenticated by session cookie require a matching CSRF header.
+- Bearer API tokens do not use the CSRF requirement.
 
 ### `GET /auth/api-tokens`
 
@@ -134,15 +160,32 @@ Returns one run.
 
 ### `DELETE /projects/{project_id}/runs/{run_id}`
 
-Deletes a run. Project admin only.
+Deletes a run and its stored artifact. Project admin only.
 
 ### `POST /projects/{project_id}/runs/{run_id}/artifact`
 
-Uploads the artifact for a run. The API accepts JSON, NDJSON, JSONL, and gzip variants, validates headers and payload signatures, stores the raw artifact, and queues ingestion.
+Uploads the artifact for a run. The API accepts JSON, NDJSON, JSONL, and gzip variants, validates headers and basic payload structure, stores the raw artifact, and tries to queue ingestion.
+
+Important note:
+
+- a successful upload response can still return `queued: false`
+- when that happens, the worker will discover the run through its recovery path instead of the primary Redis stream handoff
 
 ### `GET /projects/{project_id}/runs/{run_id}/diff`
 
 Compares a run with a baseline run. If no `baseline_run_id` is supplied, the API uses the nearest earlier complete run when possible.
+
+Current caveat:
+
+- the diff payload is not paginated, so very large churn can produce a large response
+
+### `GET /projects/{project_id}/runs/{run_id}/errors`
+
+Lists recorded ingest warnings and errors for a run with search, severity filtering, and keyset pagination.
+
+### `GET /projects/{project_id}/runs/{run_id}/activity`
+
+Lists run-scoped audit activity such as creation, upload, and ingest lifecycle events.
 
 ### `GET /projects/{project_id}/runs/{run_id}/endpoints`
 
@@ -162,7 +205,11 @@ Searches items within a run.
 
 ## Inventory
 
-Inventory routes work across runs in the current project. The UI uses them for guided filters, extension chips, and the optional query DSL.
+Inventory routes work across runs in the current project.
+
+Important note:
+
+- inventory views can include data from `INGESTING` runs, so results may move until ingest completes
 
 ### `GET /projects/{project_id}/inventory/stats`
 
@@ -212,11 +259,28 @@ Endpoint-level inventory view. Supports:
 
 ### `GET /projects/{project_id}/inventory/investigations`
 
-Lists saved investigations for the project.
+Lists project-shared saved investigations.
 
 ### `POST /projects/{project_id}/inventory/investigations`
 
 Creates a saved investigation definition.
+
+Important note:
+
+- create, update, and delete investigation routes require a browser session user
+- API-token-only callers can read investigations but cannot mutate them
+
+### `PATCH /projects/{project_id}/inventory/investigations/{investigation_id}`
+
+Updates the name, description, target tab, query text, or saved definition for a project investigation.
+
+Key fields:
+
+- `name`
+- `description`
+- `target_tab`
+- `query_text`
+- `definition`
 
 ### `DELETE /projects/{project_id}/inventory/investigations/{investigation_id}`
 
@@ -224,7 +288,7 @@ Deletes a saved investigation.
 
 ## User administration
 
-These routes back the `Access` settings area and are sysadmin-only.
+These routes back the sysadmin `Access` workflow.
 
 ### `GET /users`
 
@@ -232,11 +296,16 @@ Lists users with filters:
 
 - `search`
 - `include_pending_only`
+- `project_id`
 - `is_active`
 - `is_approved`
 - `is_sysadmin`
 - `limit`
 - `cursor`
+
+Important note:
+
+- `search` can match either user email or related project names
 
 ### `POST /users`
 
@@ -252,9 +321,17 @@ Payload supports:
 - `add_to_all_projects`
 - `all_projects_role`
 
+### `GET /users/{user_id}`
+
+Returns one user for the per-user IAM detail page.
+
 ### `PATCH /users/{user_id}`
 
-Updates email, password, and admin-controlled flags in one request.
+Updates email, password, approval state, active state, and sysadmin state in one request.
+
+Important note:
+
+- password reset, disable, and unapprove actions revoke active sessions
 
 ### `PATCH /users/{user_id}/status`
 
@@ -268,9 +345,18 @@ Approves or unapproves a user.
 
 Adds or updates the user across every project with one role.
 
+Important note:
+
+- this route supports `overwrite_existing`
+- responses can include `partial` and `skipped_projects`
+
 ## System settings and governance
 
 These routes back the sysadmin settings area.
+
+### `GET /settings/overview`
+
+Returns the live posture snapshot used by the settings overview page.
 
 ### `GET /settings/projects`
 
@@ -330,9 +416,10 @@ Removes one membership entry.
 
 Bulk-assigns a user across all projects.
 
-## A few important behavior notes
+## Important behavior notes
 
 - Password policy is driven by environment variables and enforced for registration, admin-created users, password changes, and seeded admin validation.
 - Login and upload paths are rate-limited.
+- Browser session tokens are invalidated on logout, logout-all, password change, admin password reset, disable, and unapprove.
 - Audit events are written for both changes and many read operations.
 - Inventory and run listings use keyset pagination rather than offset pagination.
