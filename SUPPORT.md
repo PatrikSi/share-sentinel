@@ -20,4 +20,10 @@ Do not file public issues for vulnerabilities. Use [SECURITY.md](./SECURITY.md).
 
 ## Scope of support
 
-This project currently documents and supports the code in `main` on a best-effort basis. Older local forks or heavily modified deployments may require self-service debugging.
+This project currently follows a source-first support model:
+
+- `main` is supported on a best-effort basis.
+- If tagged releases are published, support is expected to focus on `main` plus the latest tagged release unless a newer policy says otherwise.
+- Docker images, when published, are convenience artifacts and do not imply a separate long-term support stream.
+
+Older local forks, heavily modified deployments, and stale unpublished commits may require self-service debugging.

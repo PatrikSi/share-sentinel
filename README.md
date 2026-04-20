@@ -52,6 +52,8 @@ The bundled Compose file keeps the gateway on `127.0.0.1:80` by default. That is
 
 The checked-in Compose stack is for local evaluation and development. Do not expose it as-is with placeholder secrets, default admin credentials, or plain HTTP.
 
+The default gateway also mounts the host Docker socket read-only so Traefik can discover the API and UI containers. Treat that as a trust boundary in its own right and review whether that deployment model fits your environment before publishing the stack.
+
 ## Main workflows
 
 ### Dashboard
@@ -108,8 +110,16 @@ For a fuller component and trust-boundary walkthrough, see [docs/architecture.md
 - Browser auth uses cookie-backed JWT sessions with CSRF protection.
 - API automation uses hashed, project-scoped API tokens with role and scope checks.
 - `GET /api/healthz` is public, while deep health and Prometheus metrics are sysadmin-only routes.
+- The bundled gateway relies on a read-only host Docker socket mount for Traefik service discovery.
 - OpenAPI and Swagger docs are intended for development-style environments and are hidden in production-style `APP_ENV` values.
 - The default Docker deployment is local-first, not internet-ready. Replace secrets, enable TLS, and review the reverse-proxy posture before exposing it.
+
+## Release and support policy
+
+- Source is released from this repository and is the primary supported distribution format.
+- Until a tagged release process is published, support is best-effort on `main`.
+- When tagged releases exist, expect support to focus on `main` plus the latest tagged release unless a future policy says otherwise.
+- Docker images may be published for convenience, but they should be treated as secondary artifacts to the tagged source release.
 
 ## Current limitations
 
@@ -123,6 +133,7 @@ For a fuller component and trust-boundary walkthrough, see [docs/architecture.md
 - [Docs index](./docs/README.md)
 - [Architecture overview](./docs/architecture.md)
 - [API reference](./docs/reference/api.md)
+- [Auth and RBAC reference](./docs/reference/auth-rbac.md)
 - [Frontend reference](./docs/reference/frontend.md)
 - [Release readiness checklist](./docs/release-readiness.md)
 - [Settings guide](./docs/pages/settings.md)

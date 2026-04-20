@@ -32,10 +32,9 @@ Do not send:
 
 At the moment, security fixes should be assumed to land on `main` first.
 
-- Supported: the current `main` branch and the latest Docker Compose deployment built from it
-- Not yet supported as a separate maintenance stream: older commits, forks, or unpublished local variants
-
-If you plan to publish tagged releases, extend this section with an explicit support matrix.
+- Supported: the current `main` branch
+- Supported when present: the latest tagged source release
+- Not supported as a separate maintenance stream: older commits, forks, unpublished local variants, or convenience Docker images older than the latest tagged source release
 
 ## Secure deployment baseline
 
@@ -50,6 +49,7 @@ Before exposing Share Sentinel outside a local workstation:
 7. Restrict who can reach sysadmin routes, including deep health and metrics.
 8. Prefer expiring API tokens over never-expiring tokens unless you have a strong operational reason.
 9. Review audit events regularly and rotate credentials after personnel or environment changes.
+10. Review the Traefik Docker-socket mount and replace that service-discovery model if your environment does not allow the gateway to read container metadata from the host.
 
 ## Current security posture
 

@@ -25,6 +25,8 @@ Out of scope:
 
 Traefik fronts the API and UI in the default Docker deployment. The bundled Compose file binds it to `127.0.0.1:80` by default.
 
+In the bundled Compose stack, Traefik discovers services through a read-only mount of the host Docker socket. That is a real trust boundary and should be reviewed before using this deployment model outside a local workstation.
+
 ### API
 
 The FastAPI service is the control plane. It owns:

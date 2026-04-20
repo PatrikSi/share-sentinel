@@ -90,6 +90,7 @@ The usual starting points are:
 
 - `README.md`
 - `docs/reference/api.md`
+- `docs/reference/auth-rbac.md`
 - `docs/reference/frontend.md`
 - `docs/pages/settings.md`
 - subsystem READMEs in `api/`, `worker/`, and `collector/`

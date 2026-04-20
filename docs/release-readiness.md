@@ -38,6 +38,7 @@ Use this checklist before publishing a public release of the current tree. It is
 
 - [ ] Confirm the repository host has a private security reporting path enabled
 - [ ] Prepare release notes summarizing user-visible behavior changes, migrations, and new env vars
-- [ ] Decide whether you are publishing Docker image tags, source tarballs, or both
+- [ ] Publish or verify the tagged source release artifact for the selected commit
+- [ ] If you publish Docker images, confirm they map clearly to the same tagged source release
 - [ ] Confirm issue tracker, default branch, and support expectations match `SUPPORT.md`
 - [ ] Re-read `README.md` and `SECURITY.md` for any placeholders or environment-specific wording before publishing
