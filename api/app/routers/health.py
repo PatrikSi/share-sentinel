@@ -19,11 +19,7 @@ def healthz():
     return {"ok": True}
 
 
-@router.get("/healthz/deep")
-def healthz_deep(
-    db: Session = Depends(get_db),
-    _=Depends(require_sysadmin),
-):
+def _dependency_checks(db: Session) -> tuple[bool, dict[str, str]]:
     checks: dict[str, str] = {}
 
     try:
@@ -39,6 +35,22 @@ def healthz_deep(
         checks["redis"] = "error"
 
     ok = all(value == "ok" for value in checks.values())
+    return ok, checks
+
+
+@router.get("/healthz/ready")
+def healthz_ready(db: Session = Depends(get_db)):
+    ok, checks = _dependency_checks(db)
+    status_code = 200 if ok else 503
+    return JSONResponse(status_code=status_code, content={"ok": ok, "checks": checks})
+
+
+@router.get("/healthz/deep")
+def healthz_deep(
+    db: Session = Depends(get_db),
+    _=Depends(require_sysadmin),
+):
+    ok, checks = _dependency_checks(db)
     status_code = 200 if ok else 503
     return JSONResponse(status_code=status_code, content={"ok": ok, "checks": checks})
 

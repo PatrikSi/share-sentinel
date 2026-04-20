@@ -142,6 +142,44 @@ def test_write_worker_heartbeat_persists_status_payload(tmp_path: Path, monkeypa
     assert "ts" in payload
 
 
+def test_ingest_error_fingerprint_is_stable_for_same_payload() -> None:
+    row_a = main.build_ingest_error_row("run-1", "error", "SCHEMA_INVALID", "bad record", "host:445", "share", "/a")
+    row_b = main.build_ingest_error_row("run-1", "error", "SCHEMA_INVALID", "bad record", "host:445", "share", "/a")
+    row_c = main.build_ingest_error_row("run-1", "error", "SCHEMA_INVALID", "different", "host:445", "share", "/a")
+
+    assert row_a == row_b
+    assert row_a[-1] != row_c[-1]
+    assert len(row_a[-1]) == 32
+
+
+def test_flush_error_batch_uses_fingerprint_deduplication() -> None:
+    captured: dict[str, object] = {}
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def executemany(self, query, params):
+            captured["query"] = query
+            captured["params"] = list(params)
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    rows = [main.build_ingest_error_row("run-1", "error", "SCHEMA_INVALID", "bad record", "host:445", "share", "/a")]
+
+    main.flush_error_batch(_Conn(), rows)
+
+    assert "fingerprint" in str(captured["query"])
+    assert "ON CONFLICT (run_id, fingerprint) DO NOTHING" in str(captured["query"])
+    assert len(captured["params"][0]) == 8
+    assert rows == []
+
+
 def test_validate_record_requires_numeric_schema_version_for_run_meta() -> None:
     invalid, invalid_reason = main.validate_record(
         {

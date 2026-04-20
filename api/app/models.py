@@ -164,6 +164,7 @@ class Item(Base):
 
 class IngestError(Base):
     __tablename__ = "ingest_errors"
+    __table_args__ = (UniqueConstraint("run_id", "fingerprint", name="uq_ingest_errors_run_fingerprint"),)
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
     run_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, ForeignKey("scan_runs.id", ondelete="CASCADE"), nullable=False)
@@ -173,6 +174,7 @@ class IngestError(Base):
     endpoint_key: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
     resource_name: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
     path: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    fingerprint: Mapped[str] = mapped_column(sa.String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
 
 

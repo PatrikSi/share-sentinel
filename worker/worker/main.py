@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import json
 import logging
 import os
@@ -223,12 +224,61 @@ def flush_error_batch(conn: psycopg.Connection, rows: list[tuple]) -> None:
     with conn.cursor() as cur:
         cur.executemany(
             """
-            INSERT INTO ingest_errors (run_id, severity, code, message, endpoint_key, resource_name, path)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO ingest_errors (run_id, severity, code, message, endpoint_key, resource_name, path, fingerprint)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (run_id, fingerprint) DO NOTHING
             """,
             rows,
         )
     rows.clear()
+
+
+def _ingest_error_fingerprint(
+    severity: str,
+    code: str,
+    message: str,
+    endpoint_key: str | None,
+    resource_name: str | None,
+    path: str | None,
+) -> str:
+    digest = hashlib.md5(usedforsecurity=False)
+    digest.update(
+        json.dumps(
+            {
+                "severity": severity,
+                "code": code,
+                "message": message,
+                "endpoint_key": endpoint_key,
+                "resource_name": resource_name,
+                "path": path,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    )
+    return digest.hexdigest()
+
+
+def build_ingest_error_row(
+    run_id: str,
+    severity: str,
+    code: str,
+    message: str,
+    endpoint_key: str | None,
+    resource_name: str | None,
+    path: str | None,
+) -> tuple[str, str, str, str, str | None, str | None, str | None, str]:
+    return (
+        run_id,
+        severity,
+        code,
+        message,
+        endpoint_key,
+        resource_name,
+        path,
+        _ingest_error_fingerprint(severity, code, message, endpoint_key, resource_name, path),
+    )
 
 
 def update_run_status(
@@ -900,7 +950,7 @@ def process_job(fields: dict[str, str]) -> str:
                 valid, reason = validate_record(rec)
                 if not valid:
                     error_batch.append(
-                        (
+                        build_ingest_error_row(
                             run_id,
                             "error",
                             "SCHEMA_INVALID",
@@ -969,7 +1019,7 @@ def process_job(fields: dict[str, str]) -> str:
                         flush_item_batch(conn, item_batch)
                 elif rec_type == "error":
                     error_batch.append(
-                        (
+                        build_ingest_error_row(
                             run_id,
                             rec.get("severity", "error"),
                             rec.get("code", "UNKNOWN"),
@@ -1038,7 +1088,17 @@ def process_job(fields: dict[str, str]) -> str:
                     try:
                         rec = json.loads(line)
                     except json.JSONDecodeError as exc:
-                        error_batch.append((run_id, "error", "JSON_DECODE_ERROR", str(exc), None, None, None))
+                        error_batch.append(
+                            build_ingest_error_row(
+                                run_id,
+                                "error",
+                                "JSON_DECODE_ERROR",
+                                str(exc),
+                                None,
+                                None,
+                                None,
+                            )
+                        )
                         counts["errors"] += 1
                         if len(error_batch) >= BATCH_SIZE:
                             flush_error_batch(conn, error_batch)

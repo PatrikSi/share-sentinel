@@ -95,7 +95,7 @@ services:
     volumes:
       - artifacts:/artifacts
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz/ready', timeout=2)"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -128,13 +128,7 @@ services:
       - artifacts:/artifacts
     restart: unless-stopped
     healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import json, os, sys; from datetime import datetime, timezone; path = os.getenv('WORKER_HEARTBEAT_PATH', '/tmp/share-sentinel-worker-heartbeat.json'); timeout = int(os.getenv('WORKER_HEALTH_TIMEOUT_SECONDS', '45')); data = json.load(open(path)); ts = datetime.fromisoformat(data['ts']); age = (datetime.now(timezone.utc) - ts).total_seconds(); sys.exit(0 if age <= timeout else 1)",
-        ]
+      test: ["CMD", "python", "-m", "worker.healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
