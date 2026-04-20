@@ -9,6 +9,7 @@ This project is split across an API, a worker, a UI, and a collector. The quicke
 - Docker and Docker Compose
 - Python 3.11 if you want to run services or tests outside containers
 - A copy of `.env` based on `.env.example`
+- Placeholder values in `.env` replaced before you start the stack
 
 ## Local development
 

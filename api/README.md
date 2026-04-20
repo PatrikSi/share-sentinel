@@ -26,6 +26,11 @@ alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
+The API only auto-loads `.env` from the current working directory. If your `.env` lives at the repo root, either:
+
+- run the API from the repo root with `alembic -c api/alembic.ini upgrade head` and `uvicorn app.main:app --app-dir api --reload`
+- or copy/link `.env` into `api/` before using the commands above
+
 If you also run the worker outside Docker, point both processes at the same `ARTIFACT_STORAGE_PATH` so uploaded artifacts and ingestion reads use the same shared directory.
 
 Password policy is controlled through environment variables:

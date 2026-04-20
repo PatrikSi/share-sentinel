@@ -76,7 +76,7 @@ The project does not currently provide:
 - `GET /healthz` is public; `/healthz/deep` and `/metrics` require sysadmin access.
 - Artifact validation at upload time is structural, not malware-aware.
 - Raw artifacts are stored on shared disk for worker access.
-- Upload throttling is designed to fail open when Redis is unavailable.
+- Upload throttling fails closed by default when Redis is unavailable. This can be changed with `RATE_LIMIT_FAIL_OPEN=true`, but the shipped default is `false`.
 
 ## Disclosure expectations
 
