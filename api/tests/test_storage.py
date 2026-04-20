@@ -39,3 +39,14 @@ def test_storage_rejects_path_traversal(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="inside artifact storage"):
         storage.create_multipart_upload("../escape")
+
+
+def test_artifact_storage_ready_requires_existing_accessible_directory(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+
+    assert storage.artifact_storage_ready() is True
+
+    missing = tmp_path / "missing"
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(missing)))
+
+    assert storage.artifact_storage_ready() is False

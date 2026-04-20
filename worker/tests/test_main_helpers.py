@@ -28,6 +28,14 @@ def test_should_log_redis_error_uses_interval_threshold() -> None:
     assert main._should_log_redis_error(last_logged_at=100.0, now=110.0, interval_seconds=10.0) is True
 
 
+def test_should_ack_stream_result_skips_busy_only() -> None:
+    assert main.should_ack_stream_result("complete") is True
+    assert main.should_ack_stream_result("failed") is True
+    assert main.should_ack_stream_result("retry_scheduled") is True
+    assert main.should_ack_stream_result("ignored") is True
+    assert main.should_ack_stream_result("busy") is False
+
+
 def test_normalize_uuid_str_returns_canonical_uuid_or_none() -> None:
     value = uuid.uuid4()
     assert main._normalize_uuid_str(str(value)) == str(value)

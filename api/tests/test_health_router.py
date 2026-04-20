@@ -29,6 +29,7 @@ class _RedisFail:
 
 def test_healthz_ready_ok(monkeypatch) -> None:
     monkeypatch.setattr(health_router, "redis_client", _RedisOK())
+    monkeypatch.setattr(health_router.storage, "artifact_storage_ready", lambda: True)
 
     def _override_db():
         yield _DbOK()
@@ -47,6 +48,7 @@ def test_healthz_ready_ok(monkeypatch) -> None:
 
 def test_healthz_ready_unhealthy(monkeypatch) -> None:
     monkeypatch.setattr(health_router, "redis_client", _RedisFail())
+    monkeypatch.setattr(health_router.storage, "artifact_storage_ready", lambda: False)
 
     def _override_db():
         yield _DbFail()
@@ -61,10 +63,12 @@ def test_healthz_ready_unhealthy(monkeypatch) -> None:
     assert payload["ok"] is False
     assert payload["checks"]["database"] == "error"
     assert payload["checks"]["redis"] == "error"
+    assert payload["checks"]["artifact_storage"] == "error"
 
 
 def test_healthz_deep_ok(monkeypatch) -> None:
     monkeypatch.setattr(health_router, "redis_client", _RedisOK())
+    monkeypatch.setattr(health_router.storage, "artifact_storage_ready", lambda: True)
 
     def _override_db():
         yield _DbOK()
@@ -80,10 +84,12 @@ def test_healthz_deep_ok(monkeypatch) -> None:
     assert payload["ok"] is True
     assert payload["checks"]["database"] == "ok"
     assert payload["checks"]["redis"] == "ok"
+    assert payload["checks"]["artifact_storage"] == "ok"
 
 
 def test_healthz_deep_unhealthy(monkeypatch) -> None:
     monkeypatch.setattr(health_router, "redis_client", _RedisFail())
+    monkeypatch.setattr(health_router.storage, "artifact_storage_ready", lambda: False)
 
     def _override_db():
         yield _DbFail()
@@ -99,3 +105,4 @@ def test_healthz_deep_unhealthy(monkeypatch) -> None:
     assert payload["ok"] is False
     assert payload["checks"]["database"] == "error"
     assert payload["checks"]["redis"] == "error"
+    assert payload["checks"]["artifact_storage"] == "error"

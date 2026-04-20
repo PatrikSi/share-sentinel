@@ -61,6 +61,22 @@ class _FakeConn:
         self.commit_calls += 1
 
 
+class _BusyConn(_FakeConn):
+    def execute(self, query, _params=None):
+        if "pg_try_advisory_lock" in query:
+            return _FakeResult((False,))
+        raise AssertionError(f"unexpected query: {query}")
+
+
+def test_process_job_returns_busy_when_another_worker_holds_the_lock(monkeypatch) -> None:
+    fake_conn = _BusyConn(run_row=None)
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+
+    result = main.process_job({"run_id": "11111111-1111-1111-1111-111111111111"})
+
+    assert result == "busy"
+
+
 def test_process_job_skips_failed_runs_without_touching_s3(monkeypatch) -> None:
     run_id = "11111111-1111-1111-1111-111111111111"
     project_id = "22222222-2222-2222-2222-222222222222"

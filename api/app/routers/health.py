@@ -8,6 +8,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import require_sysadmin
 from app import metrics as metrics_module
+from app.services import storage
 
 router = APIRouter(tags=["health"])
 settings = get_settings()
@@ -33,6 +34,8 @@ def _dependency_checks(db: Session) -> tuple[bool, dict[str, str]]:
         checks["redis"] = "ok"
     except redis.RedisError:
         checks["redis"] = "error"
+
+    checks["artifact_storage"] = "ok" if storage.artifact_storage_ready() else "error"
 
     ok = all(value == "ok" for value in checks.values())
     return ok, checks

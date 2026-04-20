@@ -119,6 +119,10 @@ def _should_log_redis_error(last_logged_at: float, now: float, interval_seconds:
     return now - last_logged_at >= interval_seconds
 
 
+def should_ack_stream_result(result: str) -> bool:
+    return result != "busy"
+
+
 def now_iso() -> str:
     return datetime.now(tz=UTC).isoformat()
 
@@ -887,7 +891,7 @@ def process_job(fields: dict[str, str]) -> str:
         locked = conn.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]
         if not locked:
             logger.info("run is already being processed run_id=%s", run_id)
-            return "ignored"
+            return "busy"
 
         try:
             row = conn.execute(
@@ -1334,8 +1338,9 @@ def main() -> int:
             for _, jobs in messages:
                 for message_id, fields in jobs:
                     try:
-                        process_job(fields)
-                        redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
+                        result = process_job(fields)
+                        if should_ack_stream_result(result):
+                            redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
                     except Exception:
                         logger.exception(
                             "failed processing stream message message_id=%s run_id=%s",
@@ -1347,8 +1352,9 @@ def main() -> int:
         next_claim_start_id, stale_jobs = claim_stale_messages(next_claim_start_id)
         for message_id, fields in stale_jobs:
             try:
-                process_job(fields)
-                redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
+                result = process_job(fields)
+                if should_ack_stream_result(result):
+                    redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
             except Exception:
                 logger.exception(
                     "failed processing claimed stream message message_id=%s run_id=%s",

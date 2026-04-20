@@ -12,6 +12,17 @@ def _artifact_root() -> Path:
     return Path(get_settings().artifact_storage_path)
 
 
+def artifact_storage_ready() -> bool:
+    root = _artifact_root()
+    if not root.exists() or not root.is_dir():
+        return False
+    try:
+        next(root.iterdir(), None)
+    except OSError:
+        return False
+    return os.access(root, os.R_OK | os.W_OK | os.X_OK)
+
+
 def _key_parts(key: str) -> tuple[str, ...]:
     pure_path = PurePosixPath(str(key or ""))
     if pure_path.is_absolute():

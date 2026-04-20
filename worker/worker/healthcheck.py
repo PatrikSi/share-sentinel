@@ -31,9 +31,17 @@ def check_redis(redis_url: str) -> None:
     redis.Redis.from_url(redis_url, decode_responses=True).ping()
 
 
+def check_artifact_storage(artifact_storage_path: str) -> None:
+    root = Path(artifact_storage_path)
+    if not root.exists() or not root.is_dir():
+        raise RuntimeError("artifact storage path is missing")
+    next(root.iterdir(), None)
+
+
 def run_healthcheck(
     database_url: str,
     redis_url: str,
+    artifact_storage_path: str,
     heartbeat_path: str,
     timeout_seconds: int,
 ) -> tuple[bool, dict[str, str]]:
@@ -57,6 +65,12 @@ def run_healthcheck(
     except Exception:  # noqa: BLE001
         checks["redis"] = "error"
 
+    try:
+        check_artifact_storage(artifact_storage_path)
+        checks["artifact_storage"] = "ok"
+    except Exception:  # noqa: BLE001
+        checks["artifact_storage"] = "error"
+
     ok = all(value == "ok" for value in checks.values())
     return ok, checks
 
@@ -67,10 +81,11 @@ def main() -> int:
         "postgresql+psycopg://share_sentinel:share_sentinel@db:5432/share_sentinel",
     )
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+    artifact_storage_path = os.getenv("ARTIFACT_STORAGE_PATH", "/artifacts")
     heartbeat_path = os.getenv("WORKER_HEARTBEAT_PATH", "/tmp/share-sentinel-worker-heartbeat.json")
     timeout_seconds = int(os.getenv("WORKER_HEALTH_TIMEOUT_SECONDS", "45"))
 
-    ok, checks = run_healthcheck(database_url, redis_url, heartbeat_path, timeout_seconds)
+    ok, checks = run_healthcheck(database_url, redis_url, artifact_storage_path, heartbeat_path, timeout_seconds)
     if ok:
         return 0
 

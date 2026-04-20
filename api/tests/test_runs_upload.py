@@ -123,3 +123,52 @@ def test_delete_artifact_quietly_ignores_missing_files(monkeypatch) -> None:
     monkeypatch.setattr(runs_router, "delete_object", lambda _key: (_ for _ in ()).throw(FileNotFoundError("gone")))
 
     runs_router._delete_artifact_quietly("projects/p/runs/r/artifact.ndjson")
+
+
+def test_try_lock_run_for_mutation_returns_boolean() -> None:
+    class _Result:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar(self):
+            return self._value
+
+    class _Db:
+        def __init__(self, value):
+            self._value = value
+
+        def execute(self, _statement, _params):
+            return _Result(self._value)
+
+    run_id = uuid.uuid4()
+    assert runs_router._try_lock_run_for_mutation(_Db(True), run_id) is True
+    assert runs_router._try_lock_run_for_mutation(_Db(False), run_id) is False
+
+
+def test_delete_run_rejects_locked_ingesting_run(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
+    run = SimpleNamespace(id=run_id, artifact_key="projects/p/runs/r/artifact.ndjson")
+
+    monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runs_router, "_get_run", lambda *_args, **_kwargs: run)
+    monkeypatch.setattr(runs_router, "_try_lock_run_for_mutation", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(runs_router, "request_meta", lambda _request: {})
+
+    class _Db:
+        def execute(self, *_args, **_kwargs):
+            raise AssertionError("delete should not be attempted when the run lock is unavailable")
+
+    with pytest.raises(runs_router.HTTPException) as exc:
+        runs_router.delete_run(
+            project_id=project_id,
+            run_id=run_id,
+            request=SimpleNamespace(),
+            db=_Db(),
+            _=auth,
+            auth=auth,
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "run is currently ingesting"

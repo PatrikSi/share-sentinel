@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
-from sqlalchemy import String, cast, delete, func, or_, select
+from sqlalchemy import String, cast, delete, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -72,6 +72,14 @@ RUN_ACTIVITY_ACTIONS = {
     "INGEST_FAILED",
 }
 EMPTY_RUN_SUMMARY = {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
+
+
+def _run_lock_key(run_id: uuid.UUID) -> int:
+    return run_id.int % (2**63 - 1)
+
+
+def _try_lock_run_for_mutation(db: Session, run_id: uuid.UUID) -> bool:
+    return bool(db.execute(text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": _run_lock_key(run_id)}).scalar())
 
 
 def _get_run(db: Session, project_id: uuid.UUID, run_id: uuid.UUID) -> ScanRun:
@@ -926,6 +934,8 @@ def delete_run(
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
     run = _get_run(db, project_id, run_id)
+    if not _try_lock_run_for_mutation(db, run.id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run is currently ingesting")
     artifact_key = run.artifact_key
     db.execute(delete(ScanRun).where(ScanRun.id == run.id))
     write_audit_event(
