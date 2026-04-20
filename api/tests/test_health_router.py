@@ -2,6 +2,7 @@ import redis
 from fastapi.testclient import TestClient
 
 from app.db import get_db
+from app.deps import require_sysadmin
 from app.main import app
 from app.routers import health as health_router
 
@@ -33,6 +34,7 @@ def test_healthz_deep_ok(monkeypatch) -> None:
         yield _DbOK()
 
     app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[require_sysadmin] = lambda: object()
     with TestClient(app) as client:
         response = client.get("/healthz/deep")
     app.dependency_overrides.clear()
@@ -51,6 +53,7 @@ def test_healthz_deep_unhealthy(monkeypatch) -> None:
         yield _DbFail()
 
     app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[require_sysadmin] = lambda: object()
     with TestClient(app) as client:
         response = client.get("/healthz/deep")
     app.dependency_overrides.clear()

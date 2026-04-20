@@ -14,7 +14,7 @@ from app.models import Project, ProjectMember, RefreshToken, User
 from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_datetime_cursor_value, parse_uuid_cursor_value
 from app.password_policy import password_policy_kwargs
 from app.schemas import UserAdminOut, UserApprovalIn, UserAssignAllProjectsIn, UserCreateIn, UserOut, UserUpdateIn
-from app.security import hash_password, validate_password_strength
+from app.security import hash_password, next_session_version, validate_password_strength
 from app.services.audit import write_audit_event
 from app.token_scopes import SCOPE_READ_USERS, SCOPE_WRITE_MEMBERS, SCOPE_WRITE_USERS, has_required_scope
 
@@ -203,7 +203,12 @@ def update_user(
         db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="email already exists") from exc
     revoked_sessions = 0
+    should_rotate_session = payload.password is not None
     if (prev_is_active and not user.is_active) or (prev_is_approved and not user.is_approved):
+        should_rotate_session = True
+    if should_rotate_session:
+        user.session_version = next_session_version(getattr(user, "session_version", 1))
+    if should_rotate_session:
         revoked_sessions = _revoke_active_refresh_tokens(db, user.id)
 
     write_audit_event(
@@ -218,6 +223,7 @@ def update_user(
             "is_sysadmin": user.is_sysadmin,
             "is_approved": user.is_approved,
             "revoked_sessions": revoked_sessions,
+            "session_version": getattr(user, "session_version", 1),
         },
     )
     db.commit()
@@ -244,6 +250,8 @@ def update_user_status(
     _enforce_admin_safety(db, auth.user_id, user, is_active, user.is_approved, user.is_sysadmin)
 
     user.is_active = is_active
+    if was_active and not is_active:
+        user.session_version = next_session_version(getattr(user, "session_version", 1))
     db.add(user)
     revoked_sessions = _revoke_active_refresh_tokens(db, user.id) if was_active and not is_active else 0
     write_audit_event(
@@ -252,7 +260,12 @@ def update_user_status(
         object_type="user",
         object_id=str(user.id),
         actor_user_id=auth.user_id,
-        metadata={**request_meta(request), "is_active": is_active, "revoked_sessions": revoked_sessions},
+        metadata={
+            **request_meta(request),
+            "is_active": is_active,
+            "revoked_sessions": revoked_sessions,
+            "session_version": getattr(user, "session_version", 1),
+        },
     )
     db.commit()
     db.refresh(user)
@@ -285,6 +298,8 @@ def update_user_approval(
         user.approved_at = None
         user.approved_by_user_id = None
 
+    if was_approved and not user.is_approved:
+        user.session_version = next_session_version(getattr(user, "session_version", 1))
     db.add(user)
     revoked_sessions = _revoke_active_refresh_tokens(db, user.id) if was_approved and not user.is_approved else 0
     write_audit_event(
@@ -293,7 +308,12 @@ def update_user_approval(
         object_type="user",
         object_id=str(user.id),
         actor_user_id=auth.user_id,
-        metadata={**request_meta(request), "is_approved": user.is_approved, "revoked_sessions": revoked_sessions},
+        metadata={
+            **request_meta(request),
+            "is_approved": user.is_approved,
+            "revoked_sessions": revoked_sessions,
+            "session_version": getattr(user, "session_version", 1),
+        },
     )
     db.commit()
     db.refresh(user)

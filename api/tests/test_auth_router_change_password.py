@@ -71,7 +71,7 @@ def test_change_password_rejects_invalid_current_password(monkeypatch) -> None:
 
 def test_change_password_revokes_active_refresh_sessions(monkeypatch) -> None:
     fake_db = _FakeDb()
-    user = SimpleNamespace(id=uuid.uuid4(), password_hash="old-hash")
+    user = SimpleNamespace(id=uuid.uuid4(), password_hash="old-hash", session_version=3)
     active_session = SimpleNamespace(id=uuid.uuid4(), user_id=user.id, revoked_at=None)
     fake_db.execute_queue.append(_ExecuteResult([active_session]))
     payload = ChangePasswordIn(current_password="old-password", new_password="NewPassword123456")
@@ -86,6 +86,7 @@ def test_change_password_revokes_active_refresh_sessions(monkeypatch) -> None:
 
     assert response == {"ok": True}
     assert user.password_hash == "new-hash"
+    assert user.session_version == 4
     assert active_session.revoked_at is not None
     assert active_session.revoked_at > datetime.now(tz=UTC) - timedelta(minutes=1)
     assert fake_db.commit_count == 1

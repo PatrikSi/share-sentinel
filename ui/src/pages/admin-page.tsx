@@ -20,6 +20,7 @@ type SecuritySettings = {
   allow_self_registration: boolean;
   auth_require_csrf: boolean;
   auth_cookie_secure: boolean;
+  allow_never_expiring_api_tokens: boolean;
   password_min_length: number;
   auth_login_max_attempts: number;
   auth_login_window_seconds: number;
@@ -506,6 +507,7 @@ export function AdminPage() {
                 <li>Self-registration: {securitySettings.allow_self_registration ? "enabled" : "disabled"}</li>
                 <li>CSRF required: {securitySettings.auth_require_csrf ? "yes" : "no"}</li>
                 <li>Secure auth cookie: {securitySettings.auth_cookie_secure ? "yes" : "no"}</li>
+                <li>Never-expiring token issuance: {securitySettings.allow_never_expiring_api_tokens ? "enabled" : "disabled"}</li>
                 <li>Password minimum: {securitySettings.password_min_length}</li>
                 <li>
                   Login lockout: {securitySettings.auth_login_max_attempts} attempts / {securitySettings.auth_login_window_seconds}s window /{" "}

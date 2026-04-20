@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import metrics
+from app.deps import require_sysadmin
 from app.main import app
 
 
@@ -22,10 +23,12 @@ def _reset_metrics():
 
 
 def test_metrics_endpoint_exposes_request_and_error_counters() -> None:
+    app.dependency_overrides[require_sysadmin] = lambda: object()
     with TestClient(app) as client:
         ok_response = client.get("/healthz")
         missing_response = client.get("/does-not-exist")
         metrics_response = client.get("/metrics")
+    app.dependency_overrides.clear()
 
     assert ok_response.status_code == 200
     assert missing_response.status_code == 404
@@ -41,9 +44,11 @@ def test_metrics_endpoint_exposes_request_and_error_counters() -> None:
 
 def test_metrics_capture_uncaught_exceptions() -> None:
     _ensure_error_route()
+    app.dependency_overrides[require_sysadmin] = lambda: object()
     with TestClient(app, raise_server_exceptions=False) as client:
         error_response = client.get("/_test/metrics-error")
         metrics_response = client.get("/metrics")
+    app.dependency_overrides.clear()
 
     assert error_response.status_code == 500
     assert metrics_response.status_code == 200

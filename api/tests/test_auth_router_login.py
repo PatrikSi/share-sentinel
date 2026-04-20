@@ -32,6 +32,11 @@ class _FakeDb:
     def add(self, obj):
         self.added.append(obj)
 
+    def flush(self):
+        for obj in self.added:
+            if getattr(obj, "id", None) is None:
+                obj.id = uuid.uuid4()
+
     def commit(self):
         self.commit_count += 1
 
@@ -55,6 +60,7 @@ def test_login_sets_session_and_refresh_cookies(monkeypatch) -> None:
         id=uuid.uuid4(),
         email="user@example.com",
         password_hash="stored-hash",
+        session_version=4,
         is_active=True,
         is_sysadmin=False,
         is_approved=True,
@@ -65,12 +71,18 @@ def test_login_sets_session_and_refresh_cookies(monkeypatch) -> None:
     fake_db = _FakeDb(execute_row=user)
     auth_cookie_calls: list[tuple[str, str]] = []
     refresh_cookie_calls: list[str] = []
+    access_token_calls: list[tuple[str, int | None, str | None]] = []
 
     monkeypatch.setattr(auth_router, "check_login_throttle", lambda *_args, **_kwargs: SimpleNamespace(blocked=False, retry_after_seconds=None))
     monkeypatch.setattr(auth_router.rate_limiter, "check", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(auth_router, "verify_password", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(auth_router, "clear_login_failures", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(auth_router, "make_access_token", lambda *_args, **_kwargs: "access-token")
+    monkeypatch.setattr(
+        auth_router,
+        "make_access_token",
+        lambda subject, session_version=None, session_id=None: access_token_calls.append((subject, session_version, session_id))
+        or "access-token",
+    )
     monkeypatch.setattr(auth_router, "generate_csrf_token", lambda: "csrf-token")
     monkeypatch.setattr(auth_router, "random_token", lambda *_args, **_kwargs: "refresh-token")
     monkeypatch.setattr(auth_router, "hash_external_token", lambda value: f"hash:{value}")
@@ -90,3 +102,4 @@ def test_login_sets_session_and_refresh_cookies(monkeypatch) -> None:
     assert isinstance(fake_db.added[0], RefreshToken)
     assert auth_cookie_calls == [("access-token", "csrf-token")]
     assert refresh_cookie_calls == ["refresh-token"]
+    assert access_token_calls == [(str(user.id), 4, str(fake_db.added[0].id))]

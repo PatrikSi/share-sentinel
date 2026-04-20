@@ -24,6 +24,16 @@ class _ExecuteResult:
     def scalar_one_or_none(self):
         return self._row
 
+    def scalars(self):
+        return self
+
+    def all(self):
+        if self._row is None:
+            return []
+        if isinstance(self._row, list):
+            return self._row
+        return [self._row]
+
 
 @dataclass
 class _FakeDb:
@@ -40,6 +50,11 @@ class _FakeDb:
 
     def add(self, obj):
         self.added.append(obj)
+
+    def flush(self):
+        for obj in self.added:
+            if getattr(obj, "id", None) is None:
+                obj.id = uuid.uuid4()
 
     def commit(self):
         self.commit_count += 1
@@ -88,7 +103,8 @@ def test_refresh_allows_single_use_and_rejects_replay(monkeypatch) -> None:
     used = False
     consumed = SimpleNamespace(id=uuid.uuid4(), user_id=user_id)
     fake_db = _FakeDb()
-    fake_db.get_map[(User, user_id)] = SimpleNamespace(id=user_id, is_active=True, is_approved=True)
+    fake_db.get_map[(User, user_id)] = SimpleNamespace(id=user_id, is_active=True, is_approved=True, session_version=7)
+    access_token_calls: list[tuple[str, int | None, str | None]] = []
 
     def _consume_once(_db, _token_hash, _now):
         nonlocal used
@@ -114,7 +130,12 @@ def test_refresh_allows_single_use_and_rejects_replay(monkeypatch) -> None:
     monkeypatch.setattr(auth_router, "_consume_refresh_token", _consume_once)
     monkeypatch.setattr(auth_router, "hash_external_token", lambda value: f"hash:{value}")
     monkeypatch.setattr(auth_router, "random_token", lambda *_args, **_kwargs: "new-refresh")
-    monkeypatch.setattr(auth_router, "make_access_token", lambda *_args, **_kwargs: "new-access")
+    monkeypatch.setattr(
+        auth_router,
+        "make_access_token",
+        lambda subject, session_version=None, session_id=None: access_token_calls.append((subject, session_version, session_id))
+        or "new-access",
+    )
     monkeypatch.setattr(auth_router, "generate_csrf_token", lambda: "csrf-token")
     monkeypatch.setattr(auth_router, "set_auth_cookies", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(auth_router, "set_refresh_cookie", lambda *_args, **_kwargs: None)
@@ -134,6 +155,7 @@ def test_refresh_allows_single_use_and_rejects_replay(monkeypatch) -> None:
     assert fake_db.commit_count == 1
     assert any(call["actor_key"] == "refresh" for call in rate_limit_calls)
     assert any(call["actor_key"] == "refresh:hash:old-refresh" for call in rate_limit_calls)
+    assert access_token_calls == [(str(user_id), 7, str(fake_db.added[0].id))]
 
 
 def test_refresh_accepts_refresh_cookie_when_csrf_matches(monkeypatch) -> None:
@@ -291,3 +313,24 @@ def test_logout_revokes_refresh_cookie_when_present(monkeypatch) -> None:
     assert result == {"ok": True}
     assert refresh_token.revoked_at is not None
     assert fake_db.commit_count == 1
+
+
+def test_logout_all_revokes_refresh_sessions_and_bumps_session_version(monkeypatch) -> None:
+    user_id = uuid.uuid4()
+    user = SimpleNamespace(id=user_id, session_version=2)
+    refresh_tokens = [
+        SimpleNamespace(id=uuid.uuid4(), user_id=user_id, revoked_at=None),
+        SimpleNamespace(id=uuid.uuid4(), user_id=user_id, revoked_at=None),
+    ]
+    fake_db = _FakeDb(execute_row=refresh_tokens)
+    audit_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(auth_router, "write_audit_event", lambda *_args, **kwargs: audit_calls.append(kwargs))
+
+    result = auth_router.logout_all(_request(), Response(), fake_db, user)
+
+    assert result == {"ok": True, "revoked_sessions": 2}
+    assert user.session_version == 3
+    assert all(token.revoked_at is not None for token in refresh_tokens)
+    assert fake_db.commit_count == 1
+    assert audit_calls[-1]["metadata"]["session_version"] == 3

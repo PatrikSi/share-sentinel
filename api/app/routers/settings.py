@@ -177,6 +177,7 @@ def settings_overview(
         allow_self_registration=settings.allow_self_registration,
         auth_require_csrf=settings.auth_require_csrf,
         auth_cookie_secure=settings.auth_cookie_secure,
+        allow_never_expiring_api_tokens=settings.allow_never_expiring_api_tokens,
         password_min_length=settings.password_min_length,
         password_require_lowercase=settings.password_require_lowercase,
         password_require_uppercase=settings.password_require_uppercase,
@@ -308,6 +309,8 @@ def create_any_api_token(
     expires_in_days = payload.expires_in_days
     if expires_in_days is None:
         expires_in_days = settings.default_api_token_expiry_days
+    if expires_in_days == 0 and not settings.allow_never_expiring_api_tokens:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="never-expiring api tokens are disabled")
     expires_at = datetime.now(tz=UTC) + timedelta(days=expires_in_days) if expires_in_days else None
 
     scopes = normalize_token_scopes(payload.scopes)
@@ -364,6 +367,7 @@ def update_any_api_token(
     __: User = Depends(require_sysadmin),
 ):
     _ = __
+    settings = get_settings()
     token = db.get(ApiToken, token_id)
     if token is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="token not found")
@@ -371,6 +375,8 @@ def update_any_api_token(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="cannot update a revoked token")
     if payload.never_expires and payload.expires_in_days is not None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="cannot set both never_expires and expires_in_days")
+    if payload.never_expires and not settings.allow_never_expiring_api_tokens:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="never-expiring api tokens are disabled")
 
     owner = db.get(User, token.user_id)
     if owner is None:

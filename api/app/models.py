@@ -26,6 +26,7 @@ class User(Base):
     id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=uuid.uuid4)
     email: Mapped[str] = mapped_column(sa.String(320), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    session_version: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="1")
     is_active: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.true())
     is_sysadmin: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
     is_approved: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.true())

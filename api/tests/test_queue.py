@@ -12,10 +12,10 @@ class _FakeRedis:
         return "1-0"
 
 
-def test_enqueue_ingest_job_does_not_trim_by_default(monkeypatch) -> None:
+def test_enqueue_ingest_job_trims_by_default(monkeypatch) -> None:
     fake_redis = _FakeRedis()
     monkeypatch.setattr(queue, "_redis", fake_redis)
-    monkeypatch.setattr(queue, "get_settings", lambda: SimpleNamespace(redis_stream_maxlen=0))
+    monkeypatch.setattr(queue, "get_settings", lambda: SimpleNamespace(redis_stream_maxlen=250000))
 
     message_id = queue.enqueue_ingest_job({"run_id": "abc", "meta": {"a": 1}})
 
@@ -24,7 +24,7 @@ def test_enqueue_ingest_job_does_not_trim_by_default(monkeypatch) -> None:
         {
             "stream_name": queue.STREAM_NAME,
             "payload": {"run_id": "abc", "meta": '{"a": 1}'},
-            "kwargs": {},
+            "kwargs": {"maxlen": 250000, "approximate": True},
         }
     ]
 

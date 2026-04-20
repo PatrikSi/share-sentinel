@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     require_user_for_api_token_create: bool = True
     allow_legacy_unscoped_tokens: bool = False
     default_api_token_expiry_days: int = 90
+    allow_never_expiring_api_tokens: bool = False
     api_token_last_used_update_interval_seconds: int = 300
     auth_cookie_name: str = "share_sentinel_session"
     auth_cookie_domain: str | None = None
@@ -46,7 +47,7 @@ class Settings(BaseSettings):
     upload_chunk_bytes: int = 8 * 1024 * 1024
     rate_limit_fail_open: bool = False
     redis_stream_retries: int = 3
-    redis_stream_maxlen: int = 0
+    redis_stream_maxlen: int = 250000
     auth_login_max_attempts: int = 8
     auth_login_window_seconds: int = 300
     auth_login_lockout_seconds: int = 900
@@ -94,6 +95,15 @@ class Settings(BaseSettings):
             raise ValueError("password_min_length must be 256 or less")
         return value
 
+    @field_validator("default_api_token_expiry_days")
+    @classmethod
+    def _validate_default_api_token_expiry_days(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("default_api_token_expiry_days must be 0 or greater")
+        if value > 3650:
+            raise ValueError("default_api_token_expiry_days must be 3650 or less")
+        return value
+
     @model_validator(mode="after")
     def _validate_seed_admin_settings(self):
         has_seed_email = bool(self.seed_admin_email)
@@ -109,6 +119,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_production_settings(self):
+        if self.default_api_token_expiry_days == 0 and not self.allow_never_expiring_api_tokens:
+            raise ValueError(
+                "default_api_token_expiry_days must be at least 1 when allow_never_expiring_api_tokens is false"
+            )
         if self.app_env.lower() in {"production", "prod"}:
             if self.jwt_secret == "dev-secret" or len(self.jwt_secret) < 32:
                 raise ValueError("jwt_secret must be set and at least 32 characters in production")
@@ -124,6 +138,8 @@ class Settings(BaseSettings):
                 raise ValueError("SEED_ADMIN_PASSWORD must not use the default value in production")
             if not self.auth_cookie_secure:
                 raise ValueError("auth_cookie_secure must be true in production")
+            if self.allow_never_expiring_api_tokens:
+                raise ValueError("allow_never_expiring_api_tokens must be false in production")
         return self
 
 

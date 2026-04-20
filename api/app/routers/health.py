@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
+from app.deps import require_sysadmin
 from app import metrics as metrics_module
 
 router = APIRouter(tags=["health"])
@@ -19,7 +20,10 @@ def healthz():
 
 
 @router.get("/healthz/deep")
-def healthz_deep(db: Session = Depends(get_db)):
+def healthz_deep(
+    db: Session = Depends(get_db),
+    _=Depends(require_sysadmin),
+):
     checks: dict[str, str] = {}
 
     try:
@@ -40,7 +44,7 @@ def healthz_deep(db: Session = Depends(get_db)):
 
 
 @router.get("/metrics", include_in_schema=False)
-def metrics():
+def metrics(_=Depends(require_sysadmin)):
     return PlainTextResponse(
         metrics_module.render_prometheus(),
         media_type="text/plain; version=0.0.4; charset=utf-8",

@@ -26,17 +26,32 @@ def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
 
-def make_access_token(subject: str) -> str:
+def session_version_value(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return parsed if parsed > 0 else 1
+
+
+def next_session_version(value: Any) -> int:
+    return session_version_value(value) + 1
+
+
+def make_access_token(subject: str, session_version: int | None = None, session_id: str | None = None) -> str:
     settings = get_settings()
     now = datetime.now(tz=UTC)
     payload: dict[str, Any] = {
         "iss": settings.jwt_issuer,
         "sub": subject,
         "type": "access",
+        "sv": session_version_value(session_version),
         "jti": str(uuid4()),
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=settings.access_token_minutes)).timestamp()),
     }
+    if session_id:
+        payload["sid"] = session_id
     return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
 

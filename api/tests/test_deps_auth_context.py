@@ -9,9 +9,10 @@ from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from starlette.requests import Request
 
+from app import deps as deps_module
 from app.deps import get_auth_context, require_session_user, require_sysadmin
 from app.enums import ProjectRole
-from app.models import ProjectMember, User
+from app.models import ProjectMember, RefreshToken, User
 
 
 class _ExecuteResult:
@@ -135,6 +136,50 @@ def test_api_token_auth_accepts_membership_and_updates_last_used(monkeypatch) ->
     assert token.last_used_at is not None
     assert persisted == [(token.id, token.last_used_at)]
     assert fake_db.added == []
+
+
+def test_access_token_auth_rejects_revoked_session_version(monkeypatch) -> None:
+    user_id = uuid.uuid4()
+    user = SimpleNamespace(id=user_id, is_active=True, is_approved=True, session_version=3)
+    fake_db = _FakeDb(token_row=None)
+    fake_db.get_map[(User, user_id)] = user
+
+    monkeypatch.setattr(deps_module, "decode_access_token", lambda _token: {"sub": str(user_id), "sv": 2})
+
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="a.b.c")
+    with pytest.raises(HTTPException) as exc:
+        get_auth_context(_request(), credentials, fake_db)
+
+    assert exc.value.status_code == 401
+    assert exc.value.detail == "session revoked"
+
+
+def test_access_token_auth_rejects_revoked_refresh_session(monkeypatch) -> None:
+    user_id = uuid.uuid4()
+    refresh_token_id = uuid.uuid4()
+    user = SimpleNamespace(id=user_id, is_active=True, is_approved=True, session_version=1)
+    refresh_token = SimpleNamespace(
+        id=refresh_token_id,
+        user_id=user_id,
+        revoked_at=datetime.now(tz=UTC),
+        expires_at=datetime.now(tz=UTC) + timedelta(hours=1),
+    )
+    fake_db = _FakeDb(token_row=None)
+    fake_db.get_map[(User, user_id)] = user
+    fake_db.get_map[(RefreshToken, refresh_token_id)] = refresh_token
+
+    monkeypatch.setattr(
+        deps_module,
+        "decode_access_token",
+        lambda _token: {"sub": str(user_id), "sv": 1, "sid": str(refresh_token_id)},
+    )
+
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="a.b.c")
+    with pytest.raises(HTTPException) as exc:
+        get_auth_context(_request(), credentials, fake_db)
+
+    assert exc.value.status_code == 401
+    assert exc.value.detail == "session revoked"
 
 
 def test_require_session_user_rejects_api_token_auth() -> None:

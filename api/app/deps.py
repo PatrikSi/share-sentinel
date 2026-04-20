@@ -12,8 +12,8 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import SessionLocal, get_db
 from app.enums import ProjectRole
-from app.models import ApiToken, ProjectMember, User
-from app.security import decode_access_token, hash_external_token
+from app.models import ApiToken, ProjectMember, RefreshToken, User
+from app.security import decode_access_token, hash_external_token, session_version_value
 from app.token_scopes import has_required_scope, normalize_token_scopes
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -73,6 +73,19 @@ def get_auth_context(
                 raise _unauthorized("user not active")
             if not user.is_approved:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account pending approval")
+            if session_version_value(payload.get("sv")) != session_version_value(getattr(user, "session_version", 1)):
+                raise _unauthorized("session revoked")
+            session_id = payload.get("sid")
+            if session_id is not None:
+                try:
+                    refresh_token_id = uuid.UUID(str(session_id))
+                except Exception as exc:  # noqa: BLE001
+                    raise _unauthorized("invalid session token") from exc
+                refresh_token = db.get(RefreshToken, refresh_token_id)
+                if refresh_token is None or refresh_token.user_id != user_id or refresh_token.revoked_at is not None:
+                    raise _unauthorized("session revoked")
+                if _coerce_utc(refresh_token.expires_at) < datetime.now(tz=UTC):
+                    raise _unauthorized("session revoked")
             return AuthContext(user_id=user_id, token_id=None, token_project_id=None, token_role=None, token_scopes=None)
         except JWTError:
             # Fallback to API token lookup for token strings that resemble JWTs.

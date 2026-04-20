@@ -318,6 +318,7 @@ def test_settings_overview_returns_aggregate_counts() -> None:
     assert payload["tokens"]["active"] == 6
     assert payload["tokens"]["revoked"] == 3
     assert payload["tokens"]["never_expires"] == 3
+    assert payload["security"]["allow_never_expiring_api_tokens"] is False
     assert payload["projects"]["total"] == 4
     assert payload["recent_audit"][0]["project_name"] == "Core"
 
@@ -370,6 +371,91 @@ def test_settings_api_token_catalog_and_create_and_rotate() -> None:
     rotate_payload = rotate_response.json()
     assert rotate_payload["token"]
     assert rotate_payload["token_meta"]["id"] == created_id
+
+
+def test_settings_api_token_create_rejects_zero_day_default_when_never_expiring_tokens_are_disabled(monkeypatch) -> None:
+    fake_db = _FakeDb()
+    actor_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    fake_db.get_map[(User, user_id)] = SimpleNamespace(
+        id=user_id,
+        email="owner@example.com",
+        is_sysadmin=False,
+        is_active=True,
+        is_approved=True,
+    )
+    fake_db.get_map[(Project, project_id)] = SimpleNamespace(id=project_id, name="Core")
+    fake_db.get_map[(ProjectMember, _normalize_key({"project_id": project_id, "user_id": user_id}))] = SimpleNamespace(
+        project_id=project_id,
+        user_id=user_id,
+        role=ProjectRole.ADMIN,
+    )
+
+    monkeypatch.setattr("app.routers.settings.get_settings", lambda: SimpleNamespace(default_api_token_expiry_days=0, allow_never_expiring_api_tokens=False))
+
+    client = _client_for_db(fake_db, actor_user_id=actor_id)
+    try:
+        response = client.post(
+            "/settings/api-tokens",
+            json={
+                "user_id": str(user_id),
+                "project_id": str(project_id),
+                "name": "global-agent",
+                "role": "admin",
+                "scopes": [],
+            },
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "never-expiring api tokens are disabled"
+
+
+def test_settings_api_token_update_rejects_never_expiring_tokens_by_default(monkeypatch) -> None:
+    fake_db = _FakeDb()
+    actor_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    token_id = uuid.uuid4()
+    fake_db.get_map[(ApiToken, token_id)] = SimpleNamespace(
+        id=token_id,
+        user_id=user_id,
+        project_id=project_id,
+        name="collector",
+        role=ProjectRole.ADMIN,
+        scopes=["read:projects"],
+        expires_at=datetime.now(tz=UTC),
+        revoked_at=None,
+    )
+    fake_db.get_map[(User, user_id)] = SimpleNamespace(
+        id=user_id,
+        email="owner@example.com",
+        is_sysadmin=False,
+        is_active=True,
+        is_approved=True,
+    )
+    fake_db.get_map[(Project, project_id)] = SimpleNamespace(id=project_id, name="Core")
+    fake_db.get_map[(ProjectMember, _normalize_key({"project_id": project_id, "user_id": user_id}))] = SimpleNamespace(
+        project_id=project_id,
+        user_id=user_id,
+        role=ProjectRole.ADMIN,
+    )
+
+    monkeypatch.setattr("app.routers.settings.get_settings", lambda: SimpleNamespace(default_api_token_expiry_days=90, allow_never_expiring_api_tokens=False))
+
+    client = _client_for_db(fake_db, actor_user_id=actor_id)
+    try:
+        response = client.patch(
+            f"/settings/api-tokens/{token_id}",
+            json={"never_expires": True},
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "never-expiring api tokens are disabled"
 
 
 def test_settings_rejects_removing_last_project_admin() -> None:

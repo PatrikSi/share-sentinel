@@ -84,7 +84,6 @@ export function SettingsApiTokensPage() {
   const [editUseDefaults, setEditUseDefaults] = useState(true);
   const [editScopesCsv, setEditScopesCsv] = useState("");
   const [editExpiryDays, setEditExpiryDays] = useState("");
-  const [editNeverExpires, setEditNeverExpires] = useState(false);
 
   const [secretReveal, setSecretReveal] = useState<{ label: string; secret: string } | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingTokenAction>(null);
@@ -99,8 +98,7 @@ export function SettingsApiTokensPage() {
     const total = tokens.length;
     const active = tokens.filter((token) => !token.revoked_at).length;
     const revoked = total - active;
-    const neverExpires = tokens.filter((token) => !token.revoked_at && !token.expires_at).length;
-    return { total, active, revoked, neverExpires };
+    return { total, active, revoked };
   }, [tokens]);
 
   async function loadReferenceData() {
@@ -167,7 +165,6 @@ export function SettingsApiTokensPage() {
     setEditScopesCsv(editToken.scopes.join(", "));
     setEditUseDefaults(false);
     setEditExpiryDays("");
-    setEditNeverExpires(false);
   }, [editToken]);
 
   async function createToken(event: FormEvent<HTMLFormElement>) {
@@ -226,7 +223,6 @@ export function SettingsApiTokensPage() {
           role: editRole,
           scopes,
           expires_in_days: Number.isFinite(expiryDays) && expiryDays > 0 ? expiryDays : undefined,
-          never_expires: editNeverExpires,
         }),
       })) as ApiTokenRow;
       setInfo("API token updated.");
@@ -460,10 +456,6 @@ export function SettingsApiTokensPage() {
                 <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Revoked</p>
                 <p className="mt-1 text-2xl font-semibold">{tokenStats.revoked}</p>
               </div>
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Never expire</p>
-                <p className="mt-1 text-2xl font-semibold">{tokenStats.neverExpires}</p>
-              </div>
             </div>
           </section>
 
@@ -676,21 +668,18 @@ export function SettingsApiTokensPage() {
                 ))}
               </select>
             </label>
-            <label className="block text-sm">
-              New expiry days
-              <input
-                className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-                value={editExpiryDays}
-                onChange={(event) => setEditExpiryDays(event.target.value)}
-                placeholder="180"
-                disabled={editSubmitting || editNeverExpires}
-              />
-            </label>
-            <label className="flex items-center gap-2 text-sm md:mt-8">
-              <input checked={editNeverExpires} disabled={editSubmitting} type="checkbox" onChange={(event) => setEditNeverExpires(event.target.checked)} />
-              Never expire
-            </label>
-            <label className="flex items-center gap-2 text-sm md:col-span-2">
+	            <label className="block text-sm">
+	              New expiry days
+	              <input
+	                className="mt-1 w-full rounded-2xl border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+	                value={editExpiryDays}
+	                onChange={(event) => setEditExpiryDays(event.target.value)}
+	                placeholder="180"
+	                disabled={editSubmitting}
+	                inputMode="numeric"
+	              />
+	            </label>
+	            <label className="flex items-center gap-2 text-sm md:col-span-2">
               <input checked={editUseDefaults} disabled={editSubmitting} type="checkbox" onChange={(event) => setEditUseDefaults(event.target.checked)} />
               Reset scopes to the selected role defaults
             </label>

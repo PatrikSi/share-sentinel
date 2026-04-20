@@ -7,6 +7,7 @@ type SecuritySettings = {
   allow_self_registration: boolean;
   auth_require_csrf: boolean;
   auth_cookie_secure: boolean;
+  allow_never_expiring_api_tokens: boolean;
   password_min_length: number;
   password_require_lowercase: boolean;
   password_require_uppercase: boolean;
@@ -140,7 +141,8 @@ export function SettingsOverviewPage() {
           <p className="text-xs uppercase tracking-[0.18em] text-slate-500">API Tokens</p>
           <p className="mt-2 text-3xl font-semibold">{tokens.active}</p>
           <p className="mt-2 text-sm text-slate-500">
-            {tokens.revoked} revoked, {tokens.never_expires} never expire.
+            {tokens.revoked} revoked, {tokens.never_expires} never expire, issuance is{" "}
+            {security.allow_never_expiring_api_tokens ? "enabled" : "disabled"}.
           </p>
         </section>
         <section className="workspace-card">
@@ -193,6 +195,10 @@ export function SettingsOverviewPage() {
             <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Never-expiring tokens</p>
               <p className="mt-1 text-sm font-semibold">{tokens.never_expires}</p>
+            </div>
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Issuance policy</p>
+              <p className="mt-1 text-sm font-semibold">{security.allow_never_expiring_api_tokens ? "Opt-in enabled" : "Expiry required"}</p>
             </div>
             <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Last active token use</p>

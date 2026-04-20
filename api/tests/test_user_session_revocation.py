@@ -9,7 +9,7 @@ from app.deps import AuthContext
 from app.enums import UITheme
 from app.models import User
 from app.routers import users as users_router
-from app.schemas import UserApprovalIn
+from app.schemas import UserApprovalIn, UserUpdateIn
 
 
 @dataclass
@@ -58,11 +58,12 @@ def _request() -> Request:
     return Request(scope)
 
 
-def _user(user_id: uuid.UUID, is_active: bool = True, is_approved: bool = True):
+def _user(user_id: uuid.UUID, is_active: bool = True, is_approved: bool = True, session_version: int = 1):
     return SimpleNamespace(
         id=user_id,
         email="user@example.com",
         password_hash="hash",
+        session_version=session_version,
         is_active=is_active,
         is_sysadmin=False,
         is_approved=is_approved,
@@ -75,7 +76,8 @@ def _user(user_id: uuid.UUID, is_active: bool = True, is_approved: bool = True):
 def test_update_user_status_revokes_sessions_when_disabling(monkeypatch) -> None:
     user_id = uuid.uuid4()
     actor_id = uuid.uuid4()
-    fake_db = _FakeDb(get_map={(User, user_id): _user(user_id, is_active=True, is_approved=True)})
+    target_user = _user(user_id, is_active=True, is_approved=True, session_version=2)
+    fake_db = _FakeDb(get_map={(User, user_id): target_user})
     auth = AuthContext(user_id=actor_id, token_id=None, token_project_id=None, token_role=None, token_scopes=None)
     audit_calls: list[dict[str, Any]] = []
 
@@ -85,6 +87,7 @@ def test_update_user_status_revokes_sessions_when_disabling(monkeypatch) -> None
     result = users_router.update_user_status(user_id, False, _request(), fake_db, auth, auth, SimpleNamespace(id=actor_id))
 
     assert result.is_active is False
+    assert target_user.session_version == 3
     assert fake_db.commit_count == 1
     assert fake_db.refresh_count == 1
     assert audit_calls[-1]["metadata"]["revoked_sessions"] == 2
@@ -114,7 +117,8 @@ def test_update_user_status_does_not_revoke_when_enabling(monkeypatch) -> None:
 def test_update_user_approval_revokes_sessions_when_unapproving(monkeypatch) -> None:
     user_id = uuid.uuid4()
     actor_id = uuid.uuid4()
-    fake_db = _FakeDb(get_map={(User, user_id): _user(user_id, is_active=True, is_approved=True)})
+    target_user = _user(user_id, is_active=True, is_approved=True, session_version=4)
+    fake_db = _FakeDb(get_map={(User, user_id): target_user})
     auth = AuthContext(user_id=actor_id, token_id=None, token_project_id=None, token_role=None, token_scopes=None)
     audit_calls: list[dict[str, Any]] = []
 
@@ -132,9 +136,43 @@ def test_update_user_approval_revokes_sessions_when_unapproving(monkeypatch) -> 
     )
 
     assert result.is_approved is False
+    assert target_user.session_version == 5
     assert fake_db.commit_count == 1
     assert fake_db.refresh_count == 1
     assert audit_calls[-1]["metadata"]["revoked_sessions"] == 5
+
+
+def test_update_user_password_revokes_sessions_and_bumps_session_version(monkeypatch) -> None:
+    user_id = uuid.uuid4()
+    actor_id = uuid.uuid4()
+    target_user = _user(user_id, is_active=True, is_approved=True, session_version=6)
+    fake_db = _FakeDb(get_map={(User, user_id): target_user})
+    auth = AuthContext(user_id=actor_id, token_id=None, token_project_id=None, token_role=None, token_scopes=None)
+    audit_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(users_router, "_revoke_active_refresh_tokens", lambda *_args, **_kwargs: 4)
+    monkeypatch.setattr(users_router, "validate_password_strength", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(users_router, "hash_password", lambda *_args, **_kwargs: "new-hash")
+    monkeypatch.setattr(users_router, "get_settings", lambda: SimpleNamespace(password_min_length=12))
+    monkeypatch.setattr(users_router, "write_audit_event", lambda *_args, **kwargs: audit_calls.append(kwargs))
+
+    result = users_router.update_user(
+        user_id,
+        UserUpdateIn(password="NewPassword123456"),
+        _request(),
+        fake_db,
+        auth,
+        auth,
+        SimpleNamespace(id=actor_id),
+    )
+
+    assert result.email == "user@example.com"
+    assert target_user.password_hash == "new-hash"
+    assert target_user.session_version == 7
+    assert fake_db.commit_count == 1
+    assert fake_db.refresh_count == 1
+    assert audit_calls[-1]["metadata"]["revoked_sessions"] == 4
+    assert audit_calls[-1]["metadata"]["session_version"] == 7
 
 
 def test_revoke_active_refresh_tokens_returns_rowcount() -> None:

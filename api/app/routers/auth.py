@@ -45,6 +45,7 @@ from app.security import (
     hash_external_token,
     hash_password,
     make_access_token,
+    next_session_version,
     random_token,
     set_auth_cookies,
     set_refresh_cookie,
@@ -79,6 +80,7 @@ def security_settings(_admin: User = Depends(require_sysadmin)):
         allow_self_registration=settings.allow_self_registration,
         auth_require_csrf=settings.auth_require_csrf,
         auth_cookie_secure=settings.auth_cookie_secure,
+        allow_never_expiring_api_tokens=settings.allow_never_expiring_api_tokens,
         password_min_length=settings.password_min_length,
         password_require_lowercase=settings.password_require_lowercase,
         password_require_uppercase=settings.password_require_uppercase,
@@ -212,9 +214,6 @@ def login(payload: LoginIn, request: Request, response: Response, db: Session = 
 
     clear_login_failures(email, client_ip)
 
-    access_token = make_access_token(str(user.id))
-    csrf_token = generate_csrf_token()
-    set_auth_cookies(response, access_token, csrf_token)
     refresh_raw = random_token(48)
     refresh_hash = hash_external_token(refresh_raw)
     settings = get_settings()
@@ -225,6 +224,10 @@ def login(payload: LoginIn, request: Request, response: Response, db: Session = 
         expires_at=datetime.now(tz=UTC) + timedelta(days=settings.refresh_token_days),
     )
     db.add(refresh)
+    db.flush()
+    access_token = make_access_token(str(user.id), getattr(user, "session_version", 1), session_id=str(refresh.id))
+    csrf_token = generate_csrf_token()
+    set_auth_cookies(response, access_token, csrf_token)
     set_refresh_cookie(response, refresh_raw)
 
     write_audit_event(
@@ -282,8 +285,13 @@ def refresh(request: Request, response: Response, payload: RefreshIn | None = No
         expires_at=datetime.now(tz=UTC) + timedelta(days=settings.refresh_token_days),
     )
     db.add(replacement)
+    db.flush()
 
-    access_token = make_access_token(str(refresh_token.user_id))
+    access_token = make_access_token(
+        str(refresh_token.user_id),
+        getattr(user, "session_version", 1),
+        session_id=str(replacement.id),
+    )
     csrf_token = generate_csrf_token()
     set_auth_cookies(response, access_token, csrf_token)
     set_refresh_cookie(response, new_refresh_raw)
@@ -331,6 +339,8 @@ def logout_all(request: Request, response: Response, db: Session = Depends(get_d
     active_tokens = db.execute(stmt).scalars().all()
     revoked = 0
     now = datetime.now(tz=UTC)
+    user.session_version = next_session_version(getattr(user, "session_version", 1))
+    db.add(user)
     for token in active_tokens:
         token.revoked_at = now
         db.add(token)
@@ -342,7 +352,7 @@ def logout_all(request: Request, response: Response, db: Session = Depends(get_d
         object_type="user",
         object_id=str(user.id),
         actor_user_id=user.id,
-        metadata={**request_meta(request), "revoked_sessions": revoked},
+        metadata={**request_meta(request), "revoked_sessions": revoked, "session_version": user.session_version},
     )
     db.commit()
     clear_auth_cookies(response)
@@ -381,6 +391,7 @@ def change_password(
 
     now = datetime.now(tz=UTC)
     user.password_hash = hash_password(payload.new_password)
+    user.session_version = next_session_version(getattr(user, "session_version", 1))
     db.add(user)
     active_sessions = db.execute(
         select(RefreshToken).where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
@@ -394,7 +405,11 @@ def change_password(
         object_type="user",
         object_id=str(user.id),
         actor_user_id=user.id,
-        metadata={**request_meta(request), "revoked_sessions": len(active_sessions)},
+        metadata={
+            **request_meta(request),
+            "revoked_sessions": len(active_sessions),
+            "session_version": user.session_version,
+        },
     )
     db.commit()
     return {"ok": True}
@@ -435,6 +450,8 @@ def create_api_token(
     expires_in_days = payload.expires_in_days
     if expires_in_days is None:
         expires_in_days = settings.default_api_token_expiry_days
+    if expires_in_days == 0 and not settings.allow_never_expiring_api_tokens:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="never-expiring api tokens are disabled")
     expires_at = datetime.now(tz=UTC) + timedelta(days=expires_in_days) if expires_in_days else None
 
     scopes = normalize_token_scopes(payload.scopes)

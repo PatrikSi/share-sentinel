@@ -46,6 +46,7 @@ class SecuritySettingsOut(BaseModel):
     allow_self_registration: bool
     auth_require_csrf: bool
     auth_cookie_secure: bool
+    allow_never_expiring_api_tokens: bool
     password_min_length: int
     password_require_lowercase: bool
     password_require_uppercase: bool
@@ -308,6 +309,24 @@ class SavedInvestigationIn(BaseModel):
     @field_validator("target_tab")
     @classmethod
     def validate_target_tab(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"items", "resources", "endpoints"}:
+            raise ValueError("target_tab must be one of: items, resources, endpoints")
+        return normalized
+
+
+class SavedInvestigationUpdateIn(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+    target_tab: str | None = Field(default=None, min_length=1, max_length=32)
+    query_text: str | None = Field(default=None, max_length=4000)
+    definition: dict[str, Any] | None = None
+
+    @field_validator("target_tab")
+    @classmethod
+    def validate_target_tab(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         normalized = value.strip().lower()
         if normalized not in {"items", "resources", "endpoints"}:
             raise ValueError("target_tab must be one of: items, resources, endpoints")
