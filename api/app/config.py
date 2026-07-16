@@ -8,6 +8,8 @@ from app.password_policy import password_policy_kwargs, validate_password_streng
 
 
 PLACEHOLDER_PREFIXES = ("change-me", "changeme", "replace-", "replace_", "example-", "your-")
+DEFAULT_JWT_SECRET = "dev-secret-not-for-production-0123456789"
+DEFAULT_TOKEN_PEPPER = "dev-token-pepper-not-for-production-012345"
 
 
 def looks_like_placeholder(value: str | None) -> bool:
@@ -28,11 +30,11 @@ class Settings(BaseSettings):
 
     artifact_storage_path: str = "/artifacts"
 
-    jwt_secret: str = "dev-secret-not-for-production-0123456789"
+    jwt_secret: str = DEFAULT_JWT_SECRET
     jwt_issuer: str = "share-sentinel"
     access_token_minutes: int = 15
     refresh_token_days: int = 14
-    token_pepper: str = "dev-token-pepper-not-for-production-012345"
+    token_pepper: str = DEFAULT_TOKEN_PEPPER
     require_user_for_api_token_create: bool = True
     allow_legacy_unscoped_tokens: bool = False
     default_api_token_expiry_days: int = 90
@@ -90,6 +92,12 @@ class Settings(BaseSettings):
         if normalized not in {"lax", "strict", "none"}:
             raise ValueError("auth_cookie_samesite must be one of: lax, strict, none")
         return normalized
+
+    @field_validator("auth_cookie_domain", mode="before")
+    @classmethod
+    def _normalize_cookie_domain(cls, value: str | None) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None
 
     @field_validator("auth_csrf_header_name", mode="before")
     @classmethod
@@ -158,6 +166,11 @@ class Settings(BaseSettings):
             raise ValueError("jwt_secret must be replaced before startup")
         if looks_like_placeholder(self.token_pepper):
             raise ValueError("token_pepper must be replaced before startup")
+        if self.app_env.lower() in {"production", "prod", "staging", "stage"}:
+            if self.jwt_secret == DEFAULT_JWT_SECRET:
+                raise ValueError("jwt_secret must be replaced in production")
+            if self.token_pepper == DEFAULT_TOKEN_PEPPER:
+                raise ValueError("token_pepper must be replaced in production")
         return self
 
     @model_validator(mode="after")
@@ -166,13 +179,13 @@ class Settings(BaseSettings):
             raise ValueError(
                 "default_api_token_expiry_days must be at least 1 when allow_never_expiring_api_tokens is false"
             )
+        if self.auth_cookie_samesite == "none" and not self.auth_cookie_secure:
+            raise ValueError("auth_cookie_secure must be true when auth_cookie_samesite is none")
         if self.app_env.lower() in {"production", "prod", "staging", "stage"}:
             if not self.auth_require_csrf:
                 raise ValueError("auth_require_csrf must be true in production")
             if self.allow_legacy_unscoped_tokens:
                 raise ValueError("allow_legacy_unscoped_tokens must be false in production")
-            if not self.seed_admin_email or not self.seed_admin_password:
-                raise ValueError("SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD must both be set in production")
             if not self.auth_cookie_secure:
                 raise ValueError("auth_cookie_secure must be true in production")
             if self.allow_never_expiring_api_tokens:

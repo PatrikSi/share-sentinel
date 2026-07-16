@@ -2,6 +2,21 @@
 
 The collector is a standalone Python CLI for scanning SMB and NFS targets, writing a Share Sentinel-compatible artifact, and optionally uploading that artifact into a project run.
 
+## Prerequisites and installation
+
+- Python 3.11
+- Network access to the explicitly authorized SMB/NFS targets
+- `showmount` for NFS discovery (`nfs-common` on Debian/Ubuntu or `nfs-utils` on Fedora/RHEL)
+
+From this directory:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python share_sentinel_collector.py --help
+```
+
 ## What it produces
 
 The final artifact is a compact JSON document, optionally gzip-compressed when `--gzip` is used.
@@ -24,11 +39,23 @@ python share_sentinel_collector.py \
   --gzip
 ```
 
+Command-line secrets can be visible in shell history and process listings. Prefer the supported environment variables:
+
+```bash
+read -rsp "SMB password: " SHARE_SENTINEL_SMB_PASSWORD && echo
+export SHARE_SENTINEL_SMB_PASSWORD
+```
+
+The collector also reads `SHARE_SENTINEL_SMB_HASHES` and `SHARE_SENTINEL_API_TOKEN`. Protect the collector host and unset secret variables after the run.
+
 ## Common upload example
 
 For the bundled Docker deployment, the API base is typically `http://localhost/api` rather than a separate `api.example.com` host.
 
 ```bash
+read -rsp "Share Sentinel API token: " SHARE_SENTINEL_API_TOKEN && echo
+export SHARE_SENTINEL_API_TOKEN
+
 python share_sentinel_collector.py \
   --hosts hosts.txt \
   --share-types smb \
@@ -39,9 +66,10 @@ python share_sentinel_collector.py \
   --gzip \
   --upload \
   --api-base http://localhost/api \
-  --project-id <project-uuid> \
-  --api-token <token>
+  --project-id <project-uuid>
 ```
+
+Create a project-scoped token with `runs:read` and `runs:write`; the token role must be at least `operator`.
 
 ## Operational notes
 
@@ -58,6 +86,8 @@ Treat these flags as capacity levers:
 
 For shared or fragile environments, start conservatively and scale up after you understand target behavior and ingest throughput.
 
+Only scan systems for which you have explicit authorization. The collector performs concurrent authentication, share enumeration, and directory traversal and can create meaningful target load.
+
 ### Output and retry behavior
 
 - If no endpoint, resource, item, or error data is collected, the collector does not keep an output file.
@@ -73,3 +103,11 @@ When the API falls back to database-based recovery, the collector will emit an u
 ## Artifact compatibility
 
 The API accepts raw JSON, NDJSON, JSONL, and gzip variants, but the bundled collector writes compact JSON or JSON.GZ output. If you build another producer, make sure it matches the API artifact contract described in the main project docs.
+
+The tracked [`examples/sample-artifact.json`](../examples/sample-artifact.json) is synthetic and safe to use for a first ingest test.
+
+## Exit codes
+
+- `0`: collection completed without target failures
+- `1`: partial result; an artifact may still have been written or uploaded
+- `2`: configuration, input, output, or complete collection failure

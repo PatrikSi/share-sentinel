@@ -1,6 +1,10 @@
 # share-sentinel
 
+[![CI](https://github.com/PatrikSi/share-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/PatrikSi/share-sentinel/actions/workflows/ci.yml)
+
 Share Sentinel is a self-hostable workspace for ingesting SMB and NFS collection artifacts, tracking project-scoped inventory, and reviewing run-to-run changes without losing analyst context.
+
+Version 0.2.0 is an initial publication candidate: the core local workflow is tested end to end, while HA operation, MFA, SSO, and turnkey internet-facing deployment are intentionally outside the current support boundary.
 
 It is built around one loop:
 
@@ -50,6 +54,8 @@ docker compose up --build
 ./scripts/smoke-routes.sh http://localhost
 ```
 
+To exercise ingest without real infrastructure data, upload [`examples/sample-artifact.json`](./examples/sample-artifact.json) through the Import page.
+
 The bundled Compose file keeps the gateway on `127.0.0.1:80` by default. That is intentional. If you expose the stack on a real network, put it behind TLS and review [SECURITY.md](./SECURITY.md) first.
 
 The checked-in Compose stack is for local evaluation and development. Do not expose it as-is with placeholder secrets, default admin credentials, or plain HTTP.
@@ -90,12 +96,13 @@ Run-scoped saved searches remain browser-local. Project-wide shared investigatio
 
 ### Settings
 
-Sysadmins get four settings areas:
+Sysadmins get five settings areas:
 
-- `Overview` for security posture, token hygiene, and recent audit activity
-- `Access` for users, approvals, password resets, and project memberships
-- `Tokens` for global API token administration
-- `Audit` for global event review and export
+- `General` for security posture, token hygiene, and recent audit activity
+- `Users` for approvals, password resets, and project memberships
+- `Projects` for project ownership, rename, membership review, and guarded deletion
+- `API Tokens` for global machine credential administration
+- `Audit Log` for global event review and export
 
 ## Architecture at a glance
 
@@ -116,10 +123,12 @@ For a fuller component and trust-boundary walkthrough, see [docs/architecture.md
 - OpenAPI and Swagger docs are intended for development-style environments and are hidden in production-style `APP_ENV` values.
 - The default Docker deployment is local-first, not internet-ready. Replace secrets, enable TLS, and review the reverse-proxy posture before exposing it.
 
+See the [deployment guide](./docs/deployment.md) for the production configuration contract, backups, upgrades, and known topology limits.
+
 ## Release and support policy
 
 - Source is released from this repository and is the primary supported distribution format.
-- Until a tagged release process is published, support is best-effort on `main`.
+- Before the first tag, support is best-effort on `main`; matching `vX.Y.Z` tags publish verified source archives and checksums.
 - When tagged releases exist, expect support to focus on `main` plus the latest tagged release unless a future policy says otherwise.
 - Docker images may be published for convenience, but they should be treated as secondary artifacts to the tagged source release.
 
@@ -134,6 +143,8 @@ For a fuller component and trust-boundary walkthrough, see [docs/architecture.md
 
 - [Docs index](./docs/README.md)
 - [Architecture overview](./docs/architecture.md)
+- [Deployment and operations](./docs/deployment.md)
+- [Security review](./docs/security-review.md)
 - [API reference](./docs/reference/api.md)
 - [Auth and RBAC reference](./docs/reference/auth-rbac.md)
 - [Frontend reference](./docs/reference/frontend.md)

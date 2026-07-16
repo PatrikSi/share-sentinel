@@ -43,6 +43,9 @@ except ImportError:
 
 TOOL_VERSION = "0.2.0"
 SENSITIVE_ARGUMENT_FLAGS = {"--password", "--hashes", "--api-token"}
+SMB_PASSWORD_ENV = "SHARE_SENTINEL_SMB_PASSWORD"
+SMB_HASHES_ENV = "SHARE_SENTINEL_SMB_HASHES"
+API_TOKEN_ENV = "SHARE_SENTINEL_API_TOKEN"
 EXIT_SUCCESS = 0
 EXIT_PARTIAL = 1
 EXIT_FAILURE = 2
@@ -372,8 +375,18 @@ def _build_parser() -> argparse.ArgumentParser:
     smb_auth = parser.add_argument_group("SMB Authentication")
     smb_auth.add_argument("--smb-anonymous", action="store_true", help="Force anonymous SMB session.")
     smb_auth.add_argument("--username", type=str, default="", help="SMB username for NTLM/Kerberos.")
-    smb_auth.add_argument("--password", type=str, default="", help="SMB password for NTLM/Kerberos.")
-    smb_auth.add_argument("--hashes", type=str, help="LM:NT hash pair for NTLM auth.")
+    smb_auth.add_argument(
+        "--password",
+        type=str,
+        default=os.getenv(SMB_PASSWORD_ENV, ""),
+        help=f"SMB password for NTLM/Kerberos (prefer {SMB_PASSWORD_ENV}).",
+    )
+    smb_auth.add_argument(
+        "--hashes",
+        type=str,
+        default=os.getenv(SMB_HASHES_ENV),
+        help=f"LM:NT hash pair for NTLM auth (prefer {SMB_HASHES_ENV}).",
+    )
     smb_auth.add_argument("--domain", type=str, default="", help="SMB domain for NTLM/Kerberos.")
     smb_auth.add_argument("--local-auth", action="store_true", help="Use local SAM auth (empty domain) for NTLM.")
     smb_auth.add_argument("--kerberos", action="store_true", help="Use Kerberos authentication for SMB.")
@@ -401,7 +414,12 @@ def _build_parser() -> argparse.ArgumentParser:
     upload.add_argument("--upload", action="store_true", help="Upload artifact to Share Sentinel API after scan.")
     upload.add_argument("--api-base", type=str, help="API base URL, e.g. https://api.example")
     upload.add_argument("--project-id", type=str, help="Destination project UUID.")
-    upload.add_argument("--api-token", type=str, help="API token with run write scope.")
+    upload.add_argument(
+        "--api-token",
+        type=str,
+        default=os.getenv(API_TOKEN_ENV),
+        help=f"API token with run write scope (prefer {API_TOKEN_ENV}).",
+    )
     upload.add_argument("--run-name", type=str, default="Share Collector Run", help="Run name for uploaded scan.")
 
     return parser

@@ -8,6 +8,7 @@ This project is split across an API, a worker, a UI, and a collector. The quicke
 
 - Docker and Docker Compose
 - Python 3.11 if you want to run services or tests outside containers
+- Node.js 20 if you want to build the UI outside containers
 - A copy of `.env` based on `.env.example`
 - Placeholder values in `.env` replaced before you start the stack
 
@@ -54,6 +55,8 @@ cd api && pip install -r requirements-dev.txt && pytest -q
 cd worker && pip install -r requirements-dev.txt && pytest -q
 cd collector && pip install -r requirements-dev.txt && pytest -q
 cd ui && npm ci && npm run typecheck && npm run build
+python scripts/validate-sample.py
+python scripts/check-release.py
 ```
 
 If you prefer to stay inside the running stack:
@@ -68,6 +71,8 @@ For behavior that crosses services, rebuild the affected containers and rerun:
 docker compose up -d --build
 ./scripts/smoke-routes.sh http://localhost
 ```
+
+CI repeats all three Python suites, the sample validation, JavaScript and Python dependency audits, the UI production build, Compose validation, and all production container builds.
 
 ## Migrations and schema changes
 
@@ -115,3 +120,7 @@ The usual starting points are:
 This repository is Apache-2.0 licensed. Unless the maintainers publish a separate CLA or DCO process, assume inbound contributions are accepted under the repository license terms.
 
 Accuracy beats breadth. Honest small improvements are better than sweeping but partially verified changes.
+
+## Releases
+
+Release metadata is centralized in `VERSION`. Keep the API, collector, UI, and changelog versions aligned; `python scripts/check-release.py` verifies them. Pushing a matching `vX.Y.Z` tag runs the full release workflow and publishes source archives plus SHA-256 checksums after validation succeeds.

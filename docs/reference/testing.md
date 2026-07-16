@@ -1,6 +1,6 @@
 # Testing and Validation
 
-## Automated Tests
+## Automated tests
 
 Backend tests include:
 
@@ -11,13 +11,19 @@ Backend tests include:
 - settings router coverage
 - user all-project assignment coverage
 
-Run in container:
+Run all component suites from a Python 3.11 environment:
 
 ```bash
-docker compose run --rm api bash -lc "pip install -q -r requirements-dev.txt && pytest -q"
+cd api && pip install -r requirements-dev.txt && pytest -q -p no:cacheprovider
+cd ../worker && pip install -r requirements-dev.txt && pytest -q -p no:cacheprovider
+cd ../collector && pip install -r requirements-dev.txt && pytest -q -p no:cacheprovider
+cd ../ui && npm ci && npm audit --audit-level=high && npm run build
+cd .. && python scripts/validate-sample.py && python scripts/check-release.py
 ```
 
-## Smoke Validation
+CI runs those checks independently and then builds every production container through Compose.
+
+## Smoke validation
 
 End-to-end smoke checks verify:
 
@@ -33,7 +39,17 @@ Run:
 ./scripts/smoke-routes.sh http://localhost
 ```
 
-## Deployment Checks
+## Dependency audit
+
+```bash
+pip install pip-audit
+pip-audit -r api/requirements-dev.txt
+pip-audit -r worker/requirements-dev.txt
+pip-audit -r collector/requirements-dev.txt
+cd ui && npm audit --audit-level=high
+```
+
+## Deployment checks
 
 After API/UI changes:
 

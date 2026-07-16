@@ -277,6 +277,29 @@ def test_redact_cli_arguments_hides_sensitive_values() -> None:
     assert redacted == ["--username", "svc", "--password", "<redacted>", "--hashes=<redacted>", "--api-token", "<redacted>"]
 
 
+def test_parse_args_reads_secrets_from_environment(monkeypatch) -> None:
+    collector = _load_collector_module()
+    monkeypatch.setenv(collector.SMB_PASSWORD_ENV, "password-from-env")
+    monkeypatch.setenv(collector.API_TOKEN_ENV, "token-from-env")
+
+    args = collector.parse_args(
+        [
+            "--hosts",
+            "hosts.txt",
+            "--username",
+            "svc",
+            "--upload",
+            "--api-base",
+            "https://sentinel.example.test/api",
+            "--project-id",
+            "00000000-0000-4000-8000-000000000001",
+        ]
+    )
+
+    assert args.password == "password-from-env"
+    assert args.api_token == "token-from-env"
+
+
 def test_session_error_hint_includes_share_name_guidance() -> None:
     collector = _load_collector_module()
 

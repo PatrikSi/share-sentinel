@@ -1,0 +1,86 @@
+# Security review
+
+Review date: 2026-07-16  
+Target: Share Sentinel 0.2.0 publication candidate  
+Scope: API, worker, collector, UI, dependency manifests, containers, and reference Compose topology
+
+## Outcome
+
+No known high- or critical-severity dependency advisories remain in the reviewed manifests. The core authentication, project authorization, upload, ingest, and administration paths have automated coverage. The repository is suitable for an initial open source publication with the deployment limitations below stated explicitly.
+
+This is a code and configuration review, not a penetration test or certification.
+
+## Findings
+
+### SS-SEC-001 — Vulnerable dependency set
+
+- Severity: High
+- Status: Resolved
+- Affected: `api/requirements.txt`, `worker/requirements.txt`, `collector/requirements.txt`, `ui/package.json`
+- Resolution: upgraded the affected Python and React Router/Vite dependency chains; current `pip-audit` checks for all Python development manifests and `npm audit --audit-level=high` report no known vulnerabilities.
+- Regression control: `.github/workflows/ci.yml` and `.github/dependabot.yml`
+
+### SS-SEC-002 — Unrestricted host and CORS configuration
+
+- Severity: Medium
+- Status: Resolved
+- Affected: `api/app/config.py:109`, `api/app/config.py:162`, `api/app/main.py:29`
+- Resolution: added trusted-host middleware, explicit CORS methods and headers, production rejection of wildcard CORS, validation of proxy CIDRs, and fail-fast production hostname requirements.
+- Verification: configuration and request tests in `api/tests/test_config.py` and `api/tests/test_request_context.py`
+
+### SS-SEC-003 — Mutable or contaminated container inputs
+
+- Severity: Medium
+- Status: Resolved
+- Affected: `api/Dockerfile:1`, `worker/Dockerfile:1`, `ui/Dockerfile:1`, and service `.dockerignore` files
+- Resolution: pinned base images by digest, added `.dockerignore` files so host dependencies cannot overwrite locked build output, removed the API compiler toolchain, and run API/worker processes as UID 10001.
+- Verification: clean container builds, image-user inspection, Nginx config test, and non-root artifact write check
+
+### SS-SEC-004 — JWT validation contract
+
+- Severity: Medium
+- Status: Resolved
+- Affected: `api/app/security.py:59`, `api/app/deps.py:64`
+- Resolution: replaced the vulnerable JWT dependency, pins `HS256`, verifies issuer, requires `exp`, `iat`, `iss`, and `sub`, and rejects non-access token types.
+- Existing controls: server-side user/session-version checks invalidate cookies after logout-all, password changes, disable, and unapproval.
+
+### SS-SEC-005 — Browser response hardening
+
+- Severity: Low
+- Status: Resolved
+- Affected: `api/app/middleware.py:45`, `ui/nginx.conf:11`
+- Resolution: API request IDs now accompany nosniff, frame, referrer, and permissions headers; auth and cookie responses are non-cacheable. The UI ships a restrictive CSP and equivalent browser headers.
+
+### SS-SEC-006 — Secrets passed in collector arguments
+
+- Severity: Medium
+- Status: Mitigated
+- Affected: `collector/share_sentinel_collector.py:44`, `collector/share_sentinel_collector.py:378`
+- Resolution: collector CLI accepts SMB passwords, hashes, and API tokens through dedicated environment variables and redacts secret CLI values from artifact metadata.
+- Remaining risk: environment variables are still sensitive process state. Protect the collector host, prefer Kerberos session credentials where available, and unset secrets after use.
+
+### SS-SEC-007 — Docker socket trust boundary
+
+- Severity: Medium
+- Status: Accepted for the local reference topology
+- Affected: `docker-compose.yml:2`, `docker-compose.yml:13`
+- Risk: the gateway can read host container metadata through the Docker socket; compromise of a socket-aware component can increase impact.
+- Control: the mount is read-only, the gateway is loopback-bound by default, and production guidance recommends static discovery when the socket is not acceptable.
+
+### SS-SEC-008 — Sensitive raw artifact storage
+
+- Severity: Medium
+- Status: Deployment responsibility
+- Affected: `docker-compose.yml:65`, `docker-compose.yml:124`, `docker-compose.yml:156`
+- Risk: raw paths, hostnames, share names, and scan findings remain on filesystem storage; application-layer encryption and malware scanning are not provided.
+- Control: keep storage private, use encrypted disks/backups where required, restrict volume access, and apply retention procedures outside the application.
+
+## Accepted product limitations
+
+- No MFA, SSO, SCIM, or external identity-provider integration.
+- No turnkey TLS or HA topology; TLS termination and proxy policy are deployment responsibilities.
+- No malware/content scanner for uploaded artifacts.
+- No formal compatibility guarantee for multiple application versions running during migration.
+- No dedicated worker metrics endpoint or comprehensive queue-backlog dashboard.
+
+These limitations do not block an initial source release, but they should be revisited before high-assurance or large multi-tenant use.

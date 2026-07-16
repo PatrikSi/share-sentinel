@@ -30,6 +30,39 @@ def test_production_rejects_default_seed_password() -> None:
         )
 
 
+def test_production_rejects_builtin_development_secrets() -> None:
+    with pytest.raises(ValueError, match="jwt_secret must be replaced in production"):
+        Settings(
+            app_env="production",
+            token_pepper="y" * 64,
+            auth_cookie_secure=True,
+            trusted_proxy_cidrs="10.0.0.0/8",
+            trusted_hosts="sentinel.example.com",
+        )
+
+
+def test_production_runtime_does_not_require_seed_admin_credentials() -> None:
+    settings = Settings(
+        app_env="production",
+        jwt_secret="x" * 64,
+        token_pepper="y" * 64,
+        auth_cookie_secure=True,
+        trusted_proxy_cidrs="10.0.0.0/8",
+        trusted_hosts="sentinel.example.com",
+        cors_origins="https://sentinel.example.com",
+    )
+
+    assert settings.seed_admin_email is None
+    assert settings.seed_admin_password is None
+
+
+def test_blank_cookie_domain_is_normalized_and_samesite_none_requires_secure_cookie() -> None:
+    assert Settings(auth_cookie_domain="").auth_cookie_domain is None
+
+    with pytest.raises(ValueError, match="auth_cookie_secure must be true when auth_cookie_samesite is none"):
+        Settings(auth_cookie_samesite="none", auth_cookie_secure=False)
+
+
 def test_non_testing_env_rejects_placeholder_secrets() -> None:
     with pytest.raises(ValueError, match="jwt_secret must be replaced before startup"):
         Settings(jwt_secret="replace-before-running-secret-value-0123456789", token_pepper="y" * 64)

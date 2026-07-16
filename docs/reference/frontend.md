@@ -10,24 +10,29 @@ The UI is a single-page app built with React and Vite. It keeps most work center
 - `/projects/:projectId/inventory` project inventory
 - `/projects/:projectId/runs/:runId` run explorer
 - `/account` current-user account settings
-- `/settings/overview`
-- `/settings/iam`
-- `/settings/iam/users/:userId`
-- `/settings/api-tokens`
-- `/settings/audit-logs`
+- `/settings/general`
+- `/settings/users`
+- `/settings/users/:userId`
+- `/settings/projects`
+- `/settings/projects/:projectId`
+- `/settings/tokens`
+- `/settings/audit`
 
 Legacy redirects that still exist:
 
-- `/settings/users` -> `/settings/iam`
-- `/settings/rbac` -> `/settings/iam`
-- `/admin` -> `/settings/overview`
+- `/settings/overview` -> `/settings/general`
+- `/settings/iam` -> `/settings/users`
+- `/settings/rbac` -> `/settings/users`
+- `/settings/api-tokens` -> `/settings/tokens`
+- `/settings/audit-logs` -> `/settings/audit`
+- `/admin` -> `/settings/users`
 
 ## Navigation model
 
 - The brand in the top nav returns to the dashboard.
 - Project context stays visible across `/projects/*`.
 - Project creation and project switching live in the top nav.
-- Settings uses a dedicated tab bar with `Overview`, `Access`, `Tokens`, and `Audit`.
+- Settings uses a dedicated sidebar with `General`, `Users`, `Projects`, `API Tokens`, and `Audit Log`.
 
 ## Login and account entry
 
@@ -113,9 +118,9 @@ Run-scoped saved search presets are browser-local and separate from project-shar
 
 ## Settings
 
-Settings is sysadmin-only and split into four sections.
+Settings is sysadmin-only and split into five sections.
 
-### Overview
+### General
 
 Shows live counts and posture data:
 
@@ -128,14 +133,18 @@ Shows live counts and posture data:
 - token hygiene
 - recent audit activity
 
-### Access
+### Users
 
 The IAM workflow is two-step:
 
 - the main `Access` page is a directory and creation surface
 - the per-user detail page handles approvals, activation, sysadmin state, password resets, membership edits, and bulk all-project assignment
 
-### Tokens
+### Projects
+
+Project administration supports search, project detail, membership review, rename, and guarded deletion. Deletion requires typing the project name and removes database state plus stored run artifacts.
+
+### API Tokens
 
 Global API token administration with:
 
@@ -144,7 +153,7 @@ Global API token administration with:
 - create, update, rotate, and revoke flows
 - one-time secret reveal on create or rotate
 
-### Audit
+### Audit Log
 
 Global audit search and export.
 

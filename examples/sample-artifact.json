@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "format": "share_sentinel_compact_json",
+  "meta": {
+    "tool": "share-sentinel-collector",
+    "tool_version": "0.2.0",
+    "run_id": "00000000-0000-4000-8000-000000000001",
+    "started_at": "2026-01-15T10:00:00+00:00",
+    "finished_at": "2026-01-15T10:00:10+00:00",
+    "operator_label": "synthetic-example",
+    "auth": {
+      "mode": "none",
+      "domain": null,
+      "username": null,
+      "method": "none"
+    }
+  },
+  "collection": {
+    "command": "share_sentinel_collector.py",
+    "arguments": [
+      "--hosts",
+      "synthetic-hosts.txt",
+      "--share-types",
+      "both",
+      "--output",
+      "sample-artifact.json"
+    ],
+    "target_scope": {
+      "cidrs": [],
+      "hosts": [
+        "fileserver.example.test",
+        "nfs.example.test"
+      ],
+      "target_count": 2,
+      "share_types": [
+        "nfs",
+        "smb"
+      ],
+      "disabled_share_types": []
+    },
+    "enumeration": {
+      "workers": 2,
+      "timeout_seconds": 3,
+      "max_depth": 2,
+      "max_entries_per_share": 100,
+      "include_share": [],
+      "exclude_share": [],
+      "exclude_path_regex": null,
+      "extensions_only": null
+    }
+  },
+  "summary": {
+    "endpoints": 2,
+    "resources": 2,
+    "items": 4,
+    "errors": 1
+  },
+  "issue_summary": [
+    {
+      "severity": "warn",
+      "code": "SYNTHETIC_PARTIAL_SCAN",
+      "count": 1,
+      "sample_message": "Synthetic warning included to demonstrate issue ingestion.",
+      "sample_hint": "This fixture contains no real infrastructure data."
+    }
+  ],
+  "endpoints": [
+    {
+      "endpoint_key": "192.0.2.10:445",
+      "ip": "192.0.2.10",
+      "hostname": "fileserver.example.test",
+      "domain": "EXAMPLE",
+      "auth": {
+        "method": "none"
+      },
+      "smb": {
+        "dialect": "3.1.1",
+        "signing_required": true
+      },
+      "shares": [
+        {
+          "name": "Documents",
+          "share_type": "smb",
+          "remark": "Synthetic SMB share",
+          "access_level": "read",
+          "entries": [
+            {
+              "path": "\\",
+              "name": "Policies",
+              "is_dir": true,
+              "children": [
+                {
+                  "path": "\\Policies",
+                  "name": "retention.pdf",
+                  "is_dir": false
+                },
+                {
+                  "path": "\\Policies",
+                  "name": "readme.txt",
+                  "is_dir": false
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "endpoint_key": "192.0.2.20:2049",
+      "ip": "192.0.2.20",
+      "hostname": "nfs.example.test",
+      "domain": null,
+      "nfs": {
+        "version": "4"
+      },
+      "shares": [
+        {
+          "name": "/exports/public",
+          "share_type": "nfs",
+          "remark": "Synthetic NFS export",
+          "access_level": "read",
+          "entries": [
+            {
+              "path": "/",
+              "name": "welcome.txt",
+              "is_dir": false
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

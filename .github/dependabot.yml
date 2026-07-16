@@ -1,0 +1,61 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /ui
+    schedule:
+      interval: weekly
+    groups:
+      ui-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /api
+    schedule:
+      interval: weekly
+    groups:
+      api-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /worker
+    schedule:
+      interval: weekly
+    groups:
+      worker-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /collector
+    schedule:
+      interval: weekly
+    groups:
+      collector-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /api
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /worker
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /ui
+    schedule:
+      interval: weekly

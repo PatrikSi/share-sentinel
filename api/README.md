@@ -17,6 +17,7 @@ FastAPI service for auth, project management, run lifecycle, artifact upload, an
 - Redis-backed fixed-window rate limits (auth + upload)
 - Deep health endpoint for database and Redis readiness (`/healthz/deep`)
 - Async ingestion queueing via Redis Streams
+- Trusted-host enforcement and explicit production configuration validation
 
 ## Local run (without Docker)
 
@@ -42,3 +43,12 @@ Password policy is controlled through environment variables:
 - `PASSWORD_REQUIRE_SPECIAL`
 
 If `SEED_ADMIN_PASSWORD` is configured and does not match the active policy, startup fails with a configuration error so the container logs point directly at the invalid env values.
+
+Production-style `APP_ENV` values also require secure cookies, explicit `TRUSTED_HOSTS`, and valid `TRUSTED_PROXY_CIDRS`. Interactive API docs are disabled in those environments. See the repository [deployment guide](../docs/deployment.md) before exposing the service.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q -p no:cacheprovider
+```

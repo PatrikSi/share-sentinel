@@ -362,6 +362,22 @@ Returns the live posture snapshot used by the settings overview page.
 
 Returns all projects for global admin workflows.
 
+### `GET /settings/projects/catalog`
+
+Returns the searchable project catalog with aggregate counts for the project administration page.
+
+### `GET /settings/projects/{project_id}`
+
+Returns project detail, memberships, run counts, and artifact storage totals.
+
+### `PATCH /settings/projects/{project_id}`
+
+Renames a project. Project names remain unique.
+
+### `DELETE /settings/projects/{project_id}`
+
+Deletes a project after an exact-name confirmation. Related database state is removed transactionally; the response separately reports any raw artifact cleanup failures.
+
 ### `GET /settings/api-token-scopes`
 
 Returns the allowed token scope catalog and the default scopes for each project role.

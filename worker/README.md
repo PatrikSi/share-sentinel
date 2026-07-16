@@ -57,3 +57,10 @@ At minimum, the worker needs:
 - `WORKER_HEALTH_TIMEOUT_SECONDS`
 
 In Docker, those are already wired in `docker-compose.yml`.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q -p no:cacheprovider
+```

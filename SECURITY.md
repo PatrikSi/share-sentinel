@@ -44,7 +44,7 @@ Before exposing Share Sentinel outside a local workstation:
 2. Keep the gateway bound to localhost or put it behind a TLS-terminating reverse proxy with access controls.
 3. Enable HTTPS and set `AUTH_COOKIE_SECURE=true` for real deployments.
 4. Set a production-style `APP_ENV` so interactive API docs are not exposed by default.
-5. Narrow `CORS_ORIGINS` and configure `TRUSTED_PROXY_CIDRS` so audit and rate-limit IP attribution only trusts your real proxy tier.
+5. Set `TRUSTED_HOSTS` to the deployed hostnames, narrow `CORS_ORIGINS`, and configure `TRUSTED_PROXY_CIDRS` for every real proxy hop so audit and rate-limit IP attribution is correct.
 6. Keep Postgres, Redis, and the shared artifact volume on private network boundaries.
 7. Restrict who can reach sysadmin routes, including deep health and metrics.
 8. Prefer expiring API tokens over never-expiring tokens unless you have a strong operational reason.
@@ -62,6 +62,8 @@ The project currently provides:
 - audit logging for administrative and many read actions
 - worker heartbeat files plus a Docker healthcheck in the default stack
 - localhost-first Docker defaults
+- trusted-host enforcement, explicit CORS methods/headers, and production configuration fail-fast checks
+- digest-pinned base images with unprivileged API and worker processes
 
 The project does not currently provide:
 
@@ -76,7 +78,10 @@ The project does not currently provide:
 - `GET /healthz` is public; `/healthz/deep` and `/metrics` require sysadmin access.
 - Artifact validation at upload time is structural, not malware-aware.
 - Raw artifacts are stored on shared disk for worker access.
+- Share Sentinel does not provide application-layer encryption for raw artifacts; use encrypted storage and backups when required.
 - Upload throttling fails closed by default when Redis is unavailable. This can be changed with `RATE_LIMIT_FAIL_OPEN=true`, but the shipped default is `false`.
+
+The current code-level review and accepted deployment risks are recorded in [docs/security-review.md](./docs/security-review.md).
 
 ## Disclosure expectations
 

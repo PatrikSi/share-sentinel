@@ -12,14 +12,15 @@ The settings area is the sysadmin control surface for Share Sentinel. It is wher
 
 Current tabs:
 
-- `Overview`
-- `Access`
-- `Tokens`
-- `Audit`
+- `General`
+- `Users`
+- `Projects`
+- `API Tokens`
+- `Audit Log`
 
-Older links such as `/settings/users` and `/settings/rbac` still redirect into the current `Access` area.
+Older links such as `/settings/iam` and `/settings/rbac` still redirect into the current `Users` area.
 
-## Overview
+## General
 
 The overview page is a live posture snapshot, not a checklist page.
 
@@ -34,9 +35,9 @@ It shows:
 - token hygiene details like default expiry, whether never-expiring issuance is allowed, and how many legacy never-expiring tokens still exist
 - recent global audit events
 
-## Access
+## Users
 
-`Access` is now a two-screen workflow.
+`Users` is a two-screen workflow.
 
 ### Directory page
 
@@ -65,7 +66,19 @@ Important guardrails enforced by the API:
 - the last active approved sysadmin cannot be removed
 - the last project admin on a project cannot be removed
 
-## Tokens
+## Projects
+
+`Projects` provides global project lifecycle administration:
+
+- search the complete project catalog
+- inspect run, membership, and storage counts
+- review and change memberships through the existing user workflow
+- rename a project while preserving its id and related data
+- delete a project only after typing its exact name
+
+Project deletion is irreversible. The API deletes related database rows transactionally, then removes associated raw artifacts. Its response reports artifact cleanup failures so operators can resolve residual files.
+
+## API Tokens
 
 `Tokens` is the global API token admin page.
 
@@ -80,7 +93,7 @@ Main workflows:
 The UI shows secrets only at create or rotate time through a dedicated reveal component.
 Never-expiring token issuance is disabled by default and requires explicit configuration.
 
-## Audit
+## Audit Log
 
 `Audit` is the global event stream for the whole system.
 
@@ -102,6 +115,10 @@ The settings area depends mostly on these routes:
 - `PATCH /users/{user_id}`
 - `GET /settings/overview`
 - `GET /settings/projects`
+- `GET /settings/projects/catalog`
+- `GET /settings/projects/{project_id}`
+- `PATCH /settings/projects/{project_id}`
+- `DELETE /settings/projects/{project_id}`
 - `GET /settings/api-token-scopes`
 - `GET /settings/api-tokens`
 - `POST /settings/api-tokens`

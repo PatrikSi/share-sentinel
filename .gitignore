@@ -23,6 +23,7 @@ node_modules/
 .env
 dummy-scan-data*.json
 dummy-scan-data*.json.gz
+!examples/*.json
 
 # OS / editor
 .DS_Store
