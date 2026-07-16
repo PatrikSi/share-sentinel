@@ -41,7 +41,9 @@ class _FakeDb:
     commit_count: int = 0
     flush_error: Exception | None = None
 
-    def execute(self, _statement):
+    def execute(self, _statement, params=None):
+        if params is not None and "key" in params:
+            return _ExecuteResult([])
         if not self.execute_queue:
             raise AssertionError("unexpected execute() call with empty queue")
         return self.execute_queue.pop(0)

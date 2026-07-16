@@ -43,6 +43,13 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         elif response.status_code >= 400:
             metrics.record_http_error(request.method, path_label, "http_4xx")
         response.headers["X-Request-ID"] = request_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), geolocation=(), microphone=()"
+        if request.url.path.startswith("/auth/") or "set-cookie" in response.headers:
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
         logger.info(
             "request method=%s path=%s status=%s latency_ms=%s request_id=%s",
             request.method,

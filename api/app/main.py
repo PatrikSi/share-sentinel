@@ -2,6 +2,7 @@ import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.config import get_settings
 from app.middleware import RequestContextMiddleware
@@ -18,7 +19,7 @@ logging.basicConfig(
 
 app = FastAPI(
     title="Share Sentinel API",
-    version="0.1.0",
+    version="0.2.0",
     root_path=app_settings.api_root_path,
     docs_url="/docs" if docs_enabled else None,
     redoc_url="/redoc" if docs_enabled else None,
@@ -30,9 +31,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID", app_settings.auth_csrf_header_name],
+    expose_headers=["Content-Disposition", "X-Request-ID"],
 )
+trusted_hosts = [item.strip() for item in app_settings.trusted_hosts.split(",") if item.strip()]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
 app.add_middleware(RequestContextMiddleware)
 
 app.include_router(auth.router)

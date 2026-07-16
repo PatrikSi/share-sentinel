@@ -120,6 +120,40 @@ def test_production_requires_trusted_proxy_cidrs() -> None:
         )
 
 
+def test_production_requires_explicit_trusted_hosts() -> None:
+    with pytest.raises(ValueError, match="trusted_hosts must name the deployed hostnames in production"):
+        Settings(
+            app_env="production",
+            jwt_secret="x" * 64,
+            token_pepper="y" * 64,
+            seed_admin_email="admin@example.com",
+            seed_admin_password="StrongPassword123",
+            auth_cookie_secure=True,
+            trusted_proxy_cidrs="10.0.0.0/8",
+            trusted_hosts="*",
+        )
+
+
+def test_production_rejects_wildcard_cors() -> None:
+    with pytest.raises(ValueError, match="cors_origins must not contain a wildcard in production"):
+        Settings(
+            app_env="production",
+            jwt_secret="x" * 64,
+            token_pepper="y" * 64,
+            seed_admin_email="admin@example.com",
+            seed_admin_password="StrongPassword123",
+            auth_cookie_secure=True,
+            trusted_proxy_cidrs="10.0.0.0/8",
+            trusted_hosts="sentinel.example.com",
+            cors_origins="*",
+        )
+
+
+def test_trusted_proxy_cidrs_reject_invalid_networks() -> None:
+    with pytest.raises(ValueError, match="invalid trusted proxy CIDR"):
+        Settings(trusted_proxy_cidrs="not-a-network")
+
+
 def test_app_env_rejects_unknown_values() -> None:
     with pytest.raises(ValueError, match="app_env must be one of"):
         Settings(app_env="prodution")

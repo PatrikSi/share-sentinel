@@ -63,6 +63,7 @@ def test_rejects_self_sysadmin_removal() -> None:
 
 def test_rejects_removing_last_active_sysadmin(monkeypatch) -> None:
     target = _target_user(is_active=True, is_approved=True, is_sysadmin=True)
+    monkeypatch.setattr(users_router, "lock_sysadmin_guard", lambda _db: None)
     monkeypatch.setattr(users_router, "_count_active_approved_sysadmins", lambda _db, exclude_user_id=None: 0)
     with pytest.raises(HTTPException) as exc:
         users_router._enforce_admin_safety(
@@ -79,6 +80,7 @@ def test_rejects_removing_last_active_sysadmin(monkeypatch) -> None:
 
 def test_allows_admin_update_when_other_sysadmins_exist(monkeypatch) -> None:
     target = _target_user(is_active=True, is_approved=True, is_sysadmin=True)
+    monkeypatch.setattr(users_router, "lock_sysadmin_guard", lambda _db: None)
     monkeypatch.setattr(users_router, "_count_active_approved_sysadmins", lambda _db, exclude_user_id=None: 2)
     users_router._enforce_admin_safety(
         db=SimpleNamespace(),

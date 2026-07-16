@@ -17,7 +17,7 @@ services:
       - ui
 
   db:
-    image: postgres:16
+    image: postgres:16@sha256:17e67d7b9890c99b055ba1e0d5c5be4ec27c9d3a72bda32db24a5e5d8a85af0c
     environment:
       POSTGRES_DB: share_sentinel
       POSTGRES_USER: share_sentinel
@@ -31,7 +31,7 @@ services:
       retries: 10
 
   redis:
-    image: redis:7
+    image: redis:7@sha256:a8f08480e1f88f2647fed492d1178c06abb0d0c1fbf02c682a61e2f483fb3954
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redisdata:/data
@@ -74,6 +74,8 @@ services:
       JWT_ISSUER: share-sentinel
       TOKEN_PEPPER: ${TOKEN_PEPPER:?set TOKEN_PEPPER in .env}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.16.0.0/12}
       API_ROOT_PATH: /api
       LOG_LEVEL: INFO
       PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-12}

@@ -4,8 +4,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+import jwt
 from fastapi import Response
-from jose import JWTError, jwt
+from jwt import InvalidTokenError
 from passlib.exc import UnknownHashError
 from passlib.context import CryptContext
 
@@ -57,9 +58,15 @@ def make_access_token(subject: str, session_version: int | None = None, session_
 
 def decode_access_token(token: str) -> dict[str, Any]:
     settings = get_settings()
-    payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"], issuer=settings.jwt_issuer)
+    payload = jwt.decode(
+        token,
+        settings.jwt_secret,
+        algorithms=["HS256"],
+        issuer=settings.jwt_issuer,
+        options={"require": ["exp", "iat", "iss", "sub"]},
+    )
     if payload.get("type") != "access":
-        raise JWTError("invalid token type")
+        raise InvalidTokenError("invalid token type")
     return payload
 
 

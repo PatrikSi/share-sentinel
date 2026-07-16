@@ -5,7 +5,7 @@ from ipaddress import ip_address, ip_network
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError
+from jwt import InvalidTokenError
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -87,7 +87,7 @@ def get_auth_context(
                 if _coerce_utc(refresh_token.expires_at) < datetime.now(tz=UTC):
                     raise _unauthorized("session revoked")
             return AuthContext(user_id=user_id, token_id=None, token_project_id=None, token_role=None, token_scopes=None)
-        except JWTError:
+        except InvalidTokenError:
             # Fallback to API token lookup for token strings that resemble JWTs.
             pass
     elif token_source == "cookie":

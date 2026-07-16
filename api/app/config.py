@@ -1,4 +1,5 @@
 from functools import lru_cache
+from ipaddress import ip_network
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -48,6 +49,7 @@ class Settings(BaseSettings):
     auth_require_csrf: bool = True
 
     cors_origins: str = "http://localhost"
+    trusted_hosts: str = "localhost,127.0.0.1,testserver"
     trusted_proxy_cidrs: str = ""
     allow_self_registration: bool = False
 
@@ -93,6 +95,19 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_csrf_header_name(cls, value: str) -> str:
         return str(value).strip().lower()
+
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def _validate_trusted_proxy_cidrs(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        for raw_cidr in (item.strip() for item in normalized.split(",")):
+            if not raw_cidr:
+                continue
+            try:
+                ip_network(raw_cidr, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"invalid trusted proxy CIDR: {raw_cidr}") from exc
+        return normalized
 
     @field_validator("password_min_length")
     @classmethod
@@ -164,6 +179,12 @@ class Settings(BaseSettings):
                 raise ValueError("allow_never_expiring_api_tokens must be false in production")
             if not str(self.trusted_proxy_cidrs or "").strip():
                 raise ValueError("trusted_proxy_cidrs must be set in production")
+            trusted_hosts = [host.strip().lower() for host in self.trusted_hosts.split(",") if host.strip()]
+            if not trusted_hosts or "*" in trusted_hosts or "testserver" in trusted_hosts:
+                raise ValueError("trusted_hosts must name the deployed hostnames in production")
+            cors_origins = [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+            if "*" in cors_origins:
+                raise ValueError("cors_origins must not contain a wildcard in production")
         return self
 
 
