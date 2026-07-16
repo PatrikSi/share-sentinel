@@ -21,7 +21,7 @@ cd ../ui && npm ci && npm audit --audit-level=high && npm run build
 cd .. && python scripts/validate-sample.py && python scripts/check-release.py
 ```
 
-CI runs those checks independently and then builds every production container through Compose.
+CI runs those checks independently, builds every production container through Compose, and exercises both development and production-style live stacks.
 
 ## Smoke validation
 
@@ -32,11 +32,26 @@ End-to-end smoke checks verify:
 - API health endpoint returns `ok=true`
 - Settings API route is correctly routed (not proxy 404)
 - Auth login route is wired to API (not proxy 404)
+- A tracked artifact reaches `COMPLETE` through Redis and the worker
+- Normalized endpoint, resource, item, and warning counts match the fixture
+- Project deletion requires an exact-name confirmation and cleans up its artifact
+- Production hides API docs, emits security headers, uses secure cookies, and allows only the configured CORS origin
 
 Run:
 
 ```bash
 ./scripts/smoke-routes.sh http://localhost
+export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
+./scripts/smoke-ingest.sh http://localhost admin@example.com
+unset SHARE_SENTINEL_SMOKE_PASSWORD
+```
+
+Against a production-style deployment, pass both the reachable gateway URL and the configured host router name:
+
+```bash
+export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
+./scripts/smoke-production.sh https://sentinel.example.com sentinel.example.com admin@example.com
+unset SHARE_SENTINEL_SMOKE_PASSWORD
 ```
 
 ## Dependency audit

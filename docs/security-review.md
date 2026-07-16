@@ -63,7 +63,7 @@ This is a code and configuration review, not a penetration test or certification
 
 - Severity: Medium
 - Status: Accepted for the local reference topology
-- Affected: `docker-compose.yml:2`, `docker-compose.yml:13`
+- Affected: `docker-compose.yml:2`, `docker-compose.yml:17`
 - Risk: the gateway can read host container metadata through the Docker socket; compromise of a socket-aware component can increase impact.
 - Control: the mount is read-only, the gateway is loopback-bound by default, and production guidance recommends static discovery when the socket is not acceptable.
 
@@ -71,9 +71,36 @@ This is a code and configuration review, not a penetration test or certification
 
 - Severity: Medium
 - Status: Deployment responsibility
-- Affected: `docker-compose.yml:65`, `docker-compose.yml:124`, `docker-compose.yml:156`
+- Affected: `docker-compose.yml:68`, `docker-compose.yml:128`, `docker-compose.yml:160`
 - Risk: raw paths, hostnames, share names, and scan findings remain on filesystem storage; application-layer encryption and malware scanning are not provided.
 - Control: keep storage private, use encrypted disks/backups where required, restrict volume access, and apply retention procedures outside the application.
+
+### SS-SEC-009 — Cross-stack gateway discovery
+
+- Severity: Medium
+- Status: Resolved
+- Affected: `docker-compose.yml:12`, `docker-compose.yml:135`, `docker-compose.yml:186`
+- Risk: multiple Share Sentinel Compose projects on the same Docker host exposed identical Traefik router names and could be discovered by one another's gateways.
+- Resolution: every gateway now constrains Docker discovery to an exact `SHARE_SENTINEL_STACK` label applied to its API and UI; the production guide requires a distinct value for each deployment.
+- Verification: simultaneous development and production-style stacks routed only to their own API and UI services.
+
+### SS-SEC-010 — Destructive confirmation enforced only by the client
+
+- Severity: Low
+- Status: Resolved
+- Affected: `api/app/routers/settings.py:378`, `ui/src/pages/settings-project-detail-page.tsx:175`
+- Risk: a sysadmin calling the API directly could delete a project without the exact-name confirmation presented by the UI.
+- Resolution: the DELETE route requires a JSON body containing `confirm_name` and rejects anything other than the project's exact current name before deleting database rows or artifacts.
+- Regression control: API router tests plus the live ingest-and-cleanup smoke test.
+
+### SS-SEC-011 — Invalid bootstrap identity accepted until login
+
+- Severity: Low
+- Status: Resolved
+- Affected: `api/app/config.py:71`
+- Risk: bootstrap could create a seed administrator whose address failed the stricter login schema, leaving a fresh deployment without a usable administrator.
+- Resolution: seed administrator addresses use the same validated email type during configuration loading, so startup fails before creating an unusable identity.
+- Regression control: production configuration tests.
 
 ## Accepted product limitations
 

@@ -54,7 +54,15 @@ docker compose up --build
 ./scripts/smoke-routes.sh http://localhost
 ```
 
-To exercise ingest without real infrastructure data, upload [`examples/sample-artifact.json`](./examples/sample-artifact.json) through the Import page.
+To verify the complete project, upload, worker-ingest, result, and cleanup lifecycle without real infrastructure data, provide the seeded admin password and run:
+
+```bash
+export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
+./scripts/smoke-ingest.sh http://localhost admin@example.com
+unset SHARE_SENTINEL_SMOKE_PASSWORD
+```
+
+The same tracked fixture is available at [`examples/sample-artifact.json`](./examples/sample-artifact.json) for manual testing through the Import page.
 
 The bundled Compose file keeps the gateway on `127.0.0.1:80` by default. That is intentional. If you expose the stack on a real network, put it behind TLS and review [SECURITY.md](./SECURITY.md) first.
 
@@ -120,6 +128,7 @@ For a fuller component and trust-boundary walkthrough, see [docs/architecture.md
 - API automation uses hashed, project-scoped API tokens with role and scope checks.
 - `GET /api/healthz` is public, while deep health and Prometheus metrics are sysadmin-only routes.
 - The bundled gateway relies on a read-only host Docker socket mount for Traefik service discovery.
+- Each gateway discovers only containers with its `SHARE_SENTINEL_STACK` label, preventing multiple Share Sentinel deployments on one Docker host from routing into one another.
 - OpenAPI and Swagger docs are intended for development-style environments and are hidden in production-style `APP_ENV` values.
 - The default Docker deployment is local-first, not internet-ready. Replace secrets, enable TLS, and review the reverse-proxy posture before exposing it.
 

@@ -27,6 +27,9 @@ Replace the four placeholder secrets in `.env`, then run:
 docker compose up -d --build
 docker compose ps
 ./scripts/smoke-routes.sh http://localhost
+export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
+./scripts/smoke-ingest.sh http://localhost admin@example.com
+unset SHARE_SENTINEL_SMOKE_PASSWORD
 ```
 
 The gateway listens on `127.0.0.1:80` by default. The `bootstrap` service applies migrations and creates the initial admin before the API and worker start.
@@ -40,6 +43,7 @@ At minimum, set:
 ```dotenv
 APP_ENV=production
 APP_HOST=sentinel.example.com
+SHARE_SENTINEL_STACK=production
 GATEWAY_BIND_ADDRESS=127.0.0.1
 GATEWAY_HTTP_PORT=8080
 AUTH_COOKIE_SECURE=true
@@ -54,6 +58,8 @@ SEED_ADMIN_PASSWORD=<strong-unique-password>
 ```
 
 `APP_HOST` controls the Traefik host router. `TRUSTED_HOSTS` is the API-level host allowlist. They normally contain the same public hostname, but `TRUSTED_HOSTS` may contain a comma-separated set when the service has intentional aliases.
+
+`SHARE_SENTINEL_STACK` scopes Traefik discovery to this deployment. Give every Share Sentinel Compose project on the same Docker host a distinct value so gateways cannot discover one another's API/UI containers.
 
 `TRUSTED_PROXY_CIDRS` must cover the API's immediate Traefik peer and every trusted proxy hop represented in `X-Forwarded-For`. Do not add client networks or broad public ranges. If the chain is incomplete, audit and rate-limit attribution stops at the first untrusted proxy rather than trusting spoofable headers.
 
@@ -75,9 +81,12 @@ docker compose config --quiet
 docker compose up -d --build
 docker compose ps
 ./scripts/smoke-routes.sh https://sentinel.example.com
+export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
+./scripts/smoke-production.sh https://sentinel.example.com sentinel.example.com '<the SEED_ADMIN_EMAIL value>'
+unset SHARE_SENTINEL_SMOKE_PASSWORD
 ```
 
-Then sign in and upload [`examples/sample-artifact.json`](../examples/sample-artifact.json). A successful verification reaches `COMPLETE`, shows two endpoints and two resources, and records the synthetic warning under run Issues.
+The production smoke verifies the public health route, hidden API docs, UI routing, secure browser cookies, response headers, and exact configured CORS origin. The ingest smoke creates and removes its own temporary project; a successful run reaches `COMPLETE`, shows two endpoints and two resources, and records the synthetic warning under run Issues.
 
 Production-style API startup fails fast when secure cookies, proxy CIDRs, hostnames, secrets, or seed-admin settings are missing. Interactive API docs are disabled outside development/test environments.
 

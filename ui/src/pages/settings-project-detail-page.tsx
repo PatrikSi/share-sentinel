@@ -177,7 +177,10 @@ export function SettingsProjectDetailPage() {
     setDeleteSubmitting(true);
     setError(null);
     try {
-      await apiFetch(`/settings/projects/${projectId}`, { method: "DELETE" });
+      await apiFetch(`/settings/projects/${projectId}`, {
+        method: "DELETE",
+        body: JSON.stringify({ confirm_name: deleteConfirmation }),
+      });
       navigate("/settings/projects", { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete project");

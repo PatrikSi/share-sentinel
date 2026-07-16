@@ -145,6 +145,10 @@ class ProjectUpdateIn(BaseModel):
         return normalized
 
 
+class ProjectDeleteIn(BaseModel):
+    confirm_name: str = Field(min_length=1, max_length=255)
+
+
 class SettingsProjectCatalogItemOut(BaseModel):
     id: uuid.UUID
     name: str

@@ -1,7 +1,7 @@
 from functools import lru_cache
 from ipaddress import ip_network
 
-from pydantic import field_validator, model_validator
+from pydantic import EmailStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.password_policy import password_policy_kwargs, validate_password_strength
@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     password_require_uppercase: bool = True
     password_require_number: bool = True
     password_require_special: bool = False
-    seed_admin_email: str | None = None
+    seed_admin_email: EmailStr | None = None
     seed_admin_password: str | None = None
 
     @field_validator("app_env", mode="before")

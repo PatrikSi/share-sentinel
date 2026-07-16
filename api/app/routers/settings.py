@@ -12,10 +12,10 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import escape_like, get_db
-from app.enums import ProjectRole, RunStatus
 from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
-from app.models import ApiToken, AuditEvent, Project, ProjectMember, ScanRun, User
+from app.enums import ProjectRole, RunStatus
 from app.locking import lock_project_admin_guard
+from app.models import ApiToken, AuditEvent, Project, ProjectMember, ScanRun, User
 from app.pagination import (
     KeysetColumn,
     apply_keyset_pagination,
@@ -29,6 +29,7 @@ from app.schemas import (
     ApiTokenAdminOut,
     ApiTokenAdminUpdateIn,
     AuditEventOut,
+    ProjectDeleteIn,
     ProjectMembershipOut,
     ProjectMembershipUpsertIn,
     ProjectOut,
@@ -377,6 +378,7 @@ def rename_project(
 @router.delete("/projects/{project_id}", response_model=SettingsProjectDeleteOut)
 def delete_project(
     project_id: uuid.UUID,
+    payload: ProjectDeleteIn,
     request: Request,
     db: Session = Depends(get_db),
     auth: AuthContext = Depends(get_auth_context),
@@ -388,6 +390,8 @@ def delete_project(
     project = db.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+    if payload.confirm_name != project.name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="project name confirmation does not match")
 
     runs = db.execute(
         select(ScanRun).where(ScanRun.project_id == project_id).order_by(ScanRun.created_at.desc(), ScanRun.id.desc())

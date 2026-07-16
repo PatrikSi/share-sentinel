@@ -376,7 +376,13 @@ Renames a project. Project names remain unique.
 
 ### `DELETE /settings/projects/{project_id}`
 
-Deletes a project after an exact-name confirmation. Related database state is removed transactionally; the response separately reports any raw artifact cleanup failures.
+Deletes a project only when the JSON body contains its exact current name:
+
+```json
+{"confirm_name": "Exact project name"}
+```
+
+The server enforces the confirmation independently of the UI. Related database state is removed transactionally; the response separately reports any raw artifact cleanup failures.
 
 ### `GET /settings/api-token-scopes`
 

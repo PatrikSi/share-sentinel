@@ -252,7 +252,11 @@ def test_settings_project_delete_reports_artifact_failures(monkeypatch) -> None:
 
     client = _client_for_db(fake_db, actor_user_id=actor_id)
     try:
-        response = client.delete(f"/settings/projects/{project_id}")
+        response = client.request(
+            "DELETE",
+            f"/settings/projects/{project_id}",
+            json={"confirm_name": "Core"},
+        )
     finally:
         _clear_overrides()
 
@@ -296,7 +300,11 @@ def test_settings_project_delete_blocks_uploaded_or_ingesting_runs() -> None:
 
     client = _client_for_db(fake_db)
     try:
-        response = client.delete(f"/settings/projects/{project_id}")
+        response = client.request(
+            "DELETE",
+            f"/settings/projects/{project_id}",
+            json={"confirm_name": "Core"},
+        )
     finally:
         _clear_overrides()
 
@@ -328,12 +336,37 @@ def test_settings_project_delete_blocks_when_run_lock_cannot_be_acquired(monkeyp
 
     client = _client_for_db(fake_db)
     try:
-        response = client.delete(f"/settings/projects/{project_id}")
+        response = client.request(
+            "DELETE",
+            f"/settings/projects/{project_id}",
+            json={"confirm_name": "Core"},
+        )
     finally:
         _clear_overrides()
 
     assert response.status_code == 409
     assert "cannot be locked" in response.json()["detail"]
+    assert fake_db.deleted == []
+    assert fake_db.commit_count == 0
+
+
+def test_settings_project_delete_requires_exact_name_confirmation() -> None:
+    fake_db = _FakeDb()
+    project_id = uuid.uuid4()
+    fake_db.get_map[(Project, project_id)] = SimpleNamespace(id=project_id, name="Core")
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.request(
+            "DELETE",
+            f"/settings/projects/{project_id}",
+            json={"confirm_name": "Wrong project"},
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "project name confirmation does not match"
     assert fake_db.deleted == []
     assert fake_db.commit_count == 0
 

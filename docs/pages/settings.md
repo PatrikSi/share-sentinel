@@ -76,7 +76,7 @@ Important guardrails enforced by the API:
 - rename a project while preserving its id and related data
 - delete a project only after typing its exact name
 
-Project deletion is irreversible. The API deletes related database rows transactionally, then removes associated raw artifacts. Its response reports artifact cleanup failures so operators can resolve residual files.
+Project deletion is irreversible. Both the UI and API require the exact current project name; the DELETE request body is `{"confirm_name":"Exact project name"}`. The API deletes related database rows transactionally, then removes associated raw artifacts. Its response reports artifact cleanup failures so operators can resolve residual files.
 
 ## API Tokens
 

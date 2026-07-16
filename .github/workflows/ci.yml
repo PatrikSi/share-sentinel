@@ -82,9 +82,23 @@ jobs:
         run: pip-audit -r collector/requirements-dev.txt
 
   containers:
-    name: Compose and container builds
+    name: Compose, containers, and live smoke tests
     runs-on: ubuntu-latest
     needs: [python-tests, ui, python-audit]
+    env:
+      POSTGRES_PASSWORD: CiDatabasePassword123
+      JWT_SECRET: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+      TOKEN_PEPPER: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+      SEED_ADMIN_EMAIL: admin@example.com
+      SEED_ADMIN_PASSWORD: CiAdminPassword123
+      SHARE_SENTINEL_SMOKE_PASSWORD: CiAdminPassword123
+      SHARE_SENTINEL_STACK: ci-${{ github.run_id }}
+      GATEWAY_BIND_ADDRESS: 127.0.0.1
+      GATEWAY_HTTP_PORT: 18080
+      APP_HOST: localhost
+      AUTH_COOKIE_SECURE: "false"
+      TRUSTED_HOSTS: localhost,127.0.0.1
+      TRUSTED_PROXY_CIDRS: 172.16.0.0/12
     steps:
       - name: Check out source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -94,3 +108,26 @@ jobs:
         run: docker compose config --quiet
       - name: Build production images
         run: docker compose build
+      - name: Start development stack
+        run: docker compose up -d
+      - name: Verify routes and complete ingest lifecycle
+        run: |
+          ./scripts/smoke-routes.sh http://localhost:18080
+          ./scripts/smoke-ingest.sh http://localhost:18080 admin@example.com
+      - name: Stop development stack
+        run: docker compose down -v --remove-orphans
+      - name: Start production-style stack
+        env:
+          APP_ENV: production
+          APP_HOST: sentinel.example.com
+          SHARE_SENTINEL_STACK: ci-production-${{ github.run_id }}
+          GATEWAY_HTTP_PORT: 18081
+          AUTH_COOKIE_SECURE: "true"
+          TRUSTED_HOSTS: sentinel.example.com
+          CORS_ORIGINS: https://sentinel.example.com
+        run: docker compose up -d
+      - name: Verify production security posture
+        run: ./scripts/smoke-production.sh http://localhost:18081 sentinel.example.com admin@example.com
+      - name: Clean up Compose resources
+        if: always()
+        run: docker compose down -v --remove-orphans

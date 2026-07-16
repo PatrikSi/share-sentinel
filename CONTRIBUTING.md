@@ -70,9 +70,12 @@ For behavior that crosses services, rebuild the affected containers and rerun:
 ```bash
 docker compose up -d --build
 ./scripts/smoke-routes.sh http://localhost
+export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
+./scripts/smoke-ingest.sh http://localhost admin@example.com
+unset SHARE_SENTINEL_SMOKE_PASSWORD
 ```
 
-CI repeats all three Python suites, the sample validation, JavaScript and Python dependency audits, the UI production build, Compose validation, and all production container builds.
+CI repeats all three Python suites, the sample validation, JavaScript and Python dependency audits, the UI production build, Compose validation, all production container builds, a complete live ingest lifecycle, and a production-style routing/security smoke test.
 
 ## Migrations and schema changes
 

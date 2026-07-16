@@ -206,6 +206,11 @@ def test_seed_admin_env_requires_email_and_password_pair() -> None:
         Settings(seed_admin_email="admin@example.com")
 
 
+def test_seed_admin_email_must_be_usable_by_login_schema() -> None:
+    with pytest.raises(ValueError, match="valid email address"):
+        Settings(seed_admin_email="admin@example.test", seed_admin_password="StrongPassword123")
+
+
 def test_password_min_length_rejects_out_of_range_values() -> None:
     with pytest.raises(ValueError, match="password_min_length must be at least 1"):
         Settings(password_min_length=0)

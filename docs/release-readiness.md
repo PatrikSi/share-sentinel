@@ -12,7 +12,7 @@ Use this checklist before publishing a public release of the current tree. It is
 - [x] Worker retry scheduling, stale-run recovery, and Docker health checks backed by heartbeat files
 - [x] Automated tests for API, worker, and collector components
 - [x] Local Docker Compose deployment with bootstrap, API, worker, UI, Postgres, Redis, and gateway services
-- [x] CI with dependency audits, UI production build, Compose validation, and all container builds
+- [x] CI with dependency audits, UI production build, Compose validation, all container builds, a live ingest, and a production-style security smoke test
 - [x] Tracked synthetic ingest fixture at `examples/sample-artifact.json`
 - [x] Tag-driven source archives and SHA-256 checksums
 
@@ -21,13 +21,14 @@ Use this checklist before publishing a public release of the current tree. It is
 - [ ] Pick the release commit and tag name
 - [ ] Run `docker compose up -d --build` from a clean checkout
 - [ ] Run `./scripts/smoke-routes.sh http://localhost`
+- [ ] Run `./scripts/smoke-ingest.sh http://localhost` with `SHARE_SENTINEL_SMOKE_PASSWORD` set
 - [ ] Run API tests: `docker compose exec -T api bash -lc "pip install -q -r requirements-dev.txt && pytest -q"`
 - [ ] Run worker tests: `cd worker && pip install -r requirements-dev.txt && pytest -q`
 - [ ] Run collector tests: `cd collector && pip install -r requirements-dev.txt && pytest -q`
 - [ ] Run UI validation: `cd ui && npm ci && npm run typecheck && npm run build`
 - [ ] Run `python scripts/check-release.py --tag vX.Y.Z`
 - [ ] Run Python and npm dependency audits
-- [ ] Perform one live end-to-end ingest using `./examples/sample-artifact.json`
+- [ ] Run `./scripts/smoke-production.sh` against the production-style hostname and gateway
 
 ## Security and deployment checks
 
