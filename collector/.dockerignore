@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.pytest_cache
+__pycache__
+venv
+.venv
+tests
+*.json
+*.json.gz
+*.jsonl
+*.jsonl.gz
+*.ndjson
+*.ndjson.gz
+*.log

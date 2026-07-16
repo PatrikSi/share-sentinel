@@ -10,7 +10,16 @@ The project follows a simple release-first workflow:
 
 ## Unreleased
 
-- No unreleased changes yet.
+### Added
+
+- GHCR publication for API, worker, UI, and collector images after full CI or release verification, including exact commit/release tags, vulnerability scans, provenance, and SBOM attestations.
+- A containerized collector with NFS tooling and an unprivileged runtime.
+- `docker-compose.dev.yml` for local source builds and `scripts/bootstrap-env.sh` for generated development or production environment files.
+
+### Changed
+
+- The base Compose stack now pulls application images from GHCR; local development selects the source-build override through generated `COMPOSE_FILE` configuration.
+- Container inputs now use readable exact version tags rather than digest pins.
 
 ## [0.2.0] - 2026-07-16
 

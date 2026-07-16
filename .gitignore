@@ -32,3 +32,4 @@ dummy-scan-data*.json.gz
 
 # Runtime data
 coverage/
+collector-output/

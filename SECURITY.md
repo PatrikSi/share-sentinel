@@ -63,7 +63,7 @@ The project currently provides:
 - worker heartbeat files plus a Docker healthcheck in the default stack
 - localhost-first Docker defaults
 - trusted-host enforcement, explicit CORS methods/headers, and production configuration fail-fast checks
-- digest-pinned base images with unprivileged API and worker processes
+- version-pinned base images with unprivileged API, worker, and collector processes
 
 The project does not currently provide:
 

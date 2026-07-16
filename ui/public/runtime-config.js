@@ -1,0 +1,1 @@
+window.__SHARE_SENTINEL_CONFIG__ = window.__SHARE_SENTINEL_CONFIG__ || {};

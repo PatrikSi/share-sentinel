@@ -59,3 +59,8 @@ updates:
     directory: /ui
     schedule:
       interval: weekly
+
+  - package-ecosystem: docker
+    directory: /collector
+    schedule:
+      interval: weekly

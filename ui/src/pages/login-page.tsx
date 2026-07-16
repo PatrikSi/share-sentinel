@@ -4,8 +4,7 @@ import { Navigate, useLocation, useNavigate } from "react-router-dom";
 import { StatusBanner } from "@/components/status-banner";
 import { responseErrorMessage } from "@/lib/api";
 import { markSessionAuthenticated, SessionUser, useSession } from "@/lib/auth";
-
-const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "/api";
+import { API_BASE } from "@/lib/runtime-config";
 
 type RegistrationSettings = {
   allow_self_registration: boolean;

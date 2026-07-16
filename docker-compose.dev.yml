@@ -1,0 +1,28 @@
+services:
+  bootstrap:
+    image: share-sentinel-api:dev
+    pull_policy: never
+
+  api:
+    image: share-sentinel-api:dev
+    pull_policy: never
+    build:
+      context: ./api
+
+  worker:
+    image: share-sentinel-worker:dev
+    pull_policy: never
+    build:
+      context: ./worker
+
+  ui:
+    image: share-sentinel-ui:dev
+    pull_policy: never
+    build:
+      context: ./ui
+
+  collector:
+    image: share-sentinel-collector:dev
+    pull_policy: never
+    build:
+      context: ./collector

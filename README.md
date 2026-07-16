@@ -19,36 +19,31 @@ It is built around one loop:
 - `worker/` background ingestion worker fed by Redis Streams
 - `ui/` React + Vite single-page app
 - `collector/` Python CLI for SMB and NFS collection plus optional direct upload
-- `docker-compose.yml` for a local all-in-one stack with Traefik, Postgres, Redis, API, worker, and UI
+- `docker-compose.yml` for a GHCR-backed single-host stack and `docker-compose.dev.yml` for local source builds
 
 ## Quick start
 
-1. Copy the example environment file:
+1. Generate a development environment with random secrets:
 
 ```bash
-cp .env.example .env
+./scripts/bootstrap-env.sh
 ```
 
-2. Edit `.env` and replace the required placeholder values before starting the stack:
+The script creates a mode-`600` `.env`, prints the one-time seed administrator password, and refuses to overwrite an existing file unless `--force` is supplied.
 
-- `POSTGRES_PASSWORD`
-- `JWT_SECRET`
-- `TOKEN_PEPPER`
-- `SEED_ADMIN_PASSWORD`
-
-The example file intentionally uses placeholder values that fail fast until you replace them.
-
-3. Build and start the stack:
+2. Build the application images from the current checkout and start the stack:
 
 ```bash
-docker compose up --build
+docker compose up -d --build
 ```
 
-4. Open the app:
+The generated development environment selects both Compose files automatically through `COMPOSE_FILE`.
+
+3. Open the app and sign in with the generated administrator credentials:
 
 - `http://localhost`
 
-5. Optional local routing smoke test:
+4. Optional local routing smoke test:
 
 ```bash
 ./scripts/smoke-routes.sh http://localhost
@@ -66,7 +61,7 @@ The same tracked fixture is available at [`examples/sample-artifact.json`](./exa
 
 The bundled Compose file keeps the gateway on `127.0.0.1:80` by default. That is intentional. If you expose the stack on a real network, put it behind TLS and review [SECURITY.md](./SECURITY.md) first.
 
-The checked-in Compose stack is for local evaluation and development. Do not expose it as-is with placeholder secrets, default admin credentials, or plain HTTP.
+The base Compose stack pulls versioned application images from `ghcr.io/patriksi`; the development override replaces them with local builds. Neither topology is a turnkey internet-facing appliance. Use the production bootstrap mode, exact release image tags, TLS, backups, and the deployment guide before network exposure.
 
 The default gateway also mounts the host Docker socket read-only so Traefik can discover the API and UI containers. Treat that as a trust boundary in its own right and review whether that deployment model fits your environment before publishing the stack.
 
@@ -137,9 +132,11 @@ See the [deployment guide](./docs/deployment.md) for the production configuratio
 ## Release and support policy
 
 - Source is released from this repository and is the primary supported distribution format.
-- Before the first tag, support is best-effort on `main`; matching `vX.Y.Z` tags publish verified source archives and checksums.
+- Verified API, worker, UI, and collector images are published under `ghcr.io/patriksi/share-sentinel-*`.
+- Successful `main` builds publish `latest` and `sha-<full-commit>` tags.
+- Matching `vX.Y.Z` tags publish `latest`, `vX.Y.Z`, and `sha-<full-commit>` images plus source archives and checksums.
 - When tagged releases exist, expect support to focus on `main` plus the latest tagged release unless a future policy says otherwise.
-- Docker images may be published for convenience, but they should be treated as secondary artifacts to the tagged source release.
+- Production deployments should select an exact `vX.Y.Z` or `sha-<full-commit>` tag instead of tracking `latest`.
 
 ## Current limitations
 

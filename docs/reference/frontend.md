@@ -163,3 +163,13 @@ Global audit search and export.
 - `StatusBanner` for inline workflow feedback
 - `Dialog` for destructive or sensitive admin actions
 - `SecretReveal` for one-time token display
+
+## Runtime configuration
+
+The published Nginx image generates `/runtime-config.js` at container startup. The browser loads it before the Vite bundle, so the same image can use deployment-specific values without rebuilding:
+
+- `VITE_API_BASE_URL` — relative API path, default `/api`
+- `VITE_CSRF_COOKIE_NAME` — must match `AUTH_CSRF_COOKIE_NAME`
+- `VITE_CSRF_HEADER_NAME` — must match `AUTH_CSRF_HEADER_NAME`
+
+The startup hook accepts only a relative API path and conservative cookie/header characters. Invalid values stop the UI container before Nginx starts.

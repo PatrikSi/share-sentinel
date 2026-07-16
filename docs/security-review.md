@@ -31,10 +31,11 @@ This is a code and configuration review, not a penetration test or certification
 ### SS-SEC-003 — Mutable or contaminated container inputs
 
 - Severity: Medium
-- Status: Resolved
+- Status: Mitigated
 - Affected: `api/Dockerfile:1`, `worker/Dockerfile:1`, `ui/Dockerfile:1`, and service `.dockerignore` files
-- Resolution: pinned base images by digest, added `.dockerignore` files so host dependencies cannot overwrite locked build output, removed the API compiler toolchain, and run API/worker processes as UID 10001.
-- Verification: clean container builds, image-user inspection, Nginx config test, and non-root artifact write check
+- Resolution: version-pinned base images, service `.dockerignore` files so host dependencies cannot overwrite locked build output, no API compiler toolchain, and unprivileged API, worker, and collector processes.
+- Remaining risk: version and application tags are registry-mutable by design. Published application images carry source/revision labels, provenance, and SBOM attestations, but deployments requiring immutable inputs must enforce resolved registry digests separately.
+- Verification: clean container builds, high/critical Trivy scans, image-user inspection, Nginx config test, and non-root artifact write check
 
 ### SS-SEC-004 — JWT validation contract
 
@@ -71,7 +72,7 @@ This is a code and configuration review, not a penetration test or certification
 
 - Severity: Medium
 - Status: Deployment responsibility
-- Affected: `docker-compose.yml:68`, `docker-compose.yml:128`, `docker-compose.yml:160`
+- Affected: `docker-compose.yml:68`, `docker-compose.yml:130`, `docker-compose.yml:164`
 - Risk: raw paths, hostnames, share names, and scan findings remain on filesystem storage; application-layer encryption and malware scanning are not provided.
 - Control: keep storage private, use encrypted disks/backups where required, restrict volume access, and apply retention procedures outside the application.
 
@@ -79,7 +80,7 @@ This is a code and configuration review, not a penetration test or certification
 
 - Severity: Medium
 - Status: Resolved
-- Affected: `docker-compose.yml:12`, `docker-compose.yml:135`, `docker-compose.yml:186`
+- Affected: `docker-compose.yml:12`, `docker-compose.yml:137`, `docker-compose.yml:189`
 - Risk: multiple Share Sentinel Compose projects on the same Docker host exposed identical Traefik router names and could be discovered by one another's gateways.
 - Resolution: every gateway now constrains Docker discovery to an exact `SHARE_SENTINEL_STACK` label applied to its API and UI; the production guide requires a distinct value for each deployment.
 - Verification: simultaneous development and production-style stacks routed only to their own API and UI services.

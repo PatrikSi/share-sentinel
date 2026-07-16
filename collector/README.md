@@ -17,6 +17,20 @@ pip install -r requirements.txt
 python share_sentinel_collector.py --help
 ```
 
+The published container includes `showmount` and runs as an unprivileged user:
+
+```bash
+docker run --rm ghcr.io/patriksi/share-sentinel-collector:latest --help
+```
+
+For repeatable use, replace `latest` with an exact `vX.Y.Z` or `sha-<full-commit>` tag. The root Compose file also exposes the collector through the optional `tools` profile and a persistent output volume. In a generated development environment, build it from the checkout on first use:
+
+```bash
+docker compose --profile tools run --rm --build collector --help
+```
+
+Production environments omit `--build`; Compose pulls the configured GHCR tag.
+
 ## What it produces
 
 The final artifact is a compact JSON document, optionally gzip-compressed when `--gzip` is used.

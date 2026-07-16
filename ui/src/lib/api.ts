@@ -1,8 +1,6 @@
 import { markSessionAnonymous, refreshSession } from "@/lib/auth";
+import { API_BASE, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "@/lib/runtime-config";
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "/api";
-const CSRF_COOKIE_NAME = (import.meta.env.VITE_CSRF_COOKIE_NAME as string) || "share_sentinel_csrf";
-const CSRF_HEADER_NAME = ((import.meta.env.VITE_CSRF_HEADER_NAME as string) || "x-csrf-token").toLowerCase();
 const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 function loginRedirectPath(): string {

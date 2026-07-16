@@ -9,15 +9,14 @@ This project is split across an API, a worker, a UI, and a collector. The quicke
 - Docker and Docker Compose
 - Python 3.11 if you want to run services or tests outside containers
 - Node.js 20 if you want to build the UI outside containers
-- A copy of `.env` based on `.env.example`
-- Placeholder values in `.env` replaced before you start the stack
+- A generated `.env` from `./scripts/bootstrap-env.sh`
 
 ## Local development
 
-1. Copy the example environment:
+1. Generate local configuration and random secrets:
 
 ```bash
-cp .env.example .env
+./scripts/bootstrap-env.sh
 ```
 
 2. Build and start the local stack:
@@ -34,7 +33,7 @@ docker compose up --build
 ./scripts/smoke-routes.sh http://localhost
 ```
 
-The Compose stack runs a `bootstrap` container that applies Alembic migrations and seeds the initial admin account before the API and worker start.
+The generated `.env` selects `docker-compose.yml` plus `docker-compose.dev.yml`, so application images build from the current checkout. The `bootstrap` container applies Alembic migrations and seeds the initial admin account before the API and worker start.
 
 ## Repo layout
 
@@ -75,7 +74,7 @@ export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
 unset SHARE_SENTINEL_SMOKE_PASSWORD
 ```
 
-CI repeats all three Python suites, the sample validation, JavaScript and Python dependency audits, the UI production build, Compose validation, all production container builds, a complete live ingest lifecycle, and a production-style routing/security smoke test.
+CI repeats all three Python suites, the sample validation, JavaScript and Python dependency audits, the UI production build, both Compose configurations, all four application image builds, high/critical container vulnerability scans, a complete live ingest lifecycle, and a production-style routing/security smoke test. A successful `main` run publishes API, worker, UI, and collector images to GHCR.
 
 ## Migrations and schema changes
 

@@ -21,7 +21,7 @@ cd ../ui && npm ci && npm audit --audit-level=high && npm run build
 cd .. && python scripts/validate-sample.py && python scripts/check-release.py
 ```
 
-CI runs those checks independently, builds every production container through Compose, and exercises both development and production-style live stacks.
+CI runs those checks independently, builds and vulnerability-scans API, worker, UI, and collector images, and exercises both development and production-style live stacks. Successful `main` runs then publish the four images to GHCR.
 
 ## Smoke validation
 
@@ -69,7 +69,7 @@ cd ui && npm audit --audit-level=high
 After API/UI changes:
 
 ```bash
-docker compose build api ui
+docker compose build api worker ui
 docker compose up -d api ui gateway
 ```
 

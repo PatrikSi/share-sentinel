@@ -12,14 +12,15 @@ Use this checklist before publishing a public release of the current tree. It is
 - [x] Worker retry scheduling, stale-run recovery, and Docker health checks backed by heartbeat files
 - [x] Automated tests for API, worker, and collector components
 - [x] Local Docker Compose deployment with bootstrap, API, worker, UI, Postgres, Redis, and gateway services
-- [x] CI with dependency audits, UI production build, Compose validation, all container builds, a live ingest, and a production-style security smoke test
+- [x] CI with dependency audits, UI production build, production/development Compose validation, all four application image builds, a live ingest, and a production-style security smoke test
+- [x] GHCR publication for `latest`, exact commit, and exact release image tags with high/critical vulnerability scans, provenance, and SBOM attestations
 - [x] Tracked synthetic ingest fixture at `examples/sample-artifact.json`
 - [x] Tag-driven source archives and SHA-256 checksums
 
 ## Per-release validation
 
 - [ ] Pick the release commit and tag name
-- [ ] Run `docker compose up -d --build` from a clean checkout
+- [ ] Run `./scripts/bootstrap-env.sh` and `docker compose up -d --build` from a clean checkout
 - [ ] Run `./scripts/smoke-routes.sh http://localhost`
 - [ ] Run `./scripts/smoke-ingest.sh http://localhost` with `SHARE_SENTINEL_SMOKE_PASSWORD` set
 - [ ] Run API tests: `docker compose exec -T api bash -lc "pip install -q -r requirements-dev.txt && pytest -q"`
@@ -45,6 +46,7 @@ Use this checklist before publishing a public release of the current tree. It is
 - [ ] Confirm the repository host has a private security reporting path enabled
 - [ ] Draft release notes in `CHANGELOG.md`, including user-visible behavior changes, migrations, and new env vars
 - [ ] Push the matching `vX.Y.Z` tag and verify the release workflow publishes source archives and checksums
-- [ ] If you publish Docker images, confirm they map clearly to the same tagged source release
+- [ ] Confirm all four `vX.Y.Z` GHCR images map to the same tagged source release and commit
+- [ ] Confirm all four GHCR packages have the intended visibility; public packages support anonymous Compose pulls
 - [ ] Confirm issue tracker, default branch, and support expectations match `SUPPORT.md`
 - [ ] Re-read `README.md` and `SECURITY.md` for any placeholders or environment-specific wording before publishing
