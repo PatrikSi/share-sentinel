@@ -8,7 +8,6 @@ output="$root_dir/.env"
 mode="development"
 app_host="localhost"
 admin_email="admin@example.com"
-image_registry="ghcr.io/patriksi"
 image_tag="latest"
 force="false"
 
@@ -22,7 +21,6 @@ Options:
   --development            Generate local-development settings (default).
   --production HOSTNAME    Generate production-style settings for HOSTNAME.
   --admin-email EMAIL      Seed administrator email (default: admin@example.com).
-  --registry REGISTRY      Container registry namespace (default: ghcr.io/patriksi).
   --image-tag TAG          Application image tag (default: latest).
   --output PATH            Output file (default: .env in the repository root).
   --force                  Replace an existing output file.
@@ -56,11 +54,6 @@ while [[ $# -gt 0 ]]; do
     --admin-email)
       require_value "$1" "${2:-}"
       admin_email="$2"
-      shift 2
-      ;;
-    --registry)
-      require_value "$1" "${2:-}"
-      image_registry="${2%/}"
       shift 2
       ;;
     --image-tag)
@@ -99,10 +92,6 @@ if [[ "$app_host" == *://* || "$app_host" == */* || ! "$app_host" =~ ^[A-Za-z0-9
 fi
 if [[ ! "$admin_email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
   echo "FAIL: --admin-email must be a valid-looking email address" >&2
-  exit 2
-fi
-if [[ ! "$image_registry" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
-  echo "FAIL: --registry contains unsupported characters" >&2
   exit 2
 fi
 if [[ ! "$image_tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -156,7 +145,6 @@ awk \
   -v app_env="$mode" \
   -v app_host="$app_host" \
   -v stack_name="$stack_name" \
-  -v image_registry="$image_registry" \
   -v image_tag="$image_tag" \
   -v gateway_port="$gateway_port" \
   -v postgres_password="$postgres_password" \
@@ -172,7 +160,6 @@ BEGIN {
   replacement["APP_ENV"] = app_env
   replacement["APP_HOST"] = app_host
   replacement["SHARE_SENTINEL_STACK"] = stack_name
-  replacement["SHARE_SENTINEL_IMAGE_REGISTRY"] = image_registry
   replacement["SHARE_SENTINEL_IMAGE_TAG"] = image_tag
   replacement["GATEWAY_BIND_ADDRESS"] = "127.0.0.1"
   replacement["GATEWAY_HTTP_PORT"] = gateway_port

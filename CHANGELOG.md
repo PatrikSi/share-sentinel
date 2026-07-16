@@ -18,7 +18,7 @@ The project follows a simple release-first workflow:
 
 ### Changed
 
-- The base Compose stack now pulls application images from GHCR; local development selects the source-build override through generated `COMPOSE_FILE` configuration.
+- The base Compose stack pulls the canonical `ghcr.io/patriksi/share-sentinel-*` images directly; local development selects the source-build override through generated `COMPOSE_FILE` configuration.
 - Container inputs now use readable exact version tags rather than digest pins.
 
 ## [0.2.0] - 2026-07-16

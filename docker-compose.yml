@@ -45,7 +45,7 @@ services:
       retries: 10
 
   bootstrap:
-    image: ${SHARE_SENTINEL_IMAGE_REGISTRY:-ghcr.io/patriksi}/share-sentinel-api:${SHARE_SENTINEL_IMAGE_TAG:-latest}
+    image: ghcr.io/patriksi/share-sentinel-api:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
     command: ["sh", "-lc", "alembic upgrade head && python -m app.bootstrap"]
     environment:
@@ -73,7 +73,7 @@ services:
     restart: "no"
 
   api:
-    image: ${SHARE_SENTINEL_IMAGE_REGISTRY:-ghcr.io/patriksi}/share-sentinel-api:${SHARE_SENTINEL_IMAGE_TAG:-latest}
+    image: ghcr.io/patriksi/share-sentinel-api:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
     environment:
       APP_ENV: ${APP_ENV:-development}
@@ -144,7 +144,7 @@ services:
       - "traefik.http.services.api.loadbalancer.server.port=8000"
 
   worker:
-    image: ${SHARE_SENTINEL_IMAGE_REGISTRY:-ghcr.io/patriksi}/share-sentinel-worker:${SHARE_SENTINEL_IMAGE_TAG:-latest}
+    image: ghcr.io/patriksi/share-sentinel-worker:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
     environment:
       DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/share_sentinel
@@ -171,7 +171,7 @@ services:
       start_period: 20s
 
   ui:
-    image: ${SHARE_SENTINEL_IMAGE_REGISTRY:-ghcr.io/patriksi}/share-sentinel-ui:${SHARE_SENTINEL_IMAGE_TAG:-latest}
+    image: ghcr.io/patriksi/share-sentinel-ui:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
     environment:
       VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
@@ -194,7 +194,7 @@ services:
       - "traefik.http.services.ui.loadbalancer.server.port=3000"
 
   collector:
-    image: ${SHARE_SENTINEL_IMAGE_REGISTRY:-ghcr.io/patriksi}/share-sentinel-collector:${SHARE_SENTINEL_IMAGE_TAG:-latest}
+    image: ghcr.io/patriksi/share-sentinel-collector:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
     profiles: ["tools"]
     environment:
