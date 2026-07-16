@@ -17,6 +17,8 @@ import { SettingsIamPage } from "@/pages/settings-iam-page";
 import { SettingsIamUserPage } from "@/pages/settings-iam-user-page";
 import { SettingsLayout } from "@/pages/settings-layout";
 import { SettingsOverviewPage } from "@/pages/settings-overview-page";
+import { SettingsProjectDetailPage } from "@/pages/settings-project-detail-page";
+import { SettingsProjectsPage } from "@/pages/settings-projects-page";
 
 function RequireAuth({ children }: { children: JSX.Element }) {
   const location = useLocation();
@@ -102,7 +104,7 @@ export function App() {
               path="/admin"
               element={
                 <RequireAuth>
-                  <Navigate to="/settings/overview" replace />
+                  <Navigate to="/settings/users" replace />
                 </RequireAuth>
               }
             />
@@ -114,14 +116,20 @@ export function App() {
                 </RequireAuth>
               }
             >
-              <Route index element={<Navigate to="/settings/overview" replace />} />
-              <Route path="overview" element={<SettingsOverviewPage />} />
-              <Route path="iam" element={<SettingsIamPage />} />
+              <Route index element={<Navigate to="/settings/users" replace />} />
+              <Route path="general" element={<SettingsOverviewPage />} />
+              <Route path="users" element={<SettingsIamPage />} />
+              <Route path="users/:userId" element={<SettingsIamUserPage />} />
+              <Route path="projects" element={<SettingsProjectsPage />} />
+              <Route path="projects/:projectId" element={<SettingsProjectDetailPage />} />
+              <Route path="tokens" element={<SettingsApiTokensPage />} />
+              <Route path="audit" element={<SettingsAuditLogsPage />} />
+              <Route path="overview" element={<Navigate to="/settings/general" replace />} />
+              <Route path="iam" element={<Navigate to="/settings/users" replace />} />
               <Route path="iam/users/:userId" element={<SettingsIamUserPage />} />
-              <Route path="users" element={<Navigate to="/settings/iam" replace />} />
-              <Route path="rbac" element={<Navigate to="/settings/iam" replace />} />
-              <Route path="api-tokens" element={<SettingsApiTokensPage />} />
-              <Route path="audit-logs" element={<SettingsAuditLogsPage />} />
+              <Route path="rbac" element={<Navigate to="/settings/users" replace />} />
+              <Route path="api-tokens" element={<Navigate to="/settings/tokens" replace />} />
+              <Route path="audit-logs" element={<Navigate to="/settings/audit" replace />} />
             </Route>
             <Route
               path="/account"

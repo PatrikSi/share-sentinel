@@ -1,20 +1,9 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import { StatePanel } from "@/components/state-panel";
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
-import { Membership, PROJECT_ROLES, Project, rolePillClass, UserRow } from "@/lib/iam";
-
-function statusPillClass(state: "positive" | "warning" | "neutral"): string {
-  if (state === "positive") return "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-200";
-  if (state === "warning") return "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200";
-  return "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200";
-}
-
-function formatDate(value: string): string {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return value;
-  return parsed.toLocaleDateString();
-}
+import { Membership, PROJECT_ROLES, Project, UserRow } from "@/lib/iam";
 
 type DirectorySummary = {
   users: {
@@ -23,70 +12,129 @@ type DirectorySummary = {
     pending: number;
     sysadmins: number;
   };
-  projects: {
-    total: number;
-  };
 };
+
+type SecuritySettings = {
+  password_min_length: number;
+  password_require_lowercase: boolean;
+  password_require_uppercase: boolean;
+  password_require_number: boolean;
+  password_require_special: boolean;
+};
+
+type FilterState = {
+  search: string;
+  is_active: string;
+  is_approved: string;
+  is_sysadmin: string;
+  project_id: string;
+};
+
+const DEFAULT_FILTERS: FilterState = {
+  search: "",
+  is_active: "all",
+  is_approved: "all",
+  is_sysadmin: "all",
+  project_id: "all",
+};
+
+function formatDate(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleDateString();
+}
+
+function passwordPolicySummary(settings: SecuritySettings | null): string {
+  if (!settings) return "Password policy unavailable.";
+  const parts = [`Minimum ${settings.password_min_length} characters`];
+  if (settings.password_require_lowercase) parts.push("lowercase");
+  if (settings.password_require_uppercase) parts.push("uppercase");
+  if (settings.password_require_number) parts.push("number");
+  if (settings.password_require_special) parts.push("special character");
+  return parts.join(", ");
+}
+
+function userStateBadges(user: UserRow): Array<{ label: string; className: string }> {
+  return [
+    {
+      label: user.is_active ? "Active" : "Disabled",
+      className: user.is_active ? "settings-badge settings-badge-positive" : "settings-badge settings-badge-warning",
+    },
+    {
+      label: user.is_approved ? "Approved" : "Pending approval",
+      className: user.is_approved ? "settings-badge settings-badge-neutral" : "settings-badge settings-badge-warning",
+    },
+    {
+      label: user.is_sysadmin ? "Sysadmin" : "Standard user",
+      className: user.is_sysadmin ? "settings-badge settings-badge-positive" : "settings-badge settings-badge-neutral",
+    },
+  ];
+}
 
 export function SettingsIamPage() {
   const [users, setUsers] = useState<UserRow[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [summary, setSummary] = useState<DirectorySummary | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [securitySettings, setSecuritySettings] = useState<SecuritySettings | null>(null);
 
-  const [userSearch, setUserSearch] = useState("");
-  const [userActiveFilter, setUserActiveFilter] = useState("all");
-  const [userApprovalFilter, setUserApprovalFilter] = useState("all");
-  const [userSysadminFilter, setUserSysadminFilter] = useState("all");
-  const [assignedProjectFilter, setAssignedProjectFilter] = useState("all");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+
   const [cursor, setCursor] = useState<string | null>(null);
   const [history, setHistory] = useState<Array<string | null>>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
 
+  const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTERS);
+  const [filterDraft, setFilterDraft] = useState<FilterState>(DEFAULT_FILTERS);
+
+  const [showCreateForm, setShowCreateForm] = useState(false);
   const [newUserEmail, setNewUserEmail] = useState("");
   const [newUserPassword, setNewUserPassword] = useState("");
   const [newUserSysadmin, setNewUserSysadmin] = useState(false);
-  const [newUserApproved, setNewUserApproved] = useState(true);
+  const [newUserApproved, setNewUserApproved] = useState(false);
   const [newUserAllProjects, setNewUserAllProjects] = useState(false);
   const [newUserAllProjectsRole, setNewUserAllProjectsRole] = useState("viewer");
 
-  const [error, setError] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
-
-  const loadProjects = async () => {
+  async function loadProjects() {
     const data = await apiFetch("/settings/projects");
     setProjects((data || []) as Project[]);
-  };
+  }
 
-  const loadSummary = async () => {
+  async function loadSummary() {
     const data = await apiFetch("/settings/overview");
     setSummary((data || null) as DirectorySummary | null);
-  };
+  }
 
-  const loadUsersPage = async () => {
-    const query = new URLSearchParams({ limit: "24" });
-    if (userSearch.trim()) query.set("search", userSearch.trim());
-    if (userActiveFilter !== "all") query.set("is_active", userActiveFilter);
-    if (userApprovalFilter !== "all") query.set("is_approved", userApprovalFilter);
-    if (userSysadminFilter !== "all") query.set("is_sysadmin", userSysadminFilter);
-    if (assignedProjectFilter !== "all") query.set("project_id", assignedProjectFilter);
-    if (cursor) query.set("cursor", cursor);
+  async function loadSecuritySettings() {
+    const data = await apiFetch("/auth/security-settings");
+    setSecuritySettings(data as SecuritySettings);
+  }
+
+  async function loadUsersPage(activeFilters: FilterState, activeCursor: string | null) {
+    const query = new URLSearchParams({ limit: "30" });
+    if (activeFilters.search.trim()) query.set("search", activeFilters.search.trim());
+    if (activeFilters.is_active !== "all") query.set("is_active", activeFilters.is_active);
+    if (activeFilters.is_approved !== "all") query.set("is_approved", activeFilters.is_approved);
+    if (activeFilters.is_sysadmin !== "all") query.set("is_sysadmin", activeFilters.is_sysadmin);
+    if (activeFilters.project_id !== "all") query.set("project_id", activeFilters.project_id);
+    if (activeCursor) query.set("cursor", activeCursor);
 
     const data = await apiFetch(`/users?${query.toString()}`);
     const rows = ((data?.items || []) as UserRow[]) || [];
     setUsers(rows);
     setNextCursor((data?.next_cursor as string | null) || null);
     return rows;
-  };
+  }
 
-  const loadMembershipsForUsers = async (userIds: string[]) => {
+  async function loadMembershipsForUsers(userIds: string[]) {
     if (userIds.length === 0) {
       setMemberships([]);
       return;
     }
     const rows = await apiFetchAllPages<Membership>((pageCursor) => {
-      const query = new URLSearchParams({ limit: "200" });
+      const query = new URLSearchParams({ limit: "250" });
       if (pageCursor) query.set("cursor", pageCursor);
       for (const userId of userIds) {
         query.append("user_ids", userId);
@@ -94,33 +142,31 @@ export function SettingsIamPage() {
       return `/settings/rbac/project-memberships?${query.toString()}`;
     });
     setMemberships(rows);
-  };
+  }
 
-  const refreshDirectory = async (includeMetadata = false) => {
+  async function refreshDirectory(activeFilters = filters, activeCursor = cursor) {
     setLoading(true);
     setError(null);
     try {
-      if (includeMetadata) {
-        await Promise.all([loadProjects(), loadSummary()]);
-      }
-      const rows = await loadUsersPage();
+      const rows = await loadUsersPage(activeFilters, activeCursor);
       await loadMembershipsForUsers(rows.map((user) => user.id));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load IAM directory");
+      setError(err instanceof Error ? err.message : "Failed to load users");
     } finally {
       setLoading(false);
     }
-  };
+  }
 
   useEffect(() => {
-    Promise.all([loadProjects(), loadSummary()]).catch((err) => {
-      setError(err instanceof Error ? err.message : "Failed to load IAM metadata");
+    Promise.all([loadProjects(), loadSummary(), loadSecuritySettings()]).catch((err) => {
+      setError(err instanceof Error ? err.message : "Failed to load user admin metadata");
     });
   }, []);
 
   useEffect(() => {
-    refreshDirectory().catch(() => undefined);
-  }, [assignedProjectFilter, cursor, userActiveFilter, userApprovalFilter, userSearch, userSysadminFilter]);
+    refreshDirectory(filters, cursor).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters, cursor]);
 
   const membershipsByUserId = useMemo(() => {
     const grouped = new Map<string, Membership[]>();
@@ -134,11 +180,6 @@ export function SettingsIamPage() {
     }
     return grouped;
   }, [memberships]);
-
-  useEffect(() => {
-    setCursor(null);
-    setHistory([]);
-  }, [assignedProjectFilter, userActiveFilter, userApprovalFilter, userSearch, userSysadminFilter]);
 
   async function createUser(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -157,17 +198,40 @@ export function SettingsIamPage() {
           all_projects_role: newUserAllProjectsRole,
         }),
       });
-      setInfo("Identity created.");
+      setInfo("User created.");
       setNewUserEmail("");
       setNewUserPassword("");
       setNewUserSysadmin(false);
-      setNewUserApproved(true);
+      setNewUserApproved(false);
       setNewUserAllProjects(false);
       setNewUserAllProjectsRole("viewer");
-      await Promise.all([loadSummary(), refreshDirectory()]);
+      setShowCreateForm(false);
+      await Promise.all([loadProjects(), loadSummary(), loadSecuritySettings(), refreshDirectory(filters, cursor)]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create identity");
+      setError(err instanceof Error ? err.message : "Failed to create user");
     }
+  }
+
+  function applyFilters(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setHistory([]);
+    setCursor(null);
+    setFilters({ ...filterDraft });
+  }
+
+  function clearFilters() {
+    setHistory([]);
+    setCursor(null);
+    setFilterDraft(DEFAULT_FILTERS);
+    setFilters(DEFAULT_FILTERS);
+  }
+
+  function setQuickView(partial: Partial<FilterState>) {
+    const nextFilters = { ...DEFAULT_FILTERS, ...partial };
+    setHistory([]);
+    setCursor(null);
+    setFilterDraft(nextFilters);
+    setFilters(nextFilters);
   }
 
   function previousPage() {
@@ -185,85 +249,144 @@ export function SettingsIamPage() {
   }
 
   return (
-    <>
-      {error || info ? (
-        <div className="workspace-section space-y-2">
-          {error ? <p className="rounded-xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{error}</p> : null}
-          {info ? <p className="rounded-xl bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">{info}</p> : null}
+    <div className="settings-page">
+      <div className="settings-page-header">
+        <div>
+          <h2 className="settings-page-title">Users</h2>
+          <p className="settings-page-copy">Manage user lifecycle, approvals, system administrators, and project access.</p>
+        </div>
+        <div className="settings-toolbar">
+          <button
+            className="settings-button"
+            onClick={() => {
+              setError(null);
+              setInfo(null);
+              setShowCreateForm((open) => !open);
+            }}
+            type="button"
+          >
+            {showCreateForm ? "Close User Form" : "New User"}
+          </button>
+          <button className="settings-button" onClick={() => refreshDirectory(filters, cursor).catch(() => undefined)} type="button">
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      {error ? (
+        <div className="settings-panel">
+          <p className="text-sm text-rose-700 dark:text-rose-200">{error}</p>
+        </div>
+      ) : null}
+      {info ? (
+        <div className="settings-panel">
+          <p className="text-sm text-emerald-700 dark:text-emerald-200">{info}</p>
         </div>
       ) : null}
 
-      <div className="workspace-section grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Identities</p>
-          <p className="mt-2 text-3xl font-semibold">{summary?.users.total ?? users.length}</p>
-          <p className="mt-2 text-sm text-slate-500">Directory-wide user count.</p>
-        </section>
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">System Admins</p>
-          <p className="mt-2 text-3xl font-semibold">{summary?.users.sysadmins ?? 0}</p>
-          <p className="mt-2 text-sm text-slate-500">Platform-wide administrators.</p>
-        </section>
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Pending Approval</p>
-          <p className="mt-2 text-3xl font-semibold">{summary?.users.pending ?? 0}</p>
-          <p className="mt-2 text-sm text-slate-500">Accounts waiting for approval.</p>
-        </section>
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Projects</p>
-          <p className="mt-2 text-3xl font-semibold">{summary?.projects.total ?? projects.length}</p>
-          <p className="mt-2 text-sm text-slate-500">Projects currently represented in the access catalog.</p>
-        </section>
-      </div>
+      <section className="settings-panel">
+        <div className="settings-grid-3">
+          <div className="settings-kpi">
+            <span className="settings-kpi-label">Total users</span>
+            <span className="settings-kpi-value">{summary?.users.total ?? users.length}</span>
+            <p className="settings-kpi-copy">Full directory count.</p>
+          </div>
+          <div className="settings-kpi">
+            <span className="settings-kpi-label">Pending approval</span>
+            <span className="settings-kpi-value">{summary?.users.pending ?? 0}</span>
+            <p className="settings-kpi-copy">Accounts waiting for review.</p>
+          </div>
+          <div className="settings-kpi">
+            <span className="settings-kpi-label">Sysadmins</span>
+            <span className="settings-kpi-value">{summary?.users.sysadmins ?? 0}</span>
+            <p className="settings-kpi-copy">Global administrators.</p>
+          </div>
+        </div>
+      </section>
 
-      <div className="workspace-section grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
-        <section className="workspace-card">
+      <section className="settings-panel">
+        <div className="settings-panel-header">
           <div>
-            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Create Identity</p>
-            <h2 className="mt-2 text-xl font-semibold">New user</h2>
-            <p className="mt-1 text-sm text-slate-500">Create the account here. Project-specific changes happen on the user detail page.</p>
+            <h3 className="settings-panel-title">Quick Views</h3>
+            <p className="settings-panel-copy">Start from the most common user queues and states.</p>
+          </div>
+        </div>
+        <div className="mt-4 settings-toolbar">
+          <button className="settings-button" onClick={() => setQuickView(DEFAULT_FILTERS)} type="button">
+            All Users
+          </button>
+          <button className="settings-button" onClick={() => setQuickView({ is_approved: "false" })} type="button">
+            Pending Approval
+          </button>
+          <button className="settings-button" onClick={() => setQuickView({ is_active: "false" })} type="button">
+            Disabled
+          </button>
+          <button className="settings-button" onClick={() => setQuickView({ is_sysadmin: "true" })} type="button">
+            Sysadmins
+          </button>
+        </div>
+      </section>
+
+      {showCreateForm ? (
+        <section className="settings-panel">
+          <div className="settings-panel-header">
+            <div>
+              <h3 className="settings-panel-title">Create User</h3>
+              <p className="settings-panel-copy">Use restrained defaults. Approval is off by default so access is explicit.</p>
+            </div>
           </div>
 
-          <form className="mt-5 space-y-3" onSubmit={createUser}>
-            <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
-              Email
-              <input
-                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-                placeholder="user@example.com"
-                type="email"
-                value={newUserEmail}
-                onChange={(event) => setNewUserEmail(event.target.value)}
-                required
-              />
-            </label>
-            <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
-              Temporary password
-              <input
-                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-                placeholder="Must satisfy server password policy"
-                type="password"
-                value={newUserPassword}
-                onChange={(event) => setNewUserPassword(event.target.value)}
-                required
-              />
-            </label>
-            <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300">
-              <input checked={newUserSysadmin} onChange={(event) => setNewUserSysadmin(event.target.checked)} type="checkbox" />
-              Grant system admin
-            </label>
-            <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300">
-              <input checked={newUserApproved} onChange={(event) => setNewUserApproved(event.target.checked)} type="checkbox" />
-              Mark approved immediately
-            </label>
-            <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300">
-              <input checked={newUserAllProjects} onChange={(event) => setNewUserAllProjects(event.target.checked)} type="checkbox" />
-              Add to every project on create
-            </label>
+          <form className="mt-4 grid gap-4" onSubmit={createUser}>
+            <div className="settings-grid-2">
+              <label className="settings-field">
+                <span className="settings-label">Email</span>
+                <input
+                  className="settings-input"
+                  placeholder="user@example.com"
+                  type="email"
+                  value={newUserEmail}
+                  onChange={(event) => setNewUserEmail(event.target.value)}
+                  required
+                />
+              </label>
+
+              <label className="settings-field">
+                <span className="settings-label">Temporary password</span>
+                <input
+                  className="settings-input"
+                  placeholder="Enter a temporary password"
+                  type="password"
+                  value={newUserPassword}
+                  onChange={(event) => setNewUserPassword(event.target.value)}
+                  required
+                />
+              </label>
+            </div>
+
+            <div className="settings-note-list">
+              <p>{passwordPolicySummary(securitySettings)}</p>
+            </div>
+
+            <div className="settings-toolbar">
+              <label className="inline-flex items-center gap-2 text-sm">
+                <input checked={newUserApproved} onChange={(event) => setNewUserApproved(event.target.checked)} type="checkbox" />
+                Approve immediately
+              </label>
+              <label className="inline-flex items-center gap-2 text-sm">
+                <input checked={newUserSysadmin} onChange={(event) => setNewUserSysadmin(event.target.checked)} type="checkbox" />
+                Grant sysadmin
+              </label>
+              <label className="inline-flex items-center gap-2 text-sm">
+                <input checked={newUserAllProjects} onChange={(event) => setNewUserAllProjects(event.target.checked)} type="checkbox" />
+                Add to every project
+              </label>
+            </div>
+
             {newUserAllProjects ? (
-              <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
-                Baseline project role
+              <label className="settings-field">
+                <span className="settings-label">Role for all projects</span>
                 <select
-                  className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  className="settings-select max-w-[220px]"
                   value={newUserAllProjectsRole}
                   onChange={(event) => setNewUserAllProjectsRole(event.target.value)}
                 >
@@ -275,167 +398,173 @@ export function SettingsIamPage() {
                 </select>
               </label>
             ) : null}
-            <button className="w-full rounded-lg bg-pine px-3 py-2 text-sm font-semibold text-white" type="submit">
-              Create identity
-            </button>
+
+            <div className="settings-toolbar">
+              <button className="settings-button-primary" type="submit">
+                Create User
+              </button>
+              <button
+                className="settings-button"
+                onClick={() => setShowCreateForm(false)}
+                type="button"
+              >
+                Cancel
+              </button>
+            </div>
           </form>
         </section>
+      ) : null}
 
-        <section className="workspace-card space-y-4">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <p className="text-xs uppercase tracking-[0.18em] text-slate-500">IAM Directory</p>
-              <h2 className="mt-2 text-xl font-semibold">Users and access tags</h2>
-              <p className="mt-1 text-sm text-slate-500">Each card shows identity state plus project role tags. Use Manage to edit one user at a time.</p>
-            </div>
-            <button
-              className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-              onClick={() => refreshDirectory().catch(() => undefined)}
-              type="button"
-            >
-              Refresh
+      <section className="settings-panel">
+        <div className="settings-panel-header">
+          <div>
+            <h3 className="settings-panel-title">Directory</h3>
+            <p className="settings-panel-copy">Dense user inventory with predictable filters and one clear detail path.</p>
+          </div>
+        </div>
+
+        <form className="mt-4 grid gap-4" onSubmit={applyFilters}>
+          <div className="settings-grid-3">
+            <label className="settings-field">
+              <span className="settings-label">Search</span>
+              <input
+                className="settings-input"
+                placeholder="Email or project name"
+                value={filterDraft.search}
+                onChange={(event) => setFilterDraft((prev) => ({ ...prev, search: event.target.value }))}
+              />
+            </label>
+
+            <label className="settings-field">
+              <span className="settings-label">Activity</span>
+              <select
+                className="settings-select"
+                value={filterDraft.is_active}
+                onChange={(event) => setFilterDraft((prev) => ({ ...prev, is_active: event.target.value }))}
+              >
+                <option value="all">All</option>
+                <option value="true">Active</option>
+                <option value="false">Disabled</option>
+              </select>
+            </label>
+
+            <label className="settings-field">
+              <span className="settings-label">Approval</span>
+              <select
+                className="settings-select"
+                value={filterDraft.is_approved}
+                onChange={(event) => setFilterDraft((prev) => ({ ...prev, is_approved: event.target.value }))}
+              >
+                <option value="all">All</option>
+                <option value="true">Approved</option>
+                <option value="false">Pending approval</option>
+              </select>
+            </label>
+
+            <label className="settings-field">
+              <span className="settings-label">System role</span>
+              <select
+                className="settings-select"
+                value={filterDraft.is_sysadmin}
+                onChange={(event) => setFilterDraft((prev) => ({ ...prev, is_sysadmin: event.target.value }))}
+              >
+                <option value="all">All</option>
+                <option value="true">Sysadmins</option>
+                <option value="false">Standard users</option>
+              </select>
+            </label>
+
+            <label className="settings-field">
+              <span className="settings-label">Project</span>
+              <select
+                className="settings-select"
+                value={filterDraft.project_id}
+                onChange={(event) => setFilterDraft((prev) => ({ ...prev, project_id: event.target.value }))}
+              >
+                <option value="all">All projects</option>
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div className="settings-toolbar">
+            <button className="settings-button-primary" type="submit">
+              Apply Filters
+            </button>
+            <button className="settings-button" onClick={clearFilters} type="button">
+              Clear
             </button>
           </div>
+        </form>
 
-          <div className="grid gap-2 md:grid-cols-5">
-            <input
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-              placeholder="Search email or project"
-              value={userSearch}
-              onChange={(event) => setUserSearch(event.target.value)}
-            />
-            <select
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-              value={userActiveFilter}
-              onChange={(event) => setUserActiveFilter(event.target.value)}
-            >
-              <option value="all">All activity</option>
-              <option value="true">Active only</option>
-              <option value="false">Disabled only</option>
-            </select>
-            <select
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-              value={userApprovalFilter}
-              onChange={(event) => setUserApprovalFilter(event.target.value)}
-            >
-              <option value="all">All approval</option>
-              <option value="true">Approved only</option>
-              <option value="false">Pending only</option>
-            </select>
-            <select
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-              value={userSysadminFilter}
-              onChange={(event) => setUserSysadminFilter(event.target.value)}
-            >
-              <option value="all">All system roles</option>
-              <option value="true">System admins</option>
-              <option value="false">Standard users</option>
-            </select>
-            <select
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-              value={assignedProjectFilter}
-              onChange={(event) => setAssignedProjectFilter(event.target.value)}
-            >
-              <option value="all">All projects</option>
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                </option>
-              ))}
-            </select>
+        {loading ? (
+          <div className="mt-4">
+            <StatePanel title="Loading Users" description="Fetching the current directory view." />
           </div>
-
-          {loading ? <p className="text-sm text-slate-500">Loading IAM directory…</p> : null}
-
-          {!loading && users.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-slate-300 px-4 py-8 text-center text-sm text-slate-500 dark:border-slate-700">
-              No identities match the current filters.
-            </div>
-          ) : null}
-
-          <div className="grid gap-3 2xl:grid-cols-2">
-            {users.map((user) => {
-              const assigned = membershipsByUserId.get(user.id) || [];
-              const visibleTags = assigned.slice(0, 4);
-              const hiddenCount = Math.max(0, assigned.length - visibleTags.length);
-              return (
-                <article className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800" key={user.id}>
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div>
-                      <h3 className="text-base font-semibold">{user.email}</h3>
-                      <p className="mt-1 text-xs text-slate-500">Created {formatDate(user.created_at)}</p>
-                    </div>
-                    <Link
-                      className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                      to={`/settings/iam/users/${user.id}`}
-                    >
-                      Manage
-                    </Link>
-                  </div>
-
-                  <div className="mt-4 flex flex-wrap gap-2 text-xs font-semibold uppercase tracking-wide">
-                    <span className={`rounded-full px-2.5 py-1 ${user.is_sysadmin ? statusPillClass("positive") : statusPillClass("neutral")}`}>
-                      {user.is_sysadmin ? "System admin" : "Standard user"}
-                    </span>
-                    <span className={`rounded-full px-2.5 py-1 ${user.is_active ? statusPillClass("positive") : statusPillClass("warning")}`}>
-                      {user.is_active ? "Active" : "Disabled"}
-                    </span>
-                    <span className={`rounded-full px-2.5 py-1 ${user.is_approved ? statusPillClass("positive") : statusPillClass("warning")}`}>
-                      {user.is_approved ? "Approved" : "Pending approval"}
-                    </span>
-                    <span className={`rounded-full px-2.5 py-1 ${statusPillClass("neutral")}`}>{assigned.length} project{assigned.length === 1 ? "" : "s"}</span>
-                  </div>
-
-                  <div className="mt-4 rounded-2xl bg-slate-50 p-3 dark:bg-slate-900/60">
-                    <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Project access</p>
-                    {assigned.length === 0 ? (
-                      <p className="mt-2 text-sm text-slate-500">No project assignments.</p>
-                    ) : (
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        {visibleTags.map((membership) => (
-                          <span className="inline-flex items-center gap-2 rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-700 dark:border-slate-700 dark:text-slate-200" key={`${membership.project_id}:${membership.user_id}`}>
-                            <span>{membership.project_name}</span>
-                            <span className={`rounded-full px-2 py-0.5 font-semibold uppercase tracking-wide ${rolePillClass(membership.role)}`}>
-                              {membership.role}
+        ) : users.length === 0 ? (
+          <div className="mt-4 settings-empty">No users matched the current filters.</div>
+        ) : (
+          <div className="mt-4 settings-table-wrap">
+            <table className="settings-table">
+              <thead>
+                <tr>
+                  <th>User</th>
+                  <th>State</th>
+                  <th>Project access</th>
+                  <th>Created</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {users.map((user) => {
+                  const assigned = membershipsByUserId.get(user.id) || [];
+                  const preview = assigned.slice(0, 2).map((membership) => membership.project_name).join(", ");
+                  return (
+                    <tr key={user.id}>
+                      <td>
+                        <div className="font-semibold">{user.email}</div>
+                        <div className="settings-meta">{user.id}</div>
+                      </td>
+                      <td>
+                        <div className="settings-badge-row">
+                          {userStateBadges(user).map((badge) => (
+                            <span className={badge.className} key={badge.label}>
+                              {badge.label}
                             </span>
-                          </span>
-                        ))}
-                        {hiddenCount > 0 ? (
-                          <span className="rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-500 dark:border-slate-700 dark:text-slate-300">
-                            +{hiddenCount} more
-                          </span>
-                        ) : null}
-                      </div>
-                    )}
-                  </div>
-                </article>
-              );
-            })}
+                          ))}
+                        </div>
+                      </td>
+                      <td>
+                        <div>{assigned.length} project{assigned.length === 1 ? "" : "s"}</div>
+                        {preview ? <div className="settings-meta">{preview}{assigned.length > 2 ? ", ..." : ""}</div> : null}
+                      </td>
+                      <td>{formatDate(user.created_at)}</td>
+                      <td className="text-right">
+                        <Link className="settings-button" to={`/settings/users/${user.id}`}>
+                          Manage
+                        </Link>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
+        )}
 
-          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--app-border)] pt-3">
-            <p className="text-xs text-slate-500">Membership tags are loaded only for users on the current page.</p>
-            <div className="flex gap-2">
-              <button
-                className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                disabled={history.length === 0}
-                onClick={previousPage}
-                type="button"
-              >
-                Previous
-              </button>
-              <button
-                className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                disabled={!nextCursor}
-                onClick={nextPage}
-                type="button"
-              >
-                Next
-              </button>
-            </div>
-          </div>
-        </section>
-      </div>
-    </>
+        <div className="mt-4 settings-toolbar">
+          <button className="settings-button" disabled={history.length === 0} onClick={previousPage} type="button">
+            Previous
+          </button>
+          <button className="settings-button" disabled={!nextCursor} onClick={nextPage} type="button">
+            Next
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }

@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import { useEffect, useState } from "react";
 
 import { StatePanel } from "@/components/state-panel";
@@ -17,12 +18,6 @@ type SecuritySettings = {
   auth_login_window_seconds: number;
   auth_login_lockout_seconds: number;
   default_api_token_expiry_days: number;
-  rbac_enabled: boolean;
-  mfa_enabled: boolean;
-  sso_enabled: boolean;
-  scim_enabled: boolean;
-  password_history_enforced: boolean;
-  session_idle_timeout_minutes: number | null;
 };
 
 type AuditEventRow = {
@@ -63,6 +58,15 @@ function formatTime(value: string | null): string {
   return parsed.toLocaleString();
 }
 
+function passwordPolicySummary(security: SecuritySettings): string {
+  const parts = [`Minimum ${security.password_min_length} characters`];
+  if (security.password_require_lowercase) parts.push("lowercase");
+  if (security.password_require_uppercase) parts.push("uppercase");
+  if (security.password_require_number) parts.push("number");
+  if (security.password_require_special) parts.push("special character");
+  return parts.join(", ");
+}
+
 export function SettingsOverviewPage() {
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
   const [loading, setLoading] = useState(true);
@@ -81,7 +85,7 @@ export function SettingsOverviewPage() {
         }
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Failed to load settings overview");
+          setError(err instanceof Error ? err.message : "Failed to load administration summary");
         }
       } finally {
         if (!cancelled) {
@@ -97,145 +101,234 @@ export function SettingsOverviewPage() {
   }, []);
 
   if (loading) {
-    return (
-      <div className="workspace-section">
-        <StatePanel title="Loading Overview" description="Pulling live security posture, token inventory, and recent audit activity." />
-      </div>
-    );
+    return <StatePanel title="Loading Administration Summary" description="Collecting current user, token, and policy state." />;
   }
 
   if (error) {
-    return (
-      <div className="workspace-section">
-        <StatePanel title="Overview Unavailable" description={error} tone="error" />
-      </div>
-    );
+    return <StatePanel title="Administration Summary Unavailable" description={error} tone="error" />;
   }
 
   if (!overview) {
-    return (
-      <div className="workspace-section">
-        <StatePanel title="No Overview Data" description="Security posture data was not returned by the API." tone="warning" />
-      </div>
-    );
+    return <StatePanel title="No Administration Summary" description="The API did not return summary data." tone="warning" />;
   }
 
   const { security, users, tokens, projects, recent_audit: recentAudit } = overview;
 
   return (
-    <div className="workspace-section space-y-4">
-      <div className="grid gap-4 xl:grid-cols-4">
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Registration</p>
-          <p className="mt-2 text-3xl font-semibold">{security.allow_self_registration ? "Open" : "Approval only"}</p>
-          <p className="mt-2 text-sm text-slate-500">Self-registration is {security.allow_self_registration ? "enabled" : "disabled"}.</p>
-        </section>
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Identity Directory</p>
-          <p className="mt-2 text-3xl font-semibold">{users.total}</p>
-          <p className="mt-2 text-sm text-slate-500">
-            {users.active} active, {users.pending} pending, {users.sysadmins} sysadmins.
-          </p>
-        </section>
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">API Tokens</p>
-          <p className="mt-2 text-3xl font-semibold">{tokens.active}</p>
-          <p className="mt-2 text-sm text-slate-500">
-            {tokens.revoked} revoked, {tokens.never_expires} never expire, issuance is{" "}
-            {security.allow_never_expiring_api_tokens ? "enabled" : "disabled"}.
-          </p>
-        </section>
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Projects</p>
-          <p className="mt-2 text-3xl font-semibold">{projects.total}</p>
-          <p className="mt-2 text-sm text-slate-500">Projects currently available for access control and token scoping.</p>
-        </section>
+    <div className="settings-page">
+      <div className="settings-page-header">
+        <div>
+          <h2 className="settings-page-title">General</h2>
+          <p className="settings-page-copy">A small admin home for the current system state and the next places to work.</p>
+        </div>
       </div>
 
-      <div className="grid gap-4">
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Password Policy</p>
-          <h2 className="mt-2 text-xl font-semibold">Current requirements</h2>
-          <div className="mt-4 flex flex-wrap gap-2 text-xs">
-            <span className="rounded-full bg-slate-100 px-3 py-1 dark:bg-slate-800">Min length: {security.password_min_length}</span>
-            {security.password_require_lowercase ? <span className="rounded-full bg-slate-100 px-3 py-1 dark:bg-slate-800">Lowercase required</span> : null}
-            {security.password_require_uppercase ? <span className="rounded-full bg-slate-100 px-3 py-1 dark:bg-slate-800">Uppercase required</span> : null}
-            {security.password_require_number ? <span className="rounded-full bg-slate-100 px-3 py-1 dark:bg-slate-800">Number required</span> : null}
-            {security.password_require_special ? <span className="rounded-full bg-slate-100 px-3 py-1 dark:bg-slate-800">Special char required</span> : null}
-          </div>
-          <div className="mt-5 grid gap-3 md:grid-cols-3">
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Login guardrail</p>
-              <p className="mt-1 text-sm font-semibold">{security.auth_login_max_attempts} attempts</p>
-              <p className="mt-1 text-xs text-slate-500">Within {security.auth_login_window_seconds} seconds.</p>
-            </div>
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Lockout</p>
-              <p className="mt-1 text-sm font-semibold">{security.auth_login_lockout_seconds} seconds</p>
-              <p className="mt-1 text-xs text-slate-500">Temporary lockout after repeated failures.</p>
-            </div>
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Session timeout</p>
-              <p className="mt-1 text-sm font-semibold">{security.session_idle_timeout_minutes ? `${security.session_idle_timeout_minutes} min` : "Not enforced"}</p>
-              <p className="mt-1 text-xs text-slate-500">Idle session expiration.</p>
+      <div className="settings-grid-2">
+        <section className="settings-panel">
+          <div className="settings-panel-header">
+            <div>
+              <h3 className="settings-panel-title">Attention</h3>
+              <p className="settings-panel-copy">Jump directly into the areas that usually need action.</p>
             </div>
           </div>
-        </section>
-      </div>
 
-      <div className="grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Token Hygiene</p>
-          <h2 className="mt-2 text-xl font-semibold">Credential posture</h2>
-          <div className="mt-4 space-y-3">
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Default expiry</p>
-              <p className="mt-1 text-sm font-semibold">{security.default_api_token_expiry_days} days</p>
+          <div className="mt-4 grid gap-3">
+            <div className="settings-kpi">
+              <span className="settings-kpi-label">Pending approvals</span>
+              <span className="settings-kpi-value">{users.pending}</span>
+              <p className="settings-kpi-copy">
+                Review account approvals in <Link className="font-semibold text-slate-900 underline dark:text-slate-100" to="/settings/users">Users</Link>.
+              </p>
             </div>
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Never-expiring tokens</p>
-              <p className="mt-1 text-sm font-semibold">{tokens.never_expires}</p>
+            <div className="settings-kpi">
+              <span className="settings-kpi-label">Projects</span>
+              <span className="settings-kpi-value">{projects.total}</span>
+              <p className="settings-kpi-copy">
+                Manage project ownership and cleanup in{" "}
+                <Link className="font-semibold text-slate-900 underline dark:text-slate-100" to="/settings/projects">
+                  Projects
+                </Link>
+                .
+              </p>
             </div>
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Issuance policy</p>
-              <p className="mt-1 text-sm font-semibold">{security.allow_never_expiring_api_tokens ? "Opt-in enabled" : "Expiry required"}</p>
-            </div>
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Last active token use</p>
-              <p className="mt-1 text-sm font-semibold">{formatTime(tokens.last_active_at)}</p>
+            <div className="settings-kpi">
+              <span className="settings-kpi-label">Never-expiring tokens</span>
+              <span className="settings-kpi-value">{tokens.never_expires}</span>
+              <p className="settings-kpi-copy">
+                Review credential risk in{" "}
+                <Link className="font-semibold text-slate-900 underline dark:text-slate-100" to="/settings/tokens">
+                  API Tokens
+                </Link>
+                .
+              </p>
             </div>
           </div>
         </section>
 
-        <section className="workspace-card">
-          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Recent Audit</p>
-          <h2 className="mt-2 text-xl font-semibold">Latest global events</h2>
-          {recentAudit.length === 0 ? (
-            <div className="mt-4">
-              <StatePanel title="No Audit Events" description="No recent global audit events were returned by the API." />
+        <section className="settings-panel">
+          <div className="settings-panel-header">
+            <div>
+              <h3 className="settings-panel-title">Policy Snapshot</h3>
+              <p className="settings-panel-copy">Read-only platform controls that affect user and token handling.</p>
             </div>
-          ) : (
-            <div className="mt-4 space-y-3">
-              {recentAudit.map((event) => (
-                <article className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800" key={event.id}>
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">{event.action}</p>
-                      <p className="mt-1 text-sm font-semibold">
-                        {event.object_type}: {event.object_id}
-                      </p>
-                    </div>
-                    <p className="text-xs text-slate-500">{formatTime(event.ts)}</p>
-                  </div>
-                  <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-                    Actor: {event.actor_email || "system"} {event.project_name ? `• Project: ${event.project_name}` : "• Global"}
-                  </p>
-                </article>
-              ))}
+          </div>
+
+          <dl className="mt-4 grid gap-3 text-sm">
+            <div className="flex items-start justify-between gap-3">
+              <dt className="text-slate-500 dark:text-slate-400">Registration</dt>
+              <dd>{security.allow_self_registration ? "Self-registration enabled" : "Approval required"}</dd>
             </div>
-          )}
+            <div className="flex items-start justify-between gap-3">
+              <dt className="text-slate-500 dark:text-slate-400">Password policy</dt>
+              <dd className="max-w-[32rem] text-right">{passwordPolicySummary(security)}</dd>
+            </div>
+            <div className="flex items-start justify-between gap-3">
+              <dt className="text-slate-500 dark:text-slate-400">Login throttling</dt>
+              <dd>
+                {security.auth_login_max_attempts} attempts in {security.auth_login_window_seconds}s, lock for{" "}
+                {security.auth_login_lockout_seconds}s
+              </dd>
+            </div>
+            <div className="flex items-start justify-between gap-3">
+              <dt className="text-slate-500 dark:text-slate-400">Default token expiry</dt>
+              <dd>{security.default_api_token_expiry_days} days</dd>
+            </div>
+            <div className="flex items-start justify-between gap-3">
+              <dt className="text-slate-500 dark:text-slate-400">Never-expiring tokens</dt>
+              <dd>{security.allow_never_expiring_api_tokens ? "Allowed" : "Blocked"}</dd>
+            </div>
+            <div className="flex items-start justify-between gap-3">
+              <dt className="text-slate-500 dark:text-slate-400">CSRF protection</dt>
+              <dd>{security.auth_require_csrf ? "Required" : "Disabled"}</dd>
+            </div>
+            <div className="flex items-start justify-between gap-3">
+              <dt className="text-slate-500 dark:text-slate-400">Secure auth cookies</dt>
+              <dd>{security.auth_cookie_secure ? "Enabled" : "Disabled"}</dd>
+            </div>
+          </dl>
         </section>
       </div>
+
+      <div className="settings-grid-3">
+        <section className="settings-panel">
+          <div className="settings-panel-header">
+            <div>
+              <h3 className="settings-panel-title">Users</h3>
+              <p className="settings-panel-copy">Current directory footprint.</p>
+            </div>
+          </div>
+          <div className="mt-4 grid gap-2 text-sm">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-slate-500 dark:text-slate-400">Total users</span>
+              <span>{users.total}</span>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-slate-500 dark:text-slate-400">Active</span>
+              <span>{users.active}</span>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-slate-500 dark:text-slate-400">Sysadmins</span>
+              <span>{users.sysadmins}</span>
+            </div>
+          </div>
+        </section>
+
+        <section className="settings-panel">
+          <div className="settings-panel-header">
+            <div>
+              <h3 className="settings-panel-title">Tokens</h3>
+              <p className="settings-panel-copy">Machine credential posture.</p>
+            </div>
+          </div>
+          <div className="mt-4 grid gap-2 text-sm">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-slate-500 dark:text-slate-400">Active</span>
+              <span>{tokens.active}</span>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-slate-500 dark:text-slate-400">Revoked</span>
+              <span>{tokens.revoked}</span>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-slate-500 dark:text-slate-400">Last activity</span>
+              <span>{formatTime(tokens.last_active_at)}</span>
+            </div>
+          </div>
+        </section>
+
+        <section className="settings-panel">
+          <div className="settings-panel-header">
+            <div>
+              <h3 className="settings-panel-title">Next Steps</h3>
+              <p className="settings-panel-copy">The main admin surfaces linked from one place.</p>
+            </div>
+          </div>
+          <ul className="mt-4 settings-note-list">
+            <li>
+              <Link className="font-semibold text-slate-900 underline dark:text-slate-100" to="/settings/users">
+                Users
+              </Link>
+              : approvals, lifecycle, and project access.
+            </li>
+            <li>
+              <Link className="font-semibold text-slate-900 underline dark:text-slate-100" to="/settings/projects">
+                Projects
+              </Link>
+              : ownership, members, and deletion.
+            </li>
+            <li>
+              <Link className="font-semibold text-slate-900 underline dark:text-slate-100" to="/settings/audit">
+                Audit Log
+              </Link>
+              : privileged activity and export.
+            </li>
+          </ul>
+        </section>
+      </div>
+
+      <section className="settings-panel">
+        <div className="settings-panel-header">
+          <div>
+            <h3 className="settings-panel-title">Recent Administrative Activity</h3>
+            <p className="settings-panel-copy">Recent cross-system events for fast orientation, with full review in the audit log.</p>
+          </div>
+          <Link className="settings-button" to="/settings/audit">
+            Open Audit Log
+          </Link>
+        </div>
+
+        {recentAudit.length === 0 ? (
+          <div className="mt-4 settings-empty">No recent audit events were returned.</div>
+        ) : (
+          <div className="mt-4 settings-table-wrap">
+            <table className="settings-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Action</th>
+                  <th>Object</th>
+                  <th>Actor</th>
+                  <th>Scope</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recentAudit.map((event) => (
+                  <tr key={event.id}>
+                    <td>{formatTime(event.ts)}</td>
+                    <td>{event.action}</td>
+                    <td>
+                      <div>{event.object_type}</div>
+                      <div className="settings-meta">{event.object_id}</div>
+                    </td>
+                    <td>{event.actor_email || "system"}</td>
+                    <td>{event.project_name || "Global"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </div>
   );
 }

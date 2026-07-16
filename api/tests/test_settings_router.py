@@ -8,9 +8,9 @@ from fastapi.testclient import TestClient
 
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_sysadmin
-from app.enums import ProjectRole
+from app.enums import ProjectRole, RunStatus
 from app.main import app
-from app.models import ApiToken, Project, ProjectMember, User
+from app.models import ApiToken, AuditEvent, Project, ProjectMember, User
 
 
 class _ExecuteResult:
@@ -19,6 +19,11 @@ class _ExecuteResult:
 
     def all(self):
         return self._rows
+
+    def first(self):
+        if not self._rows:
+            return None
+        return self._rows[0]
 
     def scalars(self):
         return self
@@ -32,12 +37,19 @@ class _ExecuteResult:
 @dataclass
 class _FakeDb:
     execute_queue: list[_ExecuteResult] = field(default_factory=list)
+    executed_statements: list[tuple[Any, Any | None]] = field(default_factory=list)
     get_map: dict[tuple[Any, Any], Any] = field(default_factory=dict)
     added: list[Any] = field(default_factory=list)
     deleted: list[Any] = field(default_factory=list)
     commit_count: int = 0
 
-    def execute(self, _statement):
+    def execute(self, _statement, params=None):
+        self.executed_statements.append((_statement, params))
+        statement_text = str(_statement)
+        if "pg_try_advisory_xact_lock" in statement_text:
+            return _ExecuteResult([True])
+        if "pg_advisory_xact_lock" in statement_text:
+            return _ExecuteResult([1])
         if not self.execute_queue:
             raise AssertionError("unexpected execute() call with empty queue")
         return self.execute_queue.pop(0)
@@ -53,6 +65,9 @@ class _FakeDb:
 
     def commit(self):
         self.commit_count += 1
+
+    def rollback(self):
+        return None
 
     def flush(self):
         for obj in self.added:
@@ -93,6 +108,24 @@ def _clear_overrides():
     app.dependency_overrides.clear()
 
 
+def _project_catalog_row(project_id: uuid.UUID, **overrides: Any) -> SimpleNamespace:
+    values = {
+        "project_id": project_id,
+        "project_name": "Core",
+        "created_at": datetime.now(tz=UTC),
+        "member_count": 3,
+        "admin_count": 1,
+        "token_count": 4,
+        "active_token_count": 3,
+        "run_count": 2,
+        "artifact_count": 2,
+        "blocking_run_count": 0,
+        "last_run_at": datetime.now(tz=UTC),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_settings_projects_lists_global_projects() -> None:
     fake_db = _FakeDb()
     project = SimpleNamespace(id=uuid.uuid4(), name="Core", created_at=datetime.now(tz=UTC))
@@ -109,6 +142,200 @@ def test_settings_projects_lists_global_projects() -> None:
     assert len(payload) == 1
     assert payload[0]["id"] == str(project.id)
     assert payload[0]["name"] == "Core"
+
+
+def test_settings_project_catalog_and_detail() -> None:
+    fake_db = _FakeDb()
+    project_id = uuid.uuid4()
+    blocking_run = SimpleNamespace(
+        id=uuid.uuid4(),
+        name="Queued ingest",
+        status=RunStatus.UPLOADED,
+        created_at=datetime.now(tz=UTC),
+    )
+    fake_db.execute_queue.extend(
+        [
+            _ExecuteResult([_project_catalog_row(project_id, blocking_run_count=1)]),
+            _ExecuteResult([_project_catalog_row(project_id, blocking_run_count=1)]),
+            _ExecuteResult(
+                [
+                    SimpleNamespace(status=RunStatus.COMPLETE, count=5),
+                    SimpleNamespace(status=RunStatus.UPLOADED, count=1),
+                ]
+            ),
+            _ExecuteResult([blocking_run]),
+        ]
+    )
+
+    client = _client_for_db(fake_db)
+    try:
+        catalog_response = client.get("/settings/projects/catalog")
+        detail_response = client.get(f"/settings/projects/{project_id}")
+    finally:
+        _clear_overrides()
+
+    assert catalog_response.status_code == 200
+    catalog_payload = catalog_response.json()
+    assert len(catalog_payload["items"]) == 1
+    assert catalog_payload["items"][0]["id"] == str(project_id)
+    assert catalog_payload["items"][0]["has_blocking_runs"] is True
+    assert catalog_payload["items"][0]["blocking_run_count"] == 1
+
+    assert detail_response.status_code == 200
+    detail_payload = detail_response.json()
+    assert detail_payload["id"] == str(project_id)
+    assert detail_payload["run_status_counts"]["COMPLETE"] == 5
+    assert detail_payload["run_status_counts"]["UPLOADED"] == 1
+    assert detail_payload["run_status_counts"]["INGESTING"] == 0
+    assert detail_payload["blocking_runs"] == [
+        {
+            "id": str(blocking_run.id),
+            "name": "Queued ingest",
+            "status": "UPLOADED",
+            "created_at": blocking_run.created_at.isoformat().replace("+00:00", "Z"),
+        }
+    ]
+
+
+def test_settings_project_rename() -> None:
+    fake_db = _FakeDb()
+    actor_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    project = SimpleNamespace(id=project_id, name="Core", created_at=datetime.now(tz=UTC))
+    fake_db.get_map[(Project, project_id)] = project
+
+    client = _client_for_db(fake_db, actor_user_id=actor_id)
+    try:
+        response = client.patch(f"/settings/projects/{project_id}", json={"name": "Renamed Core"})
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == str(project_id)
+    assert payload["name"] == "Renamed Core"
+    assert project.name == "Renamed Core"
+    audit_event = next(obj for obj in fake_db.added if isinstance(obj, AuditEvent))
+    assert audit_event.action == "SETTINGS_PROJECT_RENAMED"
+    assert audit_event.metadata_json["previous_name"] == "Core"
+
+
+def test_settings_project_delete_reports_artifact_failures(monkeypatch) -> None:
+    fake_db = _FakeDb()
+    actor_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    project = SimpleNamespace(id=project_id, name="Core")
+    run_a = SimpleNamespace(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        name="Baseline",
+        status=RunStatus.COMPLETE,
+        created_at=datetime.now(tz=UTC),
+        artifact_key="projects/core/runs/a/artifact.ndjson",
+    )
+    run_b = SimpleNamespace(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        name="Follow-up",
+        status=RunStatus.FAILED,
+        created_at=datetime.now(tz=UTC),
+        artifact_key="projects/core/runs/b/artifact.ndjson",
+    )
+    fake_db.get_map[(Project, project_id)] = project
+    fake_db.execute_queue.append(_ExecuteResult([run_a, run_b]))
+
+    def _fake_delete_object(key: str) -> None:
+        if key == run_b.artifact_key:
+            raise OSError("disk busy")
+
+    monkeypatch.setattr("app.routers.settings.delete_object", _fake_delete_object)
+
+    client = _client_for_db(fake_db, actor_user_id=actor_id)
+    try:
+        response = client.delete(f"/settings/projects/{project_id}")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["project_id"] == str(project_id)
+    assert payload["project_name"] == "Core"
+    assert payload["deleted_run_count"] == 2
+    assert payload["deleted_artifact_count"] == 2
+    assert payload["artifact_delete_failures"] == [
+        {
+            "artifact_key": run_b.artifact_key,
+            "error": "disk busy",
+        }
+    ]
+    assert fake_db.deleted == [project]
+    assert fake_db.commit_count == 1
+    audit_event = next(obj for obj in fake_db.added if isinstance(obj, AuditEvent))
+    assert audit_event.action == "SETTINGS_PROJECT_DELETED"
+    assert audit_event.metadata_json["deleted_run_count"] == 2
+
+
+def test_settings_project_delete_blocks_uploaded_or_ingesting_runs() -> None:
+    fake_db = _FakeDb()
+    project_id = uuid.uuid4()
+    fake_db.get_map[(Project, project_id)] = SimpleNamespace(id=project_id, name="Core")
+    fake_db.execute_queue.append(
+        _ExecuteResult(
+            [
+                SimpleNamespace(
+                    id=uuid.uuid4(),
+                    project_id=project_id,
+                    name="Queued ingest",
+                    status=RunStatus.UPLOADED,
+                    created_at=datetime.now(tz=UTC),
+                    artifact_key="projects/core/runs/a/artifact.ndjson",
+                )
+            ]
+        )
+    )
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.delete(f"/settings/projects/{project_id}")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 409
+    assert "UPLOADED or INGESTING" in response.json()["detail"]
+    assert fake_db.deleted == []
+    assert fake_db.commit_count == 0
+
+
+def test_settings_project_delete_blocks_when_run_lock_cannot_be_acquired(monkeypatch) -> None:
+    fake_db = _FakeDb()
+    project_id = uuid.uuid4()
+    fake_db.get_map[(Project, project_id)] = SimpleNamespace(id=project_id, name="Core")
+    fake_db.execute_queue.append(
+        _ExecuteResult(
+            [
+                SimpleNamespace(
+                    id=uuid.uuid4(),
+                    project_id=project_id,
+                    name="Complete run",
+                    status=RunStatus.COMPLETE,
+                    created_at=datetime.now(tz=UTC),
+                    artifact_key="projects/core/runs/a/artifact.ndjson",
+                )
+            ]
+        )
+    )
+    monkeypatch.setattr("app.routers.settings._try_lock_run_for_mutation", lambda *_args: False)
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.delete(f"/settings/projects/{project_id}")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 409
+    assert "cannot be locked" in response.json()["detail"]
+    assert fake_db.deleted == []
+    assert fake_db.commit_count == 0
 
 
 def test_settings_api_tokens_list_and_revoke() -> None:
@@ -150,6 +377,37 @@ def test_settings_api_tokens_list_and_revoke() -> None:
     assert fake_db.commit_count == 2
 
 
+def test_settings_api_tokens_support_exact_project_filter() -> None:
+    fake_db = _FakeDb()
+    actor_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    token = SimpleNamespace(
+        id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        project_id=project_id,
+        name="collector",
+        role=ProjectRole.ADMIN,
+        scopes=["read:projects"],
+        last_used_at=None,
+        expires_at=None,
+        created_at=datetime.now(tz=UTC),
+        revoked_at=None,
+    )
+    row = SimpleNamespace(ApiToken=token, user_email="owner@example.com", project_name="Core")
+    fake_db.execute_queue.append(_ExecuteResult([row]))
+
+    client = _client_for_db(fake_db, actor_user_id=actor_id)
+    try:
+        response = client.get(f"/settings/api-tokens?project_id={project_id}")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    assert "api_tokens.project_id" in str(fake_db.executed_statements[0][0])
+    audit_event = next(obj for obj in fake_db.added if isinstance(obj, AuditEvent))
+    assert audit_event.metadata_json["project_id"] == str(project_id)
+
+
 def test_settings_audit_lists_global_events() -> None:
     fake_db = _FakeDb()
     event = SimpleNamespace(
@@ -180,6 +438,35 @@ def test_settings_audit_lists_global_events() -> None:
     assert payload["items"][0]["actor_email"] == "admin@example.com"
     assert payload["items"][0]["project_name"] == "Core"
     assert payload["items"][0]["metadata"]["ip"] == "127.0.0.1"
+
+
+def test_settings_audit_supports_exact_project_filter() -> None:
+    fake_db = _FakeDb()
+    project_id = uuid.uuid4()
+    event = SimpleNamespace(
+        id=44,
+        ts=datetime.now(tz=UTC),
+        actor_user_id=uuid.uuid4(),
+        actor_token_id=None,
+        project_id=project_id,
+        action="RUN_CREATED",
+        object_type="scan_run",
+        object_id="run-2",
+        metadata_json={"ip": "127.0.0.1"},
+    )
+    row = SimpleNamespace(AuditEvent=event, actor_email="admin@example.com", project_name="Core")
+    fake_db.execute_queue.append(_ExecuteResult([row]))
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get(f"/settings/audit?project_id={project_id}")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    assert "audit_events.project_id" in str(fake_db.executed_statements[0][0])
+    audit_event = next(obj for obj in fake_db.added if isinstance(obj, AuditEvent))
+    assert audit_event.metadata_json["project_id"] == str(project_id)
 
 
 def test_settings_audit_export_returns_csv_attachment() -> None:

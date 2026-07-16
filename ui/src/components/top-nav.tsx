@@ -43,7 +43,7 @@ export function TopNav() {
     { to: "/account", label: "Account", match: "/account" },
   ];
   if (session.user?.is_sysadmin) {
-    navItems.push({ to: "/settings/iam", label: "Settings", match: "/settings" });
+    navItems.push({ to: "/settings/users", label: "Settings", match: "/settings" });
   }
   const showDashboardControls = inProjectArea;
 

@@ -133,6 +133,59 @@ class ProjectOut(BaseModel):
     created_at: datetime
 
 
+class ProjectUpdateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("name must not be blank")
+        return normalized
+
+
+class SettingsProjectCatalogItemOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    created_at: datetime
+    member_count: int
+    admin_count: int
+    token_count: int
+    active_token_count: int
+    run_count: int
+    artifact_count: int
+    blocking_run_count: int
+    has_blocking_runs: bool
+    last_run_at: datetime | None
+
+
+class SettingsProjectBlockingRunOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    status: RunStatus
+    created_at: datetime
+
+
+class SettingsProjectDetailOut(SettingsProjectCatalogItemOut):
+    run_status_counts: dict[str, int]
+    blocking_runs: list[SettingsProjectBlockingRunOut]
+
+
+class SettingsProjectArtifactDeleteFailureOut(BaseModel):
+    artifact_key: str
+    error: str
+
+
+class SettingsProjectDeleteOut(BaseModel):
+    ok: bool = True
+    project_id: uuid.UUID
+    project_name: str
+    deleted_run_count: int
+    deleted_artifact_count: int
+    artifact_delete_failures: list[SettingsProjectArtifactDeleteFailureOut]
+
+
 class MemberAddIn(BaseModel):
     user_id: uuid.UUID
     role: ProjectRole

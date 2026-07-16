@@ -1,18 +1,20 @@
 import csv
 import json
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy import String, case, cast, func, or_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import escape_like, get_db
-from app.enums import ProjectRole
+from app.enums import ProjectRole, RunStatus
 from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
-from app.models import ApiToken, AuditEvent, Project, ProjectMember, User
+from app.models import ApiToken, AuditEvent, Project, ProjectMember, ScanRun, User
 from app.locking import lock_project_admin_guard
 from app.pagination import (
     KeysetColumn,
@@ -30,17 +32,25 @@ from app.schemas import (
     ProjectMembershipOut,
     ProjectMembershipUpsertIn,
     ProjectOut,
+    ProjectUpdateIn,
     SecuritySettingsOut,
+    SettingsProjectArtifactDeleteFailureOut,
+    SettingsProjectBlockingRunOut,
+    SettingsProjectCatalogItemOut,
+    SettingsProjectDeleteOut,
+    SettingsProjectDetailOut,
     UserAssignAllProjectsIn,
 )
 from app.routers import users as users_router
 from app.security import hash_external_token, random_token
 from app.services.audit import write_audit_event
+from app.services.storage import delete_object
 from app.token_scopes import (
     ALLOWED_API_TOKEN_SCOPES,
     SCOPE_READ_AUDIT,
     SCOPE_READ_MEMBERS,
     SCOPE_READ_TOKENS,
+    SCOPE_WRITE_PROJECTS,
     SCOPE_WRITE_MEMBERS,
     SCOPE_WRITE_TOKENS,
     default_scopes_for_project_role,
@@ -48,6 +58,7 @@ from app.token_scopes import (
 )
 
 router = APIRouter(prefix="/settings", tags=["settings"])
+logger = logging.getLogger("share_sentinel.settings")
 SETTINGS_API_TOKEN_CURSOR = (
     KeysetColumn(
         "created_at",
@@ -62,6 +73,15 @@ SETTINGS_API_TOKEN_CURSOR = (
         direction="desc",
         parser=parse_uuid_cursor_value,
         getter=lambda row: row.ApiToken.id,
+    ),
+)
+SETTINGS_PROJECT_CURSOR = (
+    KeysetColumn("project_name", Project.name, getter=lambda row: row.project_name),
+    KeysetColumn(
+        "project_id",
+        Project.id,
+        parser=parse_uuid_cursor_value,
+        getter=lambda row: row.project_id,
     ),
 )
 SETTINGS_AUDIT_CURSOR = (
@@ -86,9 +106,18 @@ ROLE_ORDER = {
     ProjectRole.OPERATOR: 2,
     ProjectRole.ADMIN: 3,
 }
+PROJECT_DELETE_BLOCKING_STATUSES = (RunStatus.UPLOADED, RunStatus.INGESTING)
 
 
-def _global_audit_stmt(q: str | None):
+def _run_lock_key(run_id: uuid.UUID) -> int:
+    return run_id.int % (2**63 - 1)
+
+
+def _try_lock_run_for_mutation(db: Session, run_id: uuid.UUID) -> bool:
+    return bool(db.execute(text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": _run_lock_key(run_id)}).scalar())
+
+
+def _global_audit_stmt(q: str | None, project_id: uuid.UUID | None = None):
     stmt = (
         select(
             AuditEvent,
@@ -98,6 +127,8 @@ def _global_audit_stmt(q: str | None):
         .outerjoin(User, User.id == AuditEvent.actor_user_id)
         .outerjoin(Project, Project.id == AuditEvent.project_id)
     )
+    if project_id is not None:
+        stmt = stmt.where(AuditEvent.project_id == project_id)
     if q:
         escaped = escape_like(q.strip())
         pattern = f"%{escaped}%"
@@ -132,6 +163,141 @@ def _serialize_audit_rows(rows) -> list[dict]:
     ]
 
 
+def _project_catalog_stmt(q: str | None = None, project_id: uuid.UUID | None = None):
+    member_counts = (
+        select(
+            ProjectMember.project_id.label("project_id"),
+            func.count(ProjectMember.user_id).label("member_count"),
+            func.sum(case((ProjectMember.role == ProjectRole.ADMIN, 1), else_=0)).label("admin_count"),
+        )
+        .group_by(ProjectMember.project_id)
+        .subquery()
+    )
+    token_counts = (
+        select(
+            ApiToken.project_id.label("project_id"),
+            func.count(ApiToken.id).label("token_count"),
+            func.sum(case((ApiToken.revoked_at.is_(None), 1), else_=0)).label("active_token_count"),
+        )
+        .group_by(ApiToken.project_id)
+        .subquery()
+    )
+    run_counts = (
+        select(
+            ScanRun.project_id.label("project_id"),
+            func.count(ScanRun.id).label("run_count"),
+            func.sum(case((ScanRun.artifact_key.is_not(None), 1), else_=0)).label("artifact_count"),
+            func.sum(case((ScanRun.status.in_(PROJECT_DELETE_BLOCKING_STATUSES), 1), else_=0)).label("blocking_run_count"),
+            func.max(ScanRun.created_at).label("last_run_at"),
+        )
+        .group_by(ScanRun.project_id)
+        .subquery()
+    )
+
+    stmt = (
+        select(
+            Project.id.label("project_id"),
+            Project.name.label("project_name"),
+            Project.created_at.label("created_at"),
+            func.coalesce(member_counts.c.member_count, 0).label("member_count"),
+            func.coalesce(member_counts.c.admin_count, 0).label("admin_count"),
+            func.coalesce(token_counts.c.token_count, 0).label("token_count"),
+            func.coalesce(token_counts.c.active_token_count, 0).label("active_token_count"),
+            func.coalesce(run_counts.c.run_count, 0).label("run_count"),
+            func.coalesce(run_counts.c.artifact_count, 0).label("artifact_count"),
+            func.coalesce(run_counts.c.blocking_run_count, 0).label("blocking_run_count"),
+            run_counts.c.last_run_at.label("last_run_at"),
+        )
+        .outerjoin(member_counts, member_counts.c.project_id == Project.id)
+        .outerjoin(token_counts, token_counts.c.project_id == Project.id)
+        .outerjoin(run_counts, run_counts.c.project_id == Project.id)
+    )
+    if project_id is not None:
+        stmt = stmt.where(Project.id == project_id)
+    if q:
+        escaped = escape_like(q.strip())
+        pattern = f"%{escaped}%"
+        stmt = stmt.where(
+            or_(
+                Project.name.ilike(pattern, escape="\\"),
+                cast(Project.id, String).ilike(pattern, escape="\\"),
+            )
+        )
+    return stmt
+
+
+def _project_catalog_item_out(row) -> SettingsProjectCatalogItemOut:
+    blocking_run_count = int(row.blocking_run_count or 0)
+    return SettingsProjectCatalogItemOut(
+        id=row.project_id,
+        name=row.project_name,
+        created_at=row.created_at,
+        member_count=int(row.member_count or 0),
+        admin_count=int(row.admin_count or 0),
+        token_count=int(row.token_count or 0),
+        active_token_count=int(row.active_token_count or 0),
+        run_count=int(row.run_count or 0),
+        artifact_count=int(row.artifact_count or 0),
+        blocking_run_count=blocking_run_count,
+        has_blocking_runs=blocking_run_count > 0,
+        last_run_at=row.last_run_at,
+    )
+
+
+def _project_detail_out(db: Session, project_id: uuid.UUID) -> SettingsProjectDetailOut:
+    row = db.execute(_project_catalog_stmt(project_id=project_id)).first()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+
+    status_counts = {run_status.value: 0 for run_status in RunStatus}
+    status_rows = db.execute(
+        select(ScanRun.status.label("status"), func.count(ScanRun.id).label("count"))
+        .where(ScanRun.project_id == project_id)
+        .group_by(ScanRun.status)
+    ).all()
+    for status_row in status_rows:
+        status_counts[status_row.status.value] = int(status_row.count or 0)
+
+    blocking_runs = db.execute(
+        select(ScanRun)
+        .where(ScanRun.project_id == project_id, ScanRun.status.in_(PROJECT_DELETE_BLOCKING_STATUSES))
+        .order_by(ScanRun.created_at.desc(), ScanRun.id.desc())
+    ).scalars().all()
+
+    summary = _project_catalog_item_out(row)
+    return SettingsProjectDetailOut(
+        **summary.model_dump(),
+        run_status_counts=status_counts,
+        blocking_runs=[
+            SettingsProjectBlockingRunOut(
+                id=run.id,
+                name=run.name,
+                status=run.status,
+                created_at=run.created_at,
+            )
+            for run in blocking_runs
+        ],
+    )
+
+
+def _delete_artifacts_best_effort(keys: list[str]) -> list[SettingsProjectArtifactDeleteFailureOut]:
+    failures: list[SettingsProjectArtifactDeleteFailureOut] = []
+    for key in keys:
+        try:
+            delete_object(key)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            logger.warning("failed to delete project artifact key=%s", key, exc_info=True)
+            failures.append(
+                SettingsProjectArtifactDeleteFailureOut(
+                    artifact_key=key,
+                    error=str(exc) or exc.__class__.__name__,
+                )
+            )
+    return failures
+
+
 @router.get("/projects", response_model=list[ProjectOut])
 def list_all_projects(
     db: Session = Depends(get_db),
@@ -141,6 +307,131 @@ def list_all_projects(
     _ = __
     projects = db.execute(select(Project).order_by(Project.created_at.desc())).scalars().all()
     return [ProjectOut(id=project.id, name=project.name, created_at=project.created_at) for project in projects]
+
+
+@router.get("/projects/catalog", response_model=dict)
+def list_project_catalog(
+    q: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    cursor: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_MEMBERS)),
+    __: User = Depends(require_sysadmin),
+):
+    _ = __
+    stmt = apply_keyset_pagination(_project_catalog_stmt(q=q), SETTINGS_PROJECT_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).all(), SETTINGS_PROJECT_CURSOR, limit)
+    items = [_project_catalog_item_out(row).model_dump(mode="json") for row in rows]
+    return {"items": items, "next_cursor": next_cursor}
+
+
+@router.get("/projects/{project_id}", response_model=SettingsProjectDetailOut)
+def get_project_detail(
+    project_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_MEMBERS)),
+    __: User = Depends(require_sysadmin),
+):
+    _ = __
+    return _project_detail_out(db, project_id)
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectOut)
+def rename_project(
+    project_id: uuid.UUID,
+    payload: ProjectUpdateIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_PROJECTS)),
+    __: User = Depends(require_sysadmin),
+):
+    _ = __
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+
+    previous_name = project.name
+    project.name = payload.name
+    db.add(project)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="project name already exists") from exc
+
+    write_audit_event(
+        db,
+        action="SETTINGS_PROJECT_RENAMED",
+        object_type="project",
+        object_id=str(project_id),
+        actor_user_id=auth.user_id,
+        project_id=project_id,
+        metadata={**request_meta(request), "previous_name": previous_name, "name": project.name},
+    )
+    db.commit()
+    db.refresh(project)
+    return ProjectOut(id=project.id, name=project.name, created_at=project.created_at)
+
+
+@router.delete("/projects/{project_id}", response_model=SettingsProjectDeleteOut)
+def delete_project(
+    project_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_PROJECTS)),
+    __: User = Depends(require_sysadmin),
+):
+    _ = __
+    lock_project_admin_guard(db, project_id)
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="project not found")
+
+    runs = db.execute(
+        select(ScanRun).where(ScanRun.project_id == project_id).order_by(ScanRun.created_at.desc(), ScanRun.id.desc())
+    ).scalars().all()
+
+    if any(run.status in PROJECT_DELETE_BLOCKING_STATUSES for run in runs):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="project has runs in UPLOADED or INGESTING state",
+        )
+
+    for run in runs:
+        if not _try_lock_run_for_mutation(db, run.id):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="project has a run that cannot be locked for deletion",
+            )
+
+    artifact_keys = [run.artifact_key for run in runs if run.artifact_key]
+    db.delete(project)
+    write_audit_event(
+        db,
+        action="SETTINGS_PROJECT_DELETED",
+        object_type="project",
+        object_id=str(project_id),
+        actor_user_id=auth.user_id,
+        metadata={
+            **request_meta(request),
+            "project_id": str(project_id),
+            "project_name": project.name,
+            "deleted_run_count": len(runs),
+            "deleted_artifact_count": len(artifact_keys),
+        },
+    )
+    db.commit()
+
+    artifact_delete_failures = _delete_artifacts_best_effort(artifact_keys)
+    return SettingsProjectDeleteOut(
+        project_id=project_id,
+        project_name=project.name,
+        deleted_run_count=len(runs),
+        deleted_artifact_count=len(artifact_keys),
+        artifact_delete_failures=artifact_delete_failures,
+    )
 
 
 @router.get("/overview", response_model=dict)
@@ -220,6 +511,7 @@ def settings_overview(
 def list_all_api_tokens(
     request: Request,
     q: str | None = Query(default=None),
+    project_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -234,6 +526,8 @@ def list_all_api_tokens(
         .join(User, User.id == ApiToken.user_id)
         .join(Project, Project.id == ApiToken.project_id)
     )
+    if project_id is not None:
+        stmt = stmt.where(ApiToken.project_id == project_id)
     if q:
         escaped = escape_like(q.strip())
         pattern = f"%{escaped}%"
@@ -272,7 +566,14 @@ def list_all_api_tokens(
         object_type="system",
         object_id="api_tokens",
         actor_user_id=auth.user_id,
-        metadata={**request_meta(request), "q": q, "limit": limit, "cursor": cursor, "result_count": len(items)},
+        metadata={
+            **request_meta(request),
+            "q": q,
+            "project_id": str(project_id) if project_id else None,
+            "limit": limit,
+            "cursor": cursor,
+            "result_count": len(items),
+        },
     )
     db.commit()
     return {"items": items, "next_cursor": next_cursor}
@@ -525,6 +826,7 @@ def list_api_token_scope_catalog(
 def list_global_audit(
     request: Request,
     q: str | None = Query(default=None),
+    project_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -533,7 +835,7 @@ def list_global_audit(
     __: User = Depends(require_sysadmin),
 ):
     _ = __
-    stmt = _global_audit_stmt(q)
+    stmt = _global_audit_stmt(q, project_id=project_id)
     stmt = apply_keyset_pagination(stmt, SETTINGS_AUDIT_CURSOR, cursor, limit)
     rows, next_cursor = paginate_rows(db.execute(stmt).all(), SETTINGS_AUDIT_CURSOR, limit)
     items = _serialize_audit_rows(rows)
@@ -544,7 +846,14 @@ def list_global_audit(
         object_type="system",
         object_id="audit",
         actor_user_id=auth.user_id,
-        metadata={**request_meta(request), "q": q, "limit": limit, "cursor": cursor, "result_count": len(items)},
+        metadata={
+            **request_meta(request),
+            "q": q,
+            "project_id": str(project_id) if project_id else None,
+            "limit": limit,
+            "cursor": cursor,
+            "result_count": len(items),
+        },
     )
     db.commit()
     return {"items": items, "next_cursor": next_cursor}
@@ -554,6 +863,7 @@ def list_global_audit(
 def export_global_audit(
     request: Request,
     q: str | None = Query(default=None),
+    project_id: uuid.UUID | None = Query(default=None),
     format: str = Query(default="csv", pattern="^(csv|json)$"),
     max_rows: int = Query(default=5000, ge=1, le=20000),
     db: Session = Depends(get_db),
@@ -562,7 +872,9 @@ def export_global_audit(
     __: User = Depends(require_sysadmin),
 ):
     _ = __
-    rows = db.execute(_global_audit_stmt(q).order_by(AuditEvent.ts.desc(), AuditEvent.id.desc()).limit(max_rows)).all()
+    rows = db.execute(
+        _global_audit_stmt(q, project_id=project_id).order_by(AuditEvent.ts.desc(), AuditEvent.id.desc()).limit(max_rows)
+    ).all()
     items = _serialize_audit_rows(rows)
 
     write_audit_event(
@@ -571,7 +883,14 @@ def export_global_audit(
         object_type="system",
         object_id="audit",
         actor_user_id=auth.user_id,
-        metadata={**request_meta(request), "q": q, "format": format, "max_rows": max_rows, "exported_count": len(items)},
+        metadata={
+            **request_meta(request),
+            "q": q,
+            "project_id": str(project_id) if project_id else None,
+            "format": format,
+            "max_rows": max_rows,
+            "exported_count": len(items),
+        },
     )
     db.commit()
 
