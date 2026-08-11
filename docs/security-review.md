@@ -1,6 +1,6 @@
 # Security review
 
-Review date: 2026-07-16
+Review date: 2026-08-11
 Target: Share Sentinel 0.2.0 publication candidate
 Scope: API, worker, collector, UI, dependency manifests, containers, and reference Compose topology
 
@@ -17,7 +17,7 @@ This is a code and configuration review, not a penetration test or certification
 - Severity: High
 - Status: Resolved
 - Affected: `api/requirements.txt`, `worker/requirements.txt`, `collector/requirements.txt`, `ui/package.json`
-- Resolution: upgraded the affected Python and React Router/Vite dependency chains; current `pip-audit` checks for all Python development manifests and `npm audit --audit-level=high` report no known vulnerabilities.
+- Resolution: upgraded the affected Python dependency chains and moved the UI to React Router 7.18.2, PostCSS 8.5.26, and NanoID 3.3.18. Current `pip-audit` checks for all Python development manifests and `npm audit --audit-level=high` report no known vulnerabilities.
 - Regression control: `.github/workflows/ci.yml` and `.github/dependabot.yml`
 
 ### SS-SEC-002 — Unrestricted host and CORS configuration
