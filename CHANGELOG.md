@@ -21,6 +21,7 @@ The project follows a simple release-first workflow:
 - The base Compose stack pulls the canonical `ghcr.io/patriksi/share-sentinel-*` images directly; local development selects the source-build override through generated `COMPOSE_FILE` configuration.
 - Container inputs now use readable exact version tags rather than digest pins.
 - Upgraded React Router, PostCSS, and the transitive NanoID dependency to clear the current UI dependency audit without bundling unrelated framework major upgrades.
+- Updated GitHub Actions runtimes to their Node 24-compatible releases so CI no longer relies on GitHub's deprecated Node 20 action shim.
 
 ## [0.2.0] - 2026-07-16
 
