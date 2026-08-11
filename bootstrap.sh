@@ -1,30 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-root_dir=$(cd "$script_dir/.." && pwd)
+root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 template="$root_dir/.env.example"
 output="$root_dir/.env"
 mode="development"
 app_host="localhost"
-admin_email="admin@example.com"
+admin_email="${ADMIN_EMAIL:-admin@example.com}"
+admin_password="${ADMIN_PASSWORD:-}"
 image_tag="latest"
 force="false"
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/bootstrap-env.sh [options]
+Usage: ./bootstrap.sh [options]
 
-Generate a complete Share Sentinel environment file with random secrets.
+Generate a complete Share Sentinel .env file with fresh random secrets and
+validate that Docker Compose can render the resulting stack.
 
 Options:
-  --development            Generate local-development settings (default).
-  --production HOSTNAME    Generate production-style settings for HOSTNAME.
+  --development            Configure local source builds (default).
+  --production HOSTNAME    Configure published images for an HTTPS deployment.
   --admin-email EMAIL      Seed administrator email (default: admin@example.com).
-  --image-tag TAG          Application image tag (default: latest).
+  --image-tag TAG          Published image tag (default: latest).
   --output PATH            Output file (default: .env in the repository root).
   --force                  Replace an existing output file.
   -h, --help               Show this help.
+
+Environment overrides:
+  ADMIN_EMAIL              Seed administrator email.
+  ADMIN_PASSWORD           Seed administrator password; random when unset.
 EOF
 }
 
@@ -86,12 +91,15 @@ if [[ ! -f "$template" ]]; then
   echo "FAIL: environment template not found: $template" >&2
   exit 1
 fi
+if [[ "$output" != /* ]]; then
+  output="$PWD/$output"
+fi
 if [[ "$app_host" == *://* || "$app_host" == */* || ! "$app_host" =~ ^[A-Za-z0-9.-]+$ ]]; then
   echo "FAIL: hostname must contain only letters, numbers, dots, and hyphens" >&2
   exit 2
 fi
-if [[ ! "$admin_email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
-  echo "FAIL: --admin-email must be a valid-looking email address" >&2
+if [[ ! "$admin_email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+  echo "FAIL: administrator email must be a valid-looking email address" >&2
   exit 2
 fi
 if [[ ! "$image_tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -108,10 +116,24 @@ random_hex() {
   od -An -N "$bytes" -tx1 /dev/urandom | tr -d ' \n'
 }
 
+if [[ -z "$admin_password" ]]; then
+  admin_password="Ss1-$(random_hex 18)"
+fi
+if (( ${#admin_password} < 12 )) ||
+  [[ ! "$admin_password" =~ [[:lower:]] ]] ||
+  [[ ! "$admin_password" =~ [[:upper:]] ]] ||
+  [[ ! "$admin_password" =~ [[:digit:]] ]]; then
+  echo "FAIL: ADMIN_PASSWORD must be at least 12 characters and include lowercase, uppercase, and a number" >&2
+  exit 2
+fi
+if [[ ! "$admin_password" =~ ^[-A-Za-z0-9._!@%+=:,/]+$ ]]; then
+  echo "FAIL: ADMIN_PASSWORD contains characters that are unsafe in an unquoted .env value" >&2
+  exit 2
+fi
+
 postgres_password=$(random_hex 24)
 jwt_secret=$(random_hex 32)
 token_pepper=$(random_hex 32)
-admin_password="Ss1-$(random_hex 18)"
 stack_suffix=$(printf '%s' "$app_host" | tr '[:upper:].' '[:lower:]-' | tr -cd 'a-z0-9-')
 
 if [[ "$mode" == "production" ]]; then
@@ -121,6 +143,7 @@ if [[ "$mode" == "production" ]]; then
   cors_origins="https://$app_host"
   trusted_hosts="$app_host"
   secure_cookies="true"
+  start_args="up -d"
 else
   compose_files="docker-compose.yml:docker-compose.dev.yml"
   stack_name="share-sentinel-dev"
@@ -128,6 +151,7 @@ else
   cors_origins="http://localhost"
   trusted_hosts="localhost,127.0.0.1"
   secure_cookies="false"
+  start_args="up -d --build"
 fi
 
 output_dir=$(dirname "$output")
@@ -184,10 +208,40 @@ BEGIN {
 ' "$template" > "$temp_file"
 
 chmod 600 "$temp_file"
+
+compose_validated="false"
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  (cd "$root_dir" && docker compose --env-file "$temp_file" config --quiet)
+  compose_validated="true"
+fi
+
 mv "$temp_file" "$output"
 trap - EXIT
 
-echo "Created $output for $mode mode."
-echo "Admin email: $admin_email"
-echo "Admin password: $admin_password"
-echo "Store the password securely, sign in once, and rotate it from Settings."
+if [[ "$compose_validated" == "true" ]]; then
+  validation_status="validated"
+else
+  validation_status="not validated; Docker Compose was not available"
+fi
+
+if [[ "$output" == "$root_dir/.env" ]]; then
+  start_command="docker compose $start_args"
+else
+  printf -v quoted_output '%q' "$output"
+  start_command="docker compose --env-file $quoted_output $start_args"
+fi
+
+cat <<EOF
+Created $output for $mode mode.
+Compose configuration: $validation_status
+
+Admin login:
+  Email:    $admin_email
+  Password: $admin_password
+
+Start Share Sentinel:
+  cd $root_dir
+  $start_command
+
+Store the password securely, sign in once, and rotate it from Settings.
+EOF

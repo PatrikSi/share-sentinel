@@ -20,7 +20,7 @@ Use this checklist before publishing a public release of the current tree. It is
 ## Per-release validation
 
 - [ ] Pick the release commit and tag name
-- [ ] Run `./scripts/bootstrap-env.sh` and `docker compose up -d --build` from a clean checkout
+- [ ] Run `./bootstrap.sh` and `docker compose up -d --build` from a clean checkout
 - [ ] Run `./scripts/smoke-routes.sh http://localhost`
 - [ ] Run `./scripts/smoke-ingest.sh http://localhost` with `SHARE_SENTINEL_SMOKE_PASSWORD` set
 - [ ] Run API tests: `docker compose exec -T api bash -lc "pip install -q -r requirements-dev.txt && pytest -q"`

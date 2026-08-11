@@ -20,7 +20,7 @@ The API and worker must mount the same durable POSIX artifact volume at the same
 Generate a complete local environment and start source-built services:
 
 ```bash
-./scripts/bootstrap-env.sh
+./bootstrap.sh
 docker compose up -d --build
 docker compose ps
 ./scripts/smoke-routes.sh http://localhost
@@ -29,7 +29,7 @@ export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
 unset SHARE_SENTINEL_SMOKE_PASSWORD
 ```
 
-The script creates `.env` with random database, JWT, token-pepper, and administrator secrets, prints the initial administrator password once, and sets `COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml`. The gateway listens on `127.0.0.1:80`; the `bootstrap` service applies migrations and creates the initial admin before the API and worker start.
+The script creates `.env` with random database, JWT, token-pepper, and administrator secrets, validates the rendered Compose configuration, prints the initial administrator password and exact start command, and sets `COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml`. The gateway listens on `127.0.0.1:80`; the `bootstrap` service applies migrations and creates the initial admin before the API and worker start.
 
 To regenerate intentionally, pass `--force`. Do not use `--force` on an environment whose generated secrets are already protecting persistent data.
 
@@ -61,7 +61,7 @@ SEED_ADMIN_PASSWORD=<strong-unique-password>
 The bootstrap script can create this contract without placing secrets in shell history:
 
 ```bash
-./scripts/bootstrap-env.sh \
+./bootstrap.sh \
   --production sentinel.example.com \
   --admin-email admin@example.com \
   --image-tag v0.2.0

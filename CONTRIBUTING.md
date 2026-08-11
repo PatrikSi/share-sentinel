@@ -9,14 +9,14 @@ This project is split across an API, a worker, a UI, and a collector. The quicke
 - Docker and Docker Compose
 - Python 3.11 if you want to run services or tests outside containers
 - Node.js 20 if you want to build the UI outside containers
-- A generated `.env` from `./scripts/bootstrap-env.sh`
+- A generated `.env` from `./bootstrap.sh`
 
 ## Local development
 
 1. Generate local configuration and random secrets:
 
 ```bash
-./scripts/bootstrap-env.sh
+./bootstrap.sh
 ```
 
 2. Build and start the local stack:

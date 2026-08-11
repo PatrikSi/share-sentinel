@@ -26,10 +26,14 @@ It is built around one loop:
 1. Generate a development environment with random secrets:
 
 ```bash
-./scripts/bootstrap-env.sh
+./bootstrap.sh
 ```
 
-The script creates a mode-`600` `.env`, prints the one-time seed administrator password, and refuses to overwrite an existing file unless `--force` is supplied.
+The script creates a mode-`600` `.env`, validates the rendered Compose stack, prints the one-time seed administrator password and exact start command, and refuses to overwrite an existing file unless `--force` is supplied. You can choose the initial login through environment overrides:
+
+```bash
+ADMIN_EMAIL=you@example.com ADMIN_PASSWORD='use-a-long-unique-password' ./bootstrap.sh
+```
 
 2. Build the application images from the current checkout and start the stack:
 

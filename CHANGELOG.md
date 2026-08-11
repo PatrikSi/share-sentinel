@@ -14,7 +14,7 @@ The project follows a simple release-first workflow:
 
 - GHCR publication for API, worker, UI, and collector images after full CI or release verification, including exact commit/release tags, vulnerability scans, provenance, and SBOM attestations.
 - A containerized collector with NFS tooling and an unprivileged runtime.
-- `docker-compose.dev.yml` for local source builds and `scripts/bootstrap-env.sh` for generated development or production environment files.
+- `docker-compose.dev.yml` for local source builds and a root-level `bootstrap.sh` that generates and validates development or production environment files.
 
 ### Changed
 
