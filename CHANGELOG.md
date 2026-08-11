@@ -22,6 +22,7 @@ The project follows a simple release-first workflow:
 - Container inputs now use readable exact version tags rather than digest pins.
 - Upgraded React Router, PostCSS, and the transitive NanoID dependency to clear the current UI dependency audit without bundling unrelated framework major upgrades.
 - Updated GitHub Actions runtimes to their Node 24-compatible releases so CI no longer relies on GitHub's deprecated Node 20 action shim.
+- CI now pulls the promoted `latest` image set, verifies its revision labels, and runs a clean production Compose smoke test against the published artifacts.
 
 ## [0.2.0] - 2026-07-16
 
