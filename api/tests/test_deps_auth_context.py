@@ -5,14 +5,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fastapi import HTTPException
-from fastapi.security import HTTPAuthorizationCredentials
-from starlette.requests import Request
-
 from app import deps as deps_module
 from app.deps import get_auth_context, require_session_user, require_sysadmin
 from app.enums import ProjectRole
 from app.models import ProjectMember, RefreshToken, User
+from fastapi import HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
+from starlette.requests import Request
 
 
 class _ExecuteResult:

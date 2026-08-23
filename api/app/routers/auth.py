@@ -9,14 +9,13 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import get_db
 from app.deps import (
-    _enforce_csrf_if_needed,
     AuthContext,
-    get_auth_context,
+    _enforce_csrf_if_needed,
     get_current_user,
     get_project_role,
+    request_meta,
     require_session_user,
     require_sysadmin,
-    request_meta,
     require_token_scopes,
     resolve_client_ip,
 )
@@ -30,8 +29,8 @@ from app.schemas import (
     ApiTokenOut,
     ChangePasswordIn,
     LoginIn,
-    RefreshOut,
     RefreshIn,
+    RefreshOut,
     RegisterIn,
     RegistrationSettingsOut,
     SecuritySettingsOut,
@@ -54,7 +53,12 @@ from app.security import (
 )
 from app.services.audit import write_audit_event
 from app.services.auth_rate_limit import check_login_throttle, clear_login_failures, record_login_failure
-from app.token_scopes import SCOPE_READ_TOKENS, SCOPE_WRITE_TOKENS, default_scopes_for_project_role, normalize_token_scopes
+from app.token_scopes import (
+    SCOPE_READ_TOKENS,
+    SCOPE_WRITE_TOKENS,
+    default_scopes_for_project_role,
+    normalize_token_scopes,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 rate_limiter = RateLimiter()
@@ -158,7 +162,7 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     db.add(user)
     try:
         db.flush()
-    except IntegrityError as exc:
+    except IntegrityError:
         db.rollback()
         write_audit_event(
             db,

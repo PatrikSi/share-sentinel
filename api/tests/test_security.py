@@ -1,6 +1,4 @@
 import pytest
-from fastapi import Response
-
 from app.security import (
     clear_auth_cookies,
     generate_csrf_token,
@@ -11,6 +9,7 @@ from app.security import (
     validate_password_strength,
     verify_password,
 )
+from fastapi import Response
 
 
 def test_password_hash_roundtrip() -> None:

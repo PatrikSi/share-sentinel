@@ -2,12 +2,11 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
-
 from app.deps import AuthContext
 from app.enums import ProjectRole
 from app.models import ProjectMember
 from app.routers import users as users_router
+from fastapi import HTTPException
 
 
 class _ExecuteResult:

@@ -8,9 +8,12 @@ def escape_like(value: str) -> str:
     """Escape special SQL LIKE/ILIKE characters (%, _, \\) in user input."""
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-settings = get_settings()
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+settings = get_settings()
+DATABASE_CONNECT_TIMEOUT_SECONDS = 5
+ENGINE_CONNECT_ARGS = {"connect_timeout": DATABASE_CONNECT_TIMEOUT_SECONDS}
+
+engine = create_engine(settings.database_url, pool_pre_ping=True, connect_args=ENGINE_CONNECT_ARGS)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

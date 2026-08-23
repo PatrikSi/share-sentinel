@@ -1,10 +1,9 @@
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
-
 from app.enums import ProjectRole
 from app.routers import auth as auth_router
+from fastapi import HTTPException
 
 
 def test_non_sysadmin_scope_policy_accepts_default_scopes() -> None:

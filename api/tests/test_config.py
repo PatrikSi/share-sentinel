@@ -1,6 +1,5 @@
 import pytest
-
-from app.config import Settings
+from app.config import MAX_UPLOAD_CHUNK_BYTES, Settings
 
 
 def test_log_level_normalized() -> None:
@@ -242,3 +241,51 @@ def test_default_api_token_expiry_can_be_zero_when_never_expiring_tokens_are_exp
 
     assert settings.default_api_token_expiry_days == 0
     assert settings.allow_never_expiring_api_tokens is True
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "access_token_minutes",
+        "refresh_token_days",
+        "upload_max_bytes",
+        "upload_chunk_bytes",
+        "redis_stream_retries",
+        "redis_stream_maxlen",
+        "auth_login_max_attempts",
+        "auth_login_window_seconds",
+        "auth_login_lockout_seconds",
+    ],
+)
+@pytest.mark.parametrize("invalid", [0, -1])
+def test_critical_runtime_counts_and_windows_must_be_positive(field: str, invalid: int) -> None:
+    with pytest.raises(ValueError, match="must be greater than zero"):
+        Settings(**{field: invalid})
+
+
+def test_api_token_last_used_interval_may_be_zero_but_not_negative() -> None:
+    assert Settings(api_token_last_used_update_interval_seconds=0).api_token_last_used_update_interval_seconds == 0
+
+    with pytest.raises(ValueError, match="must be zero or greater"):
+        Settings(api_token_last_used_update_interval_seconds=-1)
+
+
+def test_upload_chunk_is_memory_bounded_and_cannot_exceed_upload_limit() -> None:
+    with pytest.raises(ValueError, match="upload_chunk_bytes must be .* bytes or less"):
+        Settings(upload_chunk_bytes=MAX_UPLOAD_CHUNK_BYTES + 1, upload_max_bytes=MAX_UPLOAD_CHUNK_BYTES + 1)
+
+    with pytest.raises(ValueError, match="upload_chunk_bytes must be less than or equal to upload_max_bytes"):
+        Settings(upload_chunk_bytes=1024, upload_max_bytes=512)
+
+
+@pytest.mark.parametrize("field", ["redis_connect_timeout_seconds", "redis_socket_timeout_seconds"])
+def test_redis_timeouts_must_be_positive_and_bounded(field: str) -> None:
+    with pytest.raises(ValueError, match="must be greater than zero"):
+        Settings(**{field: 0})
+
+    with pytest.raises(ValueError, match="must be 60 seconds or less"):
+        Settings(**{field: 61})
+
+    for non_finite in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="must be finite"):
+            Settings(**{field: non_finite})

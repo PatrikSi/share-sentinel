@@ -1,18 +1,17 @@
+import redis
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, PlainTextResponse
-import redis
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.config import get_settings
+from app import metrics as metrics_module
 from app.db import get_db
 from app.deps import require_sysadmin
-from app import metrics as metrics_module
+from app.redis_client import create_redis_client
 from app.services import storage
 
 router = APIRouter(tags=["health"])
-settings = get_settings()
-redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+redis_client = create_redis_client()
 
 
 @router.get("/healthz")

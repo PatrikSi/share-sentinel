@@ -10,7 +10,6 @@ from typing import Any, Callable, Literal, Sequence
 from fastapi import HTTPException, status
 from sqlalchemy import and_, or_
 
-
 Direction = Literal["asc", "desc"]
 
 

@@ -1,15 +1,16 @@
 from functools import lru_cache
 from ipaddress import ip_network
+from math import isfinite
 
 from pydantic import EmailStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.password_policy import password_policy_kwargs, validate_password_strength
 
-
 PLACEHOLDER_PREFIXES = ("change-me", "changeme", "replace-", "replace_", "example-", "your-")
 DEFAULT_JWT_SECRET = "dev-secret-not-for-production-0123456789"
 DEFAULT_TOKEN_PEPPER = "dev-token-pepper-not-for-production-012345"
+MAX_UPLOAD_CHUNK_BYTES = 128 * 1024 * 1024
 
 
 def looks_like_placeholder(value: str | None) -> bool:
@@ -27,6 +28,8 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg://share_sentinel:share_sentinel@db:5432/share_sentinel"
     redis_url: str = "redis://redis:6379/0"
+    redis_connect_timeout_seconds: float = 3.0
+    redis_socket_timeout_seconds: float = 5.0
 
     artifact_storage_path: str = "/artifacts"
 
@@ -143,6 +146,48 @@ class Settings(BaseSettings):
             raise ValueError("default_api_token_expiry_days must be 3650 or less")
         return value
 
+    @field_validator(
+        "access_token_minutes",
+        "refresh_token_days",
+        "upload_max_bytes",
+        "upload_chunk_bytes",
+        "redis_stream_retries",
+        "redis_stream_maxlen",
+        "auth_login_max_attempts",
+        "auth_login_window_seconds",
+        "auth_login_lockout_seconds",
+    )
+    @classmethod
+    def _validate_positive_runtime_setting(cls, value: int, info) -> int:
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be greater than zero")
+        return value
+
+    @field_validator("api_token_last_used_update_interval_seconds")
+    @classmethod
+    def _validate_non_negative_runtime_setting(cls, value: int, info) -> int:
+        if value < 0:
+            raise ValueError(f"{info.field_name} must be zero or greater")
+        return value
+
+    @field_validator("upload_chunk_bytes")
+    @classmethod
+    def _validate_upload_chunk_upper_bound(cls, value: int) -> int:
+        if value > MAX_UPLOAD_CHUNK_BYTES:
+            raise ValueError(f"upload_chunk_bytes must be {MAX_UPLOAD_CHUNK_BYTES} bytes or less")
+        return value
+
+    @field_validator("redis_connect_timeout_seconds", "redis_socket_timeout_seconds")
+    @classmethod
+    def _validate_redis_timeout(cls, value: float, info) -> float:
+        if not isfinite(value):
+            raise ValueError(f"{info.field_name} must be finite")
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be greater than zero")
+        if value > 60:
+            raise ValueError(f"{info.field_name} must be 60 seconds or less")
+        return value
+
     @model_validator(mode="after")
     def _validate_seed_admin_settings(self):
         has_seed_email = bool(self.seed_admin_email)
@@ -156,6 +201,12 @@ class Settings(BaseSettings):
                 validate_password_strength(self.seed_admin_password, **password_policy_kwargs(self))
             except ValueError as exc:
                 raise ValueError(f"SEED_ADMIN_PASSWORD must satisfy the configured password policy: {exc}") from exc
+        return self
+
+    @model_validator(mode="after")
+    def _validate_upload_settings(self):
+        if self.upload_chunk_bytes > self.upload_max_bytes:
+            raise ValueError("upload_chunk_bytes must be less than or equal to upload_max_bytes")
         return self
 
     @model_validator(mode="after")

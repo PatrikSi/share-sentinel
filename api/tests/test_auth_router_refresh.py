@@ -5,13 +5,12 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fastapi import HTTPException
-from starlette.requests import Request
-from starlette.responses import Response
-
 from app.models import RefreshToken, User
 from app.routers import auth as auth_router
 from app.schemas import RefreshIn
+from fastapi import HTTPException
+from starlette.requests import Request
+from starlette.responses import Response
 
 
 class _ExecuteResult:

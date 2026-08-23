@@ -2,9 +2,8 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
-
 from app.routers import users as users_router
+from fastapi import HTTPException
 
 
 def _target_user(*, is_active: bool = True, is_approved: bool = True, is_sysadmin: bool = True):

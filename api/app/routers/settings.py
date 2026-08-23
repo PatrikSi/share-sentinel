@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import escape_like, get_db
-from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
+from app.deps import AuthContext, get_auth_context, request_meta, require_sysadmin, require_token_scopes
 from app.enums import ProjectRole, RunStatus
 from app.locking import lock_project_admin_guard
 from app.models import ApiToken, AuditEvent, Project, ProjectMember, ScanRun, User
@@ -23,6 +23,7 @@ from app.pagination import (
     parse_datetime_cursor_value,
     parse_uuid_cursor_value,
 )
+from app.routers import users as users_router
 from app.schemas import (
     ApiTokenAdminCreateIn,
     ApiTokenAdminCreateOut,
@@ -42,7 +43,6 @@ from app.schemas import (
     SettingsProjectDetailOut,
     UserAssignAllProjectsIn,
 )
-from app.routers import users as users_router
 from app.security import hash_external_token, random_token
 from app.services.audit import write_audit_event
 from app.services.storage import delete_object
@@ -51,8 +51,8 @@ from app.token_scopes import (
     SCOPE_READ_AUDIT,
     SCOPE_READ_MEMBERS,
     SCOPE_READ_TOKENS,
-    SCOPE_WRITE_PROJECTS,
     SCOPE_WRITE_MEMBERS,
+    SCOPE_WRITE_PROJECTS,
     SCOPE_WRITE_TOKENS,
     default_scopes_for_project_role,
     normalize_token_scopes,

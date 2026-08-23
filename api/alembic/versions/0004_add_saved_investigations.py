@@ -5,8 +5,8 @@ Revises: 0003_add_nfs_share_type
 Create Date: 2026-03-10
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "0004_add_saved_investigations"

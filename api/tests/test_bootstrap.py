@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from app.bootstrap import ensure_artifact_storage_path, validate_seed_admin_settings
 
 

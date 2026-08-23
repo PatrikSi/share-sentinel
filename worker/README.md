@@ -21,8 +21,19 @@ That is not just a convenience setting. The API writes uploads to local filesyst
 
 - Status flow is typically `PENDING_UPLOAD -> UPLOADED -> INGESTING -> COMPLETE` or `FAILED`.
 - Ingest progress is checkpointed so interrupted work can resume from a saved line offset.
-- Redis queue handoff is preferred, but the worker also scans Postgres for recoverable runs as a fallback path.
+- Redis queue handoff is preferred, but the worker also scans Postgres for recoverable runs as a fallback path. If Redis is unavailable at startup, stream setup is retried without blocking that database recovery scan.
+- Postgres is authoritative for the current project and artifact key, so delayed or duplicate Redis messages cannot ingest a superseded upload.
+- Upload attempts use immutable keys; committing a new database pointer precedes best-effort cleanup of the superseded file.
 - Gzip input is protected by decompression limits before parsing.
+- NDJSON reads are capped per record so a newline-free artifact cannot force an unbounded allocation.
+- Compact JSON is a compatibility format capped at 50 MiB decompressed; use NDJSON for large inventories so records remain independently bounded.
+- Invalid UTF-8 NDJSON records become explicit ingest errors and are never persisted with replacement-corrupted names or paths.
+- Resumed ingestion hydrates existing endpoint/resource identities before processing later item records, preserving checkpointed access metadata.
+- Final run counts are derived from normalized database rows rather than trusting producer-declared summary totals.
+- Optional item size and modification timestamps are normalized and retained when collectors provide them.
+- SMB signing uses the canonical `smb.signing` string (`required` or `not_required`); legacy boolean `smb.signing_required` artifacts remain accepted.
+- Unexpected poison-record failures are terminalized with a redacted operator-facing error instead of being replayed forever.
+- Duplicate stream messages honor a future `next_retry_at`; they are acknowledged while the database recovery scan owns the due retry.
 
 ## Important caveats
 
@@ -55,6 +66,11 @@ At minimum, the worker needs:
 - `ARTIFACT_STORAGE_PATH`
 - `WORKER_HEARTBEAT_PATH`
 - `WORKER_HEALTH_TIMEOUT_SECONDS`
+- `REDIS_CONNECT_TIMEOUT_SECONDS` (default `3`)
+- `REDIS_SOCKET_TIMEOUT_SECONDS` (default `5`; keep this above the worker's 3-second blocking stream read)
+- `DATABASE_CONNECT_TIMEOUT_SECONDS` (default `5`)
+- `INGEST_MAX_RECORD_BYTES` (default `8388608`)
+- `INGEST_JSON_COMPAT_MAX_BYTES` (default `52428800`; compact JSON only)
 
 In Docker, those are already wired in `docker-compose.yml`.
 

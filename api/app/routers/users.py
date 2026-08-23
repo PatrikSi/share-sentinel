@@ -8,11 +8,17 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import escape_like, get_db
-from app.deps import AuthContext, get_auth_context, require_sysadmin, request_meta, require_token_scopes
+from app.deps import AuthContext, get_auth_context, request_meta, require_sysadmin, require_token_scopes
 from app.enums import ProjectRole
 from app.locking import lock_project_admin_guard, lock_sysadmin_guard
 from app.models import Project, ProjectMember, RefreshToken, User
-from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_datetime_cursor_value, parse_uuid_cursor_value
+from app.pagination import (
+    KeysetColumn,
+    apply_keyset_pagination,
+    paginate_rows,
+    parse_datetime_cursor_value,
+    parse_uuid_cursor_value,
+)
 from app.password_policy import password_policy_kwargs
 from app.schemas import UserAdminOut, UserApprovalIn, UserAssignAllProjectsIn, UserCreateIn, UserOut, UserUpdateIn
 from app.security import hash_password, next_session_version, validate_password_strength

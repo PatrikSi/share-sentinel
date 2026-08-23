@@ -52,7 +52,12 @@ run_payload='{"name":"Synthetic publication ingest","description":"Automated rel
 run_response=$(curl -fsS -b "$cookies" -c "$cookies" -H "content-type: application/json" -H "x-csrf-token: $csrf" --data-binary @- "$api_base/projects/$project_id/runs" <<<"$run_payload")
 run_id=$(jq -er '.id' <<<"$run_response")
 
-upload_response=$(curl -fsS -b "$cookies" -c "$cookies" -H "x-csrf-token: $csrf" -F "file=@$sample_artifact;type=application/json" "$api_base/projects/$project_id/runs/$run_id/artifact")
+upload_response=$(curl -fsS -b "$cookies" -c "$cookies" \
+  -H "x-csrf-token: $csrf" \
+  -H "content-type: application/json" \
+  -H "x-artifact-filename: sample-artifact.json" \
+  --data-binary "@$sample_artifact" \
+  "$api_base/projects/$project_id/runs/$run_id/artifact")
 jq -e '.ok == true' <<<"$upload_response" >/dev/null
 
 status=""
@@ -74,6 +79,10 @@ fi
 jq -e '.summary.endpoints == 2 and .summary.resources == 2 and .summary.items == 4 and .summary.errors == 1' <<<"$run_response" >/dev/null
 stats_response=$(curl -fsS -b "$cookies" "$api_base/projects/$project_id/inventory/stats")
 jq -e '.endpoints == 2 and .shares == 2 and .files == 3 and .directories == 1' <<<"$stats_response" >/dev/null
+endpoints_response=$(curl -fsS -b "$cookies" "$api_base/projects/$project_id/runs/$run_id/endpoints")
+jq -e '(.items | map(select(.endpoint_key == "192.0.2.10:445" and .smb_signing == "required")) | length) == 1' <<<"$endpoints_response" >/dev/null
+items_response=$(curl -fsS -b "$cookies" "$api_base/projects/$project_id/inventory/items?q=retention.pdf&run_ids=$run_id")
+jq -e '(.items | length) == 1 and .items[0].size_bytes == 2048 and .items[0].mtime == "2026-01-15T09:30:00+00:00"' <<<"$items_response" >/dev/null
 errors_response=$(curl -fsS -b "$cookies" "$api_base/projects/$project_id/runs/$run_id/errors")
 jq -e '(.items | length) == 1 and .items[0].code == "SYNTHETIC_PARTIAL_SCAN"' <<<"$errors_response" >/dev/null
 detail_response=$(curl -fsS -b "$cookies" "$api_base/settings/projects/$project_id")

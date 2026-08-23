@@ -2,13 +2,12 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from fastapi.testclient import TestClient
-
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_session_user
 from app.main import app
 from app.models import SavedInvestigation
 from app.routers import inventory as inventory_router
+from fastapi.testclient import TestClient
 
 
 class _ExecuteResult:

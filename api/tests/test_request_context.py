@@ -1,7 +1,6 @@
+from app.main import app
 from app.middleware import _normalize_request_id
 from fastapi.testclient import TestClient
-
-from app.main import app
 
 
 def test_normalize_request_id_generates_value_when_missing() -> None:

@@ -65,6 +65,8 @@ jobs:
       - name: Test collector
         working-directory: collector
         run: pip install -r requirements-dev.txt && pytest -q -p no:cacheprovider
+      - name: Lint Python
+        run: ruff check api worker collector scripts
       - name: Validate sample artifact
         run: python scripts/validate-sample.py
       - name: Audit Python dependencies
@@ -80,6 +82,12 @@ jobs:
           cp .env.example .env
           docker compose -f docker-compose.yml config --quiet
           docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile tools config --quiet
+          POSTGRES_PASSWORD='reserved:@/?#[]%value' docker compose -f docker-compose.yml config --format json > "${RUNNER_TEMP}/compose-reserved-password.json"
+          jq -e '
+            [.services.bootstrap, .services.api, .services.worker]
+            | all(.environment.PGPASSWORD == "reserved:@/?#[]%value")
+              and all(.environment.DATABASE_URL == "postgresql+psycopg://share_sentinel@db:5432/share_sentinel")
+          ' "${RUNNER_TEMP}/compose-reserved-password.json" >/dev/null
           docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile tools build
       - name: Verify application image contracts
         run: |
@@ -87,7 +95,7 @@ jobs:
           docker run --rm --entrypoint sh share-sentinel-worker:dev -c 'test "$(id -u)" = 10001 && touch /artifacts/write-check && rm /artifacts/write-check'
           docker run --rm --entrypoint sh share-sentinel-collector:dev -c 'test "$(id -u)" = 10001 && command -v showmount && touch /data/write-check && rm /data/write-check'
           docker run --rm share-sentinel-collector:dev --help >/dev/null
-          docker run --rm -e VITE_API_BASE_URL=/runtime-api -e VITE_CSRF_COOKIE_NAME=runtime_csrf -e VITE_CSRF_HEADER_NAME=x-runtime-csrf --entrypoint sh share-sentinel-ui:dev -c '/docker-entrypoint.d/40-runtime-config.sh && grep -q '\''apiBase:"/runtime-api"'\'' /usr/share/nginx/html/runtime-config.js'
+          docker run --rm -e VITE_API_BASE_URL=/runtime-api -e VITE_CSRF_COOKIE_NAME=runtime_csrf -e VITE_CSRF_HEADER_NAME=x-runtime-csrf --entrypoint sh share-sentinel-ui:dev -c 'test "$(id -u)" = 10001 && test "$(id -g)" = 10001 && /docker-entrypoint.d/40-runtime-config.sh && grep -q '\''apiBase:"/runtime-api"'\'' /usr/share/nginx/html/runtime-config.js'
           docker run --rm --entrypoint nginx share-sentinel-ui:dev -t
       - name: Scan application images
         run: |

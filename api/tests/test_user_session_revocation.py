@@ -3,13 +3,12 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
-from starlette.requests import Request
-
 from app.deps import AuthContext
 from app.enums import UITheme
 from app.models import User
 from app.routers import users as users_router
 from app.schemas import UserApprovalIn, UserUpdateIn
+from starlette.requests import Request
 
 
 @dataclass

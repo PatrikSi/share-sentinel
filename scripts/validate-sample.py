@@ -6,7 +6,6 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "worker"))
 
@@ -29,6 +28,16 @@ def main() -> int:
     for record_type, expected_count in expected.items():
         if counts[record_type] != expected_count:
             raise ValueError(f"expected {expected_count} {record_type} records, found {counts[record_type]}")
+
+    retention_record = next(record for record in records if record.get("name") == "retention.pdf")
+    if retention_record.get("size_bytes") != 2048:
+        raise ValueError("sample item size metadata was not preserved")
+    if retention_record.get("mtime").isoformat() != "2026-01-15T09:30:00+00:00":
+        raise ValueError("sample item modification time was not normalized")
+
+    smb_endpoint = next(record for record in records if record.get("endpoint_key") == "192.0.2.10:445")
+    if smb_endpoint.get("smb", {}).get("signing") != "required":
+        raise ValueError("sample SMB signing metadata was not preserved")
 
     print(f"Validated {sample_path.relative_to(ROOT)} ({len(records)} normalized records)")
     return 0

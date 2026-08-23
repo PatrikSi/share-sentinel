@@ -1,11 +1,9 @@
 import pytest
-
-from fastapi import HTTPException
-from sqlalchemy import select
-
 from app.models import Endpoint, Item, Resource
 from app.routers import inventory as inventory_router
 from app.services.inventory_query import InventoryQueryClause, parse_inventory_query
+from fastapi import HTTPException
+from sqlalchemy import select
 
 
 def test_parse_inventory_query_supports_verbose_compact_and_precedence() -> None:

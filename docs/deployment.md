@@ -109,6 +109,18 @@ The production smoke verifies the public health route, hidden API docs, UI routi
 
 Production-style API startup fails fast when secure cookies, proxy CIDRs, hostnames, secrets, or seed-admin settings are missing. Interactive API docs are disabled outside development/test environments.
 
+API and worker Redis operations use bounded connect and response budgets. `REDIS_CONNECT_TIMEOUT_SECONDS` defaults to `3` and `REDIS_SOCKET_TIMEOUT_SECONDS` defaults to `5`. Keep the socket budget above the worker's three-second blocking stream read. Queue handoff timeouts are treated as ambiguous: the upload remains durably `UPLOADED`, and Postgres-backed recovery can discover it without relying on a second client submission.
+
+Rate-limit counter expiry is attached atomically with Redis `EVAL`. The bundled Redis configuration supports this command. If a managed Redis service uses ACLs, allow `EVAL`; otherwise general request rate limiting follows `RATE_LIMIT_FAIL_OPEN` and login throttling falls back to bounded per-process state rather than distributed enforcement.
+
+API, worker, and worker-health Postgres connection attempts have a five-second default budget. The worker is not startup-gated on Redis and continues its Postgres recovery scan while Redis stream setup is unavailable. Statement and transaction timeouts are not imposed by the application in this release; set them deliberately in Postgres or the deployment connection policy for the target workload.
+
+Compose passes the database password through libpq's `PGPASSWORD` environment input and keeps it out of the URL, so generated or operator-supplied passwords may contain URL-reserved characters without manual percent encoding. Treat the rendered container environment as secret-bearing operational state.
+
+Raw NDJSON ingestion limits each physical record to `INGEST_MAX_RECORD_BYTES` (default 8 MiB) before allocation. Oversized records terminalize the run with a validation error; raise the limit only for a known collector contract.
+
+Compact `.json` and `.json.gz` are compatibility formats. The bundled collector caps compact reconstruction at 8 MiB per endpoint and 40 MiB total, while the worker caps compact JSON materialization at 50 MiB by default. Use `.ndjson`, `.jsonl`, or their gzip variants for normal and large collections.
+
 The prebuilt UI writes `/runtime-config.js` when its container starts, using `VITE_API_BASE_URL`, `VITE_CSRF_COOKIE_NAME`, and `VITE_CSRF_HEADER_NAME` from Compose. This keeps one published UI image compatible with deployment-specific API paths and CSRF names. Unsafe values fail container startup instead of being injected into JavaScript; keep the VITE CSRF values identical to the corresponding `AUTH_CSRF_*` API values.
 
 ## Published images and tags
@@ -132,6 +144,8 @@ Durable state is split across:
 
 Back up Postgres and the artifact volume as one operational recovery point. A database restore without matching artifacts can leave stored run metadata pointing to missing files. Encrypt backups when scan paths and host data are sensitive, and test restoration before relying on it.
 
+Each upload attempt is stored under a new immutable artifact key before Postgres selects it for the run. A process or database failure before that pointer commit can leave an unreferenced file, but it cannot overwrite the previously committed artifact. Run and project deletion, plus cleanup of superseded uploads, remove files on a best-effort basis after the database change. Explicit request cancellation cleans up its in-progress upload, but a process kill or power loss can leave stale files under `.multipart`; failed post-commit deletions can also leave immutable-object orphans. This release does not include an automatic reconciler or retention job. Include periodic artifact-volume review of both referenced objects and `.multipart` files in the operator runbook.
+
 ## Upgrades
 
 1. Read `CHANGELOG.md` for migrations, environment changes, and caveats.
@@ -148,8 +162,9 @@ Alembic migrations are applied forward by bootstrap. Automated downgrade or zero
 
 - One worker process handles jobs serially; add replicas only with shared artifact storage and after testing database/Redis pressure.
 - Run diff responses are not paginated and can grow with large churn.
-- The default 10 GiB upload ceiling is enforced by the API and matched by the bundled Nginx configuration.
+- The default 10 GiB ceiling is an application-level streaming limit. First-party clients use raw request bodies so the API can enforce it incrementally; multipart remains a compatibility path and may be pre-spooled by the HTTP framework. Configure every external proxy with an intentional body-size limit and enough temporary storage rather than assuming the UI Nginx setting protects the direct Traefik-to-API route.
 - The Compose deployment has single Postgres, Redis, and gateway instances and therefore no HA guarantee.
 - API metrics do not include a full worker backlog or per-stage ingest telemetry surface.
+- Inventory collections use stable keyset order but do not yet expose arbitrary server-side column sorting; the UI intentionally avoids page-local sorting that would misrepresent the full result set.
 
 For these reasons, capacity testing and a deployment-specific recovery plan are required before treating the current release as a critical production service.

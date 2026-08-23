@@ -5,11 +5,10 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fastapi import HTTPException
-from starlette.requests import Request
-
 from app.routers import auth as auth_router
 from app.schemas import ChangePasswordIn
+from fastapi import HTTPException
+from starlette.requests import Request
 
 
 class _ExecuteResult:

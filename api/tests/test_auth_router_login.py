@@ -4,13 +4,12 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from starlette.requests import Request
-from starlette.responses import Response
-
 from app.enums import UITheme
 from app.models import RefreshToken
 from app.routers import auth as auth_router
 from app.schemas import LoginIn
+from starlette.requests import Request
+from starlette.responses import Response
 
 
 class _ExecuteResult:

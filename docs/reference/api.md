@@ -156,7 +156,7 @@ Lists runs for a project with keyset pagination.
 
 ### `GET /projects/{project_id}/runs/{run_id}`
 
-Returns one run.
+Returns one run, including stored artifact size, content type, and SHA-256 provenance when an upload exists.
 
 ### `DELETE /projects/{project_id}/runs/{run_id}`
 
@@ -168,8 +168,12 @@ Uploads the artifact for a run. The API accepts JSON, NDJSON, JSONL, and gzip va
 
 Important note:
 
+- first-party clients should stream a raw body with `X-Artifact-Filename` carrying the exact basename/suffix and use `application/json`, `application/x-ndjson`, or `application/gzip` as appropriate; multipart remains a compatibility input
+- use `.ndjson`, `.jsonl`, or their gzip variants for large collections; compact JSON is a bounded compatibility format
+- the API releases its preflight database transaction during the body transfer, then locks and rechecks the run before committing the immutable artifact pointer
 - a successful upload response can still return `queued: false`
 - when that happens, the worker will discover the run through its recovery path instead of the primary Redis stream handoff
+- successful responses include the stored artifact SHA-256; clients resolving an ambiguous retry should compare it with `GET` run metadata before declaring success
 
 ### `GET /projects/{project_id}/runs/{run_id}/diff`
 
@@ -233,6 +237,10 @@ Item-level inventory view. Supports:
 - `is_dir`
 - `limit`
 - `cursor`
+
+Item rows include nullable `size_bytes` and ISO-8601 `mtime` values when the source collector supplied usable metadata.
+
+Inventory pagination currently uses a stable server-defined order. Arbitrary column sorting is not part of the API contract yet; clients must not sort one fetched page and present it as a full-result sort.
 
 ### `GET /projects/{project_id}/inventory/resources`
 

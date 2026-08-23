@@ -1,7 +1,6 @@
 import asyncio
 import hashlib
 import logging
-import os
 import time
 import uuid
 from collections.abc import Iterable
@@ -15,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
 from app.db import escape_like, get_db
-from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_token_scopes
+from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
 from app.enums import ErrorSeverity, ProjectRole, RunStatus
 from app.models import AuditEvent, Endpoint, IngestError, Item, Resource, ScanRun
 from app.pagination import (
@@ -28,7 +27,6 @@ from app.pagination import (
 )
 from app.rate_limit import RateLimiter
 from app.schemas import IngestErrorOut, RunActivityEventOut, RunCreateIn, RunOut
-from app.share_types import share_type_from_resource_type
 from app.services.audit import write_audit_event
 from app.services.queue import enqueue_ingest_job
 from app.services.storage import (
@@ -38,6 +36,7 @@ from app.services.storage import (
     delete_object,
     upload_part,
 )
+from app.share_types import share_type_from_resource_type
 from app.token_scopes import SCOPE_READ_RUNS, SCOPE_WRITE_RUNS
 
 router = APIRouter(prefix="/projects/{project_id}/runs", tags=["runs"])
@@ -51,6 +50,8 @@ ALLOWED_ARTIFACT_CONTENT_TYPES = {
     "application/x-gzip",
     "application/octet-stream",
 }
+RAW_ARTIFACT_FILENAME_HEADER = "x-artifact-filename"
+ARTIFACT_SIGNATURE_SNIFF_BYTES = 4096
 RUN_LIST_CURSOR = (
     KeysetColumn("created_at", ScanRun.created_at, direction="desc", parser=parse_datetime_cursor_value),
     KeysetColumn("id", ScanRun.id, direction="desc", parser=parse_uuid_cursor_value),
@@ -68,6 +69,7 @@ RUN_ACTIVITY_ACTIONS = {
     "INGEST_QUEUED",
     "INGEST_QUEUE_FALLBACK",
     "INGEST_STARTED",
+    "INGEST_RETRY_SCHEDULED",
     "INGEST_COMPLETED",
     "INGEST_FAILED",
 }
@@ -100,6 +102,8 @@ def _to_run_out(run: ScanRun) -> RunOut:
         created_at=run.created_at,
         status=run.status,
         artifact_size=run.artifact_size,
+        artifact_sha256=run.artifact_sha256,
+        artifact_content_type=run.artifact_content_type,
         ingest_progress=run.ingest_progress,
         summary=run.summary,
     )
@@ -132,6 +136,11 @@ def _delete_artifact_quietly(key: str | None) -> None:
         return
     except (OSError, ValueError):
         logger.warning("failed to delete artifact key=%s", key, exc_info=True)
+
+
+def _delete_superseded_artifact(previous_key: str | None, current_key: str) -> None:
+    if previous_key and previous_key != current_key:
+        _delete_artifact_quietly(previous_key)
 
 
 def _resource_identity(endpoint_key: str, resource_type: str, share_name: str) -> tuple[str, str, str]:
@@ -474,13 +483,40 @@ def _default_baseline_run(db: Session, project_id: uuid.UUID, run: ScanRun) -> S
 async def _enqueue_with_retries(payload: dict, retries: int) -> bool:
     for attempt in range(retries):
         try:
-            enqueue_ingest_job(payload)
+            await run_in_threadpool(enqueue_ingest_job, payload)
             return True
         except Exception:  # noqa: BLE001
             if attempt + 1 >= retries:
                 return False
             await asyncio.sleep(min(2**attempt, 4))
     return False
+
+
+async def _check_upload_rate_limit(request: Request, actor_key: str) -> None:
+    await run_in_threadpool(
+        rate_limiter.check,
+        request,
+        "artifact_upload",
+        limit=30,
+        window_seconds=60,
+        actor_key=f"upload:{actor_key}",
+    )
+
+
+async def _run_cleanup_in_threadpool(func, *args) -> None:
+    """Finish bounded storage cleanup even when the request task is cancelled."""
+    cleanup_task = asyncio.create_task(run_in_threadpool(func, *args))
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            continue
+        except Exception:  # noqa: BLE001
+            break
+    try:
+        cleanup_task.result()
+    except BaseException:  # Cleanup must never mask the original failure/cancellation.
+        logger.exception("artifact cleanup failed")
 
 
 async def _upload_artifact_stream(
@@ -490,7 +526,7 @@ async def _upload_artifact_stream(
     content_type: str | None,
 ) -> tuple[int, str]:
     settings = get_settings()
-    chunk_bytes = max(5 * 1024 * 1024, settings.upload_chunk_bytes)
+    chunk_bytes = settings.upload_chunk_bytes
     artifact_kind = _artifact_kind(content_type, key)
 
     upload_id = await run_in_threadpool(create_multipart_upload, key, content_type)
@@ -501,6 +537,17 @@ async def _upload_artifact_stream(
     buffer = bytearray()
     signature_buffer = bytearray()
     signature_checked = False
+
+    def inspect_signature(chunk: bytes) -> None:
+        nonlocal signature_checked
+        if signature_checked:
+            return
+        remaining = ARTIFACT_SIGNATURE_SNIFF_BYTES - len(signature_buffer)
+        if remaining > 0:
+            signature_buffer.extend(chunk[:remaining])
+        signature_checked = _validate_artifact_signature(artifact_kind, bytes(signature_buffer))
+        if not signature_checked and len(signature_buffer) >= ARTIFACT_SIGNATURE_SNIFF_BYTES:
+            _validate_artifact_signature(artifact_kind, bytes(signature_buffer), final=True)
 
     async def flush_parts(force: bool = False) -> None:
         nonlocal part_number
@@ -526,9 +573,7 @@ async def _upload_artifact_stream(
                 if size > settings.upload_max_bytes:
                     raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="upload too large")
                 sha256.update(chunk)
-                if not signature_checked and len(signature_buffer) < 64:
-                    signature_buffer.extend(chunk[: 64 - len(signature_buffer)])
-                    signature_checked = _validate_artifact_signature(artifact_kind, bytes(signature_buffer))
+                inspect_signature(chunk)
                 buffer.extend(chunk)
                 await flush_parts()
         else:
@@ -539,9 +584,7 @@ async def _upload_artifact_stream(
                 if size > settings.upload_max_bytes:
                     raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="upload too large")
                 sha256.update(chunk)
-                if not signature_checked and len(signature_buffer) < 64:
-                    signature_buffer.extend(chunk[: 64 - len(signature_buffer)])
-                    signature_checked = _validate_artifact_signature(artifact_kind, bytes(signature_buffer))
+                inspect_signature(chunk)
                 buffer.extend(chunk)
                 await flush_parts()
 
@@ -553,11 +596,8 @@ async def _upload_artifact_stream(
         await flush_parts(force=True)
         await run_in_threadpool(complete_multipart_upload, key, upload_id, parts)
         return size, sha256.hexdigest()
-    except Exception:
-        try:
-            await run_in_threadpool(abort_multipart_upload, key, upload_id)
-        except Exception:  # noqa: BLE001
-            logger.exception("failed to abort multipart upload key=%s upload_id=%s", key, upload_id)
+    except BaseException:
+        await _run_cleanup_in_threadpool(abort_multipart_upload, key, upload_id)
         raise
 
 
@@ -579,8 +619,32 @@ def _artifact_suffix(content_type: str | None, filename: str | None) -> str:
     return ".ndjson.gz" if is_gzip else ".ndjson"
 
 
+def _new_artifact_key(project_id: uuid.UUID, run_id: uuid.UUID, suffix: str) -> str:
+    return f"projects/{project_id}/runs/{run_id}/artifact-{uuid.uuid4().hex}{suffix}"
+
+
 def _normalize_content_type(content_type: str | None) -> str:
     return str(content_type or "").split(";", 1)[0].strip().lower()
+
+
+def _raw_artifact_filename(request: Request) -> str | None:
+    raw = request.headers.get(RAW_ARTIFACT_FILENAME_HEADER)
+    if raw is None:
+        return None
+    filename = raw
+    if (
+        not filename
+        or filename != filename.strip()
+        or len(filename) > 255
+        or "/" in filename
+        or "\\" in filename
+        or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid {RAW_ARTIFACT_FILENAME_HEADER} header",
+        )
+    return filename
 
 
 def _artifact_kind(content_type: str | None, filename_or_key: str | None) -> str:
@@ -623,7 +687,12 @@ def _validate_artifact_signature(kind: str, sample: bytes, final: bool = False) 
 
     stripped = sample.lstrip(b" \t\r\n")
     if not stripped:
-        return final
+        if final:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="artifact does not look like JSON",
+            )
+        return False
     if stripped[:1] not in {b"{", b"["}:
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="artifact does not look like JSON")
     return True
@@ -965,58 +1034,85 @@ async def upload_artifact(
 ):
     require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
     actor_key = str(auth.token_id or auth.user_id or "anon")
-    rate_limiter.check(request, "artifact_upload", limit=30, window_seconds=60, actor_key=f"upload:{actor_key}")
+    await _check_upload_rate_limit(request, actor_key)
 
     settings = get_settings()
     run = _get_run(db, project_id, run_id)
-    if not _try_lock_run_for_mutation(db, run.id):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run is currently ingesting")
-    db.refresh(run)
     if run.status not in {RunStatus.PENDING_UPLOAD, RunStatus.UPLOADED, RunStatus.FAILED}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run state does not accept upload")
-    previous_status = run.status
-    previous_artifact_key = run.artifact_key
 
     content_type = _normalize_content_type(file.content_type if file else request.headers.get("content-type", "application/octet-stream"))
-    _validate_artifact_upload_headers(content_type, file.filename if file else None)
-    suffix = _artifact_suffix(content_type, file.filename if file else None)
-    key = f"projects/{project_id}/runs/{run_id}/artifact{suffix}"
+    filename = file.filename if file else _raw_artifact_filename(request)
+    _validate_artifact_upload_headers(content_type, filename)
+    suffix = _artifact_suffix(content_type, filename)
+    key = _new_artifact_key(project_id, run_id, suffix)
+
+    # Authentication/project preflight opens a SQLAlchemy transaction. Release
+    # its pooled connection before a potentially long request-body transfer;
+    # immutable object keys let us re-check authoritative state afterward.
+    db.rollback()
 
     started = time.perf_counter()
     size, digest = await _upload_artifact_stream(request, file, key, content_type)
 
-    if previous_status == RunStatus.FAILED:
-        _clear_run_ingest_data(db, run)
+    commit_attempted = False
+    previous_artifact_key: str | None = None
+    try:
+        require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
+        run = _get_run(db, project_id, run_id)
+        if not _try_lock_run_for_mutation(db, run.id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run is currently ingesting")
+        db.refresh(run)
+        if run.status not in {RunStatus.PENDING_UPLOAD, RunStatus.UPLOADED, RunStatus.FAILED}:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run state does not accept upload")
+        previous_status = run.status
+        previous_artifact_key = run.artifact_key
 
-    run.artifact_key = key
-    run.artifact_size = size
-    run.artifact_sha256 = digest
-    run.artifact_content_type = content_type
-    run.status = RunStatus.UPLOADED
-    run.ingest_progress = {"line_offset": 0}
-    db.add(run)
+        if previous_status == RunStatus.FAILED or previous_artifact_key is not None:
+            _clear_run_ingest_data(db, run)
 
-    write_audit_event(
-        db,
-        action="ARTIFACT_UPLOADED",
-        object_type="scan_run",
-        object_id=str(run.id),
-        actor_user_id=auth.user_id,
-        actor_token_id=auth.token_id,
-        project_id=project_id,
-        metadata={
-            **request_meta(request),
-            "size": size,
-            "content_type": content_type,
-            "upload_ms": int((time.perf_counter() - started) * 1000),
-        },
-    )
-    db.commit()
-    if previous_status == RunStatus.FAILED and previous_artifact_key != key:
-        _delete_artifact_quietly(previous_artifact_key)
+        run.artifact_key = key
+        run.artifact_size = size
+        run.artifact_sha256 = digest
+        run.artifact_content_type = content_type
+        run.status = RunStatus.UPLOADED
+        run.ingest_progress = {"line_offset": 0}
+        db.add(run)
+
+        write_audit_event(
+            db,
+            action="ARTIFACT_UPLOADED",
+            object_type="scan_run",
+            object_id=str(run.id),
+            actor_user_id=auth.user_id,
+            actor_token_id=auth.token_id,
+            project_id=project_id,
+            metadata={
+                **request_meta(request),
+                "size": size,
+                "content_type": content_type,
+                "upload_ms": int((time.perf_counter() - started) * 1000),
+            },
+        )
+        commit_attempted = True
+        db.commit()
+    except BaseException:
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to roll back artifact pointer transaction run_id=%s", run_id)
+        # Once COMMIT has been attempted its outcome can be ambiguous. Keep the
+        # immutable object so a possibly committed DB pointer never references
+        # deleted bytes; orphan reconciliation can remove it later if needed.
+        if not commit_attempted:
+            await _run_cleanup_in_threadpool(_delete_artifact_quietly, key)
+        raise
+
+    authoritative_run_id = run.id
+    await run_in_threadpool(_delete_superseded_artifact, previous_artifact_key, key)
 
     payload = {
-        "run_id": str(run.id),
+        "run_id": str(authoritative_run_id),
         "project_id": str(project_id),
         "artifact_key": key,
         "schema_version": 1,
@@ -1028,7 +1124,7 @@ async def upload_artifact(
             db,
             action="INGEST_QUEUED",
             object_type="scan_run",
-            object_id=str(run.id),
+            object_id=str(authoritative_run_id),
             actor_user_id=auth.user_id,
             actor_token_id=auth.token_id,
             project_id=project_id,
@@ -1039,7 +1135,7 @@ async def upload_artifact(
             db,
             action="INGEST_QUEUE_FALLBACK",
             object_type="scan_run",
-            object_id=str(run.id),
+            object_id=str(authoritative_run_id),
             actor_user_id=auth.user_id,
             actor_token_id=auth.token_id,
             project_id=project_id,
@@ -1049,8 +1145,9 @@ async def upload_artifact(
 
     return {
         "ok": True,
-        "run_id": str(run.id),
+        "run_id": str(authoritative_run_id),
         "artifact_key": key,
+        "artifact_sha256": digest,
         "queued": queued,
     }
 
@@ -1273,6 +1370,8 @@ def search_items(
                 "path": i.path,
                 "name": i.name,
                 "is_dir": i.is_dir,
+                "size_bytes": i.size_bytes,
+                "mtime": i.mtime.isoformat() if i.mtime else None,
             }
             for i in items
         ],

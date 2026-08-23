@@ -77,15 +77,15 @@ The bundled collector is an external producer. It can write a compatible artifac
 
 ### 1. Collection
 
-The collector scans SMB and NFS targets, writes compact JSON or gzip-compressed JSON, and can optionally upload it to a project run.
+The collector scans SMB and NFS targets and writes schema-v1 NDJSON by default, optionally gzip-compressed based on the output suffix. NDJSON records are spooled incrementally so one endpoint tree does not need to be rebuilt in memory; after collection finishes, the finalized artifact is streamed from disk during upload. Explicit `.json` and `.json.gz` outputs remain available as bounded compact-format compatibility exports.
 
 ### 2. Upload
 
 An operator or the collector creates a run, uploads the artifact, and the API:
 
 - validates content type, filename, and basic payload structure
-- stores the raw artifact on shared storage
-- records artifact metadata on the run
+- streams the raw artifact to a unique immutable key on shared storage without holding a database transaction for the body transfer
+- reacquires the run mutation lock, rechecks authoritative status, and records artifact metadata on the run
 - enqueues the run id into Redis
 
 ### 3. Ingest
@@ -166,6 +166,8 @@ The worker is designed for asynchronous ingest and partial recovery:
 Current caveats:
 
 - retryable ingest failures are rescheduled with bounded backoff before the run is marked `FAILED`
+- Redis stream loss or unavailability does not remove the durable `UPLOADED` state; the worker periodically discovers due runs from Postgres
+- NDJSON records and compact JSON compatibility documents have explicit parser/materialization limits; large collections should use NDJSON
 - the default deployment uses a worker heartbeat file and container healthcheck instead of an HTTP health endpoint
 - the default Compose deployment is for local operation, not HA orchestration
 - inventory views can include data from `INGESTING` runs until ingest settles

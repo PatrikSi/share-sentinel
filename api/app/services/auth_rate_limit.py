@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import threading
 import time
+from dataclasses import dataclass
 
 import redis
 
 from app.config import get_settings
+from app.redis_client import create_redis_client, increment_keys_with_ttl
 
 settings = get_settings()
-redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+redis_client = create_redis_client()
 _fallback_lock = threading.Lock()
 _fallback_failures: dict[str, tuple[int, float]] = {}
 _fallback_locks: dict[str, float] = {}
@@ -41,12 +42,7 @@ def record_login_failure(email: str, ip: str) -> None:
     lock_keys = _lock_keys(email, ip)
 
     try:
-        counts: list[int] = []
-        for key in failure_keys:
-            count = int(redis_client.incr(key))
-            if count == 1:
-                redis_client.expire(key, settings.auth_login_window_seconds)
-            counts.append(count)
+        counts = increment_keys_with_ttl(redis_client, failure_keys, settings.auth_login_window_seconds)
 
         if any(count >= settings.auth_login_max_attempts for count in counts):
             for key in lock_keys:

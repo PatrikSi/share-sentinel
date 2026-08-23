@@ -3,8 +3,6 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import column
-
 from app.pagination import (
     KeysetColumn,
     build_keyset_filter,
@@ -15,6 +13,7 @@ from app.pagination import (
     parse_keyset_cursor,
     parse_uuid_cursor_value,
 )
+from sqlalchemy import column
 
 
 def test_keyset_cursor_round_trip_for_datetime_and_uuid() -> None:

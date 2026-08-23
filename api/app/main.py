@@ -32,7 +32,13 @@ app.add_middleware(
     allow_origins=origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Request-ID", app_settings.auth_csrf_header_name],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Request-ID",
+        app_settings.auth_csrf_header_name,
+        runs.RAW_ARTIFACT_FILENAME_HEADER,
+    ],
     expose_headers=["Content-Disposition", "X-Request-ID"],
 )
 trusted_hosts = [item.strip() for item in app_settings.trusted_hosts.split(",") if item.strip()]

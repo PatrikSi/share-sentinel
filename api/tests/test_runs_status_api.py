@@ -4,13 +4,12 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
-from fastapi.testclient import TestClient
-
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context
 from app.enums import ErrorSeverity, RunStatus
 from app.main import app
 from app.routers import runs as runs_router
+from fastapi.testclient import TestClient
 
 
 class _ExecuteResult:
@@ -68,6 +67,8 @@ def test_to_run_out_includes_ingest_progress() -> None:
         created_at=datetime.now(tz=UTC),
         status=RunStatus.INGESTING,
         artifact_size=4096,
+        artifact_sha256="a" * 64,
+        artifact_content_type="application/x-ndjson",
         ingest_progress={"line_offset": 2048},
         summary={"endpoints": 2, "resources": 5, "items": 100, "errors": 1},
     )
@@ -75,6 +76,8 @@ def test_to_run_out_includes_ingest_progress() -> None:
     payload = runs_router._to_run_out(run)
 
     assert payload.ingest_progress == {"line_offset": 2048}
+    assert payload.artifact_sha256 == "a" * 64
+    assert payload.artifact_content_type == "application/x-ndjson"
 
 
 def test_list_run_errors_returns_issue_rows(monkeypatch) -> None:

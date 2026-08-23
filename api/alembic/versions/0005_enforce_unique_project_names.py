@@ -5,8 +5,8 @@ Revises: 0004_add_saved_investigations
 Create Date: 2026-03-12
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "0005_unique_project_names"
 down_revision = "0004_add_saved_investigations"

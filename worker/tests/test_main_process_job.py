@@ -1,5 +1,8 @@
-from pathlib import Path
+import gzip
+import io
 import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -30,6 +33,13 @@ class _FakeResult:
     def fetchone(self):
         return self._row
 
+    def fetchall(self):
+        if self._row is None:
+            return []
+        if isinstance(self._row, list):
+            return self._row
+        return [self._row]
+
 
 class _FakeConn:
     def __init__(self, run_row):
@@ -49,6 +59,8 @@ class _FakeConn:
             return _FakeResult((True,))
         if "FROM scan_runs" in query:
             return _FakeResult(self._run_row)
+        if "SELECT COUNT(*) FROM endpoints" in query:
+            return _FakeResult((0, 0, 0, 0))
         if "pg_advisory_unlock" in query:
             self._unlocked = True
             return _FakeResult((True,))
@@ -91,9 +103,39 @@ def test_process_job_skips_failed_runs_without_touching_s3(monkeypatch) -> None:
     assert result == "ignored"
 
 
+def test_process_job_defers_uploaded_run_until_scheduled_retry_is_due(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    next_retry_at = (datetime.now(tz=UTC) + timedelta(minutes=5)).isoformat()
+    run_row = (
+        project_id,
+        "artifact.ndjson",
+        "UPLOADED",
+        {},
+        {"line_offset": 12, "attempt_count": 1, "next_retry_at": next_retry_at},
+        "application/x-ndjson",
+        64,
+    )
+    fake_conn = _FakeConn(run_row)
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(
+        main,
+        "open_artifact_stream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("deferred run must not read its artifact")),
+    )
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+
+    assert result == "deferred"
+    assert main.should_ack_stream_result(result) is True
+    assert fake_conn.commit_calls == 0
+    assert fake_conn._unlocked is True
+
+
 class _FakeBody:
-    def __init__(self, lines: list[str]):
-        self._lines = [line.encode("utf-8") for line in lines]
+    def __init__(self, lines: list[str | bytes]):
+        self._lines = [line if isinstance(line, bytes) else line.encode("utf-8") for line in lines]
+        self._index = 0
 
     def __enter__(self):
         return self
@@ -104,6 +146,17 @@ class _FakeBody:
     def __iter__(self):
         for line in self._lines:
             yield line
+
+    def readline(self, size: int = -1):
+        if self._index >= len(self._lines):
+            return b""
+        line = self._lines[self._index]
+        if size >= 0 and len(line) > size:
+            head = line[:size]
+            self._lines[self._index] = line[size:]
+            return head
+        self._index += 1
+        return line
 
     def close(self):
         return None
@@ -239,3 +292,405 @@ def test_process_job_schedules_retry_for_retryable_ingest_error(monkeypatch) -> 
     assert retry_metadata["extra_progress"]["attempt_count"] == 1
     assert "next_retry_at" in retry_metadata["extra_progress"]
     assert "INGEST_RETRY_SCHEDULED" in audit_actions
+
+
+def test_process_job_uses_database_artifact_over_stale_queue_payload(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    database_project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (
+        database_project_id,
+        "current-artifact.ndjson",
+        "UPLOADED",
+        {},
+        {"line_offset": 0},
+        "application/x-ndjson",
+        0,
+    )
+    fake_conn = _FakeConn(run_row)
+    opened_keys: list[str] = []
+    audit_projects: list[str] = []
+
+    def _open(key: str):
+        opened_keys.append(key)
+        return _FakeBody([])
+
+    def _audit(_conn, project_id, *_args, **_kwargs):
+        audit_projects.append(project_id)
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "open_artifact_stream", _open)
+    monkeypatch.setattr(main, "update_run_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "write_audit", _audit)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+
+    result = main.process_job(
+        {
+            "run_id": run_id,
+            "project_id": "33333333-3333-3333-3333-333333333333",
+            "artifact_key": "superseded-artifact.json",
+        }
+    )
+
+    assert result == "complete"
+    assert opened_keys == ["current-artifact.ndjson"]
+    assert audit_projects == [database_project_id, database_project_id]
+
+
+def test_process_job_terminalizes_unexpected_poison_exception(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (project_id, "artifact.ndjson", "UPLOADED", {}, {"line_offset": 0}, "application/x-ndjson", 64)
+    fake_conn = _FakeConn(run_row)
+    status_updates: list[tuple[str, str | None]] = []
+
+    def _update(_conn, _run_id, status, *_args, **kwargs):
+        status_updates.append((status, kwargs.get("last_error")))
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "open_artifact_stream", lambda *_args, **_kwargs: (_ for _ in ()).throw(AttributeError("poison")))
+    monkeypatch.setattr(main, "update_run_status", _update)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+
+    assert result == "failed"
+    assert status_updates == [("INGESTING", None), ("FAILED", "unexpected ingest failure")]
+    assert fake_conn.rollback_calls == 1
+
+
+def test_process_job_terminalizes_corrupt_gzip_without_scheduling_retry(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (project_id, "artifact.ndjson.gz", "UPLOADED", {}, {"line_offset": 0}, "application/gzip", 8)
+    fake_conn = _FakeConn(run_row)
+    status_updates: list[tuple[str, str | None]] = []
+
+    def _update(_conn, _run_id, status, *_args, **kwargs):
+        status_updates.append((status, kwargs.get("last_error")))
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "open_artifact_stream", lambda *_args, **_kwargs: io.BytesIO(b"\x1f\x8bcorrupt"))
+    monkeypatch.setattr(main, "update_run_status", _update)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson.gz"})
+
+    assert result == "failed"
+    assert status_updates == [("INGESTING", None), ("FAILED", main.INVALID_GZIP_ARTIFACT_ERROR)]
+
+
+def test_process_job_terminalizes_oversized_ndjson_record(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (project_id, "artifact.ndjson", "UPLOADED", {}, {"line_offset": 0}, "application/x-ndjson", 9)
+    fake_conn = _FakeConn(run_row)
+    status_updates: list[tuple[str, str | None]] = []
+
+    def _update(_conn, _run_id, status, *_args, **kwargs):
+        status_updates.append((status, kwargs.get("last_error")))
+
+    monkeypatch.setattr(main, "INGEST_MAX_RECORD_BYTES", 8)
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "open_artifact_stream", lambda *_args, **_kwargs: _FakeBody(["x" * 9]))
+    monkeypatch.setattr(main, "update_run_status", _update)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+
+    assert result == "failed"
+    assert status_updates == [("INGESTING", None), ("FAILED", main.NDJSON_RECORD_TOO_LARGE_ERROR)]
+
+
+@pytest.mark.parametrize(
+    ("artifact_key", "content_type", "payload"),
+    [
+        ("artifact.json", "application/json", b'{"x":"123456789"}'),
+        ("artifact.json.gz", "application/gzip", gzip.compress(b'{"x":"123456789"}')),
+    ],
+)
+def test_process_job_bounds_compact_json_materialization(monkeypatch, artifact_key, content_type, payload) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (project_id, artifact_key, "UPLOADED", {}, {"line_offset": 0}, content_type, len(payload))
+    fake_conn = _FakeConn(run_row)
+    status_updates: list[tuple[str, str | None]] = []
+
+    def _update(_conn, _run_id, status, *_args, **kwargs):
+        status_updates.append((status, kwargs.get("last_error")))
+
+    monkeypatch.setattr(main, "JSON_COMPAT_MAX_BYTES", 8)
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "open_artifact_stream", lambda *_args: io.BytesIO(payload))
+    monkeypatch.setattr(main, "update_run_status", _update)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": artifact_key})
+
+    assert result == "failed"
+    assert status_updates == [("INGESTING", None), ("FAILED", main.JSON_COMPAT_LIMIT_ERROR)]
+
+
+def test_process_job_resume_uses_existing_resource_without_downgrading_access(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    endpoint_key = "host:445"
+    resource_key = (endpoint_key, "Finance", "smb_share")
+    run_row = (
+        project_id,
+        "artifact.ndjson",
+        "UPLOADED",
+        {"endpoints": 1, "resources": 1, "items": 0, "errors": 0},
+        {"line_offset": 2, "attempt_count": 1},
+        "application/x-ndjson",
+        256,
+    )
+    fake_conn = _FakeConn(run_row)
+    inserted_item_rows: list[tuple] = []
+
+    def _flush_items(_conn, rows):
+        inserted_item_rows.extend(rows)
+        rows.clear()
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "load_resume_caches", lambda *_args: ({endpoint_key: 7}, {resource_key: 8}))
+    monkeypatch.setattr(
+        main,
+        "upsert_resource",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("existing readable resource must not be overwritten")),
+    )
+    monkeypatch.setattr(main, "flush_item_batch", _flush_items)
+    monkeypatch.setattr(main, "load_persisted_summary", lambda *_args: {"endpoints": 1, "resources": 1, "items": 1, "errors": 0})
+    monkeypatch.setattr(main, "update_run_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "open_artifact_stream",
+        lambda *_args: _FakeBody(
+            [
+                f'{{"type":"endpoint","run_id":"{run_id}","endpoint_key":"{endpoint_key}"}}\n',
+                f'{{"type":"resource","run_id":"{run_id}","endpoint_key":"{endpoint_key}","name":"Finance","resource_type":"smb_share","access_level":"readable"}}\n',
+                f'{{"type":"item","run_id":"{run_id}","endpoint_key":"{endpoint_key}","resource_name":"Finance","resource_type":"smb_share","path":"\\\\report.txt","name":"report.txt","is_dir":false}}\n',
+            ]
+        ),
+    )
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+
+    assert result == "complete"
+    assert len(inserted_item_rows) == 1
+    assert inserted_item_rows[0][1] == 8
+
+
+def test_process_job_records_invalid_utf8_without_persisting_corrupted_inventory(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (project_id, "artifact.ndjson", "UPLOADED", {}, {"line_offset": 0}, "application/x-ndjson", 32)
+    fake_conn = _FakeConn(run_row)
+    captured_errors: list[tuple] = []
+
+    def _flush_errors(_conn, rows):
+        captured_errors.extend(rows)
+        rows.clear()
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "open_artifact_stream", lambda *_args: _FakeBody([b'{"type":"endpoint","hostname":"bad\xff"}\n']))
+    monkeypatch.setattr(main, "upsert_endpoint", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invalid UTF-8 must not be persisted")))
+    monkeypatch.setattr(main, "flush_error_batch", _flush_errors)
+    monkeypatch.setattr(main, "load_persisted_summary", lambda *_args: {"endpoints": 0, "resources": 0, "items": 0, "errors": 1})
+    monkeypatch.setattr(main, "update_run_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+
+    assert result == "complete"
+    assert len(captured_errors) == 1
+    assert captured_errors[0][2] == "UTF8_DECODE_ERROR"
+    assert "byte offset" in captured_errors[0][3]
+
+
+def test_process_job_checkpoints_and_heartbeats_for_every_consumed_ndjson_line(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (project_id, "artifact.ndjson", "UPLOADED", {}, {"line_offset": 0}, "application/x-ndjson", 32)
+    fake_conn = _FakeConn(run_row)
+    captured_errors: list[tuple] = []
+    status_updates: list[tuple[str, int, dict[str, int]]] = []
+    heartbeats: list[tuple[str, int | None]] = []
+
+    def _flush_errors(_conn, rows):
+        captured_errors.extend(rows)
+        rows.clear()
+
+    def _update(_conn, _run_id, status, line_offset, summary, **_kwargs):
+        status_updates.append((status, line_offset, dict(summary)))
+
+    def _heartbeat(status, **kwargs):
+        heartbeats.append((status, kwargs.get("line_offset")))
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(
+        main,
+        "open_artifact_stream",
+        lambda *_args: _FakeBody(
+            [
+                b'{"type":"endpoint","hostname":"bad\xff"}\n',
+                b"   \n",
+                b"{not-json}\n",
+            ]
+        ),
+    )
+    monkeypatch.setattr(main, "PROGRESS_EVERY_LINES", 1)
+    monkeypatch.setattr(main, "WORKER_HEARTBEAT_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(main, "flush_error_batch", _flush_errors)
+    monkeypatch.setattr(
+        main,
+        "load_persisted_summary",
+        lambda *_args: {"endpoints": 0, "resources": 0, "items": 0, "errors": 2},
+    )
+    monkeypatch.setattr(main, "update_run_status", _update)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", _heartbeat)
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+
+    assert result == "complete"
+    assert [row[2] for row in captured_errors] == ["UTF8_DECODE_ERROR", "JSON_DECODE_ERROR"]
+    assert [(status, offset) for status, offset, _summary in status_updates] == [
+        ("INGESTING", 0),
+        ("INGESTING", 1),
+        ("INGESTING", 2),
+        ("INGESTING", 3),
+        ("COMPLETE", 3),
+    ]
+    assert heartbeats == [
+        ("processing", 0),
+        ("processing", 1),
+        ("processing", 2),
+        ("processing", 3),
+        ("idle", None),
+    ]
+
+
+def test_process_job_records_non_object_ndjson_and_continues(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (project_id, "artifact.ndjson", "UPLOADED", {}, {"line_offset": 0}, "application/x-ndjson", 64)
+    fake_conn = _FakeConn(run_row)
+    captured_errors: list[tuple] = []
+    endpoint_records: list[dict[str, Any]] = []
+
+    def _flush_errors(_conn, rows):
+        captured_errors.extend(rows)
+        rows.clear()
+
+    def _upsert_endpoint(_conn, _run_id, record):
+        endpoint_records.append(record)
+        return 7
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(
+        main,
+        "open_artifact_stream",
+        lambda *_args: _FakeBody(
+            [
+                "[1,2,3]\n",
+                f'{{"type":"endpoint","run_id":"{run_id}","endpoint_key":"host:445"}}\n',
+            ]
+        ),
+    )
+    monkeypatch.setattr(main, "upsert_endpoint", _upsert_endpoint)
+    monkeypatch.setattr(main, "flush_error_batch", _flush_errors)
+    monkeypatch.setattr(
+        main,
+        "load_persisted_summary",
+        lambda *_args: {"endpoints": 1, "resources": 0, "items": 0, "errors": 1},
+    )
+    monkeypatch.setattr(main, "update_run_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+
+    assert result == "complete"
+    assert len(endpoint_records) == 1
+    assert len(captured_errors) == 1
+    assert captured_errors[0][2] == "SCHEMA_INVALID"
+    assert captured_errors[0][3] == "record must be a JSON object"
+
+
+def test_process_job_uses_persisted_summary_instead_of_producer_claim(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (project_id, "artifact.ndjson", "UPLOADED", {}, {"line_offset": 0}, "application/x-ndjson", 128)
+    fake_conn = _FakeConn(run_row)
+    complete_summaries: list[dict[str, int]] = []
+    authoritative = {"endpoints": 1, "resources": 2, "items": 3, "errors": 4}
+
+    def _update(_conn, _run_id, status, _offset, summary, **_kwargs):
+        if status == "COMPLETE":
+            complete_summaries.append(dict(summary))
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(
+        main,
+        "open_artifact_stream",
+        lambda *_args: _FakeBody(
+                [
+                    f'{{"type":"run_end","run_id":"{run_id}","finished_at":"2026-01-01T00:00:00Z","stats":{{"endpoints":999,"resources":999,"items":999,"errors":999}}}}\n'
+                ]
+        ),
+    )
+    monkeypatch.setattr(main, "load_persisted_summary", lambda *_args: authoritative)
+    monkeypatch.setattr(main, "update_run_status", _update)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+
+    assert result == "complete"
+    assert complete_summaries == [authoritative]
+
+
+def test_process_job_propagates_failure_before_authoritative_run_state_is_loaded(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+
+    class _SelectFailConn(_FakeConn):
+        def execute(self, query, params=None):
+            if "FROM scan_runs" in query:
+                raise psycopg.DataError("could not load run row")
+            return super().execute(query, params)
+
+    fake_conn = _SelectFailConn(None)
+    status_updates: list[tuple[str, int, str | None]] = []
+
+    def _update(_conn, _run_id, status, line_offset, _summary, last_error=None, **_kwargs):
+        status_updates.append((status, line_offset, last_error))
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "update_run_status", _update)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(psycopg.DataError, match="could not load run row"):
+        main.process_job({"run_id": run_id, "project_id": project_id})
+
+    assert status_updates == []
+    assert fake_conn.rollback_calls == 1
+    assert fake_conn._unlocked is True
+
+
+def test_process_job_propagates_connection_failure_for_stream_redelivery(monkeypatch) -> None:
+    def _connect(*_args, **_kwargs):
+        raise psycopg.OperationalError("database unavailable")
+
+    monkeypatch.setattr(main.psycopg, "connect", _connect)
+
+    with pytest.raises(psycopg.OperationalError, match="database unavailable"):
+        main.process_job({"run_id": "11111111-1111-1111-1111-111111111111"})

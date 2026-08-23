@@ -14,11 +14,11 @@ Backend tests include:
 Run all component suites from a Python 3.11 environment:
 
 ```bash
-cd api && pip install -r requirements-dev.txt && pytest -q -p no:cacheprovider
-cd ../worker && pip install -r requirements-dev.txt && pytest -q -p no:cacheprovider
-cd ../collector && pip install -r requirements-dev.txt && pytest -q -p no:cacheprovider
+cd api && pip install -r requirements-dev.txt && ruff check . && pytest -q -p no:cacheprovider
+cd ../worker && pip install -r requirements-dev.txt && ruff check . && pytest -q -p no:cacheprovider
+cd ../collector && pip install -r requirements-dev.txt && ruff check . && pytest -q -p no:cacheprovider
 cd ../ui && npm ci && npm audit --audit-level=high && npm run build
-cd .. && python scripts/validate-sample.py && python scripts/check-release.py
+cd .. && ruff check scripts && python scripts/validate-sample.py && python scripts/check-release.py
 ```
 
 CI runs those checks independently, builds and vulnerability-scans API, worker, UI, and collector images, and exercises both development and production-style live stacks. Successful `main` runs then publish the four images to GHCR.

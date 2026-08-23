@@ -5,14 +5,21 @@ from sqlalchemy import String, and_, cast, func, not_, or_, select
 from sqlalchemy.orm import Session
 
 from app.db import escape_like, get_db
-from app.deps import AuthContext, get_auth_context, require_project_role, request_meta, require_session_user, require_token_scopes
+from app.deps import (
+    AuthContext,
+    get_auth_context,
+    request_meta,
+    require_project_role,
+    require_session_user,
+    require_token_scopes,
+)
 from app.enums import ProjectRole, RunStatus
 from app.models import Endpoint, Item, Resource, SavedInvestigation, ScanRun, User
 from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_int_cursor_value
 from app.schemas import SavedInvestigationIn, SavedInvestigationOut, SavedInvestigationUpdateIn
-from app.share_types import share_type_from_resource_type
-from app.services.inventory_query import InventoryQueryClause, parse_inventory_query
 from app.services.audit import write_audit_event
+from app.services.inventory_query import InventoryQueryClause, parse_inventory_query
+from app.share_types import share_type_from_resource_type
 from app.token_scopes import SCOPE_READ_INVENTORY
 
 router = APIRouter(prefix="/projects/{project_id}/inventory", tags=["inventory"])
@@ -578,6 +585,8 @@ def inventory_items(
             Item.path,
             Item.name,
             Item.is_dir,
+            Item.size_bytes,
+            Item.mtime,
         )
         .select_from(Item)
         .join(Resource, (Resource.id == Item.resource_id) & (Resource.run_id == Item.run_id))
@@ -638,6 +647,8 @@ def inventory_items(
             "path": row.path,
             "name": row.name,
             "is_dir": bool(row.is_dir),
+            "size_bytes": row.size_bytes,
+            "mtime": row.mtime.isoformat() if row.mtime else None,
         }
         for row in rows
     ]

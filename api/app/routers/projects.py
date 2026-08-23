@@ -9,10 +9,9 @@ from app.db import get_db
 from app.deps import (
     AuthContext,
     get_auth_context,
-    get_current_user,
+    request_meta,
     require_project_role,
     require_sysadmin,
-    request_meta,
     require_token_scopes,
 )
 from app.enums import ProjectRole

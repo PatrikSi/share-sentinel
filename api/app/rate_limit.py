@@ -1,5 +1,5 @@
-import logging
 import hashlib
+import logging
 import time
 
 import redis
@@ -7,14 +7,14 @@ from fastapi import HTTPException, Request, status
 
 from app.config import get_settings
 from app.deps import resolve_client_ip
+from app.redis_client import create_redis_client, increment_keys_with_ttl
 
 logger = logging.getLogger("share_sentinel.ratelimit")
 
 
 class RateLimiter:
     def __init__(self) -> None:
-        settings = get_settings()
-        self._redis = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+        self._redis = create_redis_client()
 
     @staticmethod
     def _hash_identity(value: str) -> str:
@@ -39,9 +39,7 @@ class RateLimiter:
         should_fail_open = get_settings().rate_limit_fail_open if fail_open is None else fail_open
 
         try:
-            count = self._redis.incr(key)
-            if count == 1:
-                self._redis.expire(key, window_seconds + 1)
+            count = increment_keys_with_ttl(self._redis, [key], window_seconds + 1)[0]
         except redis.RedisError:
             logger.warning("redis unavailable for rate limiting scope=%s", scope)
             if should_fail_open:

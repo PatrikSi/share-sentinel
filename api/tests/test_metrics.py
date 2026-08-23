@@ -1,9 +1,8 @@
 import pytest
-from fastapi.testclient import TestClient
-
 from app import metrics
 from app.deps import require_sysadmin
 from app.main import app
+from fastapi.testclient import TestClient
 
 
 def _ensure_error_route() -> None:

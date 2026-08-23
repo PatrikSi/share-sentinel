@@ -1,9 +1,8 @@
 import pytest
-from fastapi import HTTPException
-from starlette.requests import Request
-
 from app.config import get_settings
 from app.deps import _enforce_csrf_if_needed
+from fastapi import HTTPException
+from starlette.requests import Request
 
 
 def _make_request(method: str, cookie_header: str | None = None, csrf_header: str | None = None) -> Request:

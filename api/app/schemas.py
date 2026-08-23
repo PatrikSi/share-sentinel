@@ -216,6 +216,8 @@ class RunOut(BaseModel):
     created_at: datetime
     status: RunStatus
     artifact_size: int | None
+    artifact_sha256: str | None
+    artifact_content_type: str | None
     ingest_progress: dict[str, Any]
     summary: dict[str, Any]
 

@@ -1,25 +1,20 @@
 import pytest
+from app import rate_limit
 from fastapi import HTTPException
 from starlette.requests import Request
-
-from app import rate_limit
 
 
 class _FakeRedis:
     def __init__(self, count: int = 1, fail: bool = False):
         self.count = count
         self.fail = fail
-        self.incr_keys: list[str] = []
-        self.expire_calls: list[tuple[str, int]] = []
+        self.eval_calls: list[tuple] = []
 
-    def incr(self, key: str):
+    def eval(self, *args):
         if self.fail:
             raise rate_limit.redis.RedisError("redis down")
-        self.incr_keys.append(key)
-        return self.count
-
-    def expire(self, key: str, ttl: int):
-        self.expire_calls.append((key, ttl))
+        self.eval_calls.append(args)
+        return [self.count]
 
 
 def _request() -> Request:
@@ -46,8 +41,11 @@ def test_rate_limiter_uses_resolved_client_ip(monkeypatch) -> None:
     limiter.check(_request(), "auth_login", limit=20, window_seconds=60, actor_key="user:abc", fail_open=False)
 
     identity_hash = rate_limit.RateLimiter._hash_identity("198.51.100.10:user:abc")
-    assert fake_redis.incr_keys == [f"ratelimit:auth_login:{identity_hash}:2"]
-    assert fake_redis.expire_calls == [(fake_redis.incr_keys[0], 61)]
+    assert len(fake_redis.eval_calls) == 1
+    _script, key_count, key, ttl = fake_redis.eval_calls[0]
+    assert key_count == 1
+    assert key == f"ratelimit:auth_login:{identity_hash}:2"
+    assert ttl == 61
 
 
 def test_rate_limiter_fail_closed_when_redis_unavailable(monkeypatch) -> None:

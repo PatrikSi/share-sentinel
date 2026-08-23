@@ -1,10 +1,9 @@
 import redis
-from fastapi.testclient import TestClient
-
 from app.db import get_db
 from app.deps import require_sysadmin
 from app.main import app
 from app.routers import health as health_router
+from fastapi.testclient import TestClient
 
 
 class _DbOK:

@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import sys
 from datetime import UTC, datetime
@@ -6,6 +7,21 @@ from pathlib import Path
 
 import psycopg
 import redis
+
+
+def _read_timeout(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return max(0.1, value)
+
+
+REDIS_CONNECT_TIMEOUT_SECONDS = _read_timeout("REDIS_CONNECT_TIMEOUT_SECONDS", 3.0)
+REDIS_SOCKET_TIMEOUT_SECONDS = _read_timeout("REDIS_SOCKET_TIMEOUT_SECONDS", 5.0)
+DATABASE_CONNECT_TIMEOUT_SECONDS = max(1, int(_read_timeout("DATABASE_CONNECT_TIMEOUT_SECONDS", 5.0)))
 
 
 def _parse_heartbeat(path: Path) -> dict[str, object]:
@@ -23,12 +39,17 @@ def check_heartbeat(path: Path, timeout_seconds: int, now: datetime | None = Non
 
 def check_database(database_url: str) -> None:
     normalized_url = database_url.replace("postgresql+psycopg://", "postgresql://", 1)
-    with psycopg.connect(normalized_url) as conn:
+    with psycopg.connect(normalized_url, connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS) as conn:
         conn.execute("SELECT 1").fetchone()
 
 
 def check_redis(redis_url: str) -> None:
-    redis.Redis.from_url(redis_url, decode_responses=True).ping()
+    redis.Redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+        socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+    ).ping()
 
 
 def check_artifact_storage(artifact_storage_path: str) -> None:
@@ -83,7 +104,7 @@ def main() -> int:
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
     artifact_storage_path = os.getenv("ARTIFACT_STORAGE_PATH", "/artifacts")
     heartbeat_path = os.getenv("WORKER_HEARTBEAT_PATH", "/tmp/share-sentinel-worker-heartbeat.json")
-    timeout_seconds = int(os.getenv("WORKER_HEALTH_TIMEOUT_SECONDS", "45"))
+    timeout_seconds = _read_timeout("WORKER_HEALTH_TIMEOUT_SECONDS", 45.0)
 
     ok, checks = run_healthcheck(database_url, redis_url, artifact_storage_path, heartbeat_path, timeout_seconds)
     if ok:

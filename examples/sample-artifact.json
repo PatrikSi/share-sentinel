@@ -75,7 +75,7 @@
       },
       "smb": {
         "dialect": "3.1.1",
-        "signing_required": true
+        "signing": "required"
       },
       "shares": [
         {
@@ -92,7 +92,9 @@
                 {
                   "path": "\\Policies",
                   "name": "retention.pdf",
-                  "is_dir": false
+                  "is_dir": false,
+                  "size_bytes": 2048,
+                  "mtime": "2026-01-15T09:30:00+00:00"
                 },
                 {
                   "path": "\\Policies",

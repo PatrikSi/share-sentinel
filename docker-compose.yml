@@ -1,6 +1,7 @@
 services:
   gateway:
     image: traefik:v3.6.9
+    restart: unless-stopped
     environment:
       DOCKER_API_VERSION: "1.44"
     command:
@@ -21,6 +22,7 @@ services:
 
   db:
     image: postgres:16.14
+    restart: unless-stopped
     environment:
       POSTGRES_DB: share_sentinel
       POSTGRES_USER: share_sentinel
@@ -35,6 +37,7 @@ services:
 
   redis:
     image: redis:7.4.9
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redisdata:/data
@@ -50,7 +53,8 @@ services:
     command: ["sh", "-lc", "alembic upgrade head && python -m app.bootstrap"]
     environment:
       APP_ENV: ${APP_ENV:-development}
-      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/share_sentinel
+      DATABASE_URL: postgresql+psycopg://share_sentinel@db:5432/share_sentinel
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       ARTIFACT_STORAGE_PATH: /artifacts
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
@@ -75,11 +79,15 @@ services:
   api:
     image: ghcr.io/patriksi/share-sentinel-api:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
+    restart: unless-stopped
     environment:
       APP_ENV: ${APP_ENV:-development}
       APP_HOST: ${APP_HOST:-localhost}
-      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/share_sentinel
+      DATABASE_URL: postgresql+psycopg://share_sentinel@db:5432/share_sentinel
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       REDIS_URL: redis://redis:6379/0
+      REDIS_CONNECT_TIMEOUT_SECONDS: ${REDIS_CONNECT_TIMEOUT_SECONDS:-3}
+      REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-5}
       ARTIFACT_STORAGE_PATH: /artifacts
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       JWT_ISSUER: ${JWT_ISSUER:-share-sentinel}
@@ -147,16 +155,18 @@ services:
     image: ghcr.io/patriksi/share-sentinel-worker:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
     environment:
-      DATABASE_URL: postgresql+psycopg://share_sentinel:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/share_sentinel
+      DATABASE_URL: postgresql+psycopg://share_sentinel@db:5432/share_sentinel
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       REDIS_URL: redis://redis:6379/0
+      REDIS_CONNECT_TIMEOUT_SECONDS: ${REDIS_CONNECT_TIMEOUT_SECONDS:-3}
+      REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-5}
       ARTIFACT_STORAGE_PATH: /artifacts
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       WORKER_HEARTBEAT_PATH: /tmp/share-sentinel-worker-heartbeat.json
       WORKER_HEALTH_TIMEOUT_SECONDS: ${WORKER_HEALTH_TIMEOUT_SECONDS:-45}
+      INGEST_MAX_RECORD_BYTES: ${INGEST_MAX_RECORD_BYTES:-8388608}
     depends_on:
       db:
-        condition: service_healthy
-      redis:
         condition: service_healthy
       bootstrap:
         condition: service_completed_successfully
@@ -173,6 +183,7 @@ services:
   ui:
     image: ghcr.io/patriksi/share-sentinel-ui:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
+    restart: unless-stopped
     environment:
       VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
       VITE_CSRF_COOKIE_NAME: ${VITE_CSRF_COOKIE_NAME:-share_sentinel_csrf}

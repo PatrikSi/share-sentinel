@@ -1,7 +1,6 @@
-from starlette.requests import Request
-
 from app.config import get_settings
 from app.deps import resolve_client_ip
+from starlette.requests import Request
 
 
 def _make_request(remote_ip: str, x_forwarded_for: str | None = None) -> Request:

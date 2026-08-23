@@ -7,11 +7,11 @@ from uuid import uuid4
 import jwt
 from fastapi import Response
 from jwt import InvalidTokenError
-from passlib.exc import UnknownHashError
 from passlib.context import CryptContext
+from passlib.exc import UnknownHashError
 
 from app.config import get_settings
-from app.password_policy import validate_password_strength
+from app.password_policy import validate_password_strength as validate_password_strength
 
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 

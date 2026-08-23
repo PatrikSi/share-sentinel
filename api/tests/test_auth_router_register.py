@@ -5,13 +5,12 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fastapi import HTTPException
-from sqlalchemy.exc import IntegrityError
-from starlette.requests import Request
-
 from app.enums import UITheme
 from app.routers import auth as auth_router
 from app.schemas import RegisterIn
+from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
+from starlette.requests import Request
 
 
 class _ExecuteResult:

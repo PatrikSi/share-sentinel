@@ -5,8 +5,8 @@ Revises: 0006_add_user_session_version
 Create Date: 2026-04-20
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "0007_ingest_error_fp"
 down_revision = "0006_add_user_session_version"

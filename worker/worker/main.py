@@ -2,11 +2,13 @@ import gzip
 import hashlib
 import json
 import logging
+import math
 import os
 import socket
 import sys
 import time
 import uuid
+import zlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -36,6 +38,23 @@ def _read_int_env(name: str, default: int, min_value: int = 1) -> int:
     return value
 
 
+def _read_float_env(name: str, default: float, min_value: float = 0.1) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("invalid numeric value for %s=%r; using default=%s", name, raw, default)
+        return default
+
+    if not math.isfinite(value):
+        logger.warning("non-finite numeric value for %s=%r; using default=%s", name, raw, default)
+        return default
+    if value < min_value:
+        logger.warning("value for %s=%s is below min=%s; using min", name, value, min_value)
+        return min_value
+    return value
+
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://share_sentinel:share_sentinel@db:5432/share_sentinel").replace(
     "postgresql+psycopg://", "postgresql://"
@@ -52,6 +71,7 @@ RECOVERY_SCAN_SECONDS = _read_int_env("INGEST_RECOVERY_SCAN_SECONDS", 8, min_val
 RECOVERY_SCAN_LIMIT = _read_int_env("INGEST_RECOVERY_SCAN_LIMIT", 8, min_value=1)
 PENDING_IDLE_MS = _read_int_env("INGEST_PENDING_IDLE_MS", 60000, min_value=1)
 JSON_COMPAT_MAX_BYTES = _read_int_env("INGEST_JSON_COMPAT_MAX_BYTES", 50 * 1024 * 1024, min_value=1024)
+INGEST_MAX_RECORD_BYTES = _read_int_env("INGEST_MAX_RECORD_BYTES", 8 * 1024 * 1024, min_value=1024)
 GZIP_DECOMPRESSED_MAX_BYTES = _read_int_env("INGEST_GZIP_MAX_BYTES", 4 * 1024 * 1024 * 1024, min_value=1024)
 GZIP_DECOMPRESSED_MAX_RATIO = _read_int_env("INGEST_GZIP_MAX_EXPANSION_RATIO", 200, min_value=1)
 STALE_INGESTING_SECONDS = _read_int_env("INGEST_STALE_RUN_SECONDS", 300, min_value=30)
@@ -61,17 +81,17 @@ INGEST_RETRY_MAX_SECONDS = _read_int_env("INGEST_RETRY_MAX_SECONDS", 900, min_va
 WORKER_HEARTBEAT_PATH = os.getenv("WORKER_HEARTBEAT_PATH", "/tmp/share-sentinel-worker-heartbeat.json")
 WORKER_HEARTBEAT_INTERVAL_SECONDS = _read_int_env("WORKER_HEARTBEAT_INTERVAL_SECONDS", 15, min_value=1)
 WORKER_HEALTH_TIMEOUT_SECONDS = _read_int_env("WORKER_HEALTH_TIMEOUT_SECONDS", 45, min_value=5)
+REDIS_CONNECT_TIMEOUT_SECONDS = _read_float_env("REDIS_CONNECT_TIMEOUT_SECONDS", 3.0)
+REDIS_SOCKET_TIMEOUT_SECONDS = _read_float_env("REDIS_SOCKET_TIMEOUT_SECONDS", 5.0)
+DATABASE_CONNECT_TIMEOUT_SECONDS = _read_int_env("DATABASE_CONNECT_TIMEOUT_SECONDS", 5, min_value=1)
 
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-
-INGEST_OPERATION_EXCEPTIONS = (
-    psycopg.Error,
-    OSError,
-    RuntimeError,
-    ValueError,
-    TypeError,
+redis_client = redis.Redis.from_url(
+    REDIS_URL,
+    decode_responses=True,
+    socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+    socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
 )
-STREAM_MESSAGE_RETRYABLE_EXCEPTIONS = INGEST_OPERATION_EXCEPTIONS + (redis.RedisError,)
+
 SHARE_TYPE_TO_RESOURCE_TYPE = {
     "smb": "smb_share",
     "nfs": "nfs_share",
@@ -98,6 +118,10 @@ ACCESS_LEVEL_ALIASES = {
     "rw": "readable",
 }
 GZIP_DECOMPRESSED_LIMIT_ERROR = "gzip artifact exceeds decompressed size limit"
+NDJSON_RECORD_TOO_LARGE_ERROR = "NDJSON record exceeds configured size limit"
+INVALID_GZIP_ARTIFACT_ERROR = "invalid gzip artifact"
+JSON_COMPAT_LIMIT_ERROR = "JSON artifact exceeds non-streamable compatibility limit"
+INVALID_UTF8_ARTIFACT_ERROR = "artifact contains invalid UTF-8"
 
 
 def _safe_run_id(fields: dict[str, str] | None) -> str | None:
@@ -156,6 +180,7 @@ def write_audit(conn: psycopg.Connection, project_id: str, action: str, object_t
 
 
 def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) -> int:
+    smb = rec.get("smb") if isinstance(rec.get("smb"), dict) else {}
     row = conn.execute(
         """
         INSERT INTO endpoints (run_id, endpoint_key, ip, hostname, domain, smb_dialect, smb_signing, auth_method)
@@ -176,8 +201,8 @@ def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) 
             rec.get("ip"),
             rec.get("hostname"),
             rec.get("domain"),
-            (rec.get("smb") or {}).get("dialect"),
-            (rec.get("smb") or {}).get("signing"),
+            smb.get("dialect"),
+            _normalize_smb_signing(smb),
             (rec.get("auth") or {}).get("method"),
         ),
     ).fetchone()
@@ -213,9 +238,14 @@ def flush_item_batch(conn: psycopg.Connection, rows: list[tuple]) -> None:
     with conn.cursor() as cur:
         cur.executemany(
             """
-            INSERT INTO items (run_id, resource_id, path, name, is_dir)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (run_id, resource_id, path) DO NOTHING
+            INSERT INTO items (run_id, resource_id, path, name, is_dir, size_bytes, mtime)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (run_id, resource_id, path)
+            DO UPDATE SET
+                name = EXCLUDED.name,
+                is_dir = EXCLUDED.is_dir,
+                size_bytes = COALESCE(EXCLUDED.size_bytes, items.size_bytes),
+                mtime = COALESCE(EXCLUDED.mtime, items.mtime)
             """,
             rows,
         )
@@ -235,6 +265,58 @@ def flush_error_batch(conn: psycopg.Connection, rows: list[tuple]) -> None:
             rows,
         )
     rows.clear()
+
+
+def load_resume_caches(
+    conn: psycopg.Connection,
+    run_id: str,
+) -> tuple[dict[str, int], dict[tuple[str, str, str], int]]:
+    endpoint_cache: dict[str, int] = {}
+    resource_cache: dict[tuple[str, str, str], int] = {}
+    rows = conn.execute(
+        """
+        SELECT e.id, e.endpoint_key, r.id, r.resource_type, r.name
+        FROM endpoints AS e
+        LEFT JOIN resources AS r
+          ON r.run_id = e.run_id
+         AND r.endpoint_id = e.id
+        WHERE e.run_id = %s
+        """,
+        (run_id,),
+    ).fetchall()
+    for endpoint_id, endpoint_key, resource_id, resource_type, resource_name in rows:
+        normalized_endpoint_key = str(endpoint_key or "")
+        endpoint_cache[normalized_endpoint_key] = int(endpoint_id)
+        if resource_id is not None:
+            resource_cache[
+                (
+                    normalized_endpoint_key,
+                    str(resource_name or ""),
+                    str(resource_type or "smb_share"),
+                )
+            ] = int(resource_id)
+    return endpoint_cache, resource_cache
+
+
+def load_persisted_summary(conn: psycopg.Connection, run_id: str) -> dict[str, int]:
+    row = conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM endpoints WHERE run_id = %s),
+            (SELECT COUNT(*) FROM resources WHERE run_id = %s),
+            (SELECT COUNT(*) FROM items WHERE run_id = %s),
+            (SELECT COUNT(*) FROM ingest_errors WHERE run_id = %s)
+        """,
+        (run_id, run_id, run_id, run_id),
+    ).fetchone()
+    if row is None:
+        return {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
+    return {
+        "endpoints": int(row[0]),
+        "resources": int(row[1]),
+        "items": int(row[2]),
+        "errors": int(row[3]),
+    }
 
 
 def _ingest_error_fingerprint(
@@ -342,6 +424,34 @@ def parse_attempt_count(raw: Any) -> int:
         return 0
 
 
+def parse_next_retry_at(raw: Any) -> datetime | None:
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("next_retry_at")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _normalize_smb_signing(raw_smb: Any) -> str | None:
+    if not isinstance(raw_smb, dict):
+        return None
+    signing = raw_smb.get("signing")
+    if signing is not None:
+        normalized = str(signing).strip()
+        return normalized or None
+    signing_required = raw_smb.get("signing_required")
+    if isinstance(signing_required, bool):
+        return "required" if signing_required else "not_required"
+    return None
+
+
 def _normalize_share_type(raw_share_type: Any, raw_resource_type: Any = None) -> str:
     if isinstance(raw_share_type, str):
         normalized = raw_share_type.strip().lower()
@@ -367,6 +477,35 @@ def _normalize_access_level(raw_access_level: Any) -> str:
         if normalized in ACCESS_LEVEL_ALIASES:
             return ACCESS_LEVEL_ALIASES[normalized]
     return "no_access"
+
+
+def _normalize_item_size(raw_size: Any) -> int | None:
+    if raw_size is None or isinstance(raw_size, bool):
+        return None
+    try:
+        size = int(raw_size)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if size < 0 or size > 2**63 - 1:
+        return None
+    return size
+
+
+def _normalize_item_mtime(raw_mtime: Any) -> datetime | None:
+    if raw_mtime is None or isinstance(raw_mtime, bool):
+        return None
+    try:
+        if isinstance(raw_mtime, (int, float)):
+            return datetime.fromtimestamp(raw_mtime, tz=UTC)
+        normalized = str(raw_mtime).strip()
+        if not normalized:
+            return None
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
 
 
 def _bind_record_to_ingest_run(rec: dict[str, Any], run_id: str) -> dict[str, Any]:
@@ -403,7 +542,11 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
             return False, "invalid schema_version"
 
     if rec_type == "item" and not rec.get("name"):
-        rec["name"] = PurePosixPath(str(rec.get("path", ""))).name or ""
+        normalized_path = str(rec.get("path", "")).replace("\\", "/")
+        rec["name"] = PurePosixPath(normalized_path).name or ""
+    if rec_type == "item":
+        rec["size_bytes"] = _normalize_item_size(rec.get("size_bytes"))
+        rec["mtime"] = _normalize_item_mtime(rec.get("mtime"))
 
     if rec_type in {"resource", "item"}:
         share_type = _normalize_share_type(rec.get("share_type"), rec.get("resource_type"))
@@ -462,6 +605,8 @@ def _iter_items_from_entries(
             "path": full_path,
             "name": name,
             "is_dir": is_dir,
+            "size_bytes": raw_entry.get("size_bytes"),
+            "mtime": raw_entry.get("mtime"),
         }
 
         children = raw_entry.get("children")
@@ -615,12 +760,18 @@ def _is_json_artifact(artifact_key: str, content_type: str) -> bool:
     normalized_key = artifact_key.lower()
     if normalized_key.endswith(".json") or normalized_key.endswith(".json.gz"):
         return True
+    if normalized_key.endswith((".ndjson", ".ndjson.gz", ".jsonl", ".jsonl.gz")):
+        return False
     return "json" in content_type and "ndjson" not in content_type
 
 
 def _load_json_records_from_bytes(raw_bytes: bytes, run_id: str) -> list[dict[str, Any]] | None:
     try:
-        json_doc = json.loads(raw_bytes.decode("utf-8", errors="replace"))
+        decoded = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(INVALID_UTF8_ARTIFACT_ERROR) from exc
+    try:
+        json_doc = json.loads(decoded)
     except (TypeError, ValueError):
         return None
     return records_from_json_document(json_doc, run_id)
@@ -706,7 +857,7 @@ def _read_json_compat_bytes(body, gzip_input: bool, max_bytes: int) -> bytes:
                 break
             total += len(chunk)
             if total > max_bytes:
-                raise ValueError("JSON artifact exceeds non-streamable compatibility limit")
+                raise ValueError(JSON_COMPAT_LIMIT_ERROR)
             buffer.extend(chunk)
     finally:
         if gzip_input:
@@ -726,7 +877,7 @@ class _LimitedReader:
         self._reader = reader
         self._max_bytes = max_bytes
         self._error_message = error_message
-        self._total = 0
+        self._max_position = 0
 
     def __enter__(self):
         return self
@@ -736,8 +887,12 @@ class _LimitedReader:
         return False
 
     def _track(self, size: int) -> None:
-        self._total += max(0, size)
-        if self._total > self._max_bytes:
+        try:
+            position = int(self._reader.tell())
+        except (AttributeError, OSError, TypeError, ValueError):
+            position = self._max_position + max(0, size)
+        self._max_position = max(self._max_position, position)
+        if self._max_position > self._max_bytes:
             raise ValueError(self._error_message)
 
     def read(self, size: int = -1):
@@ -764,6 +919,11 @@ class _LimitedReader:
             self._track(count)
         return count
 
+    def seek(self, offset: int, whence: int = 0):
+        position = self._reader.seek(offset, whence)
+        self._track(0)
+        return position
+
     def __iter__(self):
         return self
 
@@ -780,7 +940,20 @@ class _LimitedReader:
         return getattr(self._reader, name)
 
 
+def _iter_bounded_ndjson_lines(reader, max_record_bytes: int | None = None):
+    record_limit = INGEST_MAX_RECORD_BYTES if max_record_bytes is None else max_record_bytes
+    while True:
+        raw_line = reader.readline(record_limit + 1)
+        if raw_line in {b"", ""}:
+            return
+        if len(raw_line) > record_limit:
+            raise ValueError(NDJSON_RECORD_TOO_LARGE_ERROR)
+        yield raw_line
+
+
 def _public_ingest_error(exc: BaseException) -> str:
+    if isinstance(exc, (gzip.BadGzipFile, EOFError, zlib.error)):
+        return INVALID_GZIP_ARTIFACT_ERROR
     if isinstance(exc, psycopg.Error):
         return "database operation failed during ingest"
     if isinstance(exc, OSError):
@@ -792,8 +965,10 @@ def _public_ingest_error(exc: BaseException) -> str:
         if detail in {
             "missing artifact key",
             "unsupported JSON artifact format",
-            "JSON artifact exceeds non-streamable compatibility limit",
+            JSON_COMPAT_LIMIT_ERROR,
             GZIP_DECOMPRESSED_LIMIT_ERROR,
+            NDJSON_RECORD_TOO_LARGE_ERROR,
+            INVALID_UTF8_ARTIFACT_ERROR,
         }:
             return detail
         return "artifact validation failed during ingest"
@@ -801,6 +976,8 @@ def _public_ingest_error(exc: BaseException) -> str:
 
 
 def _is_retryable_ingest_error(exc: BaseException) -> bool:
+    if isinstance(exc, gzip.BadGzipFile):
+        return False
     return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError, OSError, RuntimeError))
 
 
@@ -833,8 +1010,12 @@ def _write_worker_heartbeat(status: str, run_id: str | None = None, line_offset:
         logger.exception("failed writing worker heartbeat path=%s", heartbeat_path)
 
 
+def connect_database():
+    return psycopg.connect(DATABASE_URL, connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS)
+
+
 def discover_recoverable_runs(limit: int = 8) -> list[dict[str, str]]:
-    with psycopg.connect(DATABASE_URL) as conn:
+    with connect_database() as conn:
         rows = conn.execute(
             """
             SELECT id::text, project_id::text, artifact_key
@@ -844,14 +1025,26 @@ def discover_recoverable_runs(limit: int = 8) -> list[dict[str, str]]:
                   (
                       status = 'UPLOADED'
                       AND COALESCE(
-                          NULLIF(ingest_progress->>'next_retry_at', '')::timestamptz,
+                          CASE
+                              WHEN pg_input_is_valid(
+                                  NULLIF(ingest_progress->>'next_retry_at', ''),
+                                  'timestamp with time zone'
+                              )
+                              THEN NULLIF(ingest_progress->>'next_retry_at', '')::timestamptz
+                          END,
                           TO_TIMESTAMP(0)
                       ) <= NOW()
                   )
                   OR (
                       status = 'INGESTING'
                       AND COALESCE(
-                          NULLIF(ingest_progress->>'heartbeat_at', '')::timestamptz,
+                          CASE
+                              WHEN pg_input_is_valid(
+                                  NULLIF(ingest_progress->>'heartbeat_at', ''),
+                                  'timestamp with time zone'
+                              )
+                              THEN NULLIF(ingest_progress->>'heartbeat_at', '')::timestamptz
+                          END,
                           created_at
                       ) <= NOW() - (%s * INTERVAL '1 second')
                   )
@@ -877,8 +1070,12 @@ def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
 
 def process_job(fields: dict[str, str]) -> str:
     run_id = _normalize_uuid_str(fields.get("run_id"))
-    project_id = _normalize_uuid_str(fields.get("project_id"))
-    artifact_key = fields.get("artifact_key")
+    queued_project_id = _normalize_uuid_str(fields.get("project_id"))
+    queued_artifact_key = fields.get("artifact_key")
+    project_id = queued_project_id
+    artifact_key: str | None = None
+    progress_raw: Any = {}
+    authoritative_row_loaded = False
     last_line_offset = 0
     last_counts = {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
 
@@ -886,7 +1083,7 @@ def process_job(fields: dict[str, str]) -> str:
         logger.error("invalid job payload missing or invalid run_id: %s", fields)
         return "ignored"
 
-    with psycopg.connect(DATABASE_URL) as conn:
+    with connect_database() as conn:
         lock_key = advisory_lock_key(run_id)
         locked = conn.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]
         if not locked:
@@ -907,14 +1104,33 @@ def process_job(fields: dict[str, str]) -> str:
                 return "ignored"
 
             db_project_id, db_artifact_key, status, summary_raw, progress_raw, artifact_content_type, artifact_size = row
-            project_id = project_id or db_project_id
-            artifact_key = artifact_key or db_artifact_key
+            authoritative_row_loaded = True
+            project_id = db_project_id
+            artifact_key = db_artifact_key
+            if queued_project_id and queued_project_id != db_project_id:
+                logger.warning(
+                    "ignoring stale queue project_id run_id=%s queued_project_id=%s database_project_id=%s",
+                    run_id,
+                    queued_project_id,
+                    db_project_id,
+                )
+            if queued_artifact_key and queued_artifact_key != db_artifact_key:
+                logger.info(
+                    "ignoring superseded queue artifact run_id=%s queued_artifact_key=%s database_artifact_key=%s",
+                    run_id,
+                    queued_artifact_key,
+                    db_artifact_key,
+                )
             if not artifact_key:
                 update_run_status(conn, run_id, "FAILED", parse_offset(progress_raw), parse_summary(summary_raw), "missing artifact key")
                 conn.commit()
                 return "failed"
             if status in {"COMPLETE", "FAILED"}:
                 return "ignored"
+            next_retry_at = parse_next_retry_at(progress_raw)
+            if status == "UPLOADED" and next_retry_at and next_retry_at > datetime.now(tz=UTC):
+                logger.info("run retry is not due yet run_id=%s next_retry_at=%s", run_id, next_retry_at.isoformat())
+                return "deferred"
 
             counts = parse_summary(summary_raw)
             line_offset = parse_offset(progress_raw)
@@ -944,11 +1160,30 @@ def process_job(fields: dict[str, str]) -> str:
 
             endpoint_cache: dict[str, int] = {}
             resource_cache: dict[tuple[str, str, str], int] = {}
+            if line_offset > 0:
+                endpoint_cache, resource_cache = load_resume_caches(conn, run_id)
             item_batch: list[tuple] = []
             error_batch: list[tuple] = []
+            producer_run_end_counts: dict[str, int] | None = None
 
             def process_record(rec: dict[str, Any]) -> None:
-                nonlocal counts
+                nonlocal counts, producer_run_end_counts
+                if not isinstance(rec, dict):
+                    error_batch.append(
+                        build_ingest_error_row(
+                            run_id,
+                            "error",
+                            "SCHEMA_INVALID",
+                            "record must be a JSON object",
+                            None,
+                            None,
+                            None,
+                        )
+                    )
+                    counts["errors"] += 1
+                    if len(error_batch) >= BATCH_SIZE:
+                        flush_error_batch(conn, error_batch)
+                    return
                 rec = _bind_record_to_ingest_run(rec, run_id)
 
                 valid, reason = validate_record(rec)
@@ -1016,6 +1251,8 @@ def process_job(fields: dict[str, str]) -> str:
                             rec.get("path", ""),
                             rec.get("name", ""),
                             bool(rec.get("is_dir", False)),
+                            rec.get("size_bytes"),
+                            rec.get("mtime"),
                         )
                     )
                     counts["items"] += 1
@@ -1038,12 +1275,26 @@ def process_job(fields: dict[str, str]) -> str:
                         flush_error_batch(conn, error_batch)
                 elif rec_type == "run_end":
                     incoming = rec.get("stats") or {}
-                    counts = {
-                        "endpoints": int(incoming.get("endpoints", counts["endpoints"])),
-                        "resources": int(incoming.get("resources", counts["resources"])),
-                        "items": int(incoming.get("items", counts["items"])),
-                        "errors": int(incoming.get("errors", counts["errors"])),
-                    }
+                    if isinstance(incoming, dict):
+                        producer_run_end_counts = parse_summary(incoming)
+
+            def persist_periodic_progress() -> None:
+                nonlocal last_line_offset, last_counts
+                if line_offset % PROGRESS_EVERY_LINES != 0:
+                    return
+                flush_item_batch(conn, item_batch)
+                flush_error_batch(conn, error_batch)
+                update_run_status(
+                    conn,
+                    run_id,
+                    "INGESTING",
+                    line_offset,
+                    counts,
+                    extra_progress={"attempt_count": attempt_count},
+                )
+                conn.commit()
+                last_line_offset = line_offset
+                last_counts = counts.copy()
 
             def process_record_iter(records_iter) -> int:
                 nonlocal line_offset, last_line_offset, last_counts
@@ -1055,74 +1306,67 @@ def process_job(fields: dict[str, str]) -> str:
                     line_offset = current_line
                     emit_processing_heartbeat()
                     process_record(rec)
-
-                    if line_offset % PROGRESS_EVERY_LINES == 0:
-                        flush_item_batch(conn, item_batch)
-                        flush_error_batch(conn, error_batch)
-                        update_run_status(
-                            conn,
-                            run_id,
-                            "INGESTING",
-                            line_offset,
-                            counts,
-                            extra_progress={"attempt_count": attempt_count},
-                        )
-                        conn.commit()
-                        last_line_offset = line_offset
-                        last_counts = counts.copy()
+                    persist_periodic_progress()
                 return current_line
 
             def process_ndjson_lines(reader) -> None:
                 nonlocal line_offset, last_line_offset, last_counts
                 current_line = 0
-                for raw_line in reader:
+                for raw_line in _iter_bounded_ndjson_lines(reader):
                     current_line += 1
                     if current_line <= line_offset:
                         continue
 
                     line_offset = current_line
+                    emit_processing_heartbeat()
+                    line: str | None = None
                     if isinstance(raw_line, bytes):
-                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        try:
+                            line = raw_line.decode("utf-8").strip()
+                        except UnicodeDecodeError as exc:
+                            error_batch.append(
+                                build_ingest_error_row(
+                                    run_id,
+                                    "error",
+                                    "UTF8_DECODE_ERROR",
+                                    f"invalid UTF-8 at byte offset {exc.start}",
+                                    None,
+                                    None,
+                                    None,
+                                )
+                            )
+                            counts["errors"] += 1
+                            if len(error_batch) >= BATCH_SIZE:
+                                flush_error_batch(conn, error_batch)
                     else:
                         line = str(raw_line).strip()
-                    emit_processing_heartbeat()
-                    if not line:
-                        continue
 
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        error_batch.append(
-                            build_ingest_error_row(
-                                run_id,
-                                "error",
-                                "JSON_DECODE_ERROR",
-                                str(exc),
-                                None,
-                                None,
-                                None,
+                    if line:
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            error_batch.append(
+                                build_ingest_error_row(
+                                    run_id,
+                                    "error",
+                                    "JSON_DECODE_ERROR",
+                                    str(exc),
+                                    None,
+                                    None,
+                                    None,
+                                )
                             )
-                        )
-                        counts["errors"] += 1
-                        if len(error_batch) >= BATCH_SIZE:
-                            flush_error_batch(conn, error_batch)
-                        continue
+                            counts["errors"] += 1
+                            if len(error_batch) >= BATCH_SIZE:
+                                flush_error_batch(conn, error_batch)
+                        else:
+                            process_record(rec)
 
-                    process_record(rec)
-                    if line_offset % PROGRESS_EVERY_LINES == 0:
-                        flush_item_batch(conn, item_batch)
-                        flush_error_batch(conn, error_batch)
-                        update_run_status(
-                            conn,
-                            run_id,
-                            "INGESTING",
-                            line_offset,
-                            counts,
-                            extra_progress={"attempt_count": attempt_count},
-                        )
-                        conn.commit()
-                        last_line_offset = line_offset
-                        last_counts = counts.copy()
+                    # A physical line is the resume unit. Blank and malformed
+                    # lines must advance durable progress just like valid rows,
+                    # otherwise a bad-data-only artifact can look stuck and
+                    # repeatedly replay an unbounded transaction after failure.
+                    persist_periodic_progress()
 
             json_records: list[dict[str, Any]] | None = None
             content_type = str(artifact_content_type or "").lower()
@@ -1135,13 +1379,16 @@ def process_job(fields: dict[str, str]) -> str:
                         if gzip_input:
                             with gzip.GzipFile(fileobj=body) as gzip_reader, _LimitedReader(
                                 gzip_reader,
-                                _gzip_decompressed_limit(artifact_size),
-                                GZIP_DECOMPRESSED_LIMIT_ERROR,
+                                JSON_COMPAT_MAX_BYTES,
+                                JSON_COMPAT_LIMIT_ERROR,
                             ) as json_reader:
                                 process_record_iter(_iter_records_from_streamable_json_file(json_reader, run_id))
                         else:
-                            process_record_iter(_iter_records_from_streamable_json_file(body, run_id))
-                except ValueError:
+                            with _LimitedReader(body, JSON_COMPAT_MAX_BYTES, JSON_COMPAT_LIMIT_ERROR) as json_reader:
+                                process_record_iter(_iter_records_from_streamable_json_file(json_reader, run_id))
+                except ValueError as exc:
+                    if str(exc) == JSON_COMPAT_LIMIT_ERROR:
+                        raise
                     with open_artifact_stream(artifact_key) as compat_body:
                         raw_json = _read_json_compat_bytes(
                             compat_body,
@@ -1168,6 +1415,15 @@ def process_job(fields: dict[str, str]) -> str:
 
             flush_item_batch(conn, item_batch)
             flush_error_batch(conn, error_batch)
+            persisted_counts = load_persisted_summary(conn, run_id)
+            if producer_run_end_counts is not None and producer_run_end_counts != persisted_counts:
+                logger.warning(
+                    "producer summary differs from persisted inventory run_id=%s producer=%s persisted=%s",
+                    run_id,
+                    producer_run_end_counts,
+                    persisted_counts,
+                )
+            counts = persisted_counts
 
             update_run_status(conn, run_id, "COMPLETE", line_offset, counts)
             write_audit(
@@ -1183,8 +1439,14 @@ def process_job(fields: dict[str, str]) -> str:
             last_counts = counts.copy()
             _write_worker_heartbeat("idle")
             return "complete"
-        except INGEST_OPERATION_EXCEPTIONS as exc:
+        except Exception as exc:
             logger.exception("job failed run_id=%s", run_id)
+            if not authoritative_row_loaded:
+                try:
+                    conn.rollback()
+                except psycopg.Error:
+                    logger.exception("failed to rollback before authoritative run state was loaded run_id=%s", run_id)
+                raise
             public_error = _public_ingest_error(exc)
             retryable = _is_retryable_ingest_error(exc)
             attempt_count = parse_attempt_count(progress_raw) + 1
@@ -1269,19 +1531,17 @@ def ensure_group() -> None:
             raise
 
 
-def ensure_group_with_retry() -> None:
-    last_logged_at = 0.0
-    while True:
-        try:
-            ensure_group()
-            return
-        except redis.RedisError as exc:
-            now = time.time()
-            if _should_log_redis_error(last_logged_at, now, interval_seconds=10.0):
-                logger.warning("redis stream group setup failed, retrying: %s", exc)
-                last_logged_at = now
-            _write_worker_heartbeat("waiting_for_redis")
-            time.sleep(1)
+def try_ensure_group(last_logged_at: float) -> tuple[bool, float]:
+    try:
+        ensure_group()
+        return True, last_logged_at
+    except redis.RedisError as exc:
+        now = time.time()
+        if _should_log_redis_error(last_logged_at, now, interval_seconds=10.0):
+            logger.warning("redis stream group setup failed; continuing database recovery: %s", exc)
+            last_logged_at = now
+        _write_worker_heartbeat("waiting_for_redis")
+        return False, last_logged_at
 
 
 def claim_stale_messages(start_id: str = "0-0") -> tuple[str, list[tuple[str, dict[str, str]]]]:
@@ -1307,32 +1567,37 @@ def claim_stale_messages(start_id: str = "0-0") -> tuple[str, list[tuple[str, di
 
 
 def main() -> int:
-    ensure_group_with_retry()
     logger.info("worker started consumer=%s", CONSUMER_NAME)
     _write_worker_heartbeat("idle")
 
     last_recovery_scan = 0.0
     last_redis_error_log = 0.0
+    last_group_error_log = 0.0
     last_idle_heartbeat = time.time()
     next_claim_start_id = "0-0"
+    group_ready = False
 
     while True:
         messages = []
-        try:
-            messages = redis_client.xreadgroup(
-                GROUP_NAME,
-                CONSUMER_NAME,
-                {STREAM_NAME: ">"},
-                count=5,
-                block=3000,
-            )
-        except redis.RedisError as exc:
-            now = time.time()
-            if _should_log_redis_error(last_redis_error_log, now):
-                logger.warning("redis stream read failed, retrying: %s", exc)
-                last_redis_error_log = now
-            _write_worker_heartbeat("redis_retry")
-            time.sleep(1)
+        if not group_ready:
+            group_ready, last_group_error_log = try_ensure_group(last_group_error_log)
+
+        if group_ready:
+            try:
+                messages = redis_client.xreadgroup(
+                    GROUP_NAME,
+                    CONSUMER_NAME,
+                    {STREAM_NAME: ">"},
+                    count=5,
+                    block=3000,
+                )
+            except redis.RedisError as exc:
+                now = time.time()
+                if _should_log_redis_error(last_redis_error_log, now):
+                    logger.warning("redis stream read failed, retrying: %s", exc)
+                    last_redis_error_log = now
+                group_ready = False
+                _write_worker_heartbeat("redis_retry")
 
         if messages:
             for _, jobs in messages:
@@ -1349,19 +1614,20 @@ def main() -> int:
                         )
                         time.sleep(1)
 
-        next_claim_start_id, stale_jobs = claim_stale_messages(next_claim_start_id)
-        for message_id, fields in stale_jobs:
-            try:
-                result = process_job(fields)
-                if should_ack_stream_result(result):
-                    redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
-            except Exception:
-                logger.exception(
-                    "failed processing claimed stream message message_id=%s run_id=%s",
-                    message_id,
-                    _safe_run_id(fields),
-                )
-                time.sleep(1)
+        if group_ready:
+            next_claim_start_id, stale_jobs = claim_stale_messages(next_claim_start_id)
+            for message_id, fields in stale_jobs:
+                try:
+                    result = process_job(fields)
+                    if should_ack_stream_result(result):
+                        redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
+                except Exception:
+                    logger.exception(
+                        "failed processing claimed stream message message_id=%s run_id=%s",
+                        message_id,
+                        _safe_run_id(fields),
+                    )
+                    time.sleep(1)
 
         if time.time() - last_recovery_scan >= RECOVERY_SCAN_SECONDS:
             for recovered in discover_recoverable_runs(limit=RECOVERY_SCAN_LIMIT):
@@ -1373,9 +1639,11 @@ def main() -> int:
             last_recovery_scan = time.time()
 
         now = time.time()
-        if now - last_idle_heartbeat >= WORKER_HEARTBEAT_INTERVAL_SECONDS:
+        if group_ready and now - last_idle_heartbeat >= WORKER_HEARTBEAT_INTERVAL_SECONDS:
             _write_worker_heartbeat("idle")
             last_idle_heartbeat = now
+        if not group_ready:
+            time.sleep(1)
 
 
 if __name__ == "__main__":

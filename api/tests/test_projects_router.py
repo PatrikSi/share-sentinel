@@ -4,14 +4,13 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
-from fastapi.testclient import TestClient
-from sqlalchemy.exc import IntegrityError
-
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_sysadmin
 from app.enums import ProjectRole
 from app.main import app
 from app.models import Project, ProjectMember, User
+from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 
 class _ExecuteResult:
