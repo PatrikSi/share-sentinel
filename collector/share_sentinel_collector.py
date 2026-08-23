@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import collections
 import concurrent.futures
-from contextlib import contextmanager
 import gzip
+import hashlib
 import ipaddress
 import itertools
 import json
+import math
 import os
+import random
 import re
 import shutil
 import socket
@@ -17,17 +19,18 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-import time
 
 import requests
 
 try:
-    from impacket.smbconnection import SMBConnection, SessionError
     from impacket.nmb import NetBIOSError, NetBIOSTimeout
+    from impacket.smbconnection import SessionError, SMBConnection
 except ImportError:
     SMBConnection = None
 
@@ -49,6 +52,20 @@ API_TOKEN_ENV = "SHARE_SENTINEL_API_TOKEN"
 EXIT_SUCCESS = 0
 EXIT_PARTIAL = 1
 EXIT_FAILURE = 2
+EXIT_INTERRUPTED = 130
+ARTIFACT_FORMAT_COMPACT_JSON = "compact_json"
+ARTIFACT_FORMAT_NDJSON = "ndjson"
+COMPACT_JSON_MAX_BUFFER_BYTES = 40 * 1024 * 1024
+COMPACT_JSON_MAX_ENDPOINT_BUFFER_BYTES = 8 * 1024 * 1024
+SUPPORTED_ARTIFACT_SUFFIXES = (
+    ".json",
+    ".json.gz",
+    ".ndjson",
+    ".ndjson.gz",
+    ".jsonl",
+    ".jsonl.gz",
+)
+UPLOAD_RETRIABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
 @dataclass
@@ -61,21 +78,277 @@ class Stats:
     error_samples: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ScanOutcome:
+    targets_submitted: int
+    targets_completed: int
+    host_failures: int
+    interrupted: bool = False
+    targets_cancelled: int = 0
+
+
+class _ScanCancelled:
+    """Sentinel returned when a submitted target stops before completing its scope."""
+
+
+SCAN_CANCELLED = _ScanCancelled()
+
+
+class ProgressReporter:
+    """Thread-safe, stderr-only scan status suitable for humans and automation."""
+
+    def __init__(
+        self,
+        *,
+        total_targets: int | None,
+        stats: Stats,
+        stats_lock: threading.Lock,
+        quiet: bool = False,
+        verbosity: int = 0,
+        interval_seconds: float = 5.0,
+        stream=None,
+    ) -> None:
+        self.total_targets = total_targets
+        self.stats = stats
+        self.stats_lock = stats_lock
+        self.quiet = quiet
+        self.verbosity = verbosity
+        self.interval_seconds = interval_seconds
+        self.stream = stream if stream is not None else sys.stderr
+        self.started_monotonic = time.monotonic()
+        self._state_lock = threading.Lock()
+        self._output_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._submitted = 0
+        self._started = 0
+        self._completed = 0
+        self._succeeded = 0
+        self._failed = 0
+        self._cancelled = 0
+        self._active_hosts: set[str] = set()
+        self._completed_without_start = 0
+        self._cancelled_without_start = 0
+
+    def start(self, *, workers: int, share_types: list[str]) -> None:
+        if self.quiet:
+            return
+        total = str(self.total_targets) if self.total_targets is not None else "unknown"
+        self._write(
+            "scan started: "
+            f"targets={total} workers={workers} protocols={','.join(share_types)}"
+        )
+        if self.interval_seconds > 0:
+            self._thread = threading.Thread(
+                target=self._periodic_loop,
+                name="collector-progress",
+                daemon=True,
+            )
+            try:
+                self._thread.start()
+            except (OSError, RuntimeError) as exc:
+                self._thread = None
+                self._write(
+                    "progress warning: periodic reporter could not start; "
+                    f"continuing without periodic updates ({_error_detail(exc)})"
+                )
+
+    def target_submitted(self) -> None:
+        with self._state_lock:
+            self._submitted += 1
+
+    def target_started(self, host: str) -> None:
+        with self._state_lock:
+            if host not in self._active_hosts:
+                self._started += 1
+                self._active_hosts.add(host)
+
+    def target_completed(self, host: str, *, succeeded: bool) -> None:
+        with self._state_lock:
+            self._completed += 1
+            if host in self._active_hosts:
+                self._active_hosts.discard(host)
+            else:
+                self._completed_without_start += 1
+            if succeeded:
+                self._succeeded += 1
+            else:
+                self._failed += 1
+        if self.verbosity >= 1 and not self.quiet:
+            self._write_progress(prefix=f"host {host}: {'ok' if succeeded else 'failed'}")
+
+    def target_cancelled(self, host: str) -> None:
+        with self._state_lock:
+            self._cancelled += 1
+            if host in self._active_hosts:
+                self._active_hosts.discard(host)
+            else:
+                self._cancelled_without_start += 1
+        if self.verbosity >= 1 and not self.quiet:
+            self._write_progress(prefix=f"host {host}: cancelled")
+
+    def detail(self, message: str, *, level: int = 2) -> None:
+        if not self.quiet and self.verbosity >= level:
+            self._write(message)
+
+    def interruption_requested(self) -> None:
+        if not self.quiet:
+            self._write("interrupt received: stopping new work and draining in-flight network operations")
+
+    def finish(
+        self,
+        *,
+        status: str,
+        artifact: str | None = None,
+        upload_status: str = "not requested",
+    ) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(0.1, min(self.interval_seconds + 0.1, 1.0)))
+        if self.quiet:
+            if status in {"partial", "failure", "interrupted"}:
+                self._write_quiet_failure_summary(status)
+            return
+        self._write_progress(prefix=f"collector finished ({status})")
+        artifact_label = artifact or "not written"
+        self._write(f"result: artifact={artifact_label} upload={upload_status}")
+        with self.stats_lock:
+            error_codes = list(self.stats.error_codes.most_common(5))
+            error_samples = dict(self.stats.error_samples)
+        if error_codes:
+            self._write("issue summary:")
+            for code, count in error_codes:
+                sample = error_samples.get(code, "")
+                suffix = f": {sample}" if sample else ""
+                self._write(f"  - {code} ({count}){suffix}")
+
+    def _write_quiet_failure_summary(self, status: str) -> None:
+        with self._state_lock:
+            failed = self._failed
+            cancelled = self._cancelled
+        with self.stats_lock:
+            error_codes = list(self.stats.error_codes.most_common(5))
+        issue_label = ",".join(f"{code}={count}" for code, count in error_codes) or "none"
+        self._write(
+            f"collector finished ({status}): failed_targets={failed} "
+            f"cancelled_targets={cancelled} issues={issue_label}"
+        )
+
+    def _periodic_loop(self) -> None:
+        while not self._stop_event.wait(self.interval_seconds):
+            self._write_progress(prefix="progress")
+
+    def _write_progress(self, *, prefix: str) -> None:
+        with self._state_lock:
+            submitted = self._submitted
+            started = self._started
+            completed = self._completed
+            succeeded = self._succeeded
+            failed = self._failed
+            cancelled = self._cancelled
+            active = len(self._active_hosts)
+            completed_without_start = self._completed_without_start
+            cancelled_without_start = self._cancelled_without_start
+        with self.stats_lock:
+            endpoints = self.stats.endpoints
+            resources = self.stats.resources
+            items = self.stats.items
+            errors = self.stats.errors
+        elapsed = max(0.0, time.monotonic() - self.started_monotonic)
+        rate = completed / elapsed if elapsed > 0 else 0.0
+        if self.total_targets is None:
+            discovered = submitted
+            remaining = "unknown"
+        else:
+            discovered = self.total_targets
+            remaining = str(max(0, self.total_targets - completed))
+        pending = max(
+            0,
+            submitted - started - completed_without_start - cancelled_without_start,
+        )
+        self._write(
+            f"{prefix}: discovered={discovered} submitted={submitted} processed={completed} "
+            f"active={active} pending={pending} remaining={remaining} "
+            f"succeeded={succeeded} failed={failed} cancelled={cancelled} endpoints={endpoints} "
+            f"resources={resources} items={items} issues={errors} "
+            f"elapsed={_format_duration(elapsed)} rate={rate:.1f}/s"
+        )
+
+    def _write(self, message: str) -> None:
+        with self._output_lock:
+            print(message, file=self.stream, flush=True)
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes:d}m{secs:02d}s"
+    return f"{secs:d}s"
+
+
+def _artifact_format_for_path(path: str | None) -> str:
+    """Select the on-disk contract without inspecting or buffering its contents."""
+
+    if path is None:
+        return ARTIFACT_FORMAT_NDJSON
+    normalized = str(path).lower()
+    if normalized.endswith((".ndjson", ".ndjson.gz", ".jsonl", ".jsonl.gz")):
+        return ARTIFACT_FORMAT_NDJSON
+    return ARTIFACT_FORMAT_COMPACT_JSON
+
+
+def _artifact_upload_filename(path: str) -> str:
+    """Return an ASCII header value while preserving the format-defining suffix."""
+
+    basename = os.path.basename(path)
+    lowered = basename.lower()
+    suffix = next(
+        (
+            candidate
+            for candidate in sorted(SUPPORTED_ARTIFACT_SUFFIXES, key=len, reverse=True)
+            if lowered.endswith(candidate)
+        ),
+        ".json",
+    )
+    stem = basename[: -len(suffix)] if basename.lower().endswith(suffix) else basename
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]", "_", stem).strip(".") or "artifact"
+    return f"{safe_stem[: 255 - len(suffix)]}{suffix}"
+
+
+class CompactArtifactTooLargeError(ValueError):
+    """Raised before compact output assembly could exceed its memory budget."""
+
+
 class NDJSONWriter:
     def __init__(self, path: str | None, gzip_output: bool):
         self._lock = threading.Lock()
         self._path = path
         self._gzip = bool(gzip_output and path is not None)
+        self._artifact_format = _artifact_format_for_path(path)
         self._closed = False
         self._buffer_dir = tempfile.mkdtemp(prefix="share-sentinel-buffer-")
         self._endpoint_paths: dict[str, str] = {}
         self._run_meta: dict[str, object] | None = None
         self._run_end: dict[str, object] | None = None
         self._issues: dict[str, dict[str, object]] = {}
+        self._spool_error: OSError | None = None
+        self._ndjson_spool_path: str | None = None
+        self._ndjson_spool_fp = None
+        if self._artifact_format == ARTIFACT_FORMAT_NDJSON:
+            self._ndjson_spool_path = os.path.join(self._buffer_dir, "records.ndjson")
+            try:
+                self._ndjson_spool_fp = open(self._ndjson_spool_path, "w", encoding="utf-8")
+            except OSError:
+                shutil.rmtree(self._buffer_dir, ignore_errors=True)
+                raise
 
     def emit(self, record: dict) -> None:
         with self._lock:
-            if self._closed:
+            if self._closed or self._spool_error is not None:
                 return
             rec_type = str(record.get("type") or "")
             if rec_type == "run_meta":
@@ -83,6 +356,14 @@ class NDJSONWriter:
                 return
             if rec_type == "run_end":
                 self._run_end = dict(record)
+                return
+            if self._artifact_format == ARTIFACT_FORMAT_NDJSON:
+                if rec_type in {"endpoint", "resource", "item", "error"}:
+                    try:
+                        self._write_json_line(self._ndjson_spool_fp, record)
+                    except OSError as exc:
+                        self._spool_error = exc
+                        raise
                 return
             if rec_type == "error":
                 self._record_issue(record)
@@ -98,8 +379,17 @@ class NDJSONWriter:
             if endpoint_path is None:
                 endpoint_path = os.path.join(self._buffer_dir, f"{uuid.uuid4().hex}.jsonl")
                 self._endpoint_paths[endpoint_key] = endpoint_path
-            with open(endpoint_path, "a", encoding="utf-8") as endpoint_fp:
-                endpoint_fp.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n")
+            try:
+                with open(endpoint_path, "a", encoding="utf-8") as endpoint_fp:
+                    endpoint_fp.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n")
+            except OSError as exc:
+                self._spool_error = exc
+                raise
+
+    @property
+    def write_failed(self) -> bool:
+        with self._lock:
+            return self._spool_error is not None
 
     def close(self, keep_output: bool = True) -> None:
         with self._lock:
@@ -107,21 +397,113 @@ class NDJSONWriter:
                 return
             self._closed = True
 
+        cleanup_buffers = True
         try:
+            if self._ndjson_spool_fp is not None:
+                self._ndjson_spool_fp.flush()
+                self._ndjson_spool_fp.close()
+                self._ndjson_spool_fp = None
+            if self._spool_error is not None:
+                raise OSError(f"collector buffer write failed: {self._spool_error}") from self._spool_error
             if not keep_output:
                 return
+            if self._artifact_format == ARTIFACT_FORMAT_COMPACT_JSON:
+                self._validate_compact_output_bounds()
             if self._path is None:
-                self._write_document(sys.stdout)
+                self._write_payload(sys.stdout)
                 sys.stdout.flush()
                 return
-            if self._gzip:
-                with gzip.open(self._path, "wt", encoding="utf-8") as target_fp:
-                    self._write_document(target_fp)
-                return
-            with open(self._path, "w", encoding="utf-8") as target_fp:
-                self._write_document(target_fp)
+            self._write_file_atomically()
+        except KeyboardInterrupt:
+            with self._lock:
+                self._closed = False
+            cleanup_buffers = False
+            raise
         finally:
-            shutil.rmtree(self._buffer_dir, ignore_errors=True)
+            if self._ndjson_spool_fp is not None:
+                try:
+                    self._ndjson_spool_fp.close()
+                except OSError:
+                    pass
+                self._ndjson_spool_fp = None
+            if cleanup_buffers:
+                shutil.rmtree(self._buffer_dir, ignore_errors=True)
+
+    def _write_file_atomically(self) -> None:
+        destination = Path(str(self._path)).expanduser()
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=str(destination.parent),
+        )
+        os.close(fd)
+        committed = False
+        try:
+            if self._gzip:
+                with gzip.open(temporary_path, "wt", encoding="utf-8") as target_fp:
+                    self._write_payload(target_fp)
+                with open(temporary_path, "rb") as target_fp:
+                    os.fsync(target_fp.fileno())
+            else:
+                with open(temporary_path, "w", encoding="utf-8") as target_fp:
+                    self._write_payload(target_fp)
+                    target_fp.flush()
+                    os.fsync(target_fp.fileno())
+            os.replace(temporary_path, destination)
+            committed = True
+        finally:
+            if not committed:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+
+    def _write_payload(self, target_fp) -> None:
+        if self._artifact_format == ARTIFACT_FORMAT_NDJSON:
+            self._write_ndjson(target_fp)
+            return
+        self._write_document(target_fp)
+
+    @staticmethod
+    def _serialized_size(value: object) -> int:
+        return len(json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+
+    def _validate_compact_output_bounds(self) -> None:
+        total_bytes = 0
+        for endpoint_key, endpoint_path in self._endpoint_paths.items():
+            endpoint_bytes = os.path.getsize(endpoint_path)
+            if endpoint_bytes > COMPACT_JSON_MAX_ENDPOINT_BUFFER_BYTES:
+                raise CompactArtifactTooLargeError(
+                    "compact JSON endpoint buffer exceeds the safe 8 MiB assembly limit "
+                    f"for {endpoint_key}; write to .ndjson or .ndjson.gz for large scans"
+                )
+            total_bytes += endpoint_bytes
+
+        total_bytes += self._serialized_size(self._run_meta or {})
+        total_bytes += self._serialized_size(self._run_end or {})
+        total_bytes += self._serialized_size(self._serialized_issues())
+        if total_bytes > COMPACT_JSON_MAX_BUFFER_BYTES:
+            raise CompactArtifactTooLargeError(
+                "compact JSON buffers exceed the safe 40 MiB assembly limit; "
+                "write to .ndjson or .ndjson.gz for large scans"
+            )
+
+    @staticmethod
+    def _write_json_line(target_fp, record: dict[str, object]) -> None:
+        target_fp.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")))
+        target_fp.write("\n")
+
+    def _write_ndjson(self, target_fp) -> None:
+        if self._run_meta is not None:
+            self._write_json_line(target_fp, self._run_meta)
+
+        if self._ndjson_spool_path is not None:
+            with open(self._ndjson_spool_path, "r", encoding="utf-8") as endpoint_fp:
+                for raw_line in endpoint_fp:
+                    target_fp.write(raw_line)
+
+        if self._run_end is not None:
+            self._write_json_line(target_fp, self._run_end)
 
     def _record_issue(self, record: dict[str, object]) -> None:
         code = str(record.get("code") or "UNKNOWN")
@@ -190,6 +572,11 @@ class NDJSONWriter:
                             "index": {},
                         }
                         share_order.append(share_key)
+                    else:
+                        share_doc = share_states[share_key]["doc"]
+                        for field_name in ("resource_type", "remark", "access_level"):
+                            if record.get(field_name) is not None:
+                                share_doc[field_name] = record[field_name]
                     continue
 
                 if rec_type == "item":
@@ -265,6 +652,10 @@ class NDJSONWriter:
                 node["path"] = parent_path
                 node["name"] = leaf_name
                 node["is_dir"] = bool(record.get("is_dir", False))
+                if record.get("size_bytes") is not None:
+                    node["size_bytes"] = record["size_bytes"]
+                if record.get("mtime") is not None:
+                    node["mtime"] = record["mtime"]
                 if node["is_dir"]:
                     node.setdefault("children", [])
                 else:
@@ -321,27 +712,28 @@ class _CollectorHelpFormatter(argparse.RawDescriptionHelpFormatter):
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=(
-            "Collect SMB and/or NFS share inventory and write a compact JSON artifact.\n\n"
+            "Collect SMB and/or NFS share inventory and write a streaming NDJSON or compact JSON artifact.\n\n"
             "Workflow:\n"
             "  1) Select targets with --hosts and/or --cidr\n"
             "  2) Choose --share-types smb|nfs|both\n"
             "  3) Pick SMB auth mode if SMB is enabled\n"
-            "  4) Save with --output and optionally upload with --upload"
+            "  4) Save streaming NDJSON (.ndjson/.jsonl) or compatibility JSON (.json), then optionally upload"
         ),
         epilog=(
             "Examples:\n"
             "  Authenticated SMB scan:\n"
-            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --domain CORP --username svc_scan --password '***' --output run.json.gz --gzip\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --domain CORP --username svc_scan --password '***' --output run.ndjson.gz --gzip\n\n"
             "  Domain-qualified username (quote backslashes, or use an unquoted forward slash):\n"
-            "    share_sentinel_collector.py --hosts hosts.txt --username 'CORP\\svc_scan' --password '***' --output run.json\n"
-            "    share_sentinel_collector.py --hosts hosts.txt --username CORP/svc_scan --password '***' --output run.json\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --username 'CORP\\svc_scan' --password '***' --output run.ndjson\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --username CORP/svc_scan --password '***' --output run.ndjson\n\n"
             "  Domain shell / ticket cache auth:\n"
-            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --use-session-creds --output kerberos.json\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --use-session-creds --output kerberos.ndjson\n\n"
             "  Anonymous SMB scan:\n"
-            "    share_sentinel_collector.py --cidr 10.20.0.0/24 --share-types smb --smb-anonymous --output anon.json\n\n"
+            "    share_sentinel_collector.py --cidr 10.20.0.0/24 --share-types smb --smb-anonymous --output anon.ndjson\n\n"
             "  NFS + SMB combined scan:\n"
-            "    share_sentinel_collector.py --hosts hosts.txt --share-types both --username corp\\\\svc_scan --password '***' --output combined.json.gz --gzip\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --share-types both --username corp\\\\svc_scan --password '***' --output combined.ndjson.gz --gzip\n\n"
             "  Upload after scan:\n"
             "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --username svc --password '***' --upload --api-base https://api.example --project-id <uuid> --api-token <token>\n\n"
             "Notes:\n"
@@ -353,7 +745,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "      * Session credentials: use --use-session-creds to use the active Kerberos ticket cache\n"
             "      * Anonymous: set --smb-anonymous or omit SMB credentials\n"
             "  - NFS export enumeration uses `showmount -e`; if unavailable, only summary issues are recorded.\n"
-            "  - When no endpoint/resource/item data is collected, output files are not written."
+            "  - Progress and diagnostics are written to stderr; NDJSON written to stdout remains clean.\n"
+            "  - Ctrl-C drains bounded in-flight work, preserves a partial artifact, and exits 130.\n"
+            "  - When no endpoint/resource/item/error data is collected, output files are not written."
         ),
         formatter_class=_CollectorHelpFormatter,
     )
@@ -370,12 +764,45 @@ def _build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--output",
         type=str,
-        help="Write compact JSON output to this file. Output is only committed when scan data is collected.",
+        help=(
+            "Write streaming .ndjson/.jsonl or bounded compatibility .json output. "
+            "Output is only committed when scan data is collected."
+        ),
     )
-    common.add_argument("--gzip", action="store_true", help="Gzip-compress output when writing to a file.")
+    common.add_argument(
+        "--gzip",
+        action="store_true",
+        help="Gzip-compress file output; requires a matching .gz output suffix.",
+    )
     common.add_argument("--workers", type=int, default=100, help="Concurrent host workers.")
     common.add_argument("--timeout", type=float, default=3.0, help="Per-network-operation timeout in seconds.")
+    common.add_argument(
+        "--max-targets",
+        type=int,
+        default=65536,
+        help="Fail before scanning more than this many unique targets (0 disables the guard).",
+    )
     common.add_argument("--operator-label", type=str, help="Optional operator label stored in run metadata.")
+    output_controls = common.add_mutually_exclusive_group()
+    output_controls.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase stderr detail (-v reports each host; -vv also reports protocol/share activity).",
+    )
+    output_controls.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress routine progress and completion messages; errors still use stderr.",
+    )
+    common.add_argument(
+        "--progress-interval",
+        type=float,
+        default=5.0,
+        help="Seconds between stderr progress reports (0 disables periodic reports).",
+    )
 
     smb_auth = parser.add_argument_group("SMB Authentication")
     smb_auth.add_argument("--smb-anonymous", action="store_true", help="Force anonymous SMB session.")
@@ -431,6 +858,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"API token with run write scope (prefer {API_TOKEN_ENV}).",
     )
     upload.add_argument("--run-name", type=str, default="Share Collector Run", help="Run name for uploaded scan.")
+    upload.add_argument(
+        "--upload-timeout",
+        type=float,
+        default=600.0,
+        help="Timeout in seconds for each API create/upload attempt.",
+    )
+    upload.add_argument(
+        "--upload-attempts",
+        type=int,
+        default=3,
+        help="Maximum attempts for transient API/network failures.",
+    )
 
     return parser
 
@@ -439,22 +878,85 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return _build_parser().parse_args(argv)
 
 
+def _normalize_host_target(raw_host: str) -> tuple[str, str]:
+    host = str(raw_host).strip()
+    try:
+        normalized = str(ipaddress.ip_address(host))
+    except ValueError:
+        return host, host.casefold()
+    return normalized, normalized
+
+
 def iter_targets(cidrs: list[str], host_inputs: list[str] | None = None):
     seen: set[str] = set()
     for cidr in cidrs:
         network = ipaddress.ip_network(cidr, strict=False)
         for host in network.hosts():
             target = str(host)
-            if target in seen:
+            key = target
+            if key in seen:
                 continue
-            seen.add(target)
+            seen.add(key)
             yield target
 
     for host in host_inputs or []:
-        if host in seen:
+        target, key = _normalize_host_target(host)
+        if key in seen:
             continue
-        seen.add(host)
-        yield host
+        seen.add(key)
+        yield target
+
+
+def _cidr_host_range(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> tuple[int, int]:
+    start = int(network.network_address)
+    end = int(network.broadcast_address)
+    if network.version == 4 and network.prefixlen < 31:
+        start += 1
+        end -= 1
+    elif network.version == 6 and network.prefixlen < 127:
+        start += 1
+    return start, end
+
+
+def _merged_target_ranges(cidrs: list[str]) -> dict[int, list[tuple[int, int]]]:
+    ranges: dict[int, list[tuple[int, int]]] = {4: [], 6: []}
+    for raw_cidr in cidrs:
+        network = ipaddress.ip_network(raw_cidr, strict=False)
+        start, end = _cidr_host_range(network)
+        if start <= end:
+            ranges[network.version].append((start, end))
+
+    merged: dict[int, list[tuple[int, int]]] = {4: [], 6: []}
+    for version, version_ranges in ranges.items():
+        for start, end in sorted(version_ranges):
+            if not merged[version] or start > merged[version][-1][1] + 1:
+                merged[version].append((start, end))
+                continue
+            previous_start, previous_end = merged[version][-1]
+            merged[version][-1] = (previous_start, max(previous_end, end))
+    return merged
+
+
+def count_targets(cidrs: list[str], host_inputs: list[str] | None = None) -> int:
+    """Count iter_targets output without expanding large CIDRs into memory."""
+
+    merged = _merged_target_ranges(cidrs)
+    total = sum(end - start + 1 for ranges in merged.values() for start, end in ranges)
+    seen_host_keys: set[str] = set()
+    for raw_host in host_inputs or []:
+        target, key = _normalize_host_target(raw_host)
+        if key in seen_host_keys:
+            continue
+        seen_host_keys.add(key)
+        try:
+            address = ipaddress.ip_address(target)
+        except ValueError:
+            total += 1
+            continue
+        address_value = int(address)
+        if not any(start <= address_value <= end for start, end in merged[address.version]):
+            total += 1
+    return total
 
 
 def parse_targets(cidrs: list[str], hosts_file: str | None) -> list[str]:
@@ -465,7 +967,7 @@ def parse_hosts_file(hosts_file: str | None) -> list[str]:
     if not hosts_file:
         return []
     hosts: list[str] = []
-    for line in Path(hosts_file).read_text(encoding="utf-8").splitlines():
+    for line in Path(hosts_file).read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             hosts.append(line)
@@ -507,6 +1009,27 @@ def normalize_path(base: str, child: str) -> str:
     return joined if joined.startswith("\\") else f"\\{joined}"
 
 
+def _entry_metadata(entry: object, *, is_dir: bool) -> dict[str, object]:
+    metadata: dict[str, object] = {}
+    if not is_dir:
+        try:
+            size_bytes = int(entry.get_filesize())  # type: ignore[attr-defined]
+        except (AttributeError, OverflowError, TypeError, ValueError):
+            pass
+        else:
+            if size_bytes >= 0:
+                metadata["size_bytes"] = size_bytes
+
+    try:
+        mtime_epoch = float(entry.get_mtime_epoch())  # type: ignore[attr-defined]
+        mtime = datetime.fromtimestamp(mtime_epoch, tz=UTC)
+    except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+        pass
+    else:
+        metadata["mtime"] = mtime.isoformat()
+    return metadata
+
+
 def list_share_entries(
     conn: SMBConnection,
     share_name: str,
@@ -516,11 +1039,17 @@ def list_share_entries(
     extensions: set[str] | None,
     on_list_error=None,
     on_limit_reached=None,
+    on_list_success=None,
+    cancel_event: threading.Event | None = None,
 ):
     queue = collections.deque([("", 0)])
+    inspected = 0
     emitted = 0
+    limit_reached = False
 
-    while queue and emitted < max_entries:
+    while queue and inspected < max_entries:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         rel_path, depth = queue.popleft()
         wildcard = f"{rel_path}\\*" if rel_path else "*"
 
@@ -534,19 +1063,56 @@ def list_share_entries(
                     pass
             continue
 
-        for entry in entries:
+        if on_list_success is not None:
+            try:
+                on_list_success(rel_path or "\\")
+            except Exception:
+                pass
+
+        for entry_index, entry in enumerate(entries):
+            if cancel_event is not None and cancel_event.is_set():
+                break
             name = entry.get_longname()
             if name in {".", ".."}:
                 continue
 
+            inspected += 1
+            at_inspection_cap = inspected >= max_entries
+
+            def _finish_at_cap() -> bool:
+                nonlocal limit_reached
+                if not at_inspection_cap:
+                    return False
+                try:
+                    remaining_count = len(entries) - entry_index - 1
+                    if remaining_count <= 0:
+                        unseen_in_listing = False
+                    elif remaining_count > 2:
+                        unseen_in_listing = True
+                    else:
+                        unseen_in_listing = any(
+                            entries[offset].get_longname() not in {".", ".."}
+                            for offset in range(entry_index + 1, len(entries))
+                        )
+                except (AttributeError, IndexError, TypeError):
+                    # Impacket returns a list, but conservatively report truncation
+                    # for an unsized custom iterator because we cannot safely peek.
+                    unseen_in_listing = True
+                limit_reached = unseen_in_listing or bool(queue)
+                return True
+
             full_path = normalize_path(rel_path, name)
             if exclude_path_regex and exclude_path_regex.search(full_path):
+                if _finish_at_cap():
+                    break
                 continue
 
             is_dir = bool(entry.is_directory())
             if extensions and not is_dir:
                 suffix = os.path.splitext(name)[1].lower()
                 if suffix not in extensions:
+                    if _finish_at_cap():
+                        break
                     continue
 
             emitted += 1
@@ -554,25 +1120,27 @@ def list_share_entries(
                 "path": full_path,
                 "name": name,
                 "is_dir": is_dir,
+                **_entry_metadata(entry, is_dir=is_dir),
             }
 
             if is_dir and depth + 1 < max_depth:
                 queue.append((full_path.strip("\\"), depth + 1))
-            if emitted >= max_entries:
+            if _finish_at_cap():
                 break
 
-    if emitted >= max_entries and queue and on_limit_reached is not None:
+    if limit_reached and on_limit_reached is not None:
         try:
-            on_limit_reached(emitted)
+            on_limit_reached(inspected, emitted)
         except Exception:
             pass
 
 
 def _dialect_label(raw: str) -> str:
     mapping = {
-        "528": "2.0.2",
-        "770": "2.1",
+        "514": "2.0.2",
+        "528": "2.1",
         "768": "3.0",
+        "770": "3.0.2",
         "785": "3.1.1",
     }
     return mapping.get(str(raw), str(raw))
@@ -581,9 +1149,9 @@ def _dialect_label(raw: str) -> str:
 def _signing_label(conn: SMBConnection) -> str:
     try:
         required = bool(conn.isSigningRequired())
-        return "required" if required else "enabled"
+        return "required" if required else "not_required"
     except (AttributeError, OSError, SessionError, TypeError, ValueError):
-        return "enabled"
+        return "unknown"
 
 
 def _selected_share_types(raw_value: str) -> set[str]:
@@ -755,6 +1323,10 @@ def _validate_args(args: argparse.Namespace) -> None:
     timeout = float(getattr(args, "timeout", 1.0))
     max_depth = int(getattr(args, "max_depth", 1))
     max_entries_per_share = int(getattr(args, "max_entries_per_share", 1))
+    max_targets = int(getattr(args, "max_targets", 65536))
+    progress_interval = float(getattr(args, "progress_interval", 5.0))
+    upload_timeout = float(getattr(args, "upload_timeout", 600.0))
+    upload_attempts = int(getattr(args, "upload_attempts", 3))
     exclude_path_regex = getattr(args, "exclude_path_regex", None)
 
     if not cidr and not hosts:
@@ -766,8 +1338,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--use-session-creds cannot be combined with --smb-anonymous")
 
     if "smb" in selected_share_types:
-        if smb_anonymous and (username or hashes or domain or local_auth):
-            raise SystemExit("--smb-anonymous cannot be combined with SMB identity, domain, hashes, or local auth options")
+        if smb_anonymous and (username or password or hashes or domain or local_auth or ccache):
+            raise SystemExit(
+                "--smb-anonymous cannot be combined with SMB identity, password, domain, hashes, ccache, or local auth options"
+            )
         if local_auth and not username:
             raise SystemExit("--local-auth requires --username")
         if local_auth and (kerberos or use_session_creds):
@@ -784,8 +1358,20 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise SystemExit("--use-session-creds cannot be combined with --hashes")
         if use_session_creds and password:
             raise SystemExit("--use-session-creds cannot be combined with --password")
-        if hashes and ":" not in str(hashes):
-            raise SystemExit("--hashes must be in LMHASH:NTHASH format")
+        if password and hashes:
+            raise SystemExit("--password and --hashes are mutually exclusive SMB credential sources")
+        if hashes:
+            hash_parts = str(hashes).split(":")
+            if len(hash_parts) != 2:
+                raise SystemExit("--hashes must be in LMHASH:NTHASH format")
+            lmhash, nthash = hash_parts
+            if (
+                (lmhash and re.fullmatch(r"[0-9a-fA-F]{32}", lmhash) is None)
+                or re.fullmatch(r"[0-9a-fA-F]{32}", nthash) is None
+            ):
+                raise SystemExit(
+                    "--hashes requires an optional 32-character hexadecimal LM hash and a 32-character hexadecimal NT hash"
+                )
         if hashes and not username and not smb_anonymous:
             raise SystemExit("--hashes requires --username unless --smb-anonymous is set")
         if password and not username and not smb_anonymous:
@@ -795,6 +1381,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--upload requires --api-base, --project-id, and --api-token")
     if output_path:
         output = Path(output_path).expanduser()
+        normalized_output = str(output).lower()
+        if not normalized_output.endswith(SUPPORTED_ARTIFACT_SUFFIXES):
+            raise SystemExit(
+                "--output must end in .ndjson, .jsonl, .json, or the corresponding .gz suffix"
+            )
+        gzip_output = bool(getattr(args, "gzip", False))
+        if gzip_output and not normalized_output.endswith(".gz"):
+            raise SystemExit("--gzip requires an --output filename ending in .gz")
+        if normalized_output.endswith(".gz") and not gzip_output:
+            raise SystemExit("an --output filename ending in .gz requires --gzip")
         parent = output.parent if str(output.parent) else Path(".")
         if not parent.exists():
             raise SystemExit(f"--output directory does not exist: {parent}")
@@ -802,14 +1398,52 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise SystemExit(f"--output parent is not a directory: {parent}")
         if output.exists() and output.is_dir():
             raise SystemExit(f"--output points to a directory, expected file path: {output}")
+        preflight_path: str | None = None
+        try:
+            preflight_fd, preflight_path = tempfile.mkstemp(
+                prefix=".share-sentinel-write-check-",
+                dir=str(parent),
+            )
+            os.close(preflight_fd)
+        except OSError as exc:
+            raise SystemExit(f"--output directory is not writable: {parent}: {_error_detail(exc)}") from exc
+        finally:
+            if preflight_path:
+                try:
+                    os.unlink(preflight_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise SystemExit(
+                        f"unable to clean output write check in {parent}: {_error_detail(exc)}"
+                    ) from exc
+        args.output = str(output)
+    if bool(getattr(args, "gzip", False)) and not output_path and not upload:
+        raise SystemExit("--gzip requires --output unless --upload is enabled")
     if workers <= 0:
         raise SystemExit("--workers must be greater than zero")
+    if workers > 1024:
+        raise SystemExit("--workers must be 1024 or fewer")
+    if not math.isfinite(timeout):
+        raise SystemExit("--timeout must be finite")
     if timeout <= 0:
         raise SystemExit("--timeout must be greater than zero")
     if max_depth <= 0:
         raise SystemExit("--max-depth must be greater than zero")
     if max_entries_per_share <= 0:
         raise SystemExit("--max-entries-per-share must be greater than zero")
+    if max_targets < 0:
+        raise SystemExit("--max-targets must be zero or greater")
+    if not math.isfinite(progress_interval):
+        raise SystemExit("--progress-interval must be finite")
+    if progress_interval < 0:
+        raise SystemExit("--progress-interval must be zero or greater")
+    if not math.isfinite(upload_timeout):
+        raise SystemExit("--upload-timeout must be finite")
+    if upload_timeout <= 0:
+        raise SystemExit("--upload-timeout must be greater than zero")
+    if upload_attempts <= 0 or upload_attempts > 10:
+        raise SystemExit("--upload-attempts must be between 1 and 10")
     if exclude_path_regex:
         try:
             re.compile(exclude_path_regex)
@@ -873,6 +1507,50 @@ def _share_info_value(share: object, key: str, default: str = "") -> str:
             value = getattr(share, key, default)
     text = str(value or default)
     return text.rstrip("\x00")
+
+
+def _is_disk_share(share: object) -> bool:
+    try:
+        raw_value = share["shi1_type"]  # type: ignore[index]
+    except Exception:
+        if isinstance(share, dict):
+            raw_value = share.get("shi1_type")
+        else:
+            raw_value = getattr(share, "shi1_type", None)
+    if raw_value is None:
+        return True
+    try:
+        return int(raw_value) & 0xFFFF == 0
+    except (TypeError, ValueError):
+        return True
+
+
+def _normalized_extensions(raw_value: str | None) -> set[str] | None:
+    if not raw_value:
+        return None
+    extensions: set[str] = set()
+    for raw_extension in raw_value.split(","):
+        extension = raw_extension.strip().lower()
+        if not extension:
+            continue
+        extensions.add(extension if extension.startswith(".") else f".{extension}")
+    return extensions or None
+
+
+def _report_detail(args: argparse.Namespace, message: str, *, level: int = 2) -> None:
+    reporter = getattr(args, "progress_reporter", None)
+    if isinstance(reporter, ProgressReporter):
+        reporter.detail(message, level=level)
+
+
+def _report_notice(args: argparse.Namespace, message: str) -> None:
+    if bool(getattr(args, "quiet", False)):
+        return
+    reporter = getattr(args, "progress_reporter", None)
+    if isinstance(reporter, ProgressReporter):
+        reporter.detail(message, level=0)
+    else:
+        print(message, file=sys.stderr)
 
 
 def _record_error(stats: Stats, lock: threading.Lock, code: str, message: str) -> None:
@@ -1000,7 +1678,12 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
         _record_error(stats, lock, "SMB_SCANNER_UNAVAILABLE", message)
         return False
 
+    conn = None
+    authenticated = False
     try:
+        if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
+            return False
+        _report_detail(args, f"host {host}: starting SMB ({attempted_auth})")
         conn = SMBConnection(host, host, sess_port=445, timeout=args.timeout)
         lmhash = ""
         nthash = ""
@@ -1026,6 +1709,10 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             conn.login(args.username, args.password, domain=domain, lmhash=lmhash, nthash=nthash)
         else:
             conn.login("", "", domain="", lmhash="", nthash="")
+        authenticated = True
+
+        if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
+            return False
 
         endpoint_record = {
             "type": "endpoint",
@@ -1049,13 +1736,17 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             stats.endpoints += 1
 
         excluded_shares = {s.upper() for s in args.exclude_share}
-        include_shares = [str(share).strip() for share in getattr(args, "include_share", []) if str(share).strip()]
+        include_shares = list(
+            dict.fromkeys(
+                str(share).strip()
+                for share in getattr(args, "include_share", [])
+                if str(share).strip()
+            )
+        )
         exclude_path_regex = getattr(args, "exclude_path_pattern", None)
         if exclude_path_regex is None and args.exclude_path_regex:
             exclude_path_regex = re.compile(args.exclude_path_regex)
-        extensions = None
-        if args.extensions_only:
-            extensions = {e.strip().lower() for e in args.extensions_only.split(",") if e.strip()}
+        extensions = _normalized_extensions(args.extensions_only)
 
         if include_shares:
             shares = [{"shi1_netname": f"{name}\x00", "shi1_remark": "user-specified share"} for name in include_shares]
@@ -1080,24 +1771,24 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                     hint=hint,
                 )
                 _record_error(stats, lock, "LIST_SHARES_DENIED", message)
-                try:
-                    conn.logoff()
-                except (SessionError, OSError):
-                    pass
                 return True
 
         eligible_shares = []
+        seen_shares: set[str] = set()
         for share in shares:
             share_name = _share_info_value(share, "shi1_netname")
-            if not share_name or share_name.upper() in excluded_shares:
+            share_key = share_name.casefold()
+            if (
+                not share_name
+                or share_name.upper() in excluded_shares
+                or share_key in seen_shares
+                or (not include_shares and not _is_disk_share(share))
+            ):
                 continue
+            seen_shares.add(share_key)
             eligible_shares.append(share)
 
         if not eligible_shares:
-            try:
-                conn.logoff()
-            except (SessionError, OSError):
-                pass
             return True
 
         def _handle_list_error(share_name: str, denied_path: str, exc: BaseException) -> None:
@@ -1116,8 +1807,11 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             )
             _record_error(stats, lock, "LIST_SESSION_ERROR", message)
 
-        def _handle_list_limit(share_name: str, emitted: int) -> None:
-            message = f"SMB share listing reached max entries ({emitted}) for {share_name}."
+        def _handle_list_limit(share_name: str, inspected: int, emitted: int) -> None:
+            message = (
+                f"SMB share listing reached inspection cap for {share_name} "
+                f"(inspected={inspected}, emitted={emitted})."
+            )
             _emit_error(
                 writer,
                 run_id,
@@ -1132,8 +1826,11 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             _record_error(stats, lock, "LIST_LIMIT_REACHED", message)
 
         for share in eligible_shares:
+            if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
+                break
             share_name = _share_info_value(share, "shi1_netname")
             remark = _share_info_value(share, "shi1_remark")
+            _report_detail(args, f"host {host}: listing SMB share {share_name}")
             resource_record = {
                 "type": "resource",
                 "run_id": run_id,
@@ -1142,11 +1839,17 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "resource_type": "smb_share",
                 "name": share_name,
                 "remark": remark,
-                "access_level": "list_only",
+                "access_level": "no_access",
             }
             writer.emit(resource_record)
             with lock:
                 stats.resources += 1
+
+            listed_paths = False
+
+            def _handle_list_success(_listed_path: str) -> None:
+                nonlocal listed_paths
+                listed_paths = True
 
             try:
                 for entry in list_share_entries(
@@ -1157,7 +1860,13 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                     exclude_path_regex=exclude_path_regex,
                     extensions=extensions,
                     on_list_error=lambda denied_path, exc, share_name=share_name: _handle_list_error(share_name, denied_path, exc),
-                    on_limit_reached=lambda emitted, share_name=share_name: _handle_list_limit(share_name, emitted),
+                    on_limit_reached=lambda inspected, emitted, share_name=share_name: _handle_list_limit(
+                        share_name,
+                        inspected,
+                        emitted,
+                    ),
+                    on_list_success=_handle_list_success,
+                    cancel_event=getattr(args, "cancel_event", None),
                 ):
                     writer.emit(
                         {
@@ -1218,11 +1927,13 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 _record_error(stats, lock, "LIST_IO_ERROR", message)
             except (NetBIOSError, NetBIOSTimeout) as exc:
                 _handle_list_error(share_name, "\\", exc)
-
-        try:
-            conn.logoff()
-        except (SessionError, OSError):
-            pass
+            if listed_paths:
+                writer.emit({**resource_record, "access_level": "list_only"})
+            _report_detail(
+                args,
+                f"host {host}: finished SMB share {share_name} "
+                f"({'listable' if listed_paths else 'not listable'})",
+            )
         return True
 
     except socket.gaierror as exc:
@@ -1269,6 +1980,19 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
         code = "SMB_INPUT_INVALID"
         message = f"SMB scan input is invalid: {detail}"
         hint = "Verify CLI arguments for credentials and filters."
+    finally:
+        if conn is not None:
+            if authenticated:
+                try:
+                    conn.logoff()
+                except Exception:
+                    pass
+            close_connection = getattr(conn, "close", None)
+            if callable(close_connection):
+                try:
+                    close_connection()
+                except Exception:
+                    pass
 
     _emit_error(
         writer,
@@ -1286,6 +2010,9 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
 def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
     endpoint_key = f"{host}:2049"
 
+    if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
+        return False
+    _report_detail(args, f"host {host}: starting NFS discovery")
     try:
         with socket.create_connection((host, 2049), timeout=args.timeout):
             pass
@@ -1345,6 +2072,9 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
         _record_error(stats, lock, "NFS_CONNECT_FAILED", message)
         return False
 
+    if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
+        return False
+
     writer.emit(
         {
             "type": "endpoint",
@@ -1365,6 +2095,9 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
     with lock:
         stats.endpoints += 1
 
+    if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
+        return True
+
     exports, export_error = _discover_nfs_exports(host, args.timeout)
     if export_error:
         message = f"Failed to enumerate NFS exports on {host}: {export_error}"
@@ -1383,6 +2116,8 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
         return True
 
     for export_path in exports:
+        if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
+            break
         writer.emit(
             {
                 "type": "resource",
@@ -1392,23 +2127,38 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "resource_type": "nfs_share",
                 "name": export_path,
                 "remark": "",
-                "access_level": "list_only",
+                "access_level": "no_access",
             }
         )
         with lock:
             stats.resources += 1
+    _report_detail(args, f"host {host}: discovered {len(exports)} NFS export(s)")
     return True
 
 
-def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
+def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock):
     selected_share_types = _selected_share_types(args.share_types)
     disabled_share_types = getattr(args, "disabled_share_types", set())
+    active_share_types = selected_share_types - set(disabled_share_types)
     succeeded = False
 
-    if "smb" in selected_share_types and "smb" not in disabled_share_types:
+    cancel_event = getattr(args, "cancel_event", None)
+    if cancel_event is not None and cancel_event.is_set():
+        return SCAN_CANCELLED
+    reporter = getattr(args, "progress_reporter", None)
+    if isinstance(reporter, ProgressReporter):
+        reporter.target_started(host)
+    if "smb" in active_share_types:
         succeeded = scan_host_smb(host, args, run_id, writer, stats, lock) or succeeded
-    if "nfs" in selected_share_types and "nfs" not in disabled_share_types:
+        if cancel_event is not None and cancel_event.is_set():
+            return SCAN_CANCELLED
+    if (
+        "nfs" in active_share_types
+        and not (cancel_event is not None and cancel_event.is_set())
+    ):
         succeeded = scan_host_nfs(host, args, run_id, writer, stats, lock) or succeeded
+        if cancel_event is not None and cancel_event.is_set():
+            return SCAN_CANCELLED
     return succeeded
 
 
@@ -1420,9 +2170,14 @@ def _is_ip(value: str) -> bool:
         return False
 
 
-def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str, hosts: list[str]) -> None:
+def upload_artifact(
+    args: argparse.Namespace,
+    run_id: str,
+    artifact_path: str,
+    hosts: list[str],
+) -> str | None:
     if not args.upload:
-        return
+        return None
 
     if not args.api_base or not args.project_id or not args.api_token:
         raise RuntimeError("--upload requires --api-base --project-id --api-token")
@@ -1442,14 +2197,27 @@ def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str, h
         },
     }
     create_url = f"{base}/projects/{args.project_id}/runs"
+    upload_timeout = float(getattr(args, "upload_timeout", 600.0))
+    request_timeout = (min(10.0, upload_timeout), upload_timeout)
+    upload_attempts = int(getattr(args, "upload_attempts", 3))
+    reporter = getattr(args, "progress_reporter", None)
+
+    def _report_retry(message: str) -> None:
+        if isinstance(reporter, ProgressReporter):
+            reporter.detail(message, level=1)
+
+    _report_detail(args, "upload: creating or resuming API run", level=1)
     create_resp = _post_with_retries(
-        lambda: requests.post(create_url, json=create_payload, headers=headers, timeout=30),
+        lambda: requests.post(create_url, json=create_payload, headers=headers, timeout=request_timeout),
+        max_attempts=upload_attempts,
+        on_retry=_report_retry,
     )
     create_detail = _response_detail(create_resp)
     if create_resp.status_code != 409 or create_detail != "run already exists":
         create_resp.raise_for_status()
 
     upload_url = f"{base}/projects/{args.project_id}/runs/{run_id}/artifact"
+    local_artifact_sha256 = _sha256_file(artifact_path)
     normalized_artifact_path = artifact_path.lower()
     if normalized_artifact_path.endswith(".gz"):
         content_type = "application/gzip"
@@ -1457,34 +2225,178 @@ def upload_artifact(args: argparse.Namespace, run_id: str, artifact_path: str, h
         content_type = "application/x-ndjson"
     else:
         content_type = "application/json"
-    upload_resp = _post_with_retries(
-        lambda: _upload_artifact_once(upload_url, headers, content_type, artifact_path),
-    )
+    try:
+        upload_resp = _post_with_retries(
+            lambda: _upload_artifact_once(
+                upload_url,
+                headers,
+                content_type,
+                artifact_path,
+                timeout=request_timeout,
+            ),
+            max_attempts=upload_attempts,
+            on_retry=_report_retry,
+        )
+    except (
+        requests.ConnectionError,
+        requests.Timeout,
+        requests.exceptions.ChunkedEncodingError,
+    ) as upload_exc:
+        try:
+            return _reconcile_uploaded_artifact(
+                args=args,
+                base=base,
+                headers=headers,
+                request_timeout=request_timeout,
+                upload_attempts=upload_attempts,
+                local_artifact_sha256=local_artifact_sha256,
+                run_id=run_id,
+                context=(
+                    "the artifact request ended without a definitive response "
+                    f"({_error_detail(upload_exc)})"
+                ),
+            )
+        except RuntimeError as reconciliation_exc:
+            raise reconciliation_exc from upload_exc
     upload_detail = _response_detail(upload_resp)
-    if upload_resp.status_code != 409 or upload_detail != "run state does not accept upload":
+    if upload_resp.status_code in UPLOAD_RETRIABLE_STATUSES:
+        return _reconcile_uploaded_artifact(
+            args=args,
+            base=base,
+            headers=headers,
+            request_timeout=request_timeout,
+            upload_attempts=upload_attempts,
+            local_artifact_sha256=local_artifact_sha256,
+            run_id=run_id,
+            context=f"the artifact endpoint returned transient HTTP {upload_resp.status_code}",
+        )
+    accepted_conflict_details = {
+        "run is currently ingesting",
+        "run state does not accept upload",
+    }
+    if upload_resp.status_code == 409 and upload_detail in accepted_conflict_details:
+        return _reconcile_uploaded_artifact(
+            args=args,
+            base=base,
+            headers=headers,
+            request_timeout=request_timeout,
+            upload_attempts=upload_attempts,
+            local_artifact_sha256=local_artifact_sha256,
+            run_id=run_id,
+            context=f"the artifact endpoint returned HTTP 409 ({upload_detail})",
+        )
+
+    if upload_resp.status_code == 409:
         upload_resp.raise_for_status()
+    upload_resp.raise_for_status()
     try:
         upload_payload = upload_resp.json()
-    except ValueError:
-        upload_payload = None
-    queued = upload_payload.get("queued") if isinstance(upload_payload, dict) else None
+    except ValueError as exc:
+        raise RuntimeError("upload API returned invalid JSON after accepting the artifact") from exc
+    if not isinstance(upload_payload, dict):
+        raise RuntimeError("upload API returned an invalid payload after accepting the artifact")
+    queued = upload_payload.get("queued")
+    response_sha256 = str(upload_payload.get("artifact_sha256") or "").lower()
+    if response_sha256 != local_artifact_sha256:
+        raise RuntimeError("upload response artifact digest does not match the local artifact")
     if queued is False:
         print(
             "upload warning: artifact stored, but ingest queue handoff fell back to asynchronous recovery; monitor the run until ingestion starts.",
             file=sys.stderr,
         )
 
-    print(f"run_id={run_id}")
-    print(f"api_run_url={base}/projects/{args.project_id}/runs/{run_id}")
+    _report_notice(
+        args,
+        f"upload accepted: run_id={run_id} api_run_url={base}/projects/{args.project_id}/runs/{run_id}",
+    )
+    return "accepted"
 
 
-def _upload_artifact_once(url: str, headers: dict[str, str], content_type: str, artifact_path: str) -> requests.Response:
+def _reconcile_uploaded_artifact(
+    *,
+    args: argparse.Namespace,
+    base: str,
+    headers: dict[str, str],
+    request_timeout: tuple[float, float],
+    upload_attempts: int,
+    local_artifact_sha256: str,
+    run_id: str,
+    context: str,
+) -> str:
+    reporter = getattr(args, "progress_reporter", None)
+
+    def _report_retry(message: str) -> None:
+        if isinstance(reporter, ProgressReporter):
+            reporter.detail(message, level=1)
+
+    run_url = f"{base}/projects/{args.project_id}/runs/{run_id}"
+    try:
+        run_resp = _post_with_retries(
+            lambda: requests.get(run_url, headers=headers, timeout=request_timeout),
+            max_attempts=upload_attempts,
+            on_retry=_report_retry,
+        )
+        run_resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            "upload outcome is ambiguous: "
+            f"{context}; run reconciliation failed ({_error_detail(exc)})"
+        ) from exc
+
+    try:
+        run_payload = run_resp.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"upload outcome is ambiguous: {context}; run reconciliation returned invalid JSON"
+        ) from exc
+    if not isinstance(run_payload, dict):
+        raise RuntimeError(
+            f"upload outcome is ambiguous: {context}; run reconciliation returned an invalid payload"
+        )
+    remote_status = str(run_payload.get("status") or "").upper()
+    remote_sha256 = str(run_payload.get("artifact_sha256") or "").lower()
+    if (
+        remote_status not in {"UPLOADED", "INGESTING", "COMPLETE"}
+        or remote_sha256 != local_artifact_sha256
+    ):
+        raise RuntimeError(
+            "upload outcome is ambiguous: "
+            f"{context}; the API run does not confirm the same artifact "
+            f"(status={remote_status or 'unknown'}, sha256_match={remote_sha256 == local_artifact_sha256})"
+        )
+    _report_notice(
+        args,
+        f"upload recovered after ambiguous response: run_id={run_id} status={remote_status}",
+    )
+    return "recovered"
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as artifact_fp:
+        for chunk in iter(lambda: artifact_fp.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _upload_artifact_once(
+    url: str,
+    headers: dict[str, str],
+    content_type: str,
+    artifact_path: str,
+    *,
+    timeout: float | tuple[float, float] = (10.0, 600.0),
+) -> requests.Response:
     with open(artifact_path, "rb") as fp:
         return requests.post(
             url,
             data=fp,
-            headers={**headers, "Content-Type": content_type},
-            timeout=3600,
+            headers={
+                **headers,
+                "Content-Type": content_type,
+                "X-Artifact-Filename": _artifact_upload_filename(artifact_path),
+            },
+            timeout=timeout,
         )
 
 
@@ -1503,19 +2415,44 @@ def _post_with_retries(
     request_fn,
     max_attempts: int = 3,
     initial_backoff_seconds: float = 0.5,
+    on_retry=None,
 ) -> requests.Response:
-    retriable_statuses = {429, 500, 502, 503, 504}
     for attempt in range(max_attempts):
+        response = None
+        retry_reason = ""
         try:
             response = request_fn()
-        except requests.RequestException:
+        except (
+            requests.ConnectionError,
+            requests.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ) as exc:
+            retry_reason = _error_detail(exc)
             if attempt + 1 >= max_attempts:
                 raise
         else:
-            if response.status_code not in retriable_statuses or attempt + 1 >= max_attempts:
+            if response.status_code not in UPLOAD_RETRIABLE_STATUSES or attempt + 1 >= max_attempts:
                 return response
+            retry_reason = f"HTTP {response.status_code}"
 
-        sleep_seconds = min(initial_backoff_seconds * (2**attempt), 4.0)
+        base_delay = min(initial_backoff_seconds * (2**attempt), 4.0)
+        retry_after = 0.0
+        if response is not None:
+            try:
+                retry_after = float(response.headers.get("Retry-After", "0"))
+            except (AttributeError, TypeError, ValueError):
+                retry_after = 0.0
+            if not math.isfinite(retry_after) or retry_after < 0:
+                retry_after = 0.0
+            close_response = getattr(response, "close", None)
+            if callable(close_response):
+                close_response()
+        sleep_seconds = min(30.0, max(retry_after, base_delay + random.uniform(0.0, base_delay)))
+        if on_retry is not None:
+            on_retry(
+                f"upload: retrying after {retry_reason} "
+                f"(attempt {attempt + 2}/{max_attempts}, delay {sleep_seconds:.1f}s)"
+            )
         time.sleep(sleep_seconds)
     raise RuntimeError("post retry loop failed unexpectedly")
 
@@ -1551,6 +2488,12 @@ def _handle_scan_result(
         exc = cancelled_error
 
     if exc is not None:
+        was_cancelled = isinstance(exc, concurrent.futures.CancelledError)
+        reporter = getattr(args, "progress_reporter", None) if args is not None else None
+        if was_cancelled:
+            if isinstance(reporter, ProgressReporter):
+                reporter.target_cancelled(host)
+            return 0
         message = f"scan worker failed for host {host}: {_error_detail(exc)}"
         code = _scan_thread_error_code(exc)
         endpoint_key = _scan_thread_endpoint_key(host, args)
@@ -1564,9 +2507,20 @@ def _handle_scan_result(
             hint="Unhandled worker exception; inspect traceback/logs for root cause.",
         )
         _record_error(stats, lock, code, message)
+        if isinstance(reporter, ProgressReporter):
+            reporter.target_completed(host, succeeded=False)
         return 1
 
-    return 0 if bool(future.result()) else 1
+    result = future.result()
+    reporter = getattr(args, "progress_reporter", None) if args is not None else None
+    if result is SCAN_CANCELLED:
+        if isinstance(reporter, ProgressReporter):
+            reporter.target_cancelled(host)
+        return 0
+    succeeded = bool(result)
+    if isinstance(reporter, ProgressReporter):
+        reporter.target_completed(host, succeeded=succeeded)
+    return 0 if succeeded else 1
 
 
 def _scan_targets(
@@ -1576,31 +2530,124 @@ def _scan_targets(
     writer: NDJSONWriter,
     stats: Stats,
     lock: threading.Lock,
-) -> tuple[int, int]:
+) -> ScanOutcome:
     max_workers = max(1, args.workers)
     max_pending = max_workers * 2
     submitted = 0
+    completed = 0
+    cancelled = 0
     host_failures = 0
     pending: dict[concurrent.futures.Future, str] = {}
+    cancel_event = getattr(args, "cancel_event", None)
+    if not isinstance(cancel_event, threading.Event):
+        cancel_event = threading.Event()
+        args.cancel_event = cancel_event
+    reporter = getattr(args, "progress_reporter", None)
+    executor: concurrent.futures.ThreadPoolExecutor | None = None
+    interrupted = False
+    stop_submissions = False
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    def _consume(done_futures) -> None:
+        nonlocal cancelled, completed, host_failures, stop_submissions
+        for completed_future in done_futures:
+            host = pending.pop(completed_future)
+            result_was_cancelled = completed_future.cancelled()
+            if not result_was_cancelled:
+                try:
+                    result_was_cancelled = completed_future.exception() is None and completed_future.result() is SCAN_CANCELLED
+                except concurrent.futures.CancelledError:
+                    result_was_cancelled = True
+            host_failures += _handle_scan_result(
+                completed_future,
+                host,
+                run_id,
+                writer,
+                stats,
+                lock,
+                args=args,
+            )
+            if result_was_cancelled:
+                cancelled += 1
+            else:
+                completed += 1
+            if bool(getattr(writer, "write_failed", False)):
+                stop_submissions = True
+                cancel_event.set()
+                for queued_future in pending:
+                    queued_future.cancel()
+
+    try:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
         for host in targets:
+            if stop_submissions:
+                break
             future = executor.submit(scan_host, host, args, run_id, writer, stats, lock)
             pending[future] = host
             submitted += 1
+            if isinstance(reporter, ProgressReporter):
+                reporter.target_submitted()
 
             if len(pending) < max_pending:
                 continue
 
             done, _ = concurrent.futures.wait(tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED)
-            for future in done:
-                host = pending.pop(future)
-                host_failures += _handle_scan_result(future, host, run_id, writer, stats, lock, args=args)
+            _consume(done)
 
-        if pending:
-            host_failures += _collect_scan_results(pending, run_id, writer, stats, lock, args=args)
+        while pending:
+            done, _ = concurrent.futures.wait(
+                tuple(pending),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            _consume(done)
+    except KeyboardInterrupt:
+        interrupted = True
+        cancel_event.set()
+        if isinstance(reporter, ProgressReporter):
+            reporter.interruption_requested()
+        for future in pending:
+            future.cancel()
+    except Exception as exc:
+        cancel_event.set()
+        message = f"scan orchestration failed: {_error_detail(exc)}"
+        _emit_error(
+            writer,
+            run_id,
+            severity="error",
+            code="SCAN_ORCHESTRATION_FAILED",
+            message=message,
+            hint="Reduce --workers, verify target inputs, and retry. Existing partial results are preserved.",
+        )
+        _record_error(stats, lock, "SCAN_ORCHESTRATION_FAILED", message)
+        host_failures += 1
+        for future in pending:
+            future.cancel()
+    finally:
+        if executor is not None:
+            try:
+                executor.shutdown(wait=True, cancel_futures=cancel_event.is_set())
+            except (OSError, RuntimeError) as exc:
+                message = f"scan executor shutdown failed: {_error_detail(exc)}"
+                _emit_error(
+                    writer,
+                    run_id,
+                    severity="error",
+                    code="SCAN_ORCHESTRATION_FAILED",
+                    message=message,
+                    hint="Partial results were retained; rerun the original scope.",
+                )
+                _record_error(stats, lock, "SCAN_ORCHESTRATION_FAILED", message)
+                host_failures += 1
 
-    return submitted, host_failures
+    if pending:
+        _consume(tuple(pending))
+
+    return ScanOutcome(
+        targets_submitted=submitted,
+        targets_completed=completed,
+        host_failures=host_failures,
+        interrupted=interrupted,
+        targets_cancelled=cancelled,
+    )
 
 
 def _scan_thread_error_code(exc: BaseException) -> str:
@@ -1687,10 +2734,20 @@ def main() -> int:
 
     try:
         host_inputs = parse_hosts_file(args.hosts)
+        target_count = count_targets(args.cidr, host_inputs)
         targets = iter_targets(args.cidr, host_inputs)
     except (OSError, ValueError) as exc:
         print(f"input error: {_error_detail(exc)}", file=sys.stderr)
         print("fix target inputs and retry (--hosts file and/or --cidr values).", file=sys.stderr)
+        return EXIT_FAILURE
+
+    max_targets = int(getattr(args, "max_targets", 65536))
+    if max_targets and target_count > max_targets:
+        print(
+            f"input error: resolved {target_count} unique targets, exceeding --max-targets {max_targets}.",
+            file=sys.stderr,
+        )
+        print("narrow the scope or explicitly raise --max-targets after review.", file=sys.stderr)
         return EXIT_FAILURE
 
     targets = iter(targets)
@@ -1708,14 +2765,33 @@ def main() -> int:
     output_path = args.output
 
     if args.upload and output_path is None:
-        suffix = ".json.gz" if args.gzip else ".json"
+        suffix = ".ndjson.gz" if args.gzip else ".ndjson"
         fd, temp_artifact = tempfile.mkstemp(prefix="share-sentinel-", suffix=suffix)
         os.close(fd)
         output_path = temp_artifact
 
-    writer = NDJSONWriter(output_path, args.gzip)
+    try:
+        writer = NDJSONWriter(output_path, args.gzip)
+    except OSError as exc:
+        if temp_artifact:
+            try:
+                os.unlink(temp_artifact)
+            except OSError:
+                pass
+        print(f"output error: unable to initialize collector buffers: {_error_detail(exc)}", file=sys.stderr)
+        return EXIT_FAILURE
     stats = Stats()
     lock = threading.Lock()
+    reporter = ProgressReporter(
+        total_targets=target_count,
+        stats=stats,
+        stats_lock=lock,
+        quiet=bool(getattr(args, "quiet", False)),
+        verbosity=int(getattr(args, "verbose", 0) or 0),
+        interval_seconds=float(getattr(args, "progress_interval", 5.0)),
+    )
+    args.progress_reporter = reporter
+    args.cancel_event = threading.Event()
 
     run_meta_record = {
         "type": "run_meta",
@@ -1731,7 +2807,7 @@ def main() -> int:
             "target_scope": {
                 "cidrs": args.cidr,
                 "hosts": host_inputs,
-                "target_count": None,
+                "target_count": target_count,
                 "share_types": selected_share_types,
                 "disabled_share_types": sorted(disabled_share_types),
             },
@@ -1770,24 +2846,41 @@ def main() -> int:
         )
         _record_error(stats, lock, "SCAN_DEPENDENCY_WARNING", warning)
 
+    reporter.start(workers=args.workers, share_types=selected_share_types)
     run_ccache = args.ccache_env_value if smb_auth_method == "kerberos" else None
     with _run_scoped_kerberos_cache(run_ccache):
-        targets_scanned, host_failures = _scan_targets(targets, args, run_id, writer, stats, lock)
+        scan_outcome = _scan_targets(targets, args, run_id, writer, stats, lock)
 
-    run_meta_record["collection"]["target_scope"]["target_count"] = targets_scanned
-    writer.emit(run_meta_record)
+    if scan_outcome.interrupted:
+        interruption_message = (
+            "Collection interrupted by operator; the artifact contains only completed and drained in-flight work."
+        )
+        _emit_error(
+            writer,
+            run_id,
+            severity="warn",
+            code="SCAN_INTERRUPTED",
+            message=interruption_message,
+            hint="Review the partial artifact and rerun the original scope when ready.",
+        )
+        _record_error(stats, lock, "SCAN_INTERRUPTED", interruption_message)
 
     writer.emit(
         {
             "type": "run_end",
             "run_id": run_id,
-                "finished_at": datetime.now(tz=UTC).isoformat(),
-                "stats": {
-                    "targets_scanned": targets_scanned,
-                    "host_failures": host_failures,
-                    "endpoints": stats.endpoints,
-                    "resources": stats.resources,
-                    "items": stats.items,
+            "finished_at": datetime.now(tz=UTC).isoformat(),
+            "stats": {
+                "targets_scanned": scan_outcome.targets_completed,
+                "targets_submitted": scan_outcome.targets_submitted,
+                "targets_cancelled": scan_outcome.targets_cancelled,
+                "targets_total": target_count,
+                "targets_remaining": max(0, target_count - scan_outcome.targets_completed),
+                "host_failures": scan_outcome.host_failures,
+                "interrupted": scan_outcome.interrupted,
+                "endpoints": stats.endpoints,
+                "resources": stats.resources,
+                "items": stats.items,
                 "errors": stats.errors,
             },
         }
@@ -1795,23 +2888,79 @@ def main() -> int:
 
     run_has_data = _is_successful_run(stats)
     keep_output = run_has_data
-    writer_close_error: OSError | None = None
+    writer_close_error: BaseException | None = None
+    finalization_interrupted = False
     try:
         writer.close(keep_output=keep_output)
-    except OSError as exc:
+    except KeyboardInterrupt:
+        finalization_interrupted = True
+        if output_path is not None:
+            print(
+                "interrupt received while finalizing output; completing one atomic retry before exit.",
+                file=sys.stderr,
+            )
+            try:
+                writer.close(keep_output=keep_output)
+            except BaseException as exc:
+                writer_close_error = exc
+        else:
+            try:
+                writer.close(keep_output=False)
+            except BaseException:
+                pass
+    except Exception as exc:
         writer_close_error = exc
 
     upload_error: BaseException | None = None
-    keep_local_artifact = False
+    upload_interrupted = False
+    keep_local_artifact = bool(
+        (scan_outcome.interrupted or finalization_interrupted)
+        and writer_close_error is None
+        and output_path is not None
+        and os.path.exists(output_path)
+    )
+    upload_status = "not requested" if not args.upload else "skipped"
     try:
-        if writer_close_error is None and args.upload and keep_output and output_path is not None:
-            upload_artifact(args, run_id, output_path, host_inputs)
-    except (requests.RequestException, RuntimeError) as exc:
+        if (
+            writer_close_error is None
+            and args.upload
+            and keep_output
+            and output_path is not None
+            and not scan_outcome.interrupted
+            and not finalization_interrupted
+        ):
+            upload_status = upload_artifact(args, run_id, output_path, host_inputs) or "accepted"
+    except (requests.RequestException, RuntimeError, OSError) as exc:
         upload_error = exc
+        upload_status = "failed"
+        keep_local_artifact = output_path is not None and os.path.exists(output_path)
+    except KeyboardInterrupt:
+        upload_interrupted = True
+        upload_status = "outcome unknown (interrupted)"
         keep_local_artifact = output_path is not None and os.path.exists(output_path)
     finally:
         if temp_artifact and os.path.exists(temp_artifact) and not keep_local_artifact:
-            os.unlink(temp_artifact)
+            try:
+                os.unlink(temp_artifact)
+            except OSError as exc:
+                print(f"cleanup warning: unable to remove temporary artifact: {_error_detail(exc)}", file=sys.stderr)
+
+    if finalization_interrupted:
+        if writer_close_error is not None:
+            print(
+                "output error: interrupted finalization could not be completed: "
+                f"{_error_detail(writer_close_error)}",
+                file=sys.stderr,
+            )
+        artifact_label = output_path if keep_local_artifact else None
+        if artifact_label:
+            print(f"artifact kept at {artifact_label}", file=sys.stderr)
+        reporter.finish(
+            status="interrupted",
+            artifact=artifact_label,
+            upload_status=upload_status,
+        )
+        return EXIT_INTERRUPTED
 
     if writer_close_error is not None:
         destination = output_path or "stdout"
@@ -1819,7 +2968,22 @@ def main() -> int:
             f"output error: failed to write output to {destination}: {_error_detail(writer_close_error)}",
             file=sys.stderr,
         )
+        reporter.finish(status="failure", artifact=None, upload_status=upload_status)
         return EXIT_FAILURE
+
+    if upload_interrupted:
+        print(
+            "upload interrupted: delivery outcome is unknown; inspect the run before retrying.",
+            file=sys.stderr,
+        )
+        if keep_local_artifact and output_path:
+            print(f"artifact kept at {output_path}", file=sys.stderr)
+        reporter.finish(
+            status="interrupted",
+            artifact=output_path if keep_local_artifact else None,
+            upload_status=upload_status,
+        )
+        return EXIT_INTERRUPTED
 
     if upload_error is not None:
         print(
@@ -1828,20 +2992,56 @@ def main() -> int:
         )
         if keep_local_artifact and output_path:
             print(f"artifact kept at {output_path}", file=sys.stderr)
+            reporter.finish(
+                status="partial",
+                artifact=output_path,
+                upload_status=upload_status,
+            )
             return EXIT_PARTIAL
         print("rerun with --output if you want to keep a local artifact copy for retry.", file=sys.stderr)
+        reporter.finish(status="failure", artifact=None, upload_status=upload_status)
         return EXIT_FAILURE
+
+    if scan_outcome.interrupted:
+        artifact_label = output_path if keep_output and output_path else None
+        if artifact_label:
+            print(f"partial artifact kept at {artifact_label}", file=sys.stderr)
+        reporter.finish(
+            status="interrupted",
+            artifact=artifact_label,
+            upload_status=upload_status,
+        )
+        return EXIT_INTERRUPTED
 
     if not keep_output:
         _print_scan_failure_summary(
             stats,
-            host_failures,
+            scan_outcome.host_failures,
             reason="scan did not collect any endpoint/resource/item/error records.",
             output_path=args.output,
         )
+        reporter.finish(status="failure", artifact=None, upload_status=upload_status)
         return EXIT_FAILURE
-    if host_failures > 0:
+    if output_path is None:
+        artifact_label = "stdout"
+    elif os.path.exists(output_path):
+        artifact_label = output_path
+    elif temp_artifact and upload_status in {"accepted", "recovered"}:
+        artifact_label = "uploaded (temporary copy removed)"
+    else:
+        artifact_label = "not retained"
+    if scan_outcome.host_failures > 0 or stats.errors > 0:
+        reporter.finish(
+            status="partial",
+            artifact=artifact_label,
+            upload_status=upload_status,
+        )
         return EXIT_PARTIAL
+    reporter.finish(
+        status="success",
+        artifact=artifact_label,
+        upload_status=upload_status,
+    )
     return EXIT_SUCCESS
 
 

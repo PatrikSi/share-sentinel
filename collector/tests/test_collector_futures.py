@@ -110,7 +110,7 @@ def test_collect_scan_results_maps_netbios_timeout_to_scan_timeout() -> None:
     assert writer.records[0]["code"] == "SCAN_TIMEOUT"
 
 
-def test_collect_scan_results_emits_error_for_cancelled_future() -> None:
+def test_collect_scan_results_treats_cancelled_future_as_expected_cancellation() -> None:
     collector = _load_collector_module()
     writer = _Writer()
     stats = collector.Stats()
@@ -122,9 +122,23 @@ def test_collect_scan_results_emits_error_for_cancelled_future() -> None:
 
     host_failures = collector._collect_scan_results(futures, run_id, writer, stats, lock)
 
-    assert host_failures == 1
-    assert stats.errors == 1
-    assert writer.records[0]["code"] == "SCAN_THREAD_CANCELLED"
+    assert host_failures == 0
+    assert stats.errors == 0
+    assert writer.records == []
+
+
+def test_collect_scan_results_treats_cooperative_cancel_sentinel_as_expected_cancellation() -> None:
+    collector = _load_collector_module()
+    writer = _Writer()
+    stats = collector.Stats()
+    lock = threading.Lock()
+    futures = {_done_future(collector.SCAN_CANCELLED): "10.0.0.13"}
+
+    host_failures = collector._collect_scan_results(futures, "run-4b", writer, stats, lock)
+
+    assert host_failures == 0
+    assert stats.errors == 0
+    assert writer.records == []
 
 
 def test_collect_scan_results_uses_nfs_endpoint_key_when_nfs_only() -> None:

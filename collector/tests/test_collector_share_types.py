@@ -53,7 +53,7 @@ not-a-path value
 
 def test_list_share_entries_emits_limit_callback_when_truncated() -> None:
     collector = _load_collector_module()
-    callbacks: list[int] = []
+    callbacks: list[tuple[int, int]] = []
 
     class _Entry:
         def __init__(self, name: str, is_dir: bool):
@@ -80,12 +80,83 @@ def test_list_share_entries_emits_limit_callback_when_truncated() -> None:
             max_entries=1,
             exclude_path_regex=None,
             extensions=None,
-            on_limit_reached=lambda emitted: callbacks.append(emitted),
+            on_limit_reached=lambda inspected, emitted: callbacks.append((inspected, emitted)),
         )
     )
 
     assert len(rows) == 1
-    assert callbacks == [1]
+    assert callbacks == [(1, 1)]
+
+
+def test_list_share_entries_caps_inspection_before_extension_filtering() -> None:
+    collector = _load_collector_module()
+    callbacks: list[tuple[int, int]] = []
+    inspected_names: list[str] = []
+
+    class _Entry:
+        def __init__(self, name: str):
+            self._name = name
+
+        def get_longname(self):
+            inspected_names.append(self._name)
+            return self._name
+
+        def is_directory(self):
+            return False
+
+    class _Conn:
+        def listPath(self, *_args, **_kwargs):
+            return [_Entry(f"file-{index}.txt") for index in range(1000)]
+
+    rows = list(
+        collector.list_share_entries(
+            _Conn(),
+            "General",
+            max_depth=1,
+            max_entries=3,
+            exclude_path_regex=None,
+            extensions={".pdf"},
+            on_limit_reached=lambda inspected, emitted: callbacks.append((inspected, emitted)),
+        )
+    )
+
+    assert rows == []
+    assert inspected_names == ["file-0.txt", "file-1.txt", "file-2.txt"]
+    assert callbacks == [(3, 0)]
+
+
+def test_list_share_entries_does_not_report_limit_at_exact_end_of_share() -> None:
+    collector = _load_collector_module()
+    callbacks: list[tuple[int, int]] = []
+
+    class _Entry:
+        def __init__(self, name: str):
+            self._name = name
+
+        def get_longname(self):
+            return self._name
+
+        def is_directory(self):
+            return False
+
+    class _Conn:
+        def listPath(self, *_args, **_kwargs):
+            return [_Entry("one.txt"), _Entry("two.txt"), _Entry("."), _Entry("..")]
+
+    rows = list(
+        collector.list_share_entries(
+            _Conn(),
+            "General",
+            max_depth=1,
+            max_entries=2,
+            exclude_path_regex=None,
+            extensions=None,
+            on_limit_reached=lambda inspected, emitted: callbacks.append((inspected, emitted)),
+        )
+    )
+
+    assert [row["name"] for row in rows] == ["one.txt", "two.txt"]
+    assert callbacks == []
 
 
 def test_scan_host_dispatch_runs_only_selected_share_scanners(monkeypatch) -> None:
@@ -344,6 +415,50 @@ def test_validate_args_rejects_output_path_with_missing_parent(tmp_path) -> None
     raise AssertionError("expected SystemExit for missing output parent directory")
 
 
+@pytest.mark.parametrize(
+    ("filename", "gzip_output", "message"),
+    [
+        ("scan.txt", False, "--output must end"),
+        ("scan.ndjson", True, "filename ending in .gz"),
+        ("scan.json.gz", False, "requires --gzip"),
+    ],
+)
+def test_validate_args_rejects_ambiguous_artifact_suffixes(
+    tmp_path, filename, gzip_output, message
+) -> None:
+    collector = _load_collector_module()
+    args = collector.parse_args(
+        [
+            "--cidr",
+            "10.0.0.0/30",
+            "--smb-anonymous",
+            "--output",
+            str(tmp_path / filename),
+            *(["--gzip"] if gzip_output else []),
+        ]
+    )
+
+    with pytest.raises(SystemExit, match=message):
+        collector._validate_args(args)
+
+
+@pytest.mark.parametrize("filename", ["scan.json", "scan.ndjson", "scan.jsonl.gz"])
+def test_validate_args_accepts_supported_artifact_suffixes(tmp_path, filename) -> None:
+    collector = _load_collector_module()
+    args = collector.parse_args(
+        [
+            "--cidr",
+            "10.0.0.0/30",
+            "--smb-anonymous",
+            "--output",
+            str(tmp_path / filename),
+            *(["--gzip"] if filename.endswith(".gz") else []),
+        ]
+    )
+
+    collector._validate_args(args)
+
+
 def test_resolve_smb_auth_method_prefers_session_creds() -> None:
     collector = _load_collector_module()
     args = SimpleNamespace(smb_anonymous=False, use_session_creds=True, kerberos=False, username="")
@@ -384,6 +499,14 @@ def test_redact_cli_arguments_hides_sensitive_values() -> None:
     )
 
     assert redacted == ["--username", "svc", "--password", "<redacted>", "--hashes=<redacted>", "--api-token", "<redacted>"]
+
+
+@pytest.mark.parametrize("abbreviated_flag", ["--pass", "--hash", "--api-t"])
+def test_parse_args_rejects_abbreviated_secret_flags(abbreviated_flag) -> None:
+    collector = _load_collector_module()
+
+    with pytest.raises(SystemExit):
+        collector.parse_args(["--hosts", "hosts.txt", abbreviated_flag, "secret"])
 
 
 def test_parse_args_reads_secrets_from_environment(monkeypatch) -> None:

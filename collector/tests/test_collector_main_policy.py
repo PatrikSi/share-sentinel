@@ -2,10 +2,11 @@ import importlib.util
 import io
 import json
 import os
-import requests
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import requests
 
 
 def _load_collector_module():
@@ -280,13 +281,14 @@ def test_main_reports_upload_errors_without_traceback_returns_partial(monkeypatc
 
 def test_main_keeps_generated_temp_artifact_when_upload_fails_returns_partial(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
-    temp_output = tmp_path / "generated-upload.json"
+    temp_output = tmp_path / "generated-upload.ndjson"
     args = _base_args(None)
     args.upload = True
     args.api_base = "http://api"
     args.project_id = "project-id"
     args.api_token = "token-value"
     stderr_capture = io.StringIO()
+    requested_suffixes: list[str | None] = []
 
     def _scan_host(_host, _args, run_id, writer, stats, lock):
         writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
@@ -306,6 +308,7 @@ def test_main_keeps_generated_temp_artifact_when_upload_fails_returns_partial(mo
         return True
 
     def _fake_mkstemp(*_args, **_kwargs):
+        requested_suffixes.append(_kwargs.get("suffix"))
         fd = os.open(temp_output, os.O_CREAT | os.O_RDWR)
         return fd, str(temp_output)
 
@@ -326,6 +329,7 @@ def test_main_keeps_generated_temp_artifact_when_upload_fails_returns_partial(mo
 
     assert rc == collector.EXIT_PARTIAL
     assert temp_output.exists()
+    assert requested_suffixes[0] == ".ndjson"
     assert f"artifact kept at {temp_output}" in stderr_capture.getvalue()
 
 
@@ -448,7 +452,7 @@ def test_main_reports_upload_errors_without_traceback_returns_failure(monkeypatc
 
 def test_main_keeps_generated_temp_artifact_on_upload_error_returns_partial(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
-    output_path = tmp_path / "generated-upload-failed.json"
+    output_path = tmp_path / "generated-upload-failed.ndjson"
     args = _base_args(None)
     args.upload = True
     args.api_base = "http://api"
@@ -493,3 +497,129 @@ def test_main_keeps_generated_temp_artifact_on_upload_error_returns_partial(monk
     stderr_value = stderr_capture.getvalue().lower()
     assert "upload error: failed to send artifact" in stderr_value
     assert "artifact kept at" in stderr_value
+
+
+def test_main_keeps_generated_temp_artifact_when_upload_outcome_is_ambiguous(
+    monkeypatch, tmp_path
+) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "generated-upload-ambiguous.ndjson"
+    args = _base_args(None)
+    args.upload = True
+    args.api_base = "http://api"
+    args.project_id = "project-id"
+    args.api_token = "token-value"
+    stderr_capture = io.StringIO()
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        with lock:
+            stats.endpoints += 1
+        return True
+
+    def _fake_mkstemp(*_args, **_kwargs):
+        fd = collector.os.open(output_path, collector.os.O_RDWR | collector.os.O_CREAT | collector.os.O_TRUNC)
+        return fd, str(output_path)
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(
+        collector,
+        "upload_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("upload outcome is ambiguous: run reconciliation failed")
+        ),
+    )
+    monkeypatch.setattr(collector.tempfile, "mkstemp", _fake_mkstemp)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == collector.EXIT_PARTIAL
+    assert output_path.exists()
+    stderr_value = stderr_capture.getvalue().lower()
+    assert "upload outcome is ambiguous" in stderr_value
+    assert f"artifact kept at {output_path}" in stderr_capture.getvalue()
+
+
+def test_main_keeps_generated_temp_artifact_when_upload_is_interrupted(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "generated-upload-interrupted.ndjson"
+    args = _base_args(None)
+    args.upload = True
+    args.api_base = "http://api"
+    args.project_id = "project-id"
+    args.api_token = "token-value"
+    stderr_capture = io.StringIO()
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        with lock:
+            stats.endpoints += 1
+        return True
+
+    def _fake_mkstemp(*_args, **_kwargs):
+        fd = collector.os.open(output_path, collector.os.O_RDWR | collector.os.O_CREAT | collector.os.O_TRUNC)
+        return fd, str(output_path)
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(collector, "upload_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr(collector.tempfile, "mkstemp", _fake_mkstemp)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == collector.EXIT_INTERRUPTED
+    assert output_path.exists()
+    stderr_value = stderr_capture.getvalue().lower()
+    assert "delivery outcome is unknown" in stderr_value
+    assert f"artifact kept at {output_path}" in stderr_capture.getvalue()
+
+
+def test_main_completes_atomic_file_after_finalization_interrupt(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "finalization-interrupted.ndjson"
+    args = _base_args(str(output_path))
+    stderr_capture = io.StringIO()
+    original_write_payload = collector.NDJSONWriter._write_payload
+    calls = 0
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        with lock:
+            stats.endpoints += 1
+        return True
+
+    def _interrupt_once(self, target_fp):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt()
+        return original_write_payload(self, target_fp)
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+    monkeypatch.setattr(collector.NDJSONWriter, "_write_payload", _interrupt_once)
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == collector.EXIT_INTERRUPTED
+    assert output_path.exists()
+    assert [json.loads(line)["type"] for line in output_path.read_text(encoding="utf-8").splitlines()] == [
+        "run_meta",
+        "endpoint",
+        "run_end",
+    ]
+    assert "completing one atomic retry" in stderr_capture.getvalue()
+    assert f"artifact kept at {output_path}" in stderr_capture.getvalue()

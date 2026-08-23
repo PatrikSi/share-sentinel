@@ -68,6 +68,7 @@ API tokens are project-scoped and scope-checked.
 Important rules:
 
 - token scopes must satisfy the endpoint's required scopes
+- a `write:<resource>` scope also satisfies `read:<resource>` for the same resource; for example, collector tokens with `write:runs` can read the run status needed to reconcile an ambiguous upload
 - token role cannot exceed the owner's project role
 - non-sysadmin scope choices are constrained to the defaults allowed for that project role
 - token creation, rotation, and revocation are all audited

@@ -33,9 +33,21 @@ Production environments omit `--build`; Compose pulls the configured GHCR tag.
 
 ## What it produces
 
-The final artifact is a compact JSON document, optionally gzip-compressed when `--gzip` is used.
+Use `.ndjson` or `.jsonl` output for normal collection. These schema-v1 records
+are spooled once and copied to the final artifact as a bounded stream; this is
+also the format written to stdout and used for upload-only temporary artifacts.
+Add `.gz` and `--gzip` for streaming compression.
 
-Internally the collector buffers intermediate per-endpoint data on local disk before assembling the final document, so local temp space and inode usage matter on large scans.
+`.json` remains available as a compact, nested compatibility format. Compact
+assembly is deliberately limited to 8 MiB of flat records per endpoint and
+40 MiB in total because it must reconstruct one endpoint tree in memory. A
+larger compact run fails safely before assembly and tells you to rerun with
+`.ndjson`; it never replaces an existing destination with partial output.
+
+The filename and compression flag must agree: `.ndjson.gz`, `.jsonl.gz`, and
+`.json.gz` require `--gzip`, while a non-`.gz` filename rejects `--gzip`.
+Other output suffixes are rejected so local files and API uploads cannot be
+misclassified.
 
 ## Common local example
 
@@ -49,7 +61,8 @@ python share_sentinel_collector.py \
   --workers 50 \
   --timeout 3 \
   --max-depth 1 \
-  --output out.json.gz \
+  --progress-interval 5 \
+  --output out.ndjson.gz \
   --gzip
 ```
 
@@ -91,6 +104,10 @@ export SHARE_SENTINEL_SMB_PASSWORD
 ```
 
 The collector also reads `SHARE_SENTINEL_SMB_HASHES` and `SHARE_SENTINEL_API_TOKEN`. Protect the collector host and unset secret variables after the run.
+Hash authentication uses `LMHASH:NTHASH`; the LM component may be empty, but
+the NT component must be a 32-character hexadecimal hash. Password and hash
+sources are mutually exclusive, and anonymous mode rejects all supplied SMB
+credentials instead of silently ignoring them.
 
 ## Common upload example
 
@@ -106,16 +123,76 @@ python share_sentinel_collector.py \
   --domain CONTOSO \
   --username alice \
   --password '***' \
-  --output out.json.gz \
+  --output out.ndjson.gz \
   --gzip \
   --upload \
   --api-base http://localhost/api \
   --project-id <project-uuid>
 ```
 
-Create a project-scoped token with `runs:read` and `runs:write`; the token role must be at least `operator`.
+Create a project-scoped token with `write:runs`; the token role must be at least `operator`. The API treats `write:runs` as including run-read access. An explicit `read:runs` scope is also compatible, and ambiguous upload responses are reconciled through the run read endpoint before the collector reports success.
 
 ## Operational notes
+
+### Progress, verbosity, and shell output
+
+Routine status is line-oriented and written to stderr, including an initial
+scope summary, periodic progress, and one terminal result. Progress reports
+distinguish targets discovered, submitted, actively running, queued, processed,
+cancelled, and remaining. They also include successful/failed hosts, endpoint,
+resource, item and issue counts, elapsed time, and the current host rate.
+
+```bash
+# Default: start, periodic progress every five seconds, and final summary.
+python share_sentinel_collector.py --hosts hosts.txt --output scan.ndjson
+
+# One completion line per target in addition to periodic progress.
+python share_sentinel_collector.py --hosts hosts.txt --output scan.ndjson -v
+
+# Also report protocol and SMB share activity. Share names can be sensitive.
+python share_sentinel_collector.py --hosts hosts.txt --output scan.ndjson -vv
+
+# No routine status. Failures still emit a concise stderr issue summary.
+python share_sentinel_collector.py --hosts hosts.txt --output scan.ndjson --quiet
+
+# Disable periodic reports but retain the start and final summaries.
+python share_sentinel_collector.py --hosts hosts.txt --output scan.ndjson --progress-interval 0
+```
+
+When `--output` is omitted, NDJSON is the only content written to stdout;
+status remains on stderr. This makes shell redirection safe:
+
+```bash
+python share_sentinel_collector.py --hosts hosts.txt --quiet > scan.ndjson
+```
+
+Passwords, hashes, and API tokens are redacted from artifact command metadata
+and are never included in progress messages. Use the documented environment
+variables to keep them out of process listings as well. Long-option
+abbreviations are rejected, so an abbreviated secret flag cannot bypass this
+metadata redaction contract.
+
+### Bounded scope and interruption
+
+Before opening network connections, the collector computes the exact unique
+target count without expanding large CIDRs in memory. The default
+`--max-targets 65536` guard prevents an accidental oversized scan. Narrow the
+scope or explicitly raise the limit after review; `--max-targets 0` disables
+the guard.
+
+Pressing Ctrl-C stops new submissions, cancels queued targets, and asks active
+SMB/NFS tasks to stop between bounded network operations. The collector drains
+those operations before finalizing so the artifact cannot race with worker
+threads. It writes a `SCAN_INTERRUPTED` issue, keeps the partial artifact, skips
+automatic upload, prints an interrupted terminal summary, and exits `130`.
+If Ctrl-C arrives during upload or its retry backoff, the collector also exits
+`130`, retains the local artifact, and reports the delivery outcome as unknown
+so operators can inspect the run before retrying.
+
+If Ctrl-C arrives while a file artifact is being finalized, the collector
+keeps the disk spool, makes one atomic finalization retry, skips upload, and
+exits `130`; a prior destination is never replaced by a partial file. Stdout
+cannot be rewound safely, so an interrupted stdout finalization is not replayed.
 
 ### Capacity levers
 
@@ -126,17 +203,41 @@ Treat these flags as capacity levers:
 - `--workers`
 - `--max-depth`
 - `--max-entries-per-share`
+- `--max-targets`
 - target count and host list size
 
 For shared or fragile environments, start conservatively and scale up after you understand target behavior and ingest throughput.
 
+`--max-entries-per-share` caps entries inspected, excluding the synthetic `.`
+and `..` directory rows, before path or extension filters are applied. This
+keeps a directory containing many non-matching files bounded. A truncation
+issue reports both entries inspected and records emitted; reaching the cap on
+the exact final entry does not create a false truncation warning.
+
+Prefer `.ndjson`/`.ndjson.gz` for any inventory whose size is not already
+known to be small. The collector keeps one NDJSON spool open and writes each
+flat record once, so a large share does not require a directory tree in RAM or
+one filesystem open per item. Compact `.json` is a bounded compatibility path,
+not the large-scan format.
+
 Only scan systems for which you have explicit authorization. The collector performs concurrent authentication, share enumeration, and directory traversal and can create meaningful target load.
+
+SMB authentication is attempted once per target. The collector deliberately
+does not retry failed logons because retries across many hosts can amplify an
+incorrect credential into an Active Directory account lockout. Correct the
+credential or connectivity issue and rerun explicitly.
 
 ### Output and retry behavior
 
+- File artifacts are assembled into a private (`0600`) sibling temporary file, flushed, and atomically replaced. A failed final write does not truncate a previously good artifact at the destination.
+- Collector buffering is always removed on normal completion, partial completion, write failure, and handled interruption.
 - If no endpoint, resource, item, or error data is collected, the collector does not keep an output file.
 - If upload fails after the artifact has been written, the collector tries to keep the local artifact so you can retry without rescanning.
 - If `--upload` is used without `--output`, the collector creates a temporary local artifact first and removes it only after a successful upload path.
+- An interrupted upload keeps that temporary artifact and is reported as an unknown delivery outcome rather than as success or ordinary failure.
+- API calls retry only transient connection/timeouts and HTTP 408/429/5xx responses. Backoff has jitter, honors numeric `Retry-After` up to 30 seconds, and is bounded by `--upload-attempts` (default 3).
+- `--upload-timeout` (default 600 seconds) is the response/read budget for each attempt; API connection establishment is capped at 10 seconds per attempt.
+- A timeout after an artifact POST is ambiguous because the API may already have stored and queued it. If a retry receives an ingest/state conflict, the collector reads the run and reports recovery only when its status is `UPLOADED`, `INGESTING`, or `COMPLETE` and the server artifact SHA-256 exactly matches the local file. Missing read permission, a mismatched digest, or any other state fails the upload and retains the local artifact.
 
 ### Upload semantics
 
@@ -146,12 +247,36 @@ When the API falls back to database-based recovery, the collector will emit an u
 
 ## Artifact compatibility
 
-The API accepts raw JSON, NDJSON, JSONL, and gzip variants, but the bundled collector writes compact JSON or JSON.GZ output. If you build another producer, make sure it matches the API artifact contract described in the main project docs.
+The collector emits flat schema-v1 NDJSON/JSONL records for its streaming path
+and the nested `share_sentinel_compact_json` document for `.json` compatibility.
+The API and worker accept both forms, including their gzip variants. Compact
+`.json.gz` uploads remain raw streams and send a canonical ASCII basename in
+`X-Artifact-Filename` so the API can distinguish compact gzip from NDJSON gzip
+without multipart pre-spooling; the artifact is never loaded wholesale for
+upload.
 
 The tracked [`examples/sample-artifact.json`](../examples/sample-artifact.json) is synthetic and safe to use for a first ingest test.
+
+SMB file entries include nullable `size_bytes` and UTC ISO-8601 `mtime` values
+when the server returns valid metadata. Older entries and NFS export-only
+records remain valid without these fields.
+
+SMB dialects use Impacket's negotiated protocol constants (`2.0.2`, `2.1`,
+`3.0`, `3.0.2`, or `3.1.1`). The `smb.signing` value is deliberately limited
+to `required`, `not_required`, or `unknown`: Impacket's
+`isSigningRequired()` signal does not prove the broader server capability
+implied by labels such as `enabled`.
+
+NFS collection currently checks tcp/2049 and enumerates advertised exports via
+`showmount -e`. It does not mount exports or traverse their contents. A missing,
+timed-out, or denied `showmount` command is recorded as a partial-coverage issue
+rather than silently treated as an empty server. Discovered exports are marked
+`no_access`; an advertised export name does not prove that the scanner can mount
+or list it.
 
 ## Exit codes
 
 - `0`: collection completed without target failures
-- `1`: partial result; an artifact may still have been written or uploaded
+- `1`: partial result, including target/protocol failures, truncation, dependency warnings, or other recorded coverage issues; an artifact may still have been written or uploaded
 - `2`: configuration, input, output, or complete collection failure
+- `130`: interrupted by Ctrl-C during collection or upload; the local artifact is preserved and an upload interruption is treated as an unknown delivery outcome
