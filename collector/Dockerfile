@@ -4,7 +4,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update && \
-    apt-get install --no-install-recommends --yes nfs-common && \
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade --no-install-recommends --yes && \
+    DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --yes nfs-common && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/share-sentinel

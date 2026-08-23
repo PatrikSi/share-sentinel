@@ -137,7 +137,7 @@ jobs:
               --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL --scanners vuln "$image"
           done
       - name: Start development stack
-        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait --wait-timeout 120
       - name: Verify routes and complete ingest lifecycle
         run: |
           ./scripts/smoke-routes.sh http://localhost:18080
@@ -153,7 +153,7 @@ jobs:
           AUTH_COOKIE_SECURE: "true"
           TRUSTED_HOSTS: sentinel.example.com
           CORS_ORIGINS: https://sentinel.example.com
-        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait --wait-timeout 120
       - name: Verify production security posture
         run: ./scripts/smoke-production.sh http://localhost:18081 sentinel.example.com admin@example.com
       - name: Clean up Compose resources
