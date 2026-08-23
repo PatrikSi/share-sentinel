@@ -23,6 +23,7 @@ The project follows a simple release-first workflow:
 - Upgraded React Router, PostCSS, and the transitive NanoID dependency to clear the current UI dependency audit without bundling unrelated framework major upgrades.
 - Updated GitHub Actions runtimes to their Node 24-compatible releases so CI no longer relies on GitHub's deprecated Node 20 action shim.
 - CI now pulls the promoted `latest` image set, verifies its revision labels, and runs a clean production Compose smoke test against the published artifacts.
+- Fixed SMB authentication identity handling for `DOMAIN\user`, `DOMAIN/user`, UPN, explicit-domain, and local-account forms; conflicting modes now fail early and Kerberos correctly receives configured NTLM hashes.
 
 ## [0.2.0] - 2026-07-16
 

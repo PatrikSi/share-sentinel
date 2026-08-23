@@ -5,6 +5,8 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def _load_collector_module():
     module_path = Path(__file__).resolve().parents[1] / "share_sentinel_collector.py"
@@ -126,6 +128,113 @@ def test_validate_args_allows_anonymous_smb_without_username() -> None:
     )
 
     collector._validate_args(args)
+
+
+@pytest.mark.parametrize(
+    ("raw_username", "expected_username", "expected_domain", "expected_local_auth"),
+    [
+        (r"CONTOSO\alice", "alice", "CONTOSO", False),
+        ("CONTOSO/alice", "alice", "CONTOSO", False),
+        ("alice@contoso.example", "alice", "contoso.example", False),
+        (r".\alice", "alice", "", True),
+        ("./alice", "alice", "", True),
+        ("alice", "alice", "", False),
+    ],
+)
+def test_normalize_smb_identity_supports_established_ad_forms(
+    raw_username, expected_username, expected_domain, expected_local_auth
+) -> None:
+    collector = _load_collector_module()
+    args = SimpleNamespace(username=raw_username, domain="", local_auth=False)
+
+    collector._normalize_smb_identity(args)
+
+    assert args.username == expected_username
+    assert args.domain == expected_domain
+    assert args.local_auth is expected_local_auth
+
+
+def test_normalize_smb_identity_allows_matching_explicit_domain() -> None:
+    collector = _load_collector_module()
+    args = SimpleNamespace(username=r"contoso\alice", domain="CONTOSO", local_auth=False)
+
+    collector._normalize_smb_identity(args)
+
+    assert args.username == "alice"
+    assert args.domain == "contoso"
+
+
+@pytest.mark.parametrize(
+    ("username", "domain", "local_auth", "message"),
+    [
+        (r"CONTOSO\alice", "OTHER", False, "conflicting SMB domains"),
+        (r"CONTOSO\alice", "", True, "--local-auth cannot be combined"),
+        (r"CONTOSO\alice/extra", "", False, "ambiguous --username"),
+        (r"CONTOSO\alice\extra", "", False, "exactly one identity separator"),
+        ("CONTOSO\\", "", False, "components must be non-empty"),
+        ("@contoso.example", "", False, "components must be non-empty"),
+    ],
+)
+def test_normalize_smb_identity_rejects_ambiguous_or_conflicting_forms(
+    username, domain, local_auth, message
+) -> None:
+    collector = _load_collector_module()
+    args = SimpleNamespace(username=username, domain=domain, local_auth=local_auth)
+
+    with pytest.raises(SystemExit, match=message):
+        collector._normalize_smb_identity(args)
+
+
+def test_validate_args_normalizes_domain_username_before_authentication() -> None:
+    collector = _load_collector_module()
+    args = SimpleNamespace(
+        cidr=["10.0.0.0/24"],
+        hosts=None,
+        share_types="smb",
+        kerberos=False,
+        smb_anonymous=False,
+        use_session_creds=False,
+        username=r"CONTOSO\svc_scan",
+        password="secret",
+        domain="",
+        local_auth=False,
+        hashes=None,
+        ccache=None,
+        upload=False,
+        api_base=None,
+        project_id=None,
+        api_token=None,
+    )
+
+    collector._validate_args(args)
+
+    assert args.username == "svc_scan"
+    assert args.domain == "CONTOSO"
+
+
+def test_validate_args_rejects_kerberos_without_domain() -> None:
+    collector = _load_collector_module()
+    args = SimpleNamespace(
+        cidr=["10.0.0.0/24"],
+        hosts=None,
+        share_types="smb",
+        kerberos=True,
+        smb_anonymous=False,
+        use_session_creds=False,
+        username="svc_scan",
+        password="secret",
+        domain="",
+        local_auth=False,
+        hashes=None,
+        ccache=None,
+        upload=False,
+        api_base=None,
+        project_id=None,
+        api_token=None,
+    )
+
+    with pytest.raises(SystemExit, match="--kerberos requires --domain"):
+        collector._validate_args(args)
 
 
 def test_validate_args_rejects_password_without_username_for_smb() -> None:
@@ -370,15 +479,74 @@ def test_scan_host_smb_uses_anonymous_auth_when_username_missing(monkeypatch) ->
     assert endpoint["auth"]["method"] == "anonymous"
 
 
+def test_scan_host_smb_passes_normalized_domain_identity_to_impacket(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _Conn:
+        def __init__(self):
+            self.login_args = None
+
+        def login(self, username, password, domain="", lmhash="", nthash=""):
+            self.login_args = (username, password, domain, lmhash, nthash)
+
+        def getDialect(self):
+            return "768"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            return []
+
+        def logoff(self):
+            return None
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: fake_conn)
+
+    class _Writer:
+        def emit(self, _record):
+            return None
+
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=False,
+        username=r"CONTOSO\svc_scan",
+        password="secret",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=[],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=1,
+    )
+    collector._normalize_smb_identity(args)
+
+    ok = collector.scan_host_smb(
+        "10.0.0.5", args, "run-domain-1", _Writer(), collector.Stats(), threading.Lock()
+    )
+
+    assert ok is True
+    assert fake_conn.login_args == ("svc_scan", "secret", "CONTOSO", "", "")
+
+
 def test_scan_host_smb_kerberos_does_not_mutate_ccache_env_per_call(monkeypatch) -> None:
     collector = _load_collector_module()
 
     class _Conn:
         def __init__(self, *_args, **_kwargs):
             self.use_cache = None
+            self.login_args = None
 
-        def kerberosLogin(self, *_args, **kwargs):
+        def kerberosLogin(self, *args, **kwargs):
             self.use_cache = kwargs.get("useCache")
+            self.login_args = (args, kwargs)
             return None
 
         def getDialect(self):
@@ -412,10 +580,10 @@ def test_scan_host_smb_kerberos_does_not_mutate_ccache_env_per_call(monkeypatch)
         kerberos=True,
         smb_anonymous=False,
         username="svc",
-        password="secret",
+        password="",
         domain="EXAMPLE",
         ccache_env_value="FILE:/tmp/alternate-cache",
-        hashes=None,
+        hashes="lmhash:nthash",
         local_auth=False,
         include_share=[],
         exclude_share=[],
@@ -430,6 +598,9 @@ def test_scan_host_smb_kerberos_does_not_mutate_ccache_env_per_call(monkeypatch)
 
     assert ok is True
     assert fake_conn.use_cache is True
+    assert fake_conn.login_args[0] == ("svc", "", "EXAMPLE")
+    assert fake_conn.login_args[1]["lmhash"] == "lmhash"
+    assert fake_conn.login_args[1]["nthash"] == "nthash"
     assert os.environ.get("KRB5CCNAME") == "FILE:/tmp/original-cache"
 
 
@@ -441,6 +612,9 @@ def test_help_text_contains_common_and_examples_sections() -> None:
     assert "SMB Authentication" in help_text
     assert "Examples:" in help_text
     assert "--use-session-creds" in help_text
+    assert "DOMAIN/USER" in help_text
+    assert "USER@REALM" in help_text
+    assert "unquoted single backslash is removed by the shell" in help_text
 
 
 def test_scan_host_smb_reports_share_enumeration_denied_with_anonymous_hint(monkeypatch) -> None:

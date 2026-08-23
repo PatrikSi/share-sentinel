@@ -53,6 +53,36 @@ python share_sentinel_collector.py \
   --gzip
 ```
 
+The collector accepts the common AD identity forms used by Windows, Samba,
+Impacket, and NetExec:
+
+```bash
+# Least ambiguous; recommended for scripts.
+--domain CONTOSO --username alice
+
+# Windows down-level logon name. Quote it in POSIX shells.
+--username 'CONTOSO\alice'
+
+# Impacket-style form; safe without quoting in POSIX shells.
+--username CONTOSO/alice
+
+# User principal name (UPN).
+--username alice@contoso.example
+
+# Local SAM account.
+--username '.\alice'
+# Equivalent: --local-auth --username alice
+```
+
+Do not enter a single backslash unquoted in a POSIX shell: `CONTOSO\alice`
+is passed to the program as `CONTOSOalice` because the shell consumes the
+backslash before the collector starts. Quote the value, escape the backslash,
+use `CONTOSO/alice`, or use separate `--domain` and `--username` flags.
+
+If an identity embeds a domain and `--domain` is also supplied, both values
+must match (case-insensitively). Conflicting domain/local/Kerberos modes fail
+before any network authentication is attempted.
+
 Command-line secrets can be visible in shell history and process listings. Prefer the supported environment variables:
 
 ```bash

@@ -332,7 +332,10 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  Authenticated SMB scan:\n"
-            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --username corp\\\\svc_scan --password '***' --output run.json.gz --gzip\n\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --domain CORP --username svc_scan --password '***' --output run.json.gz --gzip\n\n"
+            "  Domain-qualified username (quote backslashes, or use an unquoted forward slash):\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --username 'CORP\\svc_scan' --password '***' --output run.json\n"
+            "    share_sentinel_collector.py --hosts hosts.txt --username CORP/svc_scan --password '***' --output run.json\n\n"
             "  Domain shell / ticket cache auth:\n"
             "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --use-session-creds --output kerberos.json\n\n"
             "  Anonymous SMB scan:\n"
@@ -343,8 +346,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "    share_sentinel_collector.py --hosts hosts.txt --share-types smb --username svc --password '***' --upload --api-base https://api.example --project-id <uuid> --api-token <token>\n\n"
             "Notes:\n"
             "  - SMB authentication modes:\n"
-                "      * NTLM: set --username (and password or hashes)\n"
-            "      * Kerberos: add --kerberos and --username\n"
+            "      * NTLM: set --username (and password or hashes)\n"
+            "      * Usernames: USER, DOMAIN\\USER, DOMAIN/USER, and USER@REALM are accepted\n"
+            "      * In POSIX shells, quote DOMAIN\\USER; an unquoted single backslash is removed by the shell\n"
+            "      * Kerberos: add --kerberos and use a domain-qualified username or --domain\n"
             "      * Session credentials: use --use-session-creds to use the active Kerberos ticket cache\n"
             "      * Anonymous: set --smb-anonymous or omit SMB credentials\n"
             "  - NFS export enumeration uses `showmount -e`; if unavailable, only summary issues are recorded.\n"
@@ -374,7 +379,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     smb_auth = parser.add_argument_group("SMB Authentication")
     smb_auth.add_argument("--smb-anonymous", action="store_true", help="Force anonymous SMB session.")
-    smb_auth.add_argument("--username", type=str, default="", help="SMB username for NTLM/Kerberos.")
+    smb_auth.add_argument(
+        "--username",
+        type=str,
+        default="",
+        help="SMB identity as USER, DOMAIN\\USER, DOMAIN/USER, or USER@REALM.",
+    )
     smb_auth.add_argument(
         "--password",
         type=str,
@@ -597,6 +607,72 @@ def _resolve_smb_auth_method(args: argparse.Namespace) -> str:
     return "anonymous"
 
 
+def _normalize_smb_identity(args: argparse.Namespace) -> None:
+    """Normalize supported AD identity forms into Impacket's user/domain fields.
+
+    Impacket's SMBConnection API accepts the username and domain separately. The
+    collector accepts Windows' down-level and UPN forms as well as Impacket's
+    domain/user convention, but rejects ambiguous or contradictory combinations.
+    """
+
+    username = str(getattr(args, "username", "") or "").strip()
+    domain = str(getattr(args, "domain", "") or "").strip()
+    local_auth = bool(getattr(args, "local_auth", False))
+
+    if any(separator in domain for separator in ("\\", "/", "@")):
+        raise SystemExit("--domain must be a domain or realm name without \\, /, or @ separators")
+
+    if domain == ".":
+        domain = ""
+        local_auth = True
+
+    detected_separators = [separator for separator in ("\\", "/", "@") if separator in username]
+    if len(detected_separators) > 1:
+        raise SystemExit(
+            "ambiguous --username; use USER, DOMAIN\\USER, DOMAIN/USER, or USER@REALM"
+        )
+
+    qualified_domain = ""
+    if detected_separators:
+        separator = detected_separators[0]
+        if username.count(separator) != 1:
+            raise SystemExit(
+                "invalid --username; use exactly one identity separator in DOMAIN\\USER, DOMAIN/USER, or USER@REALM"
+            )
+        left, right = (part.strip() for part in username.split(separator, 1))
+        if not left or not right:
+            raise SystemExit(
+                "invalid --username; both the user and domain/realm components must be non-empty"
+            )
+        if separator == "@":
+            username, qualified_domain = left, right
+        else:
+            qualified_domain, username = left, right
+
+        if qualified_domain == ".":
+            if domain:
+                raise SystemExit("local identity .\\USER cannot be combined with --domain")
+            local_auth = True
+            qualified_domain = ""
+
+    if local_auth:
+        if qualified_domain:
+            raise SystemExit("--local-auth cannot be combined with a domain-qualified --username")
+        if domain:
+            raise SystemExit("--local-auth cannot be combined with --domain")
+        domain = ""
+    elif qualified_domain:
+        if domain and domain.casefold() != qualified_domain.casefold():
+            raise SystemExit(
+                f"conflicting SMB domains: --domain specifies {domain!r}, but --username specifies {qualified_domain!r}"
+            )
+        domain = qualified_domain
+
+    args.username = username
+    args.domain = domain
+    args.local_auth = local_auth
+
+
 def _resolve_ccache_env_value(raw_path: str | None) -> str | None:
     if raw_path:
         value = str(raw_path).strip()
@@ -657,6 +733,7 @@ def _run_scoped_kerberos_cache(ccache_env_value: str | None):
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    _normalize_smb_identity(args)
     selected_share_types = _selected_share_types(getattr(args, "share_types", "smb"))
     cidr = getattr(args, "cidr", [])
     hosts = getattr(args, "hosts", None)
@@ -664,6 +741,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     smb_anonymous = bool(getattr(args, "smb_anonymous", False))
     use_session_creds = bool(getattr(args, "use_session_creds", False))
     username = str(getattr(args, "username", "") or "")
+    domain = str(getattr(args, "domain", "") or "")
+    local_auth = bool(getattr(args, "local_auth", False))
     password = str(getattr(args, "password", "") or "")
     hashes = getattr(args, "hashes", None)
     ccache = getattr(args, "ccache", None)
@@ -687,8 +766,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--use-session-creds cannot be combined with --smb-anonymous")
 
     if "smb" in selected_share_types:
+        if smb_anonymous and (username or hashes or domain or local_auth):
+            raise SystemExit("--smb-anonymous cannot be combined with SMB identity, domain, hashes, or local auth options")
+        if local_auth and not username:
+            raise SystemExit("--local-auth requires --username")
+        if local_auth and (kerberos or use_session_creds):
+            raise SystemExit("--local-auth cannot be combined with Kerberos authentication")
+        if domain and not username and not use_session_creds:
+            raise SystemExit("--domain requires --username")
         if kerberos and not username and not use_session_creds:
             raise SystemExit("--kerberos requires --username")
+        if kerberos and username and not domain and not ccache and not use_session_creds:
+            raise SystemExit("--kerberos requires --domain or a domain-qualified --username")
         if ccache and not kerberos and not use_session_creds:
             raise SystemExit("--ccache requires --kerberos (or --use-session-creds)")
         if use_session_creds and hashes:
@@ -913,6 +1002,10 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
 
     try:
         conn = SMBConnection(host, host, sess_port=445, timeout=args.timeout)
+        lmhash = ""
+        nthash = ""
+        if args.hashes and ":" in args.hashes:
+            lmhash, nthash = args.hashes.split(":", 1)
         if attempted_auth == "kerberos":
             ccache_env_value = getattr(args, "ccache_env_value", None)
             use_cache = bool(ccache_env_value)
@@ -920,8 +1013,8 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 args.username,
                 args.password,
                 args.domain,
-                lmhash="",
-                nthash="",
+                lmhash=lmhash,
+                nthash=nthash,
                 aesKey=None,
                 kdcHost=None,
                 TGT=None,
@@ -929,10 +1022,6 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 useCache=use_cache,
             )
         elif attempted_auth == "ntlm":
-            lmhash = ""
-            nthash = ""
-            if args.hashes and ":" in args.hashes:
-                lmhash, nthash = args.hashes.split(":", 1)
             domain = "" if args.local_auth else args.domain
             conn.login(args.username, args.password, domain=domain, lmhash=lmhash, nthash=nthash)
         else:
