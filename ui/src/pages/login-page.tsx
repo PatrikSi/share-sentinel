@@ -3,7 +3,8 @@ import { Navigate, useLocation, useNavigate } from "react-router-dom";
 
 import { StatusBanner } from "@/components/status-banner";
 import { responseErrorMessage } from "@/lib/api";
-import { markSessionAuthenticated, SessionUser, useSession } from "@/lib/auth";
+import { markSessionAuthenticated, resetSession, SessionUser, useSession } from "@/lib/auth";
+import { boundedFetch } from "@/lib/bounded-fetch";
 import { API_BASE } from "@/lib/runtime-config";
 
 type RegistrationSettings = {
@@ -38,12 +39,9 @@ export function LoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
-  if (session.status === "authenticated") {
-    return <Navigate to={nextPath} replace />;
-  }
-
   useEffect(() => {
-    fetch(`${API_BASE}/auth/registration-settings`)
+    const controller = new AbortController();
+    boundedFetch(`${API_BASE}/auth/registration-settings`, { signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) {
           setRegistrationWarning(await responseErrorMessage(response));
@@ -53,10 +51,14 @@ export function LoginPage() {
         setRegistrationSettings(data as RegistrationSettings);
         setRegistrationWarning(null);
       })
-      .catch(() => {
+      .catch((err) => {
+        if (err instanceof DOMException && err.name === "AbortError") return;
         setRegistrationSettings(null);
-        setRegistrationWarning("Registration options could not be loaded. Sign-in is still available.");
+        setRegistrationWarning(
+          err instanceof Error ? `${err.message} Sign-in is still available.` : "Registration options could not be loaded. Sign-in is still available.",
+        );
       });
+    return () => controller.abort();
   }, []);
 
   const allowRegistration = !!registrationSettings?.allow_self_registration;
@@ -70,6 +72,10 @@ export function LoginPage() {
     return hints;
   }, [registrationSettings]);
 
+  if (session.status === "authenticated") {
+    return <Navigate to={nextPath} replace />;
+  }
+
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setLoading(true);
@@ -81,7 +87,7 @@ export function LoginPage() {
         if (password !== confirmPassword) {
           throw new Error("Passwords do not match.");
         }
-        const response = await fetch(`${API_BASE}/auth/register`, {
+        const response = await boundedFetch(`${API_BASE}/auth/register`, {
           method: "POST",
           credentials: "include",
           headers: { "Content-Type": "application/json" },
@@ -95,7 +101,7 @@ export function LoginPage() {
         setPassword("");
         setConfirmPassword("");
       } else {
-        const response = await fetch(`${API_BASE}/auth/login`, {
+        const response = await boundedFetch(`${API_BASE}/auth/login`, {
           method: "POST",
           credentials: "include",
           headers: { "Content-Type": "application/json" },
@@ -119,8 +125,9 @@ export function LoginPage() {
 
   return (
     <section className="mx-auto mt-16 max-w-md">
-      <div className="panel rounded-[32px] p-8">
-        <h1 className="text-3xl font-bold tracking-tight">{registerMode ? "Create Account" : "Sign In"}</h1>
+      <div className="panel rounded-lg p-6 shadow-sm">
+        <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-emerald-700 dark:text-emerald-300">Share Sentinel</p>
+        <h1 className="text-2xl font-semibold tracking-tight">{registerMode ? "Create account" : "Sign in"}</h1>
 
         {allowRegistration ? (
           <button
@@ -137,6 +144,14 @@ export function LoginPage() {
         ) : null}
 
         <div className="mt-5 space-y-3">
+          {session.status === "error" ? (
+            <StatusBanner tone="error" title="Session Check Unavailable">
+              <p>{session.error || "The authentication service could not be reached."} Your login state has not been changed.</p>
+              <button className="mt-2 rounded border border-current px-2 py-1 text-xs font-semibold" onClick={resetSession} type="button">
+                Retry session check
+              </button>
+            </StatusBanner>
+          ) : null}
           {error ? (
             <StatusBanner tone="error" title="Request Failed">
               <p>{error}</p>
@@ -165,7 +180,7 @@ export function LoginPage() {
           <label className="block text-sm">
             Email
             <input
-              className="mt-1 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 text-slate-900 placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
+              className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2.5 text-slate-900 placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
               type="email"
               value={email}
               onChange={(event) => setEmail(event.target.value)}
@@ -176,7 +191,7 @@ export function LoginPage() {
           <label className="block text-sm">
             {registerMode ? "Create password" : "Password"}
             <input
-              className="mt-1 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+              className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2.5 text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
               type="password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
@@ -187,7 +202,7 @@ export function LoginPage() {
             <label className="block text-sm">
               Confirm password
               <input
-                className="mt-1 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2.5 text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                 type="password"
                 value={confirmPassword}
                 onChange={(event) => setConfirmPassword(event.target.value)}
@@ -196,7 +211,7 @@ export function LoginPage() {
             </label>
           ) : null}
           <button
-            className="w-full rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
+            className="w-full rounded-md bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-600 disabled:opacity-50"
             disabled={loading || (registerMode && !allowRegistration)}
             type="submit"
           >

@@ -1,8 +1,7 @@
 import { FormEvent, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
-import { apiFetch } from "@/lib/api";
-import { markSessionAnonymous, useSession } from "@/lib/auth";
+import { logoutSession, markSessionAnonymous, useSession } from "@/lib/auth";
 import { useDashboardWorkspace } from "@/lib/dashboard-workspace";
 import { ThemeToggle } from "@/components/theme-toggle";
 
@@ -19,7 +18,6 @@ export function TopNav() {
     projects,
     projectsReady,
     selectedProject,
-    selectedProjectName,
     switchProject,
   } = useDashboardWorkspace();
   const [creatingProject, setCreatingProject] = useState(false);
@@ -27,20 +25,25 @@ export function TopNav() {
   const [projectError, setProjectError] = useState<string | null>(null);
   const [projectInfo, setProjectInfo] = useState<string | null>(null);
   const [showCreateProjectForm, setShowCreateProjectForm] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState<string | null>(null);
 
   async function logout() {
+    setLoggingOut(true);
+    setLogoutError(null);
     try {
-      await apiFetch("/auth/logout", { method: "POST" });
-    } catch {
-      // Local cleanup still proceeds.
+      await logoutSession();
+      markSessionAnonymous();
+      navigate("/");
+    } catch (error) {
+      setLogoutError(error instanceof Error ? error.message : "Sign-out could not be confirmed. Please retry.");
+    } finally {
+      setLoggingOut(false);
     }
-    markSessionAnonymous();
-    navigate("/");
   }
 
   const navItems = [
-    { to: "/projects", label: "Dashboard", match: "/projects" },
-    { to: "/account", label: "Account", match: "/account" },
+    { to: "/projects", label: "Projects", match: "/projects" },
   ];
   if (session.user?.is_sysadmin) {
     navItems.push({ to: "/settings/users", label: "Settings", match: "/settings" });
@@ -69,11 +72,12 @@ export function TopNav() {
   return (
     <header className="app-nav">
       <div className="app-nav-inner">
-        <Link className="app-nav-brand" to="/projects">
-          <span className="app-nav-title">share-sentinel</span>
+        <Link aria-label="Share Sentinel projects" className="app-nav-brand" to="/projects">
+          <span aria-hidden="true" className="app-nav-mark">S</span>
+          <span className="app-nav-title">Share Sentinel</span>
         </Link>
 
-        <nav className="app-nav-links">
+        <nav aria-label="Primary navigation" className="app-nav-links">
           {navItems.map((item) => (
             <Link
               className={`app-nav-link ${location.pathname.startsWith(item.match) ? "is-active" : ""}`}
@@ -86,27 +90,11 @@ export function TopNav() {
         </nav>
 
         {showDashboardControls ? (
-          <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-300 bg-slate-50/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900/70">
-            <div className="basis-full flex flex-wrap items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-              <Link className="hover:text-slate-700 dark:hover:text-slate-200" to="/projects">
-                Dashboard
-              </Link>
-              {selectedProjectName ? (
-                <>
-                  <span>/</span>
-                  <span className="text-slate-700 dark:text-slate-200">{selectedProjectName}</span>
-                </>
-              ) : null}
-              {projectSectionLabel !== "Dashboard" ? (
-                <>
-                  <span>/</span>
-                  <span className="text-slate-700 dark:text-slate-200">{projectSectionLabel}</span>
-                </>
-              ) : null}
-            </div>
+          <div className="app-project-context">
+            <span className="app-project-section">{projectSectionLabel}</span>
             <select
               aria-label="Select active project"
-              className="min-w-[220px] rounded-xl border border-slate-300 bg-white/90 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+              className="app-project-select"
               disabled={!projectsReady || projects.length === 0}
               value={selectedProject}
               onChange={(event) => {
@@ -124,49 +112,63 @@ export function TopNav() {
               ))}
             </select>
             {canCreateProject ? (
-              <button
-                className="rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                onClick={() => {
-                  setProjectError(null);
-                  setProjectInfo(null);
-                  setShowCreateProjectForm((prev) => !prev);
-                }}
-                type="button"
-              >
-                  {showCreateProjectForm ? "Close" : "New Project"}
-                </button>
-              ) : null}
-            {canCreateProject && showCreateProjectForm ? (
-              <form className="flex flex-wrap items-center gap-2" onSubmit={onCreateProject}>
-                <input
-                  className="min-w-[220px] rounded-xl border border-slate-300 bg-white/90 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
-                  onChange={(event) => setNewProjectName(event.target.value)}
-                  placeholder="Client East - Q1 Shares"
-                  value={newProjectName}
-                  required
-                />
+              <div className="app-project-create">
                 <button
-                  className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-slate-800 disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
-                  disabled={creatingProject}
-                  type="submit"
+                  aria-expanded={showCreateProjectForm}
+                  aria-label="Create project"
+                  onClick={() => {
+                    setProjectError(null);
+                    setProjectInfo(null);
+                    setShowCreateProjectForm((prev) => !prev);
+                  }}
+                  title="Create project"
+                  type="button"
                 >
-                  {creatingProject ? "Creating..." : "Create"}
+                  +
                 </button>
-              </form>
+                {showCreateProjectForm ? (
+                  <form onSubmit={onCreateProject}>
+                    <label>
+                      Project name
+                      <input
+                        autoFocus
+                        onChange={(event) => setNewProjectName(event.target.value)}
+                        placeholder="Client East - Q1 Shares"
+                        value={newProjectName}
+                        required
+                      />
+                    </label>
+                    <div>
+                      <button onClick={() => setShowCreateProjectForm(false)} type="button">Cancel</button>
+                      <button disabled={creatingProject} type="submit">{creatingProject ? "Creating…" : "Create"}</button>
+                    </div>
+                  </form>
+                ) : null}
+              </div>
             ) : null}
             {projectError || projectLoadError ? (
-              <p className="basis-full text-xs text-rose-600 dark:text-rose-300">{projectError || projectLoadError}</p>
+              <p className="app-project-message is-error" role="alert">{projectError || projectLoadError}</p>
             ) : null}
-            {projectInfo ? <p className="basis-full text-xs text-emerald-700 dark:text-emerald-300">{projectInfo}</p> : null}
+            {projectInfo ? <p className="app-project-message" role="status">{projectInfo}</p> : null}
           </div>
         ) : null}
 
         <div className="app-nav-actions">
           <ThemeToggle />
-          <button className="app-logout-btn" onClick={logout} type="button">
-            Logout
+          <Link aria-current={location.pathname.startsWith("/account") ? "page" : undefined} className="app-account-link" to="/account">
+            <span aria-hidden="true">{session.user?.email?.slice(0, 1).toUpperCase() || "A"}</span>
+            <span>{session.user?.email || "Account"}</span>
+          </Link>
+          <button className="app-logout-btn" disabled={loggingOut} onClick={logout} type="button">
+            {loggingOut ? "Signing out…" : logoutError ? "Retry sign out" : "Sign out"}
           </button>
         </div>
+        {logoutError ? (
+          <p className="app-logout-error" role="alert">
+            <span>Sign-out was not confirmed. Your session is still active.</span>
+            <span>{logoutError}</span>
+          </p>
+        ) : null}
       </div>
     </header>
   );

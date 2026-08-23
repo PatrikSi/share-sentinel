@@ -29,9 +29,10 @@ Legacy redirects that still exist:
 
 ## Navigation model
 
-- The brand in the top nav returns to the dashboard.
-- Project context stays visible across `/projects/*`.
-- Project creation and project switching live in the top nav.
+- The compact top bar keeps Projects, authorized Settings, account, theme, and sign-out actions available.
+- A condensed bottom navigation preserves the same primary destinations on narrow screens.
+- Project context stays visible across `/projects/*`; project creation and switching live in the top bar.
+- Switching projects preserves portable inventory filters but drops the old project's run IDs.
 - Settings uses a dedicated sidebar with `General`, `Users`, `Projects`, `API Tokens`, and `Audit Log`.
 
 ## Login and account entry
@@ -67,12 +68,13 @@ Current behavior:
 
 - drag-and-drop upload area
 - basic file preflight with detected type and size
-- status messaging while upload and ingest begin
+- transfer progress and explicit upload cancellation
+- timeout and network-failure messaging treats delivery as unknown and directs the operator to inspect the created run before retrying
 - redirect into the run explorer after upload starts
 
 ## Inventory
 
-Inventory is designed to stay dense and practical.
+Inventory is a dense, server-backed browsing workspace. Results remain in stable server order; the UI does not imply that a visible-page sort applies to the complete project.
 
 Tabs:
 
@@ -82,12 +84,16 @@ Tabs:
 
 Main UX patterns:
 
-- compact guided filters first
-- clear active filter state
-- extension chips for the item view
-- collapsible free-text DSL editor with examples and apply/clear actions
-- collapsible run scope selector
-- column picker for the result table
+- a compact command bar with debounced search; press `/` outside an input to focus it
+- progressive guided filters, run scope, and advanced query controls instead of a permanently expanded form
+- active filter chips with individual removal and a clear-all action
+- server-backed equals and exclude shortcuts on supported table values, plus copy-exact-value actions
+- a free-text DSL editor with examples, validation, and apply/clear actions
+- column pickers, compact/comfortable density, sticky headers, and optional Size and Modified columns
+- explicit loading, no-match, request-error, and partial-ingest states; failed requests do not relabel old rows as current results
+- complete filter, tab, query, and eligible run context in the URL for refreshes and shareable links
+
+Only `COMPLETE` and `INGESTING` runs can scope inventory. `INGESTING` results are labelled partial, and unavailable run states are explained rather than producing silent empty results.
 
 Project collaboration happens here through shared investigations:
 
@@ -95,6 +101,8 @@ Project collaboration happens here through shared investigations:
 - update an existing shared investigation
 - apply a saved investigation back into the page state
 - delete no-longer-useful saved investigations
+
+Saved investigations are project-scoped and opened from the command bar. Column and density preferences are browser-local.
 
 ## Run explorer
 
@@ -115,6 +123,8 @@ What each tab is for:
 - `Search` finds items inside the run without browsing the hierarchy
 
 Run-scoped saved search presets are browser-local and separate from project-shared inventory investigations.
+
+Run artifact provenance includes content type, size, and a copyable SHA-256 when supplied by the API. Item views format collected size and modification timestamps when present.
 
 ## Settings
 
@@ -163,6 +173,8 @@ Global audit search and export.
 - `StatusBanner` for inline workflow feedback
 - `Dialog` for destructive or sensitive admin actions
 - `SecretReveal` for one-time token display
+
+API reads have finite request budgets that cover both headers and response bodies. A session-check outage is shown as retryable service failure rather than as a logout. Mutation timeouts and upload transport failures report an unknown outcome so operators inspect current state before retrying.
 
 ## Runtime configuration
 

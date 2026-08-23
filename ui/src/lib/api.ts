@@ -1,7 +1,17 @@
 import { markSessionAnonymous, refreshSession } from "@/lib/auth";
+import {
+  BLOB_REQUEST_TIMEOUT_MS,
+  boundedFetch,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  errorMessageFromBody,
+  responseErrorMessage,
+} from "@/lib/bounded-fetch";
 import { API_BASE, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "@/lib/runtime-config";
 
+export { responseErrorMessage } from "@/lib/bounded-fetch";
+
 const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const UPLOAD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 
 function loginRedirectPath(): string {
   const next = `${window.location.pathname}${window.location.search}${window.location.hash}`;
@@ -9,32 +19,6 @@ function loginRedirectPath(): string {
     return "/";
   }
   return `/?next=${encodeURIComponent(next)}`;
-}
-
-function appendRequestId(message: string, requestId: string | null): string {
-  if (!requestId || message.includes(requestId)) {
-    return message;
-  }
-  return `${message} (Request ID: ${requestId})`;
-}
-
-function toErrorMessage(body: string, status: number, requestId: string | null = null): string {
-  if (!body) return appendRequestId(`Request failed (${status}).`, requestId);
-  if (body.trimStart().startsWith("<")) {
-    return appendRequestId("API returned HTML instead of JSON. Check API routing and service health.", requestId);
-  }
-  try {
-    const parsed = JSON.parse(body);
-    if (typeof parsed?.detail === "string") return appendRequestId(parsed.detail, requestId);
-  } catch {
-    // fall through
-  }
-  return appendRequestId(body, requestId);
-}
-
-export async function responseErrorMessage(response: Pick<Response, "status" | "text" | "headers">): Promise<string> {
-  const body = await response.text();
-  return toErrorMessage(body, response.status, response.headers.get("x-request-id"));
 }
 
 function parseResponseText(contentType: string, body: string) {
@@ -85,7 +69,11 @@ export async function apiFetch(path: string, init: RequestInit = {}, allowRefres
     }
   }
 
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers, credentials: "include" });
+  const response = await boundedFetch(
+    `${API_BASE}${path}`,
+    { ...init, headers, credentials: "include" },
+    DEFAULT_REQUEST_TIMEOUT_MS,
+  );
   if (response.status === 401) {
     if (allowRefresh) {
       const refreshed = await refreshAccessToken();
@@ -120,7 +108,11 @@ export async function apiFetchBlob(
     }
   }
 
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers, credentials: "include" });
+  const response = await boundedFetch(
+    `${API_BASE}${path}`,
+    { ...init, headers, credentials: "include" },
+    BLOB_REQUEST_TIMEOUT_MS,
+  );
   if (response.status === 401) {
     if (allowRefresh) {
       const refreshed = await refreshAccessToken();
@@ -143,12 +135,20 @@ export async function apiFetchBlob(
   };
 }
 
-export async function apiFetchAllPages<T>(buildPath: (cursor: string | null) => string): Promise<T[]> {
+export async function apiFetchAllPages<T>(buildPath: (cursor: string | null) => string, init: RequestInit = {}): Promise<T[]> {
   const items: T[] = [];
   const seenCursors = new Set<string>();
   let cursor: string | null = null;
 
+  const throwIfAborted = () => {
+    if (!init.signal?.aborted) return;
+    throw init.signal.reason instanceof Error
+      ? init.signal.reason
+      : new DOMException("Request cancelled.", "AbortError");
+  };
+
   while (true) {
+    throwIfAborted();
     if (cursor) {
       if (seenCursors.has(cursor)) {
         throw new Error("Pagination cursor repeated unexpectedly.");
@@ -156,7 +156,8 @@ export async function apiFetchAllPages<T>(buildPath: (cursor: string | null) => 
       seenCursors.add(cursor);
     }
 
-    const data = await apiFetch(buildPath(cursor));
+    const data = await apiFetch(buildPath(cursor), init);
+    throwIfAborted();
     items.push(...(((data?.items as T[]) || []) as T[]));
     cursor = (data?.next_cursor as string | null) || null;
     if (!cursor) {
@@ -167,64 +168,138 @@ export async function apiFetchAllPages<T>(buildPath: (cursor: string | null) => 
   return items;
 }
 
-export async function apiUploadFormData(
+export async function apiUploadArtifact(
   path: string,
-  formData: FormData,
+  artifact: Blob,
   options: {
     method?: "POST" | "PUT" | "PATCH";
+    filename: string;
+    contentType: "application/json" | "application/x-ndjson" | "application/gzip";
     onProgress?: (loaded: number, total: number) => void;
-  } = {},
+    signal?: AbortSignal;
+  },
 ) {
   const method = options.method || "POST";
+  if (
+    options.filename.length === 0 ||
+    options.filename.length > 255 ||
+    options.filename.trim() !== options.filename ||
+    /[\\/\x00-\x1f\x7f]/.test(options.filename)
+  ) {
+    throw new Error("Artifact transport filename is invalid.");
+  }
 
   async function uploadOnce(allowRefresh: boolean): Promise<unknown> {
     const csrfToken = UNSAFE_METHODS.has(method) ? getCookieValue(CSRF_COOKIE_NAME) : null;
 
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
+      let settled = false;
+
+      const cleanup = () => options.signal?.removeEventListener("abort", abortUpload);
+      const rejectOnce = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const resolveOnce = (value: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      };
+      const abortUpload = () => {
+        if (settled) return;
+        if (xhr.readyState === XMLHttpRequest.UNSENT || xhr.readyState === XMLHttpRequest.DONE) {
+          rejectOnce(new DOMException("Upload cancelled.", "AbortError"));
+        } else {
+          xhr.abort();
+        }
+      };
+
+      xhr.onabort = () => rejectOnce(new DOMException("Upload cancelled.", "AbortError"));
+      options.signal?.addEventListener("abort", abortUpload, { once: true });
+      if (options.signal?.aborted) {
+        abortUpload();
+        return;
+      }
+
       xhr.open(method, `${API_BASE}${path}`);
+      if (options.signal?.aborted) {
+        abortUpload();
+        return;
+      }
       xhr.withCredentials = true;
+      xhr.timeout = UPLOAD_TIMEOUT_MS;
       if (csrfToken) {
         xhr.setRequestHeader(CSRF_HEADER_NAME, csrfToken);
       }
+      xhr.setRequestHeader("Content-Type", options.contentType);
+      xhr.setRequestHeader("X-Artifact-Filename", options.filename);
 
       xhr.upload.onprogress = (event) => {
         options.onProgress?.(event.loaded, event.lengthComputable ? event.total : 0);
       };
 
-      xhr.onerror = () => reject(new Error("Network error during upload."));
+      xhr.onerror = () =>
+        rejectOnce(
+          new Error(
+            "Network error during upload. Delivery status is unknown; inspect the created run before retrying or deleting it.",
+          ),
+        );
+      xhr.ontimeout = () =>
+        rejectOnce(
+          new Error(
+            "Upload timed out after 4 hours. Delivery status is unknown; inspect the run before retrying or deleting it.",
+          ),
+        );
       xhr.onload = async () => {
         if (xhr.status === 401) {
           if (allowRefresh) {
-            const refreshed = await refreshAccessToken();
+            let refreshed = false;
+            try {
+              refreshed = await refreshAccessToken();
+            } catch (error) {
+              rejectOnce(error instanceof Error ? error : new Error("Session refresh failed during upload."));
+              return;
+            }
             if (refreshed) {
+              if (options.signal?.aborted) {
+                rejectOnce(new DOMException("Upload cancelled.", "AbortError"));
+                return;
+              }
               try {
-                resolve(await uploadOnce(false));
+                resolveOnce(await uploadOnce(false));
               } catch (error) {
-                reject(error);
+                rejectOnce(error instanceof Error ? error : new Error("Upload retry failed."));
               }
               return;
             }
           }
           markSessionAnonymous();
           window.location.href = loginRedirectPath();
-          reject(new Error("Unauthorized"));
+          rejectOnce(new Error("Unauthorized"));
           return;
         }
 
         if (xhr.status < 200 || xhr.status >= 300) {
-          reject(new Error(toErrorMessage(xhr.responseText || "", xhr.status, xhr.getResponseHeader("x-request-id"))));
+          rejectOnce(
+            new Error(
+              errorMessageFromBody(xhr.responseText || "", xhr.status, xhr.getResponseHeader("x-request-id")),
+            ),
+          );
           return;
         }
 
         try {
-          resolve(parseResponseText(xhr.getResponseHeader("content-type") || "", xhr.responseText || ""));
+          resolveOnce(parseResponseText(xhr.getResponseHeader("content-type") || "", xhr.responseText || ""));
         } catch (error) {
-          reject(error);
+          rejectOnce(error instanceof Error ? error : new Error("Failed to parse upload response."));
         }
       };
 
-      xhr.send(formData);
+      xhr.send(artifact);
     });
   }
 

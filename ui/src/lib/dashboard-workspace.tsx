@@ -90,7 +90,10 @@ export function DashboardWorkspaceProvider({ children }: { children: ReactNode }
     if (!inProjectArea) return;
 
     if (inventoryMatch) {
-      navigate(`/projects/${projectId}/inventory`);
+      const portableParams = new URLSearchParams(location.search);
+      portableParams.delete("runs");
+      const portableQuery = portableParams.toString();
+      navigate(`/projects/${projectId}/inventory${portableQuery ? `?${portableQuery}` : ""}`);
       return;
     }
     if (importMatch) {
@@ -106,11 +109,15 @@ export function DashboardWorkspaceProvider({ children }: { children: ReactNode }
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
 
     async function loadWorkspace() {
       setProjectsReady(false);
       try {
-        const [meData, projectData] = await Promise.all([apiFetch("/auth/me"), apiFetch("/projects")]);
+        const [meData, projectData] = await Promise.all([
+          apiFetch("/auth/me", { signal: controller.signal }),
+          apiFetch("/projects", { signal: controller.signal }),
+        ]);
         if (cancelled) return;
         setCanCreateProject(!!(meData as UserMe | null)?.is_sysadmin);
         const rows = ((projectData as DashboardProject[]) || []) as DashboardProject[];
@@ -141,6 +148,7 @@ export function DashboardWorkspaceProvider({ children }: { children: ReactNode }
     loadWorkspace().catch(() => undefined);
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [routeProjectId]);
 

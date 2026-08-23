@@ -1,9 +1,9 @@
 import { useEffect } from "react";
-import { Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation, useParams } from "react-router-dom";
 
 import { StatePanel } from "@/components/state-panel";
 import { TopNav } from "@/components/top-nav";
-import { bootstrapSession, useSession } from "@/lib/auth";
+import { bootstrapSession, resetSession, useSession } from "@/lib/auth";
 import { DashboardWorkspaceProvider } from "@/lib/dashboard-workspace";
 import { AccountPage } from "@/pages/account-page";
 import { LoginPage } from "@/pages/login-page";
@@ -32,11 +32,43 @@ function RequireAuth({ children }: { children: JSX.Element }) {
     );
   }
 
+  if (session.status === "error") {
+    return (
+      <section className="mx-auto mt-16 max-w-md">
+        <StatePanel
+          actions={
+            <button className="rounded-md bg-emerald-700 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-600" onClick={resetSession} type="button">
+              Retry session check
+            </button>
+          }
+          description={`${session.error || "The authentication service could not be reached."} Your login state has not been changed.`}
+          title="Session Check Unavailable"
+          tone="error"
+        />
+      </section>
+    );
+  }
+
   if (session.status !== "authenticated") {
     const next = `${location.pathname}${location.search}${location.hash}`;
     return <Navigate to={`/?next=${encodeURIComponent(next)}`} replace />;
   }
   return children;
+}
+
+function RunDetailRoute() {
+  const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
+  return <RunDetailPage key={`${projectId || ""}:${runId || ""}`} />;
+}
+
+function ProjectInventoryRoute() {
+  const { projectId } = useParams<{ projectId: string }>();
+  return <ProjectInventoryPage key={projectId || ""} />;
+}
+
+function ProjectImportRoute() {
+  const { projectId } = useParams<{ projectId: string }>();
+  return <ProjectImportPage key={projectId || ""} />;
 }
 
 export function App() {
@@ -80,7 +112,7 @@ export function App() {
               path="/projects/:projectId/runs/:runId"
               element={
                 <RequireAuth>
-                  <RunDetailPage />
+                  <RunDetailRoute />
                 </RequireAuth>
               }
             />
@@ -88,7 +120,7 @@ export function App() {
               path="/projects/:projectId/inventory"
               element={
                 <RequireAuth>
-                  <ProjectInventoryPage />
+                  <ProjectInventoryRoute />
                 </RequireAuth>
               }
             />
@@ -96,7 +128,7 @@ export function App() {
               path="/projects/:projectId/import"
               element={
                 <RequireAuth>
-                  <ProjectImportPage />
+                  <ProjectImportRoute />
                 </RequireAuth>
               }
             />

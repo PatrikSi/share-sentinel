@@ -22,9 +22,9 @@ export function StatusBanner({ title, tone = "info", children }: StatusBannerPro
       : { role: "status", "aria-live": "polite" as const };
 
   return (
-    <div className={`rounded-2xl border p-3 text-sm ${TONE_CLASSES[tone]}`} {...liveProps}>
-      {title ? <p className="text-[11px] font-semibold uppercase tracking-[0.18em]">{title}</p> : null}
-      <div className={title ? "mt-2" : ""}>{children}</div>
+    <div className={`rounded-md border px-3 py-2.5 text-sm ${TONE_CLASSES[tone]}`} {...liveProps}>
+      {title ? <p className="font-semibold">{title}</p> : null}
+      <div className={title ? "mt-1" : ""}>{children}</div>
     </div>
   );
 }

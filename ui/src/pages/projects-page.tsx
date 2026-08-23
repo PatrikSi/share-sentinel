@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { Dialog } from "@/components/dialog";
@@ -8,6 +8,8 @@ import { useDashboardWorkspace } from "@/lib/dashboard-workspace";
 type RunProgress = {
   line_offset?: number;
   last_error?: string;
+  attempt_count?: number;
+  next_retry_at?: string;
   [key: string]: unknown;
 };
 
@@ -56,11 +58,29 @@ function parseLineOffset(progress: RunProgress | null | undefined): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 function describeRunCardStatus(run: Run) {
   const lineOffset = parseLineOffset(run.ingest_progress);
   const lastError = typeof run.ingest_progress?.last_error === "string" ? run.ingest_progress.last_error : null;
+  const attemptCount = Math.max(0, Number(run.ingest_progress?.attempt_count || 0));
+  const nextRetryAt = typeof run.ingest_progress?.next_retry_at === "string" ? run.ingest_progress.next_retry_at : null;
+  const parsedRetryAt = nextRetryAt ? new Date(nextRetryAt) : null;
+  const retryAtLabel = parsedRetryAt && !Number.isNaN(parsedRetryAt.getTime()) ? parsedRetryAt.toLocaleString() : null;
 
   if (run.status === "UPLOADED") {
+    if (attemptCount > 0 || nextRetryAt || lastError) {
+      return {
+        title: `Ingest retry attempt ${attemptCount + 1} scheduled`,
+        detail: `${lastError || "The previous worker attempt did not complete."} ${retryAtLabel ? `Next retry: ${retryAtLabel}.` : "The recovery worker will retry when due."}`,
+        tone: "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-200",
+        progressTone: "bg-amber-500",
+        progressWidth: "44%",
+        pulse: true,
+      };
+    }
     return {
       title: "Artifact uploaded, waiting for worker pickup",
       detail: "The file is stored and queued. No worker checkpoint has been recorded yet.",
@@ -101,9 +121,9 @@ function describeRunCardStatus(run: Run) {
 
 function StatTile({ label, value, detail }: { label: string; value: string; detail: string }) {
   return (
-    <div className="rounded-3xl border border-slate-200 bg-white/90 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950/60">
+    <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm dark:border-slate-800 dark:bg-slate-950">
       <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">{label}</p>
-      <p className="mt-3 text-3xl font-semibold tracking-tight">{value}</p>
+      <p className="mt-2 text-2xl font-semibold tracking-tight">{value}</p>
       <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">{detail}</p>
     </div>
   );
@@ -123,6 +143,7 @@ export function ProjectsPage() {
   const [projectRole, setProjectRole] = useState<string | null>(null);
 
   const [runs, setRuns] = useState<Run[]>([]);
+  const [runsProjectId, setRunsProjectId] = useState<string | null>(null);
   const [runSearch, setRunSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
 
@@ -132,32 +153,62 @@ export function ProjectsPage() {
 
   const [projectStats, setProjectStats] = useState<ProjectStats | null>(null);
   const [topExtensions, setTopExtensions] = useState<ExtensionStat[]>([]);
+  const [insightsProjectId, setInsightsProjectId] = useState<string | null>(null);
   const [loadingStats, setLoadingStats] = useState(false);
   const [runToDelete, setRunToDelete] = useState<Run | null>(null);
 
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [refreshWarning, setRefreshWarning] = useState<string | null>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const [roleProjectId, setRoleProjectId] = useState<string | null>(null);
+  const selectedProjectRef = useRef(selectedProject);
+  selectedProjectRef.current = selectedProject;
 
-  async function loadRuns(projectId: string, pageCursor: string | null) {
+  async function loadRuns(projectId: string, pageCursor: string | null, signal?: AbortSignal) {
+    if (signal?.aborted || selectedProjectRef.current !== projectId) return;
     const query = new URLSearchParams({ limit: "50" });
     if (pageCursor) query.set("cursor", pageCursor);
-    const data = await apiFetch(`/projects/${projectId}/runs?${query.toString()}`);
+    const data = await apiFetch(`/projects/${projectId}/runs?${query.toString()}`, { signal });
+    if (signal?.aborted || selectedProjectRef.current !== projectId) return;
     setRuns((data?.items || []) as Run[]);
     setNextCursor((data?.next_cursor as string | null) || null);
+    setRunsProjectId(projectId);
   }
 
-  async function loadProjectInsights(projectId: string) {
+  async function loadProjectInsights(projectId: string, signal?: AbortSignal) {
+    if (signal?.aborted || selectedProjectRef.current !== projectId) return;
     setLoadingStats(true);
     try {
       const [statsData, extData] = await Promise.all([
-        apiFetch(`/projects/${projectId}/inventory/stats`),
-        apiFetch(`/projects/${projectId}/inventory/extensions?limit=8`),
+        apiFetch(`/projects/${projectId}/inventory/stats`, { signal }),
+        apiFetch(`/projects/${projectId}/inventory/extensions?limit=8`, { signal }),
       ]);
+      if (signal?.aborted || selectedProjectRef.current !== projectId) return;
       setProjectStats((statsData || null) as ProjectStats | null);
       setTopExtensions(((extData?.items as ExtensionStat[]) || []).filter((entry) => !!entry.ext));
+      setInsightsProjectId(projectId);
     } finally {
-      setLoadingStats(false);
+      if (!signal?.aborted && selectedProjectRef.current === projectId) setLoadingStats(false);
     }
+  }
+
+  async function refreshProjectSnapshot(projectId: string, pageCursor: string | null, signal?: AbortSignal) {
+    if (signal?.aborted || selectedProjectRef.current !== projectId) return;
+    const query = new URLSearchParams({ limit: "50" });
+    if (pageCursor) query.set("cursor", pageCursor);
+    const [runsData, statsData, extData] = await Promise.all([
+      apiFetch(`/projects/${projectId}/runs?${query.toString()}`, { signal }),
+      apiFetch(`/projects/${projectId}/inventory/stats`, { signal }),
+      apiFetch(`/projects/${projectId}/inventory/extensions?limit=8`, { signal }),
+    ]);
+    if (signal?.aborted || selectedProjectRef.current !== projectId) return;
+    setRuns((runsData?.items || []) as Run[]);
+    setNextCursor((runsData?.next_cursor as string | null) || null);
+    setRunsProjectId(projectId);
+    setProjectStats((statsData || null) as ProjectStats | null);
+    setTopExtensions(((extData?.items as ExtensionStat[]) || []).filter((entry) => !!entry.ext));
+    setInsightsProjectId(projectId);
   }
 
   useEffect(() => {
@@ -165,41 +216,104 @@ export function ProjectsPage() {
     setCursor(null);
     setCursorHistory([]);
     setInfo(null);
+    setError(null);
+    setRefreshWarning(null);
+    setRuns([]);
+    setRunsProjectId(null);
+    setNextCursor(null);
     setProjectStats(null);
     setTopExtensions([]);
+    setInsightsProjectId(null);
+    setProjectRole(null);
+    setRoleProjectId(null);
     setRunToDelete(null);
   }, [selectedProject]);
 
   useEffect(() => {
     if (!selectedProject) return;
-    loadRuns(selectedProject, cursor).catch((err) => setError(err.message));
-    loadProjectInsights(selectedProject).catch((err) => setError(err.message));
-  }, [selectedProject, cursor]);
+    const controller = new AbortController();
+    setError(null);
+    setRefreshWarning(null);
+    loadRuns(selectedProject, cursor, controller.signal).catch((err) => {
+      if (!controller.signal.aborted && selectedProjectRef.current === selectedProject && !isAbortError(err)) {
+        setError(err.message);
+      }
+    });
+    loadProjectInsights(selectedProject, controller.signal).catch((err) => {
+      if (!controller.signal.aborted && selectedProjectRef.current === selectedProject && !isAbortError(err)) {
+        setError(err.message);
+      }
+    });
+    return () => controller.abort();
+  }, [selectedProject, cursor, reloadNonce]);
 
   useEffect(() => {
     if (!selectedProject) {
       setProjectRole(null);
+      setRoleProjectId(null);
       return;
     }
-    apiFetch(`/projects/${selectedProject}/my-role`)
-      .then((data) => setProjectRole((data?.role as string) || null))
-      .catch(() => setProjectRole(null));
-  }, [selectedProject]);
+    const controller = new AbortController();
+    setProjectRole(null);
+    setRoleProjectId(null);
+    apiFetch(`/projects/${selectedProject}/my-role`, { signal: controller.signal })
+      .then((data) => {
+        if (!controller.signal.aborted && selectedProjectRef.current === selectedProject) {
+          setProjectRole((data?.role as string) || null);
+          setRoleProjectId(selectedProject);
+        }
+      })
+      .catch((err) => {
+        if (!controller.signal.aborted && selectedProjectRef.current === selectedProject && !isAbortError(err)) {
+          setProjectRole(null);
+        }
+      });
+    return () => controller.abort();
+  }, [selectedProject, reloadNonce]);
+
+  const scopedRuns = runsProjectId === selectedProject ? runs : [];
+  const scopedProjectStats = insightsProjectId === selectedProject ? projectStats : null;
+  const scopedTopExtensions = insightsProjectId === selectedProject ? topExtensions : [];
+  const scopedProjectRole = roleProjectId === selectedProject ? projectRole : null;
+  const shouldPoll = scopedRuns.some((run) => run.status === "UPLOADED" || run.status === "INGESTING");
 
   useEffect(() => {
-    if (!selectedProject) return;
-    const hasActiveRun = runs.some((run) => run.status === "UPLOADED" || run.status === "INGESTING");
-    if (!hasActiveRun) return;
+    if (!selectedProject || !shouldPoll) return;
 
-    const timer = window.setInterval(() => {
-      loadRuns(selectedProject, cursor).catch(() => undefined);
-      loadProjectInsights(selectedProject).catch(() => undefined);
+    let stopped = false;
+    let timer: number | null = null;
+    let refreshController: AbortController | null = null;
+
+    const poll = async () => {
+      const tickController = new AbortController();
+      refreshController = tickController;
+      const results = await Promise.allSettled([
+        refreshProjectSnapshot(selectedProject, cursor, tickController.signal),
+      ]);
+      if (stopped || tickController.signal.aborted || selectedProjectRef.current !== selectedProject) return;
+      const failed = results.find((result) => result.status === "rejected") as PromiseRejectedResult | undefined;
+      setRefreshWarning(
+        failed
+          ? `Live refresh is delayed; showing the last confirmed project state. ${failed.reason instanceof Error ? failed.reason.message : "Retry when the API is available."}`
+          : null,
+      );
+      timer = window.setTimeout(() => {
+        void poll();
+      }, 4000);
+    };
+
+    timer = window.setTimeout(() => {
+      void poll();
     }, 4000);
-    return () => window.clearInterval(timer);
-  }, [selectedProject, runs, cursor]);
+    return () => {
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+      refreshController?.abort();
+    };
+  }, [cursor, selectedProject, shouldPoll]);
 
   const visibleRuns = useMemo(() => {
-    return runs.filter((run) => {
+    return scopedRuns.filter((run) => {
       const statusOk = statusFilter === "all" || run.status === statusFilter;
       const search = runSearch.trim().toLowerCase();
       const searchOk =
@@ -209,10 +323,10 @@ export function ProjectsPage() {
         run.id.toLowerCase().includes(search);
       return statusOk && searchOk;
     });
-  }, [runs, runSearch, statusFilter]);
+  }, [scopedRuns, runSearch, statusFilter]);
 
-  const latestRun = runs.length > 0 ? runs[0] : null;
-  const activeRunCount = runs.filter((run) => run.status === "UPLOADED" || run.status === "INGESTING").length;
+  const latestRun = scopedRuns.length > 0 ? scopedRuns[0] : null;
+  const activeRunCount = scopedRuns.filter((run) => run.status === "UPLOADED" || run.status === "INGESTING").length;
 
   function moveNext() {
     if (!nextCursor) return;
@@ -232,24 +346,30 @@ export function ProjectsPage() {
 
   async function deleteRun() {
     if (!selectedProject || !runToDelete) return;
+    const targetProjectId = selectedProject;
+    const targetRun = runToDelete;
     setError(null);
     setInfo(null);
     try {
-      await apiFetch(`/projects/${selectedProject}/runs/${runToDelete.id}`, { method: "DELETE" });
-      setInfo(`Run ${runToDelete.id} deleted.`);
+      await apiFetch(`/projects/${targetProjectId}/runs/${targetRun.id}`, { method: "DELETE" });
+      if (selectedProjectRef.current !== targetProjectId) return;
+      setInfo(`Run ${targetRun.id} deleted.`);
       setRunToDelete(null);
-      await loadRuns(selectedProject, cursor);
-      await loadProjectInsights(selectedProject);
+      await loadRuns(targetProjectId, cursor);
+      if (selectedProjectRef.current !== targetProjectId) return;
+      await loadProjectInsights(targetProjectId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Run deletion failed");
+      if (selectedProjectRef.current === targetProjectId) {
+        setError(err instanceof Error ? err.message : "Run deletion failed");
+      }
     }
   }
 
-  const canImport = projectRole === "operator" || projectRole === "admin";
-  const canDeleteRuns = projectRole === "admin";
-  const latestRunAtText = projectStats?.latest_run_at ? new Date(projectStats.latest_run_at).toLocaleString() : "No completed runs yet";
+  const canImport = scopedProjectRole === "operator" || scopedProjectRole === "admin";
+  const canDeleteRuns = scopedProjectRole === "admin";
+  const latestRunAtText = scopedProjectStats?.latest_run_at ? new Date(scopedProjectStats.latest_run_at).toLocaleString() : "No completed runs yet";
   const visibleError = error || projectLoadError;
-  const roleLabel = projectRole ? projectRole.toUpperCase() : "ROLE UNKNOWN";
+  const roleLabel = scopedProjectRole ? scopedProjectRole.toUpperCase() : "ROLE UNKNOWN";
 
   function formatCount(value: number | null | undefined): string {
     if (value === null || value === undefined) return loadingStats ? "..." : "0";
@@ -266,11 +386,11 @@ export function ProjectsPage() {
     <section className="workspace">
       <div className="workspace-header">
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.45fr)_360px]">
-          <div className="rounded-[28px] border border-slate-200 bg-[linear-gradient(135deg,rgba(255,255,255,0.98),rgba(226,232,240,0.88))] p-5 shadow-sm dark:border-slate-800 dark:bg-[linear-gradient(135deg,rgba(15,23,42,0.96),rgba(15,23,42,0.8))]">
+          <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950">
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div className="min-w-0 flex-1">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Dashboard</p>
-                <h1 className="mt-2 text-3xl font-bold tracking-tight">{selectedProjectName || "Select a project"}</h1>
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Project overview</p>
+                <h1 className="mt-1 text-2xl font-semibold tracking-tight">{selectedProjectName || "Select a project"}</h1>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <span className="rounded-full border border-slate-300 bg-white/70 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] dark:border-slate-700 dark:bg-slate-950/40">
                     {roleLabel}
@@ -325,8 +445,8 @@ export function ProjectsPage() {
             ) : null}
           </div>
 
-          <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Next Action</p>
+          <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Next action</p>
             <h2 className="mt-2 text-xl font-semibold">
               {!selectedProject ? "Create or select a project" : activeRunCount > 0 ? "Monitor the active ingest" : latestRun ? "Review the latest run" : "Import the first scan"}
             </h2>
@@ -400,9 +520,24 @@ export function ProjectsPage() {
         </div>
       </div>
 
-      {visibleError || info ? (
+      {visibleError || refreshWarning || info ? (
         <div className="workspace-section space-y-2">
-          {visibleError ? <p className="rounded-2xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{visibleError}</p> : null}
+          {visibleError ? (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200" role="alert">
+              <span>{visibleError}</span>
+              <button className="rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={() => setReloadNonce((current) => current + 1)} type="button">
+                Retry project data
+              </button>
+            </div>
+          ) : null}
+          {refreshWarning ? (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-amber-100 p-3 text-sm text-amber-800 dark:bg-amber-900/30 dark:text-amber-200" role="status">
+              <span>{refreshWarning}</span>
+              <button className="rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={() => setReloadNonce((current) => current + 1)} type="button">
+                Retry now
+              </button>
+            </div>
+          ) : null}
           {info ? <p className="rounded-2xl bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">{info}</p> : null}
         </div>
       ) : null}
@@ -412,30 +547,30 @@ export function ProjectsPage() {
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <StatTile
               label="Runs"
-              value={formatCount(projectStats?.runs_total)}
-              detail={`Scope: ${formatCount(projectStats?.scope_runs)} • Complete: ${formatCount(projectStats?.runs_complete)}`}
+              value={formatCount(scopedProjectStats?.runs_total)}
+              detail={`Scope: ${formatCount(scopedProjectStats?.scope_runs)} • Complete: ${formatCount(scopedProjectStats?.runs_complete)}`}
             />
             <StatTile
               label="Endpoints"
-              value={formatCount(projectStats?.endpoints)}
-              detail={`Unique hosts: ${formatCount(projectStats?.unique_hosts)} • Ingesting: ${formatCount(projectStats?.runs_ingesting)}`}
+              value={formatCount(scopedProjectStats?.endpoints)}
+              detail={`Unique hosts: ${formatCount(scopedProjectStats?.unique_hosts)} • Ingesting: ${formatCount(scopedProjectStats?.runs_ingesting)}`}
             />
             <StatTile
               label="Shares"
-              value={formatCount(projectStats?.shares)}
-              detail={`Files: ${formatCount(projectStats?.files)} • Directories: ${formatCount(projectStats?.directories)}`}
+              value={formatCount(scopedProjectStats?.shares)}
+              detail={`Files: ${formatCount(scopedProjectStats?.files)} • Directories: ${formatCount(scopedProjectStats?.directories)}`}
             />
             <StatTile
               label="Paths"
-              value={formatCount(projectStats?.items)}
-              detail={`File types: ${formatCount(projectStats?.file_types)} • Latest run: ${latestRunAtText}`}
+              value={formatCount(scopedProjectStats?.items)}
+              detail={`File types: ${formatCount(scopedProjectStats?.file_types)} • Latest run: ${latestRunAtText}`}
             />
           </div>
 
           <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
-            <aside className="rounded-[28px] border border-slate-200 bg-white/90 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
+            <aside className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950">
               <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Run Queue</p>
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Run queue</p>
                 <h2 className="mt-2 text-xl font-semibold">Filter and navigate</h2>
                 <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
                   Narrow the run list first, then jump directly to the run you want to inspect or delete.
@@ -492,7 +627,7 @@ export function ProjectsPage() {
                 <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
                   <div>
                     <p className="text-sm font-semibold">{visibleRuns.length.toLocaleString()} visible runs</p>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">Filtered from {runs.length.toLocaleString()} loaded runs.</p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">Filtered from {scopedRuns.length.toLocaleString()} loaded runs.</p>
                   </div>
                   <div>
                     <p className="text-sm font-semibold">Auto-refresh while ingesting</p>
@@ -501,11 +636,11 @@ export function ProjectsPage() {
                 </div>
               </div>
 
-              {topExtensions.length > 0 ? (
+              {scopedTopExtensions.length > 0 ? (
                 <div className="mt-5">
                   <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Top file types</p>
                   <div className="mt-3 flex flex-wrap gap-2">
-                    {topExtensions.map((entry) => (
+                    {scopedTopExtensions.map((entry) => (
                       <span
                         key={entry.ext}
                         className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
@@ -527,7 +662,7 @@ export function ProjectsPage() {
                   return (
                     <article
                       key={run.id}
-                      className="rounded-[28px] border border-slate-200 bg-white/90 p-5 shadow-sm transition hover:border-slate-300 dark:border-slate-800 dark:bg-slate-950/70 dark:hover:border-slate-700"
+                      className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm transition hover:border-slate-300 dark:border-slate-800 dark:bg-slate-950 dark:hover:border-slate-700"
                     >
                       <div className="flex flex-wrap items-start justify-between gap-4">
                         <div className="min-w-0 flex-1">
@@ -624,7 +759,7 @@ export function ProjectsPage() {
                   );
                 })
               ) : (
-                <div className="rounded-[28px] border border-dashed border-slate-300 bg-white/70 p-8 text-center dark:border-slate-700 dark:bg-slate-950/50">
+                <div className="rounded-lg border border-dashed border-slate-300 bg-white p-8 text-center dark:border-slate-700 dark:bg-slate-950">
                   <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-500">No Runs In View</p>
                   <h3 className="mt-3 text-xl font-semibold">Adjust the filters or import a new scan.</h3>
                   <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
@@ -637,7 +772,7 @@ export function ProjectsPage() {
         </div>
       ) : (
         <div className="workspace-section">
-          <div className="rounded-[28px] border border-dashed border-slate-300 bg-white/70 p-8 text-center dark:border-slate-700 dark:bg-slate-950/50">
+          <div className="rounded-lg border border-dashed border-slate-300 bg-white p-8 text-center dark:border-slate-700 dark:bg-slate-950">
             <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-500">No Projects</p>
             <h2 className="mt-3 text-2xl font-semibold">Create or select a project to start reviewing scan data.</h2>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">

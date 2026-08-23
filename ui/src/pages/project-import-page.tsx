@@ -1,14 +1,38 @@
-import { DragEvent, FormEvent, useEffect, useMemo, useState } from "react";
+import { DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
-import { apiFetch, apiUploadFormData } from "@/lib/api";
+import { apiFetch, apiUploadArtifact } from "@/lib/api";
 
 type Project = { id: string; name: string };
 type ProjectRoleStatus = "loading" | "ready" | "error";
 
-const ACCEPTED_ARTIFACT_SUFFIXES = [".json", ".json.gz", ".ndjson", ".jsonl", ".ndjson.gz", ".jsonl.gz", ".gz"];
+const ACCEPTED_ARTIFACT_SUFFIXES = [".ndjson.gz", ".jsonl.gz", ".json.gz", ".ndjson", ".jsonl", ".json"] as const;
+
+type ArtifactSuffix = (typeof ACCEPTED_ARTIFACT_SUFFIXES)[number];
+
+function artifactSuffix(file: File | null): ArtifactSuffix | null {
+  if (!file) return null;
+  const lowerName = file.name.toLowerCase();
+  return ACCEPTED_ARTIFACT_SUFFIXES.find((suffix) => lowerName.endsWith(suffix)) || null;
+}
+
+function artifactTransport(file: File): {
+  filename: string;
+  contentType: "application/json" | "application/x-ndjson" | "application/gzip";
+} | null {
+  const suffix = artifactSuffix(file);
+  if (!suffix) return null;
+  return {
+    filename: `artifact${suffix}`,
+    contentType: suffix.endsWith(".gz")
+      ? "application/gzip"
+      : suffix === ".json"
+        ? "application/json"
+        : "application/x-ndjson",
+  };
+}
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -20,9 +44,8 @@ function formatFileSize(bytes: number): string {
 function validateArtifactFile(file: File | null): string | null {
   if (!file) return null;
   if (file.size <= 0) return "The selected artifact is empty.";
-  const lowerName = file.name.toLowerCase();
-  if (!ACCEPTED_ARTIFACT_SUFFIXES.some((suffix) => lowerName.endsWith(suffix))) {
-    return "Supported artifact types are .json, .json.gz, .ndjson, .jsonl, and gzip variants.";
+  if (!artifactSuffix(file)) {
+    return "Supported artifact suffixes are .json, .json.gz, .ndjson, .ndjson.gz, .jsonl, and .jsonl.gz. Bare .gz files are ambiguous and are not accepted.";
   }
   return null;
 }
@@ -44,30 +67,64 @@ export function ProjectImportPage() {
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [uploadTransferredBytes, setUploadTransferredBytes] = useState(0);
   const [uploadTotalBytes, setUploadTotalBytes] = useState(0);
+  const uploadControllerRef = useRef<AbortController | null>(null);
+  const importOperationRef = useRef(0);
+  const projectIdRef = useRef(projectId);
+  projectIdRef.current = projectId;
 
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    importOperationRef.current += 1;
+    uploadControllerRef.current?.abort();
+    uploadControllerRef.current = null;
+    setRunName("");
+    setRunDescription("");
+    setArtifactFile(null);
+    setDragActive(false);
+    setImporting(false);
+    setUploadStage("idle");
+    setCurrentRunId(null);
+    setUploadTransferredBytes(0);
+    setUploadTotalBytes(0);
+    return () => {
+      importOperationRef.current += 1;
+      uploadControllerRef.current?.abort();
+    };
+  }, [projectId]);
+
+  useEffect(() => {
     if (!projectId) return;
-    apiFetch(`/projects/${projectId}`)
-      .then((data) => setProject(data as Project))
-      .catch((err) => setError(err.message));
-    setProjectRoleStatus("loading");
-    apiFetch(`/projects/${projectId}/my-role`)
+    const controller = new AbortController();
+    setProject(null);
+    setProjectRole(null);
+    setError(null);
+    apiFetch(`/projects/${projectId}`, { signal: controller.signal })
       .then((data) => {
+        if (!controller.signal.aborted) setProject(data as Project);
+      })
+      .catch((err) => {
+        if (!controller.signal.aborted && !(err instanceof DOMException && err.name === "AbortError")) setError(err.message);
+      });
+    setProjectRoleStatus("loading");
+    apiFetch(`/projects/${projectId}/my-role`, { signal: controller.signal })
+      .then((data) => {
+        if (controller.signal.aborted) return;
         setProjectRole((data?.role as string) || null);
         setProjectRoleStatus("ready");
       })
-      .catch(() => {
+      .catch((err) => {
+        if (controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
         setProjectRole(null);
         setProjectRoleStatus("error");
       });
+    return () => controller.abort();
   }, [projectId]);
 
   const canImport = projectRole === "operator" || projectRole === "admin";
   const fileValidationError = useMemo(() => validateArtifactFile(artifactFile), [artifactFile]);
   const artifactName = artifactFile?.name || "No file selected";
-  const artifactDetectedType = artifactFile ? ACCEPTED_ARTIFACT_SUFFIXES.find((suffix) => artifactFile.name.toLowerCase().endsWith(suffix)) || "custom" : null;
+  const artifactDetectedType = artifactSuffix(artifactFile);
   const uploadProgressPercent =
     uploadStage === "uploading" && uploadTotalBytes > 0 ? Math.min(100, Math.round((uploadTransferredBytes / uploadTotalBytes) * 100)) : 0;
 
@@ -97,9 +154,14 @@ export function ProjectImportPage() {
     handleFileSelection(event.dataTransfer.files?.[0] || null);
   }
 
+  function cancelUpload() {
+    uploadControllerRef.current?.abort();
+  }
+
   async function onImportRun(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!projectId) return;
+    const targetProjectId = projectId;
     if (!runName.trim()) {
       setError("Run name is required.");
       return;
@@ -112,41 +174,83 @@ export function ProjectImportPage() {
       setError(fileValidationError);
       return;
     }
+    const transport = artifactTransport(artifactFile);
+    if (!transport) {
+      setError("The artifact filename does not identify a supported transport format.");
+      return;
+    }
 
+    const operationId = importOperationRef.current + 1;
+    importOperationRef.current = operationId;
+    const operationController = new AbortController();
+    uploadControllerRef.current?.abort();
+    uploadControllerRef.current = operationController;
     setImporting(true);
     setUploadStage("creating-run");
     setError(null);
-    setCurrentRunId(null);
+    const requestedRunId = crypto.randomUUID();
+    setCurrentRunId(requestedRunId);
     setUploadTransferredBytes(0);
     setUploadTotalBytes(artifactFile.size);
 
+    let runCreated = false;
     try {
-      const run = (await apiFetch(`/projects/${projectId}/runs`, {
+      const run = (await apiFetch(`/projects/${targetProjectId}/runs`, {
         method: "POST",
+        signal: operationController.signal,
         body: JSON.stringify({
+          run_id: requestedRunId,
           name: runName.trim(),
           description: runDescription.trim() || null,
         }),
       })) as { id: string };
+      if (
+        importOperationRef.current !== operationId ||
+        projectIdRef.current !== targetProjectId ||
+        operationController.signal.aborted
+      ) return;
+      runCreated = true;
       setCurrentRunId(run.id);
 
       setUploadStage("uploading");
-      const formData = new FormData();
-      formData.append("file", artifactFile);
-      await apiUploadFormData(`/projects/${projectId}/runs/${run.id}/artifact`, formData, {
+      await apiUploadArtifact(`/projects/${targetProjectId}/runs/${run.id}/artifact`, artifactFile, {
+        filename: transport.filename,
+        contentType: transport.contentType,
+        signal: operationController.signal,
         onProgress: (loaded, total) => {
+          if (importOperationRef.current !== operationId || projectIdRef.current !== targetProjectId) return;
           setUploadTransferredBytes(loaded);
           setUploadTotalBytes(total || artifactFile.size);
         },
       });
+      if (
+        importOperationRef.current !== operationId ||
+        projectIdRef.current !== targetProjectId ||
+        operationController.signal.aborted
+      ) return;
 
       setUploadStage("queueing");
-      navigate(`/projects/${projectId}/runs/${run.id}`, { replace: true });
+      navigate(`/projects/${targetProjectId}/runs/${run.id}`, { replace: true });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Import failed");
+      if (importOperationRef.current !== operationId || projectIdRef.current !== targetProjectId) return;
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setError(
+          `Upload cancelled. Delivery status for run ${requestedRunId} may be unknown; inspect the run before retrying or deleting it.`,
+        );
+      } else {
+        const detail = err instanceof Error ? err.message : "Import failed.";
+        setError(
+          runCreated
+            ? `${detail} Artifact delivery status for run ${requestedRunId} may be unknown; inspect the run before retrying or deleting it.`
+            : `${detail} Creation status for requested run ${requestedRunId} may be unknown; inspect the run before retrying.`,
+        );
+      }
       setUploadStage("idle");
     } finally {
-      setImporting(false);
+      if (importOperationRef.current === operationId && projectIdRef.current === targetProjectId) {
+        uploadControllerRef.current = null;
+        setImporting(false);
+      }
     }
   }
 
@@ -154,9 +258,9 @@ export function ProjectImportPage() {
     <section className="workspace">
       <div className="workspace-header">
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.45fr)_360px]">
-          <div className="rounded-[28px] border border-slate-200 bg-[linear-gradient(160deg,rgba(255,255,255,0.98),rgba(226,232,240,0.88))] p-5 shadow-sm dark:border-slate-800 dark:bg-[linear-gradient(160deg,rgba(15,23,42,0.96),rgba(15,23,42,0.8))]">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Run Intake</p>
-            <h1 className="mt-2 text-3xl font-bold tracking-tight">Import Scan</h1>
+          <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Run intake</p>
+            <h1 className="mt-1 text-2xl font-semibold tracking-tight">Import scan</h1>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{project ? `${project.name} (${project.id})` : projectId}</p>
             <div className="mt-4 flex flex-wrap gap-2">
               <Link
@@ -176,8 +280,8 @@ export function ProjectImportPage() {
             </div>
           </div>
 
-          <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Upload Status</p>
+          <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Upload status</p>
             <h2 className="mt-2 text-xl font-semibold">{importing ? "In progress" : "Preflight"}</h2>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{stageLabel()}</p>
             <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
@@ -227,7 +331,7 @@ export function ProjectImportPage() {
               </div>
               <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Run ID</p>
-                <p className="mt-1 text-sm font-semibold">{currentRunId || "Allocated after step 1"}</p>
+                <p className="mt-1 break-all font-mono text-xs font-semibold">{currentRunId || "Reserved when import starts"}</p>
               </div>
             </div>
             <div className="mt-4 grid gap-2">
@@ -271,14 +375,19 @@ export function ProjectImportPage() {
         {error ? (
           <StatusBanner tone="error" title="Import Failed">
             <p>{error}</p>
+            {currentRunId && projectId ? (
+              <Link className="mt-2 inline-flex rounded border border-current px-2 py-1 text-xs font-semibold" to={`/projects/${projectId}/runs/${currentRunId}`}>
+                Inspect run {currentRunId}
+              </Link>
+            ) : null}
           </StatusBanner>
         ) : null}
       </div>
 
       <div className="workspace-section">
         <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
-          <aside className="rounded-[28px] border border-slate-200 bg-[linear-gradient(160deg,rgba(255,255,255,0.98),rgba(226,232,240,0.88))] p-5 shadow-sm dark:border-slate-800 dark:bg-[linear-gradient(160deg,rgba(15,23,42,0.96),rgba(15,23,42,0.8))]">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Workflow</p>
+          <aside className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Workflow</p>
             <h2 className="mt-2 text-xl font-semibold">Create, attach, ingest</h2>
             <div className="mt-5 space-y-4 text-sm text-slate-600 dark:text-slate-300">
               <div className="rounded-2xl border border-white/70 bg-white/70 p-4 dark:border-slate-800 dark:bg-slate-950/40">
@@ -296,10 +405,10 @@ export function ProjectImportPage() {
             </div>
           </aside>
 
-          <form className="rounded-[28px] border border-slate-200 bg-white/90 p-6 shadow-sm dark:border-slate-800 dark:bg-slate-950/70" onSubmit={onImportRun}>
+          <form className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-950" onSubmit={onImportRun}>
             <div className="grid gap-6 md:grid-cols-2">
               <div className="md:col-span-2">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Step 1</p>
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Step 1</p>
                 <h2 className="mt-2 text-2xl font-semibold tracking-tight">Run details</h2>
               </div>
 
@@ -316,8 +425,8 @@ export function ProjectImportPage() {
 
               <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/80">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Preferred artifact</p>
-                <p className="mt-2 text-sm font-semibold">Compact JSON or gzip variant</p>
-                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">Use the collector default output when possible for the most direct import path.</p>
+                <p className="mt-2 text-sm font-semibold">Streaming NDJSON or compressed NDJSON</p>
+                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">Use the collector's `.ndjson` / `.ndjson.gz` default for large scans. Compact `.json` is a compatibility format limited to 50 MiB.</p>
               </div>
 
               <label className="md:col-span-2 text-sm font-medium text-slate-700 dark:text-slate-300">
@@ -331,12 +440,12 @@ export function ProjectImportPage() {
               </label>
 
               <div className="md:col-span-2 border-t border-slate-200 pt-6 dark:border-slate-800">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Step 2</p>
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Step 2</p>
                 <h2 className="mt-2 text-2xl font-semibold tracking-tight">Artifact preflight</h2>
               </div>
 
               <label
-                className={`md:col-span-2 flex min-h-[180px] cursor-pointer flex-col items-center justify-center rounded-[28px] border-2 border-dashed px-6 py-8 text-center transition ${
+                className={`md:col-span-2 flex min-h-[150px] cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed px-6 py-6 text-center transition ${
                   dragActive
                     ? "border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20"
                     : "border-slate-300 bg-slate-50/70 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900/40 dark:hover:bg-slate-900/70"
@@ -357,14 +466,14 @@ export function ProjectImportPage() {
                 <input
                   className="sr-only"
                   type="file"
-                  accept=".json,.json.gz,.ndjson,.jsonl,.ndjson.gz,.jsonl.gz,.gz,application/json,application/x-ndjson,application/gzip"
+                  accept=".json,.json.gz,.ndjson,.jsonl,.ndjson.gz,.jsonl.gz"
                   onChange={(event) => handleFileSelection(event.target.files?.[0] || null)}
                   required
                 />
-                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Drop zone</p>
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Drop zone</p>
                 <p className="mt-2 text-lg font-semibold">{dragActive ? "Release to attach the artifact" : "Drag a collector artifact here or click to browse"}</p>
                 <p className="mt-2 max-w-xl text-sm text-slate-600 dark:text-slate-300">
-                  Accepted: `.json`, `.json.gz`, `.ndjson`, `.jsonl`, and gzip variants.
+                  Accepted: `.json`, `.json.gz`, `.ndjson`, `.ndjson.gz`, `.jsonl`, and `.jsonl.gz`.
                 </p>
               </label>
 
@@ -392,7 +501,7 @@ export function ProjectImportPage() {
               ) : null}
 
               <div className="md:col-span-2 border-t border-slate-200 pt-6 dark:border-slate-800">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Step 3</p>
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Step 3</p>
                 <h2 className="mt-2 text-2xl font-semibold tracking-tight">Create run and upload</h2>
                 <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
                   The run is created first, the artifact upload follows, and the app lands you in the run explorer as ingest begins.
@@ -407,6 +516,15 @@ export function ProjectImportPage() {
                 >
                   {importing ? "Uploading artifact..." : "Create run and upload"}
                 </button>
+                {uploadStage === "uploading" ? (
+                  <button
+                    className="rounded-lg border border-rose-300 px-4 py-2.5 text-sm font-semibold text-rose-700 transition hover:bg-rose-50 dark:border-rose-800 dark:text-rose-200 dark:hover:bg-rose-900/20"
+                    onClick={cancelUpload}
+                    type="button"
+                  >
+                    Cancel upload
+                  </button>
+                ) : null}
                 {projectRoleStatus === "loading" ? (
                   <p className="text-sm text-slate-500 dark:text-slate-400">Checking project access before enabling upload.</p>
                 ) : null}

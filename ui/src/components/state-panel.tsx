@@ -17,9 +17,9 @@ type StatePanelProps = {
 
 export function StatePanel({ title, description, tone = "neutral", actions }: StatePanelProps) {
   return (
-    <div className={`rounded-3xl border border-dashed px-6 py-8 text-center ${PANEL_CLASSES[tone]}`}>
-      <p className="text-sm font-semibold uppercase tracking-[0.18em]">{title}</p>
-      <p className="mt-3 text-sm">{description}</p>
+    <div className={`rounded-lg border border-dashed px-6 py-8 text-center ${PANEL_CLASSES[tone]}`}>
+      <p className="text-sm font-semibold">{title}</p>
+      <p className="mt-2 text-sm">{description}</p>
       {actions ? <div className="mt-4 flex justify-center">{actions}</div> : null}
     </div>
   );

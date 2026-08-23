@@ -15,6 +15,8 @@ The project follows a simple release-first workflow:
 - GHCR publication for API, worker, UI, and collector images after full CI or release verification, including exact commit/release tags, vulnerability scans, provenance, and SBOM attestations.
 - A containerized collector with NFS tooling and an unprivileged runtime.
 - `docker-compose.dev.yml` for local source builds and a root-level `bootstrap.sh` that generates and validates development or production environment files.
+- A compact enterprise inventory workspace with URL-backed filters, saved views, configurable columns and density, value include/exclude actions, keyboard shortcuts, clearer partial-ingest state, and optional file size/modified-time columns.
+- Collector progress, verbosity and quiet modes, truthful processed/remaining counters, bounded upload retries, interruption-safe partial artifacts, and streaming schema-v1 NDJSON output for large scans.
 
 ### Changed
 
@@ -25,6 +27,12 @@ The project follows a simple release-first workflow:
 - CI now pulls the promoted `latest` image set, verifies its revision labels, and runs a clean production Compose smoke test against the published artifacts.
 - Fixed SMB authentication identity handling for `DOMAIN\user`, `DOMAIN/user`, UPN, explicit-domain, and local-account forms; conflicting modes now fail early and Kerberos correctly receives configured NTLM hashes.
 - Python application images now install available Debian security updates during builds so rebuilt releases do not retain fixed vulnerabilities from an older base-image snapshot.
+- Redis calls now have bounded connect/read budgets, rate-limit increments attach expirations atomically, and long-running Compose services restart after unexpected exits.
+- Ingest now treats Postgres as authoritative when stale queue messages reference replaced uploads, terminalizes unexpected poison failures, and retains collected file size and modification time metadata.
+- Artifact upload now streams first-party raw bodies without holding a database transaction, uses immutable per-attempt keys, rechecks run state before commit, and preserves durable Postgres recovery when Redis handoff is unavailable.
+- Worker retries now expose scheduled activity and bounded backoff, resume without downgrading existing share access, reject oversized or invalidly encoded records, and derive final counts from persisted inventory.
+- Database passwords are passed through libpq rather than embedded in URLs, so URL-reserved characters render safely in Compose.
+- The UI runtime now runs as UID/GID `10001:10001`; Python linting is enforced in both main-branch and tag-release workflows.
 
 ## [0.2.0] - 2026-07-16
 

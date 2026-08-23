@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 
+import { boundedFetch, responseErrorMessage } from "@/lib/bounded-fetch";
 import { API_BASE, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "@/lib/runtime-config";
 
 export type SessionUser = {
@@ -14,14 +15,15 @@ export type SessionUser = {
 };
 
 export type SessionSnapshot = {
-  status: "unknown" | "authenticated" | "anonymous";
+  status: "unknown" | "authenticated" | "anonymous" | "error";
   user: SessionUser | null;
+  error: string | null;
 };
 
 type Listener = () => void;
 
 const listeners = new Set<Listener>();
-let snapshot: SessionSnapshot = { status: "unknown", user: null };
+let snapshot: SessionSnapshot = { status: "unknown", user: null, error: null };
 let bootstrapPromise: Promise<SessionSnapshot> | null = null;
 let refreshPromise: Promise<boolean> | null = null;
 
@@ -52,8 +54,9 @@ function getCookieValue(name: string): string | null {
 }
 
 async function fetchCurrentUser(): Promise<SessionUser | null> {
-  const response = await fetch(`${API_BASE}/auth/me`, { credentials: "include" });
-  if (!response.ok) return null;
+  const response = await boundedFetch(`${API_BASE}/auth/me`, { credentials: "include" });
+  if (response.status === 401 || response.status === 403) return null;
+  if (!response.ok) throw new Error(await responseErrorMessage(response));
   return (await response.json()) as SessionUser;
 }
 
@@ -64,12 +67,14 @@ async function refreshSessionOnce(): Promise<boolean> {
     headers.set(CSRF_HEADER_NAME, csrfToken);
   }
 
-  const response = await fetch(`${API_BASE}/auth/refresh`, {
+  const response = await boundedFetch(`${API_BASE}/auth/refresh`, {
     method: "POST",
     credentials: "include",
     headers,
   });
-  return response.ok;
+  if (response.status === 401 || response.status === 403) return false;
+  if (!response.ok) throw new Error(await responseErrorMessage(response));
+  return true;
 }
 
 export async function refreshSession(): Promise<boolean> {
@@ -99,8 +104,8 @@ export async function bootstrapSession(): Promise<SessionSnapshot> {
       } else {
         markSessionAnonymous();
       }
-    } catch {
-      markSessionAnonymous();
+    } catch (error) {
+      markSessionError(error instanceof Error ? error.message : "The session service is unavailable.");
     }
     return snapshot;
   })().finally(() => {
@@ -116,13 +121,32 @@ export function useSession(): SessionSnapshot {
 }
 
 export function markSessionAuthenticated(user: SessionUser): void {
-  emit({ status: "authenticated", user });
+  emit({ status: "authenticated", user, error: null });
 }
 
 export function markSessionAnonymous(): void {
-  emit({ status: "anonymous", user: null });
+  emit({ status: "anonymous", user: null, error: null });
+}
+
+export function markSessionError(message: string): void {
+  emit({ status: "error", user: null, error: message });
+}
+
+export async function logoutSession(): Promise<void> {
+  const headers = new Headers();
+  const csrfToken = getCookieValue(CSRF_COOKIE_NAME);
+  if (csrfToken) {
+    headers.set(CSRF_HEADER_NAME, csrfToken);
+  }
+  const response = await boundedFetch(`${API_BASE}/auth/logout`, {
+    method: "POST",
+    credentials: "include",
+    headers,
+  });
+  if (response.ok || response.status === 401) return;
+  throw new Error(await responseErrorMessage(response));
 }
 
 export function resetSession(): void {
-  emit({ status: "unknown", user: null });
+  emit({ status: "unknown", user: null, error: null });
 }

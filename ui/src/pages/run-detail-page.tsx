@@ -1,14 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
+import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
 import { useSession } from "@/lib/auth";
+import { copyText } from "@/lib/clipboard";
 
 type RunProgress = {
   line_offset?: number;
   last_error?: string;
+  attempt_count?: number;
+  next_retry_at?: string;
   [key: string]: unknown;
 };
 
@@ -19,6 +22,8 @@ type RunInfo = {
   status: string;
   created_at: string;
   artifact_size: number | null;
+  artifact_sha256: string | null;
+  artifact_content_type: string | null;
   target_scope: Record<string, unknown>;
   ingest_progress: RunProgress;
   summary: { endpoints?: number; resources?: number; items?: number; errors?: number };
@@ -38,7 +43,7 @@ type Endpoint = {
   smb_signing: string | null;
 };
 type Resource = { id: number; name: string; access_level: string; remark: string | null; share_type: string };
-type Item = { id: number; path: string; is_dir: boolean; resource_id?: number; name?: string };
+type Item = { id: number; path: string; is_dir: boolean; resource_id?: number; name?: string; size_bytes?: number | null; mtime?: string | null };
 type SavedQuery = { id: string; label: string; q: string; ext: string };
 type RunDiffShare = {
   endpoint_key: string;
@@ -89,6 +94,7 @@ type RunActivityEvent = {
   metadata: Record<string, unknown>;
 };
 type RunDetailTab = "overview" | "issues" | "diff" | "explore" | "search";
+const RUN_DETAIL_TABS: RunDetailTab[] = ["overview", "issues", "diff", "explore", "search"];
 
 const RUN_STATUS_COLORS: Record<string, string> = {
   PENDING_UPLOAD: "bg-slate-200 text-slate-900 dark:bg-slate-800 dark:text-slate-200",
@@ -142,6 +148,10 @@ function formatBytes(value: number | null | undefined): string {
   return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 function activityTitle(action: string): string {
   switch (action) {
     case "RUN_CREATED":
@@ -154,6 +164,8 @@ function activityTitle(action: string): string {
       return "Ingest queued via fallback";
     case "INGEST_STARTED":
       return "Worker started ingest";
+    case "INGEST_RETRY_SCHEDULED":
+      return "Ingest retry scheduled";
     case "INGEST_COMPLETED":
       return "Worker completed ingest";
     case "INGEST_FAILED":
@@ -186,6 +198,15 @@ function activityDetail(event: RunActivityEvent): string {
     return typeof event.metadata.error === "string" ? event.metadata.error : "The worker reported a failure.";
   }
 
+  if (event.action === "INGEST_RETRY_SCHEDULED") {
+    const attempt = Number(event.metadata.attempt_count || 0);
+    const nextRetryAt = typeof event.metadata.next_retry_at === "string" ? event.metadata.next_retry_at : null;
+    const error = typeof event.metadata.error === "string" ? event.metadata.error : "The previous ingest attempt failed.";
+    const parsedRetry = nextRetryAt ? new Date(nextRetryAt) : null;
+    const retryLabel = parsedRetry && !Number.isNaN(parsedRetry.getTime()) ? parsedRetry.toLocaleString() : "the scheduled retry time";
+    return `${error} Retry attempt ${Math.max(1, attempt + 1)} is scheduled for ${retryLabel}.`;
+  }
+
   if (event.action === "INGEST_QUEUED" || event.action === "INGEST_QUEUE_FALLBACK") {
     return "The artifact has been handed off to the background worker queue.";
   }
@@ -214,6 +235,10 @@ function describeRunStatus(run: RunInfo | null) {
   const lineOffset = parseLineOffset(run.ingest_progress);
   const issueCount = run.summary?.errors || 0;
   const lastError = typeof run.ingest_progress?.last_error === "string" ? run.ingest_progress.last_error : null;
+  const attemptCount = Math.max(0, Number(run.ingest_progress?.attempt_count || 0));
+  const nextRetryAt = typeof run.ingest_progress?.next_retry_at === "string" ? run.ingest_progress.next_retry_at : null;
+  const parsedRetryAt = nextRetryAt ? new Date(nextRetryAt) : null;
+  const retryAtLabel = parsedRetryAt && !Number.isNaN(parsedRetryAt.getTime()) ? parsedRetryAt.toLocaleString() : null;
 
   if (run.status === "PENDING_UPLOAD") {
     return {
@@ -229,6 +254,18 @@ function describeRunStatus(run: RunInfo | null) {
   }
 
   if (run.status === "UPLOADED") {
+    if (attemptCount > 0 || nextRetryAt || lastError) {
+      return {
+        headline: "Ingest retry scheduled",
+        detail: `${lastError || "The previous ingest attempt did not complete."} ${retryAtLabel ? `The next attempt is scheduled for ${retryAtLabel}.` : "The worker will retry when the recovery schedule permits."}`,
+        progressTone: "bg-amber-500",
+        progressWidth: "44%",
+        animate: true,
+        metaLabel: "Retry",
+        metaValue: `Attempt ${attemptCount + 1}${retryAtLabel ? ` · ${retryAtLabel}` : " pending"}`,
+        lastError,
+      };
+    }
     return {
       headline: "Artifact queued for worker pickup",
       detail: "Upload finished. The worker has not started parsing the artifact yet.",
@@ -345,6 +382,8 @@ export function RunDetailPage() {
   const [activityEvents, setActivityEvents] = useState<RunActivityEvent[]>([]);
   const [activityLoading, setActivityLoading] = useState(false);
   const [activityError, setActivityError] = useState<string | null>(null);
+  const [artifactCopyStatus, setArtifactCopyStatus] = useState<string | null>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   const savedQueriesKey = useMemo(() => {
     const userId = session.user?.id || "anonymous";
@@ -375,21 +414,36 @@ export function RunDetailPage() {
 
   useEffect(() => {
     if (!projectId || !runId) return;
-    apiFetch(`/projects/${projectId}/runs/${runId}`)
-      .then((data) => setRun(data as RunInfo))
-      .catch((err) => setError(err.message));
-  }, [projectId, runId]);
+    const controller = new AbortController();
+    setRun(null);
+    setError(null);
+    apiFetch(`/projects/${projectId}/runs/${runId}`, { signal: controller.signal })
+      .then((data) => {
+        if (!controller.signal.aborted) setRun(data as RunInfo);
+      })
+      .catch((err) => {
+        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+      });
+    return () => controller.abort();
+  }, [projectId, reloadNonce, runId]);
 
   useEffect(() => {
     if (!projectId) return;
+    const controller = new AbortController();
+    setProjectRuns([]);
     apiFetchAllPages<RunCompareOption>((cursor) => {
       const query = new URLSearchParams({ limit: "200" });
       if (cursor) query.set("cursor", cursor);
       return `/projects/${projectId}/runs?${query.toString()}`;
-    })
-      .then((data) => setProjectRuns(data))
-      .catch((err) => setError(err.message));
-  }, [projectId]);
+    }, { signal: controller.signal })
+      .then((data) => {
+        if (!controller.signal.aborted) setProjectRuns(data);
+      })
+      .catch((err) => {
+        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+      });
+    return () => controller.abort();
+  }, [projectId, reloadNonce]);
 
   const baselineOptions = useMemo(() => {
     if (!runId) return [];
@@ -415,39 +469,92 @@ export function RunDetailPage() {
     setSelectedIssueId(null);
     setActivityEvents([]);
     setActivityError(null);
+    setArtifactCopyStatus(null);
+    setEndpointSearch("");
+    setItemSearch("");
+    setPathPrefix("");
+    setGlobalQuery("");
+    setGlobalExt("");
+    setEndpoints([]);
+    setResources([]);
+    setItems([]);
+    setGlobalItems([]);
+    setSelectedEndpoint(null);
+    setSelectedResource(null);
+    setEndpointCursor(null);
+    setEndpointHistory([]);
+    setEndpointNext(null);
+    setItemCursor(null);
+    setItemHistory([]);
+    setItemNext(null);
+    setGlobalCursor(null);
+    setGlobalHistory([]);
+    setGlobalNext(null);
     setActiveTab("overview");
-  }, [runId]);
+  }, [projectId, runId]);
 
   useEffect(() => {
     if (!projectId || !runId) return;
+    const controller = new AbortController();
     setDiffLoading(true);
     setDiffError(null);
+    setRunDiff(null);
     const query = new URLSearchParams();
     if (selectedBaselineRunId) query.set("baseline_run_id", selectedBaselineRunId);
     const suffix = query.toString() ? `?${query.toString()}` : "";
 
-    apiFetch(`/projects/${projectId}/runs/${runId}/diff${suffix}`)
+    apiFetch(`/projects/${projectId}/runs/${runId}/diff${suffix}`, { signal: controller.signal })
       .then((data) => {
+        if (controller.signal.aborted) return;
         const payload = data as RunDiffResult;
         setRunDiff(payload);
         if (!selectedBaselineRunId && payload.baseline_run?.id) {
           setSelectedBaselineRunId(payload.baseline_run.id);
         }
       })
-      .catch((err) => setDiffError(err.message))
-      .finally(() => setDiffLoading(false));
-  }, [projectId, runId, selectedBaselineRunId]);
+      .catch((err) => {
+        if (!controller.signal.aborted && !isAbortError(err)) setDiffError(err.message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDiffLoading(false);
+      });
+    return () => controller.abort();
+  }, [projectId, reloadNonce, runId, selectedBaselineRunId]);
+
+  const shouldPollRun = run?.status === "UPLOADED" || run?.status === "INGESTING";
 
   useEffect(() => {
-    if (!projectId || !runId || !run) return;
-    if (run.status !== "UPLOADED" && run.status !== "INGESTING") return;
-    const timer = window.setInterval(() => {
-      apiFetch(`/projects/${projectId}/runs/${runId}`)
-        .then((data) => setRun(data as RunInfo))
-        .catch(() => undefined);
+    if (!projectId || !runId || !shouldPollRun) return;
+    let stopped = false;
+    let timer: number | null = null;
+    let refreshController: AbortController | null = null;
+
+    const poll = async () => {
+      const tickController = new AbortController();
+      refreshController = tickController;
+      try {
+        const data = await apiFetch(`/projects/${projectId}/runs/${runId}`, { signal: tickController.signal });
+        if (!stopped && !tickController.signal.aborted) setRun(data as RunInfo);
+      } catch (err) {
+        if (!stopped && !tickController.signal.aborted && !isAbortError(err)) {
+          setError(`Live run refresh is delayed; showing the last confirmed state. ${err instanceof Error ? err.message : "Retry when the API is available."}`);
+        }
+      }
+      if (stopped || tickController.signal.aborted) return;
+      timer = window.setTimeout(() => {
+        void poll();
+      }, 4000);
+    };
+
+    timer = window.setTimeout(() => {
+      void poll();
     }, 4000);
-    return () => window.clearInterval(timer);
-  }, [projectId, runId, run]);
+    return () => {
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+      refreshController?.abort();
+    };
+  }, [projectId, reloadNonce, runId, shouldPollRun]);
 
   useEffect(() => {
     setIssueCursor(null);
@@ -469,10 +576,14 @@ export function RunDetailPage() {
     if (issueSeverity !== "all") query.set("severity", issueSeverity);
     if (issueCursor) query.set("cursor", issueCursor);
 
+    const controller = new AbortController();
     setIssuesLoading(true);
     setIssuesError(null);
-    apiFetch(`/projects/${projectId}/runs/${runId}/errors?${query.toString()}`)
+    setIssues([]);
+    setSelectedIssueId(null);
+    apiFetch(`/projects/${projectId}/runs/${runId}/errors?${query.toString()}`, { signal: controller.signal })
       .then((data) => {
+        if (controller.signal.aborted) return;
         const rows = (data?.items || []) as RunIssue[];
         setIssues(rows);
         setIssueNext((data?.next_cursor as string | null) || null);
@@ -483,19 +594,33 @@ export function RunDetailPage() {
           return rows[0]?.id || null;
         });
       })
-      .catch((err) => setIssuesError(err.message))
-      .finally(() => setIssuesLoading(false));
-  }, [projectId, runId, issueSearch, issueSeverity, issueCursor, activeTab, run?.summary?.errors, run?.status]);
+      .catch((err) => {
+        if (!controller.signal.aborted && !isAbortError(err)) setIssuesError(err.message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setIssuesLoading(false);
+      });
+    return () => controller.abort();
+  }, [projectId, reloadNonce, runId, issueSearch, issueSeverity, issueCursor, activeTab, run?.summary?.errors, run?.status]);
 
   useEffect(() => {
     if (!projectId || !runId) return;
+    const controller = new AbortController();
     setActivityLoading(true);
     setActivityError(null);
-    apiFetch(`/projects/${projectId}/runs/${runId}/activity?limit=12`)
-      .then((data) => setActivityEvents((data?.items || []) as RunActivityEvent[]))
-      .catch((err) => setActivityError(err.message))
-      .finally(() => setActivityLoading(false));
-  }, [projectId, runId, run?.status, run?.summary?.errors]);
+    setActivityEvents([]);
+    apiFetch(`/projects/${projectId}/runs/${runId}/activity?limit=12`, { signal: controller.signal })
+      .then((data) => {
+        if (!controller.signal.aborted) setActivityEvents((data?.items || []) as RunActivityEvent[]);
+      })
+      .catch((err) => {
+        if (!controller.signal.aborted && !isAbortError(err)) setActivityError(err.message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setActivityLoading(false);
+      });
+    return () => controller.abort();
+  }, [projectId, reloadNonce, runId, run?.status, run?.summary?.errors]);
 
   useEffect(() => {
     setEndpointCursor(null);
@@ -507,8 +632,12 @@ export function RunDetailPage() {
     const query = new URLSearchParams({ limit: "100", search: endpointSearch });
     if (endpointCursor) query.set("cursor", endpointCursor);
 
-    apiFetch(`/projects/${projectId}/runs/${runId}/endpoints?${query.toString()}`)
+    const controller = new AbortController();
+    setEndpoints([]);
+    setSelectedEndpoint(null);
+    apiFetch(`/projects/${projectId}/runs/${runId}/endpoints?${query.toString()}`, { signal: controller.signal })
       .then((data) => {
+        if (controller.signal.aborted) return;
         const rows = (data?.items || []) as Endpoint[];
         setEndpoints(rows);
         setEndpointNext((data?.next_cursor as string | null) || null);
@@ -519,8 +648,11 @@ export function RunDetailPage() {
           return rows[0]?.id || null;
         });
       })
-      .catch((err) => setError(err.message));
-  }, [projectId, runId, endpointSearch, endpointCursor]);
+      .catch((err) => {
+        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+      });
+    return () => controller.abort();
+  }, [projectId, reloadNonce, runId, endpointSearch, endpointCursor]);
 
   useEffect(() => {
     if (!projectId || !runId || !selectedEndpoint) {
@@ -529,8 +661,12 @@ export function RunDetailPage() {
       return;
     }
 
-    apiFetch(`/projects/${projectId}/runs/${runId}/endpoints/${selectedEndpoint}/resources`)
+    const controller = new AbortController();
+    setResources([]);
+    setSelectedResource(null);
+    apiFetch(`/projects/${projectId}/runs/${runId}/endpoints/${selectedEndpoint}/resources`, { signal: controller.signal })
       .then((data) => {
+        if (controller.signal.aborted) return;
         const rows = (data?.items || []) as Resource[];
         setResources(rows);
         setSelectedResource((current) => {
@@ -540,8 +676,11 @@ export function RunDetailPage() {
           return rows[0]?.id || null;
         });
       })
-      .catch((err) => setError(err.message));
-  }, [projectId, runId, selectedEndpoint]);
+      .catch((err) => {
+        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+      });
+    return () => controller.abort();
+  }, [projectId, reloadNonce, runId, selectedEndpoint]);
 
   useEffect(() => {
     setItemCursor(null);
@@ -559,13 +698,20 @@ export function RunDetailPage() {
     if (pathPrefix.trim()) query.set("path_prefix", pathPrefix.trim());
     if (itemCursor) query.set("cursor", itemCursor);
 
-    apiFetch(`/projects/${projectId}/runs/${runId}/resources/${selectedResource}/items?${query.toString()}`)
+    const controller = new AbortController();
+    setItems([]);
+    setItemNext(null);
+    apiFetch(`/projects/${projectId}/runs/${runId}/resources/${selectedResource}/items?${query.toString()}`, { signal: controller.signal })
       .then((data) => {
+        if (controller.signal.aborted) return;
         setItems((data?.items || []) as Item[]);
         setItemNext((data?.next_cursor as string | null) || null);
       })
-      .catch((err) => setError(err.message));
-  }, [projectId, runId, selectedResource, itemSearch, pathPrefix, itemCursor]);
+      .catch((err) => {
+        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+      });
+    return () => controller.abort();
+  }, [projectId, reloadNonce, runId, selectedResource, itemSearch, pathPrefix, itemCursor]);
 
   useEffect(() => {
     setGlobalCursor(null);
@@ -578,13 +724,20 @@ export function RunDetailPage() {
     if (globalExt) query.set("ext", globalExt);
     if (globalCursor) query.set("cursor", globalCursor);
 
-    apiFetch(`/projects/${projectId}/runs/${runId}/search/items?${query.toString()}`)
+    const controller = new AbortController();
+    setGlobalItems([]);
+    setGlobalNext(null);
+    apiFetch(`/projects/${projectId}/runs/${runId}/search/items?${query.toString()}`, { signal: controller.signal })
       .then((data) => {
+        if (controller.signal.aborted) return;
         setGlobalItems((data?.items || []) as Item[]);
         setGlobalNext((data?.next_cursor as string | null) || null);
       })
-      .catch((err) => setError(err.message));
-  }, [projectId, runId, globalQuery, globalExt, globalCursor]);
+      .catch((err) => {
+        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+      });
+    return () => controller.abort();
+  }, [projectId, reloadNonce, runId, globalQuery, globalExt, globalCursor]);
 
   function moveCursor(
     next: string | null,
@@ -629,6 +782,16 @@ export function RunDetailPage() {
     persistSavedQueries(savedQueries.filter((query) => query.id !== id));
   }
 
+  async function copyArtifactSha256() {
+    if (!run?.artifact_sha256) return;
+    try {
+      await copyText(run.artifact_sha256);
+      setArtifactCopyStatus("SHA-256 copied");
+    } catch {
+      setArtifactCopyStatus("Copy failed; select the hash manually.");
+    }
+  }
+
   function openIssueInSearch(issue: RunIssue) {
     setGlobalQuery(issue.path || issue.resource_name || issue.endpoint_key || issue.code);
     setGlobalExt("");
@@ -638,6 +801,28 @@ export function RunDetailPage() {
   function focusIssueEndpoint(issue: RunIssue) {
     setEndpointSearch(issue.endpoint_key || "");
     setActiveTab("explore");
+  }
+
+  function retryRunData() {
+    setError(null);
+    setDiffError(null);
+    setIssuesError(null);
+    setActivityError(null);
+    setReloadNonce((current) => current + 1);
+  }
+
+  function handleTabKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, tab: RunDetailTab) {
+    const currentIndex = RUN_DETAIL_TABS.indexOf(tab);
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % RUN_DETAIL_TABS.length;
+    if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + RUN_DETAIL_TABS.length) % RUN_DETAIL_TABS.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = RUN_DETAIL_TABS.length - 1;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const nextTab = RUN_DETAIL_TABS[nextIndex];
+    setActiveTab(nextTab);
+    document.getElementById(`run-tab-${nextTab}`)?.focus();
   }
 
   function formatScopeValue(value: unknown): string {
@@ -669,9 +854,9 @@ export function RunDetailPage() {
     <section className="workspace">
       <div className="workspace-header gap-4">
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.45fr)_360px]">
-          <div className="rounded-[28px] border border-slate-200 bg-[linear-gradient(135deg,rgba(255,255,255,0.98),rgba(226,232,240,0.88))] p-5 shadow-sm dark:border-slate-800 dark:bg-[linear-gradient(135deg,rgba(15,23,42,0.96),rgba(15,23,42,0.8))]">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Run Explorer</p>
-            <h1 className="mt-2 text-3xl font-bold tracking-tight">{run?.name || "Run Explorer"}</h1>
+          <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Run explorer</p>
+            <h1 className="mt-1 text-2xl font-semibold tracking-tight">{run?.name || "Run explorer"}</h1>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">Run ID: {runId}</p>
             {run?.description ? <p className="mt-3 max-w-3xl text-sm text-slate-600 dark:text-slate-300">{run.description}</p> : null}
             <div className="mt-4 flex flex-wrap gap-2">
@@ -701,8 +886,8 @@ export function RunDetailPage() {
             ) : null}
           </div>
 
-          <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Run Status</p>
+          <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Run status</p>
             {run ? (
               <>
                 <div className="mt-2 flex items-center gap-3">
@@ -762,31 +947,41 @@ export function RunDetailPage() {
           </div>
         </div>
 
-        <div className="grid gap-3 lg:grid-cols-5">
-          {(["overview", "issues", "diff", "explore", "search"] as RunDetailTab[]).map((tab) => (
+        <div aria-label="Run explorer sections" className="run-detail-tabs" role="tablist">
+          {RUN_DETAIL_TABS.map((tab) => (
             <button
-              className={`rounded-3xl border p-4 text-left transition ${
+              aria-controls={`run-panel-${tab}`}
+              aria-selected={activeTab === tab}
+              className={`rounded-md border px-3 py-2 text-sm font-semibold transition ${
                 activeTab === tab
-                  ? "border-emerald-600 bg-emerald-50 dark:bg-emerald-900/20"
-                  : "border-slate-300 bg-white/80 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950/40 dark:hover:bg-slate-900/80"
+                  ? "border-emerald-600 bg-emerald-50 text-emerald-900 dark:bg-emerald-900/20 dark:text-emerald-100"
+                  : "border-transparent text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
               }`}
+              id={`run-tab-${tab}`}
               key={tab}
               onClick={() => setActiveTab(tab)}
+              onKeyDown={(event) => handleTabKeyDown(event, tab)}
+              role="tab"
+              tabIndex={activeTab === tab ? 0 : -1}
               type="button"
             >
-              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">{RUN_DETAIL_TAB_COPY[tab].label}</p>
-              <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{RUN_DETAIL_TAB_COPY[tab].description}</p>
+              {RUN_DETAIL_TAB_COPY[tab].label}
+              {tab === "issues" && (run?.summary?.errors || 0) > 0 ? <span className="ml-2 rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] text-rose-700 dark:bg-rose-900/40 dark:text-rose-200">{run?.summary?.errors}</span> : null}
             </button>
           ))}
         </div>
+        <p className="text-xs text-slate-500 dark:text-slate-400">{RUN_DETAIL_TAB_COPY[activeTab].description}</p>
 
         {error ? (
-          <p className="rounded-2xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/20 dark:text-rose-200">{error}</p>
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/20 dark:text-rose-200" role="alert">
+            <span>{error}</span>
+            <button className="rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">Retry run data</button>
+          </div>
         ) : null}
       </div>
 
       {activeTab === "overview" ? (
-        <div className="workspace-section space-y-4">
+        <div aria-labelledby="run-tab-overview" className="workspace-section space-y-4" id="run-panel-overview" role="tabpanel" tabIndex={0}>
           <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_360px]">
             <div className="workspace-card space-y-4">
               <div>
@@ -912,15 +1107,25 @@ export function RunDetailPage() {
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
                   <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Artifact size</p>
-                  <p className="mt-1 text-sm font-semibold">
-                    {run?.artifact_size ? `${(run.artifact_size / (1024 * 1024)).toFixed(run.artifact_size < 1024 * 1024 ? 2 : 1)} MB` : "Not uploaded"}
-                  </p>
+                  <p className="mt-1 text-sm font-semibold">{run?.artifact_size ? formatBytes(run.artifact_size) : "Not uploaded"}</p>
                 </div>
                 <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
                   <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Worker checkpoint</p>
                   <p className="mt-1 text-sm font-semibold">
                     {parseLineOffset(run?.ingest_progress) > 0 ? `Line ${parseLineOffset(run?.ingest_progress).toLocaleString()}` : "No checkpoint yet"}
                   </p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Content type</p>
+                  <p className="mt-1 truncate text-sm font-semibold" title={run?.artifact_content_type || undefined}>{run?.artifact_content_type || "Not recorded"}</p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Artifact SHA-256</p>
+                    {run?.artifact_sha256 ? <button className="rounded border border-slate-300 px-2 py-1 text-[10px] font-semibold hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800" onClick={copyArtifactSha256} type="button">Copy</button> : null}
+                  </div>
+                  <code className="mt-1 block truncate font-mono text-xs" title={run?.artifact_sha256 || undefined}>{run?.artifact_sha256 || "Not recorded"}</code>
+                  {artifactCopyStatus ? <p aria-live="polite" className="mt-1 text-xs text-slate-500">{artifactCopyStatus}</p> : null}
                 </div>
               </div>
               {diffLoading ? <p className="text-sm text-slate-500">Loading baseline comparison.</p> : null}
@@ -979,7 +1184,7 @@ export function RunDetailPage() {
       ) : null}
 
       {activeTab === "issues" ? (
-        <div className="workspace-section grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
+        <div aria-labelledby="run-tab-issues" className="workspace-section grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]" id="run-panel-issues" role="tabpanel" tabIndex={0}>
           <div className="workspace-card">
             <div>
               <h2 className="text-lg font-semibold">Issue Log</h2>
@@ -1035,6 +1240,7 @@ export function RunDetailPage() {
               <div className="mt-4">
                 <StatusBanner tone="error" title="Issue Log Unavailable">
                   <p>{issuesError}</p>
+                  <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">Retry issue log</button>
                 </StatusBanner>
               </div>
             ) : null}
@@ -1168,7 +1374,7 @@ export function RunDetailPage() {
       ) : null}
 
       {activeTab === "diff" ? (
-        <div className="workspace-section space-y-4">
+        <div aria-labelledby="run-tab-diff" className="workspace-section space-y-4" id="run-panel-diff" role="tabpanel" tabIndex={0}>
           <div className="workspace-card">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
@@ -1330,7 +1536,7 @@ export function RunDetailPage() {
       ) : null}
 
       {activeTab === "explore" ? (
-        <div className="workspace-section grid gap-4 md:grid-cols-3">
+        <div aria-labelledby="run-tab-explore" className="workspace-section grid gap-4 md:grid-cols-3" id="run-panel-explore" role="tabpanel" tabIndex={0}>
           <div className="workspace-card">
             <div className="mb-3 flex items-center justify-between gap-2">
               <div>
@@ -1456,7 +1662,11 @@ export function RunDetailPage() {
               {items.map((item) => (
                 <li key={item.id} className="rounded-2xl border border-slate-300 px-3 py-3 text-xs dark:border-slate-700">
                   <div className="font-mono">{item.path}</div>
-                  <div className="mt-1 text-slate-500">{item.is_dir ? "directory" : "file"}</div>
+                  <div className="mt-1 flex flex-wrap gap-x-3 text-slate-500">
+                    <span>{item.is_dir ? "directory" : "file"}</span>
+                    {!item.is_dir && item.size_bytes != null ? <span>{formatBytes(item.size_bytes)}</span> : null}
+                    {item.mtime ? <span>Modified {new Date(item.mtime).toLocaleString()}</span> : null}
+                  </div>
                 </li>
               ))}
             </ul>
@@ -1465,7 +1675,7 @@ export function RunDetailPage() {
       ) : null}
 
       {activeTab === "search" ? (
-        <div className="workspace-section space-y-4">
+        <div aria-labelledby="run-tab-search" className="workspace-section space-y-4" id="run-panel-search" role="tabpanel" tabIndex={0}>
           <div className="workspace-card">
             <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
               <div>
@@ -1558,7 +1768,11 @@ export function RunDetailPage() {
               {globalItems.map((item) => (
                 <li key={item.id} className="rounded-2xl border border-slate-300 px-3 py-3 text-xs dark:border-slate-700">
                   <div className="font-mono">{item.path}</div>
-                  <div className="mt-1 text-slate-500">resource_id: {item.resource_id ?? "-"}</div>
+                  <div className="mt-1 flex flex-wrap gap-x-3 text-slate-500">
+                    <span>resource_id: {item.resource_id ?? "-"}</span>
+                    {!item.is_dir && item.size_bytes != null ? <span>{formatBytes(item.size_bytes)}</span> : null}
+                    {item.mtime ? <span>Modified {new Date(item.mtime).toLocaleString()}</span> : null}
+                  </div>
                 </li>
               ))}
             </ul>

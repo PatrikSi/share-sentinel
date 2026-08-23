@@ -39,20 +39,12 @@ export function ThemeToggle() {
   }
 
   return (
-    <div className="flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-900 p-1 text-xs">
-      {THEMES.map((entry) => (
-        <button
-          key={entry}
-          onClick={() => updateTheme(entry)}
-          className={`rounded-md px-2 py-1 uppercase tracking-wide transition ${
-            theme === entry
-              ? "bg-emerald-600 text-white"
-              : "text-slate-300 hover:bg-slate-700"
-          }`}
-        >
-          {entry}
-        </button>
-      ))}
-    </div>
+    <label className="app-theme-select">
+      <span className="sr-only">Color theme</span>
+      <span aria-hidden="true">◐</span>
+      <select onChange={(event) => updateTheme(event.target.value as Theme)} value={theme}>
+        {THEMES.map((entry) => <option key={entry} value={entry}>{entry[0].toUpperCase() + entry.slice(1)}</option>)}
+      </select>
+    </label>
   );
 }
