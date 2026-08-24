@@ -89,13 +89,21 @@ jobs:
         run: python scripts/check-release.py --tag "${GITHUB_REF_NAME}"
       - name: Test API
         working-directory: api
-        run: pip install -r requirements-dev.txt && pytest -q -p no:cacheprovider
+        run: |
+          pip install -r requirements-dev.txt
+          # Unit tests exercise configuration defaults and must not inherit the
+          # production-style values used by the Compose smoke tests in this job.
+          env -i HOME="$HOME" PATH="$PATH" python -m pytest -q -p no:cacheprovider
       - name: Test worker
         working-directory: worker
-        run: pip install -r requirements-dev.txt && pytest -q -p no:cacheprovider
+        run: |
+          pip install -r requirements-dev.txt
+          env -i HOME="$HOME" PATH="$PATH" python -m pytest -q -p no:cacheprovider
       - name: Test collector
         working-directory: collector
-        run: pip install -r requirements-dev.txt && pytest -q -p no:cacheprovider
+        run: |
+          pip install -r requirements-dev.txt
+          env -i HOME="$HOME" PATH="$PATH" python -m pytest -q -p no:cacheprovider
       - name: Lint Python
         run: ruff check api worker collector scripts
       - name: Validate shell tooling
