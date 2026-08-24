@@ -13,16 +13,19 @@ Use this checklist before publishing a public release of the current tree. It is
 - [x] Automated tests for API, worker, and collector components
 - [x] Local Docker Compose deployment with bootstrap, API, worker, UI, Postgres, Redis, and gateway services
 - [x] CI with dependency audits, UI production build, production/development Compose validation, all four application image builds, a live ingest, and a production-style security smoke test
-- [x] GHCR publication for `latest`, exact commit, and exact release image tags with high/critical vulnerability scans, provenance, and SBOM attestations
+- [x] GHCR publication for main-branch `latest`, exact commit, and exact release image tags with high/critical vulnerability scans, provenance, and SBOM attestations
 - [x] Tracked synthetic ingest fixture at `examples/sample-artifact.json`
 - [x] Tag-driven source archives and SHA-256 checksums
 
 ## Per-release validation
 
 - [ ] Pick the release commit and tag name
+- [ ] Confirm the release commit completed main CI and all four `sha-<full-commit>` images exist before pushing the tag
 - [ ] Run `./bootstrap.sh` and `docker compose up -d --build` from a clean checkout
 - [ ] Run `./scripts/smoke-routes.sh http://localhost`
+- [ ] Run `./scripts/doctor.sh --url http://localhost` and resolve every failure
 - [ ] Run `./scripts/smoke-ingest.sh http://localhost` with `SHARE_SENTINEL_SMOKE_PASSWORD` set
+- [ ] Generate and ingest a representative streaming capacity artifact using `scripts/generate-capacity-artifact.py`; record host sizing, ingest rate, API latency, and worker memory
 - [ ] Run API tests: `docker compose exec -T api bash -lc "pip install -q -r requirements-dev.txt && pytest -q"`
 - [ ] Run worker tests: `cd worker && pip install -r requirements-dev.txt && pytest -q`
 - [ ] Run collector tests: `cd collector && pip install -r requirements-dev.txt && pytest -q`
@@ -39,6 +42,7 @@ Use this checklist before publishing a public release of the current tree. It is
 - [ ] Set `TRUSTED_HOSTS` and narrow `CORS_ORIGINS` and `TRUSTED_PROXY_CIDRS` to the real deployment topology
 - [ ] Verify deep health and metrics routes are reachable only by sysadmins
 - [ ] Confirm the artifact volume is durable and shared consistently between API and worker
+- [ ] Verify backup restore, worker interruption/recovery, and storage-headroom alerts on the intended production topology
 - [ ] Review audit logs after smoke testing to confirm auth, upload, and ingest events are recorded as expected
 
 ## Open source release checks

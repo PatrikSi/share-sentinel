@@ -8,6 +8,12 @@ This is a practical map of the API surface exposed by the current application. I
 
 Lightweight liveness check.
 
+### `GET /healthz/ready`
+
+Unauthenticated load-balancer readiness check. It returns only generic Postgres,
+Redis, and artifact-storage status and responds with `503` while any required
+dependency is unavailable.
+
 ### `GET /healthz/deep`
 
 Sysadmin-only readiness check for Postgres and Redis.
@@ -179,9 +185,12 @@ Important note:
 
 Compares a run with a baseline run. If no `baseline_run_id` is supplied, the API uses the nearest earlier complete run when possible.
 
-Current caveat:
+Bounds:
 
-- the diff payload is not paginated, so very large churn can produce a large response
+- both current and baseline runs must be `COMPLETE`; partial or failed inputs return `409`
+- `detail_limit` defaults to 500 and is capped at 2000 records per new-share, disappeared-share, and item-churn section
+- aggregate summary counts remain exact and `truncation` identifies any bounded detail sections
+- comparisons above `API_RUN_DIFF_MAX_ITEMS` total items across both runs return `422`; the default is 250000
 
 ### `GET /projects/{project_id}/runs/{run_id}/errors`
 
@@ -197,7 +206,7 @@ Lists endpoints discovered in a run.
 
 ### `GET /projects/{project_id}/runs/{run_id}/endpoints/{endpoint_id}/resources`
 
-Lists shares for one endpoint within the run.
+Lists shares for one endpoint within the run with `limit`, opaque `cursor`, and `next_cursor` keyset pagination.
 
 ### `GET /projects/{project_id}/runs/{run_id}/resources/{resource_id}/items`
 
@@ -214,6 +223,7 @@ Inventory routes work across runs in the current project.
 Important note:
 
 - inventory views can include data from `INGESTING` runs, so results may move until ingest completes
+- explicit `run_ids` scopes accept at most 100 UUIDs; omit the parameter to query every eligible run in the project
 
 ### `GET /projects/{project_id}/inventory/stats`
 

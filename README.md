@@ -125,7 +125,7 @@ For a fuller component and trust-boundary walkthrough, see [docs/architecture.md
 
 - Browser auth uses cookie-backed JWT sessions with CSRF protection.
 - API automation uses hashed, project-scoped API tokens with role and scope checks.
-- `GET /api/healthz` is public, while deep health and Prometheus metrics are sysadmin-only routes.
+- `GET /api/healthz` and the generic dependency readiness route `/api/healthz/ready` are public for load balancers; deep health and Prometheus metrics are sysadmin-only routes.
 - The bundled gateway relies on a read-only host Docker socket mount for Traefik service discovery.
 - Each gateway discovers only containers with its `SHARE_SENTINEL_STACK` label, preventing multiple Share Sentinel deployments on one Docker host from routing into one another.
 - OpenAPI and Swagger docs are intended for development-style environments and are hidden in production-style `APP_ENV` values.
@@ -137,10 +137,12 @@ See the [deployment guide](./docs/deployment.md) for the production configuratio
 
 - Source is released from this repository and is the primary supported distribution format.
 - Verified API, worker, UI, and collector images are published under `ghcr.io/patriksi/share-sentinel-*`.
-- Successful `main` builds publish `latest` and `sha-<full-commit>` tags.
-- Matching `vX.Y.Z` tags publish `latest`, `vX.Y.Z`, and `sha-<full-commit>` images plus source archives and checksums.
+- Every verified `main` commit publishes an immutable `sha-<full-commit>` tag. The run still matching the branch head also advances `latest`; superseded runs deliberately skip that mutable tag.
+- Matching `vX.Y.Z` tags reuse the already verified `sha-<full-commit>` image set, publish `vX.Y.Z`, and add source archives and checksums.
 - When tagged releases exist, expect support to focus on `main` plus the latest tagged release unless a future policy says otherwise.
 - Production deployments should select an exact `vX.Y.Z` or `sha-<full-commit>` tag instead of tracking `latest`.
+
+`latest` is a convenience pointer updated by verified `main` builds. The workflows treat existing `sha-<full-commit>` and `vX.Y.Z` tags as immutable and refuse to replace them with a different runnable image. Because the four components are separate packages, registry tag updates are sequential rather than atomic; use one exact tag across all services as the deployment unit for repeatable or production rollouts.
 
 ## Current limitations
 
@@ -156,6 +158,7 @@ See the [deployment guide](./docs/deployment.md) for the production configuratio
 - [Docs index](./docs/README.md)
 - [Architecture overview](./docs/architecture.md)
 - [Deployment and operations](./docs/deployment.md)
+- [Operations, scale, and recovery](./docs/operations.md)
 - [Security review](./docs/security-review.md)
 - [API reference](./docs/reference/api.md)
 - [Auth and RBAC reference](./docs/reference/auth-rbac.md)

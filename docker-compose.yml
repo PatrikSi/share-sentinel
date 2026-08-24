@@ -1,3 +1,9 @@
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   gateway:
     image: traefik:v3.6.9
@@ -19,6 +25,7 @@ services:
     depends_on:
       - api
       - ui
+    logging: *default-logging
 
   db:
     image: postgres:16.14
@@ -34,6 +41,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    stop_grace_period: 1m
+    logging: *default-logging
 
   redis:
     image: redis:7.4.9
@@ -46,14 +55,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    stop_grace_period: 30s
+    logging: *default-logging
 
   bootstrap:
     image: ghcr.io/patriksi/share-sentinel-api:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
+    init: true
     command: ["sh", "-lc", "alembic upgrade head && python -m app.bootstrap"]
     environment:
       APP_ENV: ${APP_ENV:-development}
       DATABASE_URL: postgresql+psycopg://share_sentinel@db:5432/share_sentinel
+      MIGRATION_DATABASE_CONNECT_TIMEOUT_SECONDS: ${MIGRATION_DATABASE_CONNECT_TIMEOUT_SECONDS:-10}
+      MIGRATION_DATABASE_LOCK_TIMEOUT_MS: ${MIGRATION_DATABASE_LOCK_TIMEOUT_MS:-60000}
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       ARTIFACT_STORAGE_PATH: /artifacts
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
@@ -75,16 +89,27 @@ services:
       db:
         condition: service_healthy
     restart: "no"
+    logging: *default-logging
 
   api:
     image: ghcr.io/patriksi/share-sentinel-api:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
     restart: unless-stopped
+    init: true
+    stop_grace_period: 1m
     environment:
       APP_ENV: ${APP_ENV:-development}
       APP_HOST: ${APP_HOST:-localhost}
       DATABASE_URL: postgresql+psycopg://share_sentinel@db:5432/share_sentinel
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      API_DATABASE_POOL_SIZE: ${API_DATABASE_POOL_SIZE:-10}
+      API_DATABASE_MAX_OVERFLOW: ${API_DATABASE_MAX_OVERFLOW:-20}
+      API_DATABASE_POOL_TIMEOUT_SECONDS: ${API_DATABASE_POOL_TIMEOUT_SECONDS:-10}
+      API_DATABASE_POOL_RECYCLE_SECONDS: ${API_DATABASE_POOL_RECYCLE_SECONDS:-1800}
+      API_DATABASE_CONNECT_TIMEOUT_SECONDS: ${API_DATABASE_CONNECT_TIMEOUT_SECONDS:-5}
+      API_DATABASE_STATEMENT_TIMEOUT_MS: ${API_DATABASE_STATEMENT_TIMEOUT_MS:-30000}
+      API_DATABASE_LOCK_TIMEOUT_MS: ${API_DATABASE_LOCK_TIMEOUT_MS:-5000}
+      API_RUN_DIFF_MAX_ITEMS: ${API_RUN_DIFF_MAX_ITEMS:-250000}
       REDIS_URL: redis://redis:6379/0
       REDIS_CONNECT_TIMEOUT_SECONDS: ${REDIS_CONNECT_TIMEOUT_SECONDS:-3}
       REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-5}
@@ -150,13 +175,19 @@ services:
       - "traefik.http.routers.api.middlewares=api-strip-prefix"
       - "traefik.http.middlewares.api-strip-prefix.stripprefix.prefixes=/api"
       - "traefik.http.services.api.loadbalancer.server.port=8000"
+    logging: *default-logging
 
   worker:
     image: ghcr.io/patriksi/share-sentinel-worker:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
+    init: true
+    stop_grace_period: 3m
     environment:
       DATABASE_URL: postgresql+psycopg://share_sentinel@db:5432/share_sentinel
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS: ${WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS:-5}
+      WORKER_DATABASE_STATEMENT_TIMEOUT_MS: ${WORKER_DATABASE_STATEMENT_TIMEOUT_MS:-120000}
+      WORKER_DATABASE_LOCK_TIMEOUT_MS: ${WORKER_DATABASE_LOCK_TIMEOUT_MS:-15000}
       REDIS_URL: redis://redis:6379/0
       REDIS_CONNECT_TIMEOUT_SECONDS: ${REDIS_CONNECT_TIMEOUT_SECONDS:-3}
       REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-5}
@@ -165,6 +196,11 @@ services:
       WORKER_HEARTBEAT_PATH: /tmp/share-sentinel-worker-heartbeat.json
       WORKER_HEALTH_TIMEOUT_SECONDS: ${WORKER_HEALTH_TIMEOUT_SECONDS:-45}
       INGEST_MAX_RECORD_BYTES: ${INGEST_MAX_RECORD_BYTES:-8388608}
+      INGEST_JSON_COMPAT_MAX_BYTES: ${INGEST_JSON_COMPAT_MAX_BYTES:-52428800}
+      INGEST_GZIP_MAX_BYTES: ${INGEST_GZIP_MAX_BYTES:-10737418240}
+      INGEST_RETRY_JITTER_RATIO: ${INGEST_RETRY_JITTER_RATIO:-0.2}
+      INGEST_MAX_RETRIES: ${INGEST_MAX_RETRIES:-4}
+      INGEST_IDENTITY_CACHE_SIZE: ${INGEST_IDENTITY_CACHE_SIZE:-10000}
     depends_on:
       db:
         condition: service_healthy
@@ -179,11 +215,14 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+    logging: *default-logging
 
   ui:
     image: ghcr.io/patriksi/share-sentinel-ui:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
     environment:
       VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
       VITE_CSRF_COOKIE_NAME: ${VITE_CSRF_COOKIE_NAME:-share_sentinel_csrf}
@@ -203,17 +242,20 @@ services:
       - "traefik.http.routers.ui.entrypoints=web"
       - "traefik.http.routers.ui.priority=1"
       - "traefik.http.services.ui.loadbalancer.server.port=3000"
+    logging: *default-logging
 
   collector:
     image: ghcr.io/patriksi/share-sentinel-collector:${SHARE_SENTINEL_IMAGE_TAG:-latest}
     pull_policy: always
     profiles: ["tools"]
+    init: true
     environment:
       SHARE_SENTINEL_SMB_PASSWORD: ${SHARE_SENTINEL_SMB_PASSWORD:-}
       SHARE_SENTINEL_SMB_HASHES: ${SHARE_SENTINEL_SMB_HASHES:-}
       SHARE_SENTINEL_API_TOKEN: ${SHARE_SENTINEL_API_TOKEN:-}
     volumes:
       - collector_output:/data
+    logging: *default-logging
 
 volumes:
   pgdata:

@@ -2,6 +2,13 @@
 set -euo pipefail
 
 base_url="${1:-http://localhost}"
+curl_args=(--connect-timeout 3 --max-time 10)
+temp_dir=$(mktemp -d)
+
+cleanup() {
+  rm -rf "$temp_dir"
+}
+trap cleanup EXIT
 
 assert_contains() {
   local haystack="$1"
@@ -28,9 +35,9 @@ request_with_retries() {
   local status=""
   for _ in $(seq 1 "$max_attempts"); do
     if [[ "$method" == "GET" ]]; then
-      status=$(curl -sS -o "$out_file" -w "%{http_code}" "$url" || true)
+      status=$(curl "${curl_args[@]}" -sS -o "$out_file" -w "%{http_code}" "$url" || true)
     else
-      status=$(curl -sS -o "$out_file" -w "%{http_code}" -X "$method" -H "content-type: $content_type" -d "$body" "$url" || true)
+      status=$(curl "${curl_args[@]}" -sS -o "$out_file" -w "%{http_code}" -X "$method" -H "content-type: $content_type" -d "$body" "$url" || true)
     fi
 
     IFS=',' read -r -a expected_codes <<<"$expected_csv"
@@ -48,24 +55,29 @@ request_with_retries() {
   return 1
 }
 
-ui_status=$(request_with_retries "$base_url/projects" "GET" "" "" "200" /tmp/share_sentinel_ui.out)
-ui_body=$(cat /tmp/share_sentinel_ui.out 2>/dev/null || true)
+ui_status=$(request_with_retries "$base_url/projects" "GET" "" "" "200" "$temp_dir/ui.out")
+ui_body=$(cat "$temp_dir/ui.out" 2>/dev/null || true)
 assert_contains "$ui_status" "200" "UI /projects should return 200"
 assert_contains "$ui_body" "<!doctype html>" "UI should return app shell"
 
-settings_ui_status=$(request_with_retries "$base_url/settings/projects" "GET" "" "" "200" /tmp/share_sentinel_settings_ui.out)
-settings_ui_body=$(cat /tmp/share_sentinel_settings_ui.out 2>/dev/null || true)
+settings_ui_status=$(request_with_retries "$base_url/settings/projects" "GET" "" "" "200" "$temp_dir/settings-ui.out")
+settings_ui_body=$(cat "$temp_dir/settings-ui.out" 2>/dev/null || true)
 assert_contains "$settings_ui_status" "200" "UI /settings/projects should return 200"
 assert_contains "$settings_ui_body" "<!doctype html>" "Settings route should return app shell"
 
-api_health_status=$(request_with_retries "$base_url/api/healthz" "GET" "" "" "200" /tmp/share_sentinel_health.out)
-api_health_body=$(cat /tmp/share_sentinel_health.out 2>/dev/null || true)
+api_health_status=$(request_with_retries "$base_url/api/healthz" "GET" "" "" "200" "$temp_dir/health.out")
+api_health_body=$(cat "$temp_dir/health.out" 2>/dev/null || true)
 assert_contains "$api_health_status" "200" "API /api/healthz should return 200"
 assert_contains "$api_health_body" "\"ok\":true" "API health payload should include ok=true"
 
+api_ready_status=$(request_with_retries "$base_url/api/healthz/ready" "GET" "" "" "200" "$temp_dir/ready.out")
+api_ready_body=$(cat "$temp_dir/ready.out" 2>/dev/null || true)
+assert_contains "$api_ready_status" "200" "API /api/healthz/ready should return 200"
+assert_contains "$api_ready_body" "\"ok\":true" "API readiness payload should include ok=true"
+
 # Global settings endpoint should be reachable through API router and reject unauthenticated calls with JSON.
-settings_api_status=$(request_with_retries "$base_url/api/settings/projects" "GET" "" "" "401,403" /tmp/share_sentinel_settings_api.out)
-settings_api_body=$(cat /tmp/share_sentinel_settings_api.out 2>/dev/null || true)
+settings_api_status=$(request_with_retries "$base_url/api/settings/projects" "GET" "" "" "401,403" "$temp_dir/settings-api.out")
+settings_api_body=$(cat "$temp_dir/settings-api.out" 2>/dev/null || true)
 if [[ "$settings_api_body" == *"<h1>404 Not Found</h1>"* || "$settings_api_body" == *"404 page not found"* ]]; then
   echo "FAIL: /api/settings/projects appears unrouted"
   exit 1
@@ -77,8 +89,8 @@ if [[ "$settings_api_status" != "401" && "$settings_api_status" != "403" ]]; the
 fi
 
 # Detect nginx HTML 404 responses for API routes.
-api_login_status=$(request_with_retries "$base_url/api/auth/login" "POST" '{"email":"missing@example.com","password":"bad"}' "application/json" "401,403,422,429" /tmp/share_sentinel_login.out)
-api_login_body=$(cat /tmp/share_sentinel_login.out 2>/dev/null || true)
+api_login_status=$(request_with_retries "$base_url/api/auth/login" "POST" '{"email":"missing@example.com","password":"bad"}' "application/json" "401,403,422,429" "$temp_dir/login.out")
+api_login_body=$(cat "$temp_dir/login.out" 2>/dev/null || true)
 if [[ "$api_login_body" == *"<h1>404 Not Found</h1>"* || "$api_login_body" == *"404 page not found"* ]]; then
   echo "FAIL: API login route returned a proxy 404 response"
   exit 1

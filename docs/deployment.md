@@ -113,11 +113,17 @@ API and worker Redis operations use bounded connect and response budgets. `REDIS
 
 Rate-limit counter expiry is attached atomically with Redis `EVAL`. The bundled Redis configuration supports this command. If a managed Redis service uses ACLs, allow `EVAL`; otherwise general request rate limiting follows `RATE_LIMIT_FAIL_OPEN` and login throttling falls back to bounded per-process state rather than distributed enforcement.
 
-API, worker, and worker-health Postgres connection attempts have a five-second default budget. The worker is not startup-gated on Redis and continues its Postgres recovery scan while Redis stream setup is unavailable. Statement and transaction timeouts are not imposed by the application in this release; set them deliberately in Postgres or the deployment connection policy for the target workload.
+API, worker, and worker-health Postgres connection attempts have a five-second default budget. The worker is not startup-gated on Redis and continues its Postgres recovery scan while Redis stream setup is unavailable. API connections default to a 30-second statement and five-second lock budget; worker connections default to a 120-second statement and 15-second lock budget. The `API_DATABASE_*` and `WORKER_DATABASE_*` settings keep these different workloads independently tunable. Size `API_DATABASE_POOL_SIZE + API_DATABASE_MAX_OVERFLOW` across every API replica below the server connection budget.
+
+Synchronous run comparison is capped by `API_RUN_DIFF_MAX_ITEMS` (default `250000` total items across both runs). Above that envelope the API returns `422` with guidance instead of risking unbounded process memory. Successful comparisons preserve exact totals while bounding each detail array and reporting which sections were truncated. Raise the limit only after measuring API memory and database latency; large recurring comparisons should move to a future asynchronous/materialized workflow.
+
+Compose uses bounded local JSON logs (five 20 MiB files per service), a three-minute worker stop budget, and a one-minute API stop budget. Those budgets leave checkpoint/rollback margin beyond the default database statement timeouts; UI, Postgres, and Redis have separate shorter or service-appropriate budgets. Override the logging block when forwarding to a managed log driver, but retain an explicit disk/retention policy.
 
 Compose passes the database password through libpq's `PGPASSWORD` environment input and keeps it out of the URL, so generated or operator-supplied passwords may contain URL-reserved characters without manual percent encoding. Treat the rendered container environment as secret-bearing operational state.
 
-Raw NDJSON ingestion limits each physical record to `INGEST_MAX_RECORD_BYTES` (default 8 MiB) before allocation. Oversized records terminalize the run with a validation error; raise the limit only for a known collector contract.
+Raw NDJSON ingestion limits each physical record to `INGEST_MAX_RECORD_BYTES` (default 8 MiB, maximum 16 MiB) before allocation. Compact JSON remains capped at 50 MiB by default and 128 MiB maximum; larger inventories must use streaming NDJSON. `INGEST_GZIP_MAX_BYTES` defaults to 10 GiB decompressed so the worker matches the collector and API's default 10 GiB artifact envelope, while the 200x expansion-ratio guard still rejects compressed bombs. Batch size and identity cache settings also have fail-fast upper bounds; see the worker configuration reference for exact ceilings. Oversized artifacts terminalize the run with a validation error, while unsafe worker configuration prevents startup.
+
+The collector independently caps its uncompressed NDJSON spool at 10 GiB with `--max-artifact-bytes`. Keep that value at or below the reviewed API upload and artifact-storage envelope; setting it to `0` disables the collector-side guard and should be an explicit operator decision.
 
 Compact `.json` and `.json.gz` are compatibility formats. The bundled collector caps compact reconstruction at 8 MiB per endpoint and 40 MiB total, while the worker caps compact JSON materialization at 50 MiB by default. Use `.ndjson`, `.jsonl`, or their gzip variants for normal and large collections.
 
@@ -132,7 +138,9 @@ The workflows build and publish these images:
 - `ghcr.io/patriksi/share-sentinel-ui` — static UI served by Nginx
 - `ghcr.io/patriksi/share-sentinel-collector` — standalone SMB/NFS collector CLI
 
-Verified `main` commits receive `latest` and `sha-<full-commit>`. Verified release tags receive those tags plus the exact `vX.Y.Z`. The release workflow publishes images only after tests, dependency audits, high/critical image vulnerability scans, local image builds, the full ingest smoke, and the production-style security smoke succeed. Published images include OCI source/revision labels, provenance, and an SBOM attestation.
+Verified `main` commits receive an immutable `sha-<full-commit>` tag. The run that still matches the live branch head also advances `latest`; a superseded run deliberately skips that mutable tag. Verified release tags reuse the commit image set and add the exact `vX.Y.Z`; release jobs do not rebuild the SHA set or rewrite `latest`. Before publication, main runs tests, dependency audits, local image scans, local builds, a full ingest smoke, and a production-style security smoke. It then publishes staging candidates, pulls and revision-checks them, scans the registry artifacts, exercises a clean production stack from those candidates, and only then creates the commit tags. Main publication runs share one ordered lane and recheck the live branch head immediately before moving `latest`, so an older run cannot finish after a newer one and roll the tag backward. Existing commit and version tags are never overwritten: a rerun must resolve to the same runnable image identity and revision or fail, and registry inspection errors fail closed rather than being treated as absence. Release verification pulls, scans, and production-smokes the canonical commit set again before promoting `vX.Y.Z`. Final jobs verify every promoted tag resolves to the tested image identity. Published images include OCI source/revision labels, provenance, and an SBOM attestation.
+
+The four component images live in separate registry packages, so promotion of either `latest` or `vX.Y.Z` updates their tags sequentially rather than atomically. CI verifies all four identities after promotion, but an observer could still pull during that short window. Treat one exact `vX.Y.Z` or `sha-<full-commit>` value across all services as the deployable image set; use `latest` only as a development convenience.
 
 ## Persistence and backups
 
@@ -160,11 +168,11 @@ Alembic migrations are applied forward by bootstrap. Automated downgrade or zero
 
 ## Capacity and scaling limits
 
-- One worker process handles jobs serially; add replicas only with shared artifact storage and after testing database/Redis pressure.
-- Run diff responses are not paginated and can grow with large churn.
+- One worker process handles one job at a time. Multiple replicas use database claims and per-run advisory locks, but should be added only with shared artifact storage and measured database/Redis headroom.
+- Run-diff detail arrays are bounded and disclose truncation; comparisons above the synchronous item envelope are rejected. Large comparison workloads still require an asynchronous/materialized design.
 - The default 10 GiB ceiling is an application-level streaming limit. First-party clients use raw request bodies so the API can enforce it incrementally; multipart remains a compatibility path and may be pre-spooled by the HTTP framework. Configure every external proxy with an intentional body-size limit and enough temporary storage rather than assuming the UI Nginx setting protects the direct Traefik-to-API route.
 - The Compose deployment has single Postgres, Redis, and gateway instances and therefore no HA guarantee.
 - API metrics do not include a full worker backlog or per-stage ingest telemetry surface.
 - Inventory collections use stable keyset order but do not yet expose arbitrary server-side column sorting; the UI intentionally avoids page-local sorting that would misrepresent the full result set.
 
-For these reasons, capacity testing and a deployment-specific recovery plan are required before treating the current release as a critical production service.
+Use [Operations, scale, and recovery](./operations.md) for the reference workload, capacity smoke, diagnostics, alerts, and failure playbooks. Capacity testing and a deployment-specific recovery plan remain required before treating the current release as a critical production service.

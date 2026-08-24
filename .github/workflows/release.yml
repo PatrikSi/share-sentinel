@@ -8,10 +8,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # Serialize reruns or multiple release tags for the same source commit.
+  # The release checklist requires main CI to publish the SHA set first.
+  group: share-sentinel-release-${{ github.sha }}
+  cancel-in-progress: false
+
 jobs:
   verify:
     name: Verify release
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
       POSTGRES_PASSWORD: ReleaseDatabasePassword123
       JWT_SECRET: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
@@ -67,8 +74,21 @@ jobs:
         run: pip install -r requirements-dev.txt && pytest -q -p no:cacheprovider
       - name: Lint Python
         run: ruff check api worker collector scripts
+      - name: Validate shell tooling
+        run: |
+          bash -n bootstrap.sh scripts/*.sh
+          ./scripts/doctor.sh --help >/dev/null
       - name: Validate sample artifact
-        run: python scripts/validate-sample.py
+        run: |
+          python scripts/validate-sample.py
+          python scripts/generate-capacity-artifact.py \
+            --output "${RUNNER_TEMP}/capacity.ndjson.gz" \
+            --endpoints 2 \
+            --shares-per-endpoint 3 \
+            --items-per-share 100
+          capacity_summary=$(python scripts/validate-ndjson.py --json "${RUNNER_TEMP}/capacity.ndjson.gz")
+          jq -e '.records == 610 and .endpoints == 2 and .resources == 6 and .items == 600 and .errors == 0' \
+            <<<"$capacity_summary" >/dev/null
       - name: Audit Python dependencies
         run: |
           pip-audit -r api/requirements-dev.txt
@@ -108,7 +128,7 @@ jobs:
               --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL --scanners vuln "$image"
           done
       - name: Start development stack
-        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait --wait-timeout 120
       - name: Verify routes and complete ingest lifecycle
         run: |
           ./scripts/smoke-routes.sh http://localhost:18080
@@ -124,62 +144,18 @@ jobs:
           AUTH_COOKIE_SECURE: "true"
           TRUSTED_HOSTS: sentinel.example.com
           CORS_ORIGINS: https://sentinel.example.com
-        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait --wait-timeout 120
       - name: Verify production security posture
         run: ./scripts/smoke-production.sh http://localhost:18081 sentinel.example.com admin@example.com
       - name: Clean up Compose resources
         if: always()
         run: docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v --remove-orphans
 
-  publish-images:
-    name: Publish ${{ matrix.component }} image
-    runs-on: ubuntu-latest
-    needs: verify
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - component: api
-            context: ./api
-          - component: worker
-            context: ./worker
-          - component: ui
-            context: ./ui
-          - component: collector
-            context: ./collector
-    steps:
-      - name: Check out tagged source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and publish image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: ${{ matrix.context }}
-          push: true
-          tags: ghcr.io/patriksi/share-sentinel-${{ matrix.component }}:sha-${{ github.sha }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.ref_name }}
-          cache-from: type=gha,scope=${{ matrix.component }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
-          provenance: mode=max
-          sbom: true
-
   promote-images:
     name: Promote verified release images
     runs-on: ubuntu-latest
-    needs: publish-images
+    timeout-minutes: 15
+    needs: verify-published-images
     permissions:
       contents: read
       packages: write
@@ -192,19 +168,136 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Promote complete release image set
+      - name: Promote each verified release image
         run: |
+          set -euo pipefail
+          tag_state() {
+            local reference="$1"
+            local error_file
+            local state
+            error_file=$(mktemp)
+            if docker buildx imagetools inspect "$reference" >/dev/null 2>"$error_file"; then
+              state='present'
+            elif grep -Eiq '(manifest unknown|name unknown|not found)' "$error_file"; then
+              state='missing'
+            else
+              echo "Registry inspection failed for $reference" >&2
+              cat "$error_file" >&2
+              rm -f "$error_file"
+              return 2
+            fi
+            rm -f "$error_file"
+            printf '%s\n' "$state"
+          }
           for component in api worker ui collector; do
-            docker buildx imagetools create \
-              --tag "ghcr.io/patriksi/share-sentinel-${component}:${GITHUB_REF_NAME}" \
-              --tag "ghcr.io/patriksi/share-sentinel-${component}:latest" \
+            repository="ghcr.io/patriksi/share-sentinel-${component}"
+            immutable="${repository}:sha-${GITHUB_SHA}"
+            versioned="${repository}:${GITHUB_REF_NAME}"
+            versioned_state=$(tag_state "$versioned")
+            if [[ "$versioned_state" == "missing" ]]; then
+              docker buildx imagetools create --tag "$versioned" "$immutable"
+            fi
+            docker pull "$immutable"
+            docker pull "$versioned"
+            immutable_image_id=$(docker image inspect "$immutable" --format '{{.Id}}')
+            versioned_image_id=$(docker image inspect "$versioned" --format '{{.Id}}')
+            versioned_revision=$(docker image inspect "$versioned" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+            if [[ "$immutable_image_id" != "$versioned_image_id" || "$versioned_revision" != "$GITHUB_SHA" ]]; then
+              echo "Refusing to overwrite immutable release tag $versioned" >&2
+              exit 1
+            fi
+          done
+
+  verify-published-images:
+    name: Verify published commit images
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: verify
+    permissions:
+      contents: read
+      packages: read
+    env:
+      ADMIN_PASSWORD: ReleaseAdminPassword123
+      SHARE_SENTINEL_SMOKE_PASSWORD: ReleaseAdminPassword123
+      SHARE_SENTINEL_STACK: release-published-${{ github.run_id }}
+      GATEWAY_HTTP_PORT: 18082
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate production configuration
+        run: ./bootstrap.sh --production sentinel.example.com --image-tag "sha-${GITHUB_SHA}" --output "${RUNNER_TEMP}/share-sentinel-published.env" >/dev/null
+      - name: Pull and verify published commit images
+        run: |
+          docker compose --env-file "${RUNNER_TEMP}/share-sentinel-published.env" --profile tools pull
+          for component in api worker ui collector; do
+            revision=$(docker image inspect \
+              "ghcr.io/patriksi/share-sentinel-${component}:sha-${GITHUB_SHA}" \
+              --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+            test "$revision" = "$GITHUB_SHA"
+          done
+      - name: Verify published collector contract
+        run: |
+          image="ghcr.io/patriksi/share-sentinel-collector:sha-${GITHUB_SHA}"
+          docker run --rm --entrypoint sh "$image" -c 'test "$(id -u)" = 10001 && touch /data/write-check && rm /data/write-check'
+          docker run --rm "$image" --help >/dev/null
+      - name: Scan published commit images
+        run: |
+          set -euo pipefail
+          for component in api worker ui collector; do
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v share-sentinel-trivy-cache:/root/.cache \
+              aquasec/trivy:0.72.0 image \
+              --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL --scanners vuln \
               "ghcr.io/patriksi/share-sentinel-${component}:sha-${GITHUB_SHA}"
+          done
+      - name: Start production stack from published images
+        run: docker compose --env-file "${RUNNER_TEMP}/share-sentinel-published.env" up -d --wait --wait-timeout 180
+      - name: Verify published production stack
+        run: ./scripts/smoke-production.sh http://localhost:18082 sentinel.example.com admin@example.com
+      - name: Clean up Compose resources
+        if: always()
+        run: docker compose --env-file "${RUNNER_TEMP}/share-sentinel-published.env" down -v --remove-orphans
+
+  verify-promoted-images:
+    name: Verify release-tag promotion
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: promote-images
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify promoted image identities
+        run: |
+          set -euo pipefail
+          for component in api worker ui collector; do
+            repository="ghcr.io/patriksi/share-sentinel-${component}"
+            docker pull "${repository}:sha-${GITHUB_SHA}"
+            docker pull "${repository}:${GITHUB_REF_NAME}"
+            test "$(docker image inspect "${repository}:sha-${GITHUB_SHA}" --format '{{.Id}}')" = \
+              "$(docker image inspect "${repository}:${GITHUB_REF_NAME}" --format '{{.Id}}')"
+            test "$(docker image inspect "${repository}:${GITHUB_REF_NAME}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = \
+              "$GITHUB_SHA"
           done
 
   publish-release:
     name: Publish source release
     runs-on: ubuntu-latest
-    needs: [verify, promote-images]
+    timeout-minutes: 10
+    needs: [verify, verify-promoted-images]
     permissions:
       contents: write
     steps:

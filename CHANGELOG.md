@@ -19,20 +19,28 @@ The project follows a simple release-first workflow:
 - Collector progress, verbosity and quiet modes, truthful processed/remaining counters, bounded upload retries, interruption-safe partial artifacts, and streaming schema-v1 NDJSON output for large scans.
 - Bounded, non-mutating SMB access probes for tree connection, directory listing, file reads, file and directory creation rights, existing-file modification, deletion, ACL changes, and ownership changes, with explicit allowed, denied, mixed, inconclusive, and not-tested evidence.
 - Optional SMB allocation size, creation time, last-access time, metadata-change time, and file-attribute inventory fields.
+- Read-only deployment diagnostics plus streaming capacity-artifact generation and validation for repeatable scale tests.
+- Bounded run-diff detail with exact summary totals and explicit truncation metadata, plus cursor pagination for endpoint shares.
+- Explicit API database-pool/error metrics and a public dependency-readiness probe for load balancers and deployment diagnostics.
 
 ### Changed
 
+- API database pools, connection waits, statements, and locks now have component-specific bounds; large run diffs fail safely and successful detail arrays disclose truncation while retaining exact totals.
+- Inventory, run, issue, audit, and endpoint-share pagination now use matching composite indexes; malformed cursors, filters, and validation failures return structured request-correlated errors.
+- UI collection loading is bounded by page, item, and time budgets; recent-run selectors preserve explicit older IDs, disclose partial catalogs, and cap explicit scopes, while detail routes cancel and ignore stale entity requests.
+- Long-running Compose services use bounded local log rotation and explicit graceful-stop budgets.
 - The base Compose stack pulls the canonical `ghcr.io/patriksi/share-sentinel-*` images directly; local development selects the source-build override through generated `COMPOSE_FILE` configuration.
 - Container inputs now use readable exact version tags rather than digest pins.
 - Upgraded React Router, PostCSS, and the transitive NanoID dependency to clear the current UI dependency audit without bundling unrelated framework major upgrades.
 - Updated GitHub Actions runtimes to their Node 24-compatible releases so CI no longer relies on GitHub's deprecated Node 20 action shim.
-- CI now pulls the promoted `latest` image set, verifies its revision labels, and runs a clean production Compose smoke test against the published artifacts.
+- Main CI now pull-checks, vulnerability-scans, and production-smokes registry staging images before creating immutable `sha-<commit>` tags; ordered, branch-fresh promotion updates mutable `latest`. Releases reuse and re-verify the commit set, exact release tags refuse reassignment, registry inspection fails closed, and every promoted tag is checked against the tested image identity.
+- Release tags now promote only their exact `vX.Y.Z` image set, preventing a tag workflow from racing main-branch ownership of the non-atomic `latest` convenience tags.
 - Fixed SMB authentication identity handling for `DOMAIN\user`, `DOMAIN/user`, UPN, explicit-domain, and local-account forms; conflicting modes now fail early and Kerberos correctly receives configured NTLM hashes.
 - Python application images now install available Debian security updates during builds so rebuilt releases do not retain fixed vulnerabilities from an older base-image snapshot.
 - Redis calls now have bounded connect/read budgets, rate-limit increments attach expirations atomically, and long-running Compose services restart after unexpected exits.
 - Ingest now treats Postgres as authoritative when stale queue messages reference replaced uploads, terminalizes unexpected poison failures, and retains collected file size and modification time metadata.
-- Artifact upload now streams first-party raw bodies without holding a database transaction, uses immutable per-attempt keys, rechecks run state before commit, and preserves durable Postgres recovery when Redis handoff is unavailable.
-- Worker retries now expose scheduled activity and bounded backoff, resume without downgrading existing share access, reject oversized or invalidly encoded records, and derive final counts from persisted inventory.
+- Artifact upload now streams first-party raw bodies without holding a database transaction, runs bounded database phases off the async event loop, uses immutable per-attempt keys, rechecks run state before commit, finishes durable cleanup under cancellation, and preserves Postgres recovery when Redis handoff is unavailable.
+- Worker retries now expose scheduled activity and jittered bounded backoff, resume without downgrading existing share access, reject oversized or invalidly encoded records, bound identity caches, claim recovery work safely across replicas, checkpoint graceful shutdowns, and derive final counts from persisted inventory.
 - Database passwords are passed through libpq rather than embedded in URLs, so URL-reserved characters render safely in Compose.
 - The UI runtime now runs as UID/GID `10001:10001`; Python linting is enforced in both main-branch and tag-release workflows.
 - Share access now starts as unknown and upgrades monotonically from observed evidence; inventory and run-explorer views expose compact capability summaries and expandable probe evidence, while preserving the legacy access summary for compatible filters and artifacts.
@@ -41,6 +49,8 @@ The project follows a simple release-first workflow:
 ### Operator notes
 
 - Migration `0008` adds the `unknown` access state, per-resource capability evidence, and optional item metadata columns. The bootstrap service applies it before the API and worker start.
+- Migration `0009` creates large-table pagination indexes concurrently and can be resumed after an interrupted index build. Bootstrap uses separate migration connect/lock budgets; test this migration against production-sized data before rollout.
+- New `API_DATABASE_*`, `MIGRATION_DATABASE_*`, `WORKER_DATABASE_*`, `API_RUN_DIFF_MAX_ITEMS`, `INGEST_JSON_COMPAT_MAX_BYTES`, `INGEST_GZIP_MAX_BYTES`, `INGEST_RETRY_JITTER_RATIO`, `INGEST_MAX_RETRIES`, and `INGEST_IDENTITY_CACHE_SIZE` settings are documented in `.env.example` and the deployment guide. Invalid or unsafe worker limits now fail startup.
 - Access probes use `FILE_OPEN` on existing SMB objects and never create, modify, delete, take ownership of, or rewrite ACLs. They can still generate ordinary SMB and authorization audit telemetry and may update server-side last-access accounting.
 
 ## [0.2.0] - 2026-07-16

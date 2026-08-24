@@ -87,7 +87,7 @@ An operator or the collector creates a run, uploads the artifact, and the API:
 
 - validates content type, filename, and basic payload structure
 - streams the raw artifact to a unique immutable key on shared storage without holding a database transaction for the body transfer
-- reacquires the run mutation lock, rechecks authoritative status, and records artifact metadata on the run
+- runs short-lived database phases outside the async event loop, reacquires the run mutation lock, rechecks authoritative status, and records artifact metadata on the run
 - enqueues the run id into Redis
 
 ### 3. Ingest
@@ -164,6 +164,8 @@ The worker is designed for asynchronous ingest and partial recovery:
 - runs can be resumed from saved ingest progress
 - stale pending Redis messages are reclaimed
 - `UPLOADED` runs can be rediscovered if queue handoff falls back
+- worker replicas claim different recoverable rows and use a per-run advisory lock as a final duplicate-execution guard
+- dependency failures retry with capped jitter while poison data terminates only the affected run
 
 Current caveats:
 
@@ -173,6 +175,7 @@ Current caveats:
 - the default deployment uses a worker heartbeat file and container healthcheck instead of an HTTP health endpoint
 - the default Compose deployment is for local operation, not HA orchestration
 - inventory views can include data from `INGESTING` runs until ingest settles
+- synchronous diff has an explicit item envelope and bounded detail arrays; larger comparisons need an asynchronous/materialized workflow
 
 ## ADR-style decisions
 
