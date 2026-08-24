@@ -2,28 +2,21 @@
   "schema_version": 1,
   "format": "share_sentinel_compact_json",
   "meta": {
-    "tool": "share-sentinel-collector",
+    "tool": "share-sentinel-synthetic-fixture",
     "tool_version": "1.0.0",
     "run_id": "00000000-0000-4000-8000-000000000001",
     "started_at": "2026-01-15T10:00:00+00:00",
     "finished_at": "2026-01-15T10:00:10+00:00",
     "operator_label": "synthetic-example",
     "auth": {
-      "mode": "none",
-      "domain": null,
-      "username": null,
+      "mode": "synthetic",
       "method": "none"
     }
   },
   "collection": {
-    "command": "share_sentinel_collector.py",
+    "command": "synthetic-mixed-provider-fixture",
     "arguments": [
-      "--hosts",
-      "synthetic-hosts.txt",
-      "--share-types",
-      "both",
-      "--output",
-      "sample-artifact.json"
+      "examples/sample-artifact.json"
     ],
     "target_scope": {
       "cidrs": [],
@@ -31,10 +24,14 @@
         "fileserver.example.test",
         "nfs.example.test"
       ],
-      "target_count": 2,
+      "target_count": 3,
       "share_types": [
         "nfs",
-        "smb"
+        "smb",
+        "sharepoint"
+      ],
+      "sharepoint_sites": [
+        "https://contoso.sharepoint.com/sites/Records"
       ],
       "disabled_share_types": []
     },
@@ -50,9 +47,9 @@
     }
   },
   "summary": {
-    "endpoints": 2,
-    "resources": 2,
-    "items": 4,
+    "endpoints": 3,
+    "resources": 3,
+    "items": 6,
     "errors": 1
   },
   "issue_summary": [
@@ -126,6 +123,80 @@
               "path": "/",
               "name": "welcome.txt",
               "is_dir": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "endpoint_key": "sharepoint:contoso.sharepoint.com,synthetic-site,synthetic-web",
+      "hostname": "contoso.sharepoint.com",
+      "domain": null,
+      "provider": "sharepoint",
+      "metadata": {
+        "tenant_id": "00000000-0000-4000-8000-000000000002",
+        "site_id": "contoso.sharepoint.com,synthetic-site,synthetic-web",
+        "display_name": "Synthetic records site",
+        "web_url": "https://contoso.sharepoint.com/sites/Records",
+        "collection_mode": "delegated_user_view",
+        "auth_type": "delegated",
+        "assessed_identity": "synthetic.user@example.test"
+      },
+      "shares": [
+        {
+          "name": "Shared Documents",
+          "share_type": "sharepoint",
+          "resource_type": "sharepoint_library",
+          "provider": "sharepoint",
+          "provider_resource_id": "b!synthetic-drive-id",
+          "web_url": "https://contoso.sharepoint.com/sites/Records/Shared%20Documents",
+          "remark": "Synthetic SharePoint document library",
+          "access_level": "list_only",
+          "exposure": "USER_VISIBLE",
+          "exposure_evidence": {
+            "basis": "graph_delegated_read_context",
+            "assessed_identity": "synthetic.user@example.test",
+            "classification_scope": "visibility_not_public_exposure"
+          },
+          "metadata": {
+            "drive_type": "documentLibrary",
+            "content_read_tested": false,
+            "access_observation": "graph_metadata_enumeration"
+          },
+          "entries": [
+            {
+              "path": "/",
+              "name": "Records",
+              "is_dir": true,
+              "provider": "sharepoint",
+              "provider_resource_id": "b!synthetic-drive-id",
+              "provider_item_id": "synthetic-folder-id",
+              "provider_parent_id": "synthetic-root-id",
+              "web_url": "https://contoso.sharepoint.com/sites/Records/Shared%20Documents/Records",
+              "exposure": "USER_VISIBLE",
+              "exposure_evidence": {
+                "basis": "graph_delegated_read_context",
+                "classification_scope": "visibility_not_public_exposure"
+              },
+              "children": [
+                {
+                  "name": "quarterly-review.docx",
+                  "is_dir": false,
+                  "size_bytes": 4096,
+                  "mtime": "2026-01-15T09:45:00+00:00",
+                  "provider": "sharepoint",
+                  "provider_resource_id": "b!synthetic-drive-id",
+                  "provider_item_id": "synthetic-file-id",
+                  "provider_parent_id": "synthetic-folder-id",
+                  "web_url": "https://contoso.sharepoint.com/sites/Records/Shared%20Documents/Records/quarterly-review.docx",
+                  "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                  "exposure": "USER_VISIBLE",
+                  "exposure_evidence": {
+                    "basis": "graph_delegated_read_context",
+                    "classification_scope": "visibility_not_public_exposure"
+                  }
+                }
+              ]
             }
           ]
         }

@@ -53,7 +53,10 @@ jobs:
         run: pytest -q -p no:cacheprovider
       - name: Validate tracked artifact fixture
         if: matrix.component == 'worker'
-        run: python scripts/validate-sample.py
+        run: |
+          python scripts/validate-sample.py
+          python scripts/validate-ndjson.py examples/sample-sharepoint-baseline.ndjson
+          python scripts/validate-ndjson.py examples/sample-sharepoint-current.ndjson
       - name: Validate streaming capacity fixture tooling
         if: matrix.component == 'worker'
         run: |
@@ -65,6 +68,29 @@ jobs:
           capacity_summary=$(python scripts/validate-ndjson.py --json "${RUNNER_TEMP}/capacity.ndjson.gz")
           jq -e '.records == 610 and .endpoints == 2 and .resources == 6 and .items == 600 and .errors == 0' \
             <<<"$capacity_summary" >/dev/null
+
+  sharepoint-windows:
+    name: SharePoint collector on Windows
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: collector/requirements-dev.txt
+      - name: Install collector dependencies
+        working-directory: collector
+        run: pip install -r requirements-dev.txt
+      - name: Lint SharePoint collector
+        run: ruff check collector/share_sentinel_sharepoint.py collector/collector_entrypoint.py collector/sharepoint collector/tests/test_sharepoint_auth.py collector/tests/test_sharepoint_cli.py collector/tests/test_sharepoint_collection.py collector/tests/test_sharepoint_graph.py collector/tests/test_sharepoint_state.py collector/tests/test_collector_writer.py
+      - name: Test Windows and SharePoint contracts
+        run: pytest -q -p no:cacheprovider collector/tests/test_sharepoint_auth.py collector/tests/test_sharepoint_cli.py collector/tests/test_sharepoint_collection.py collector/tests/test_sharepoint_graph.py collector/tests/test_sharepoint_state.py collector/tests/test_collector_writer.py
+      - name: Verify SharePoint command
+        run: python collector/share_sentinel_sharepoint.py --help
 
   ui:
     name: UI build and audit
@@ -114,7 +140,7 @@ jobs:
     name: Compose, containers, and live smoke tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: [python-tests, ui, python-audit]
+    needs: [python-tests, sharepoint-windows, ui, python-audit]
     env:
       POSTGRES_PASSWORD: CiDatabasePassword123
       JWT_SECRET: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
@@ -159,7 +185,9 @@ jobs:
           docker run --rm --entrypoint sh share-sentinel-api:dev -c 'test "$(id -u)" = 10001 && touch /artifacts/write-check && rm /artifacts/write-check'
           docker run --rm --entrypoint sh share-sentinel-worker:dev -c 'test "$(id -u)" = 10001 && touch /artifacts/write-check && rm /artifacts/write-check'
           docker run --rm --entrypoint sh share-sentinel-collector:dev -c 'test "$(id -u)" = 10001 && command -v showmount && touch /data/write-check && rm /data/write-check'
+          docker run --rm --entrypoint python share-sentinel-collector:dev -c 'import tempfile; assert tempfile.gettempdir() == "/data"'
           docker run --rm share-sentinel-collector:dev --help >/dev/null
+          docker run --rm share-sentinel-collector:dev sharepoint --help >/dev/null
           docker run --rm -e VITE_API_BASE_URL=/runtime-api -e VITE_CSRF_COOKIE_NAME=runtime_csrf -e VITE_CSRF_HEADER_NAME=x-runtime-csrf --entrypoint sh share-sentinel-ui:dev -c 'test "$(id -u)" = 10001 && test "$(id -g)" = 10001 && /docker-entrypoint.d/40-runtime-config.sh && grep -q '\''apiBase:"/runtime-api"'\'' /usr/share/nginx/html/runtime-config.js'
           docker run --rm --entrypoint nginx share-sentinel-ui:dev -t
       - name: Scan application images
@@ -178,6 +206,7 @@ jobs:
         run: |
           ./scripts/smoke-routes.sh http://localhost:18080
           ./scripts/smoke-ingest.sh http://localhost:18080 admin@example.com
+          ./scripts/smoke-sharepoint-ingest.sh http://localhost:18080 admin@example.com
       - name: Stop development stack
         run: docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v --remove-orphans
       - name: Start production-style stack
@@ -362,6 +391,7 @@ jobs:
           image="ghcr.io/patriksi/share-sentinel-collector:candidate-sha-${GITHUB_SHA}"
           docker run --rm --entrypoint sh "$image" -c 'test "$(id -u)" = 10001 && touch /data/write-check && rm /data/write-check'
           docker run --rm "$image" --help >/dev/null
+          docker run --rm "$image" sharepoint --help >/dev/null
       - name: Scan published image candidates
         run: |
           set -euo pipefail

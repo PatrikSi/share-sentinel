@@ -162,7 +162,7 @@ Lists runs for a project with keyset pagination.
 
 ### `GET /projects/{project_id}/runs/{run_id}`
 
-Returns one run, including stored artifact size, content type, and SHA-256 provenance when an upload exists.
+Returns one run, including stored artifact size, content type, SHA-256 provenance, and bounded non-secret `collection_context` when an upload exists. SharePoint context distinguishes application tenant inventory from a delegated user's security-trimmed view and records completeness/snapshot semantics.
 
 ### `DELETE /projects/{project_id}/runs/{run_id}`
 
@@ -191,6 +191,9 @@ Bounds:
 - `detail_limit` defaults to 500 and is capped at 2000 records per new-share, disappeared-share, and item-churn section
 - aggregate summary counts remain exact and `truncation` identifies any bounded detail sections
 - comparisons above `API_RUN_DIFF_MAX_ITEMS` total items across both runs return `422`; the default is 250000
+- provider-backed items use stable IDs to report path changes in `moved_items` / `moved_examples` rather than double-counting them as removal plus addition
+- a resource whose observed `access_level` changed is included in `item_churn` even when its item inventory did not change; `access_level_changed` and `previous_access_level` distinguish that transition from content churn
+- `comparison_compatibility` warns when source, tenant, authentication perspective, assessed identity, discovery completeness, or materialization semantics make the runs unsafe to interpret as equivalent coverage
 
 ### `GET /projects/{project_id}/runs/{run_id}/errors`
 
@@ -243,12 +246,17 @@ Item-level inventory view. Supports:
 - `endpoint`
 - `share`
 - `path_prefix`
+- `provider`
+- `resource_type`
+- `exposure`
+- `source`
 - `run_ids`
 - `is_dir`
+- `include_deleted` (default `false`)
 - `limit`
 - `cursor`
 
-Item rows include nullable `size_bytes`, `allocation_size_bytes`, ISO-8601 `mtime`, `created_at`, `accessed_at`, and `changed_at` values, plus a `file_attributes` array, when the source collector supplied usable metadata. For SMB artifacts produced by the bundled collector, `mtime` is the server's last-write time and `changed_at` is its metadata-change time.
+Item rows include nullable `size_bytes`, `allocation_size_bytes`, ISO-8601 `mtime`, `created_at`, `accessed_at`, and `changed_at` values, plus a `file_attributes` array, when the source collector supplied usable metadata. Provider-backed rows can additionally include `provider`, stable item/parent IDs, an HTTPS `web_url`, MIME type, bounded provider metadata, deletion state, exposure classification, and evidence. For SMB artifacts produced by the bundled collector, `mtime` is the server's last-write time and `changed_at` is its metadata-change time.
 
 Each item also inherits its resource's `access_level` and `access_capabilities`. Capability evidence is resource-level and sampled; it must not be interpreted as proof that the individual item row was tested.
 
@@ -262,11 +270,17 @@ Share-level inventory view. Supports:
 - `query_dsl`
 - `endpoint`
 - `access_level`
+- `provider`
+- `resource_type`
+- `exposure`
+- `source`
 - `run_ids`
 - `limit`
 - `cursor`
 
 Resource rows include the compatibility `access_level` (`unknown`, `no_access`, `list_only`, or `readable`) and an `access_capabilities` object. Known capabilities are `tree_connect`, `list`, `read_file`, `create_file`, `create_directory`, `modify_file`, `delete`, `write_acl`, and `write_owner`. Each contains a status (`allowed`, `denied`, `mixed`, `not_tested`, or `inconclusive`) and bounded evidence counts. A reserved `_metadata` object describes the non-mutating probe method and sample coverage. Its `complete` flag means a final per-share probe record was produced without cancellation, while `partial` describes limited or degraded coverage; both can truthfully be `true`.
+
+SharePoint document-library rows use `resource_type=sharepoint_library`, retain a stable `provider_resource_id`, and carry separate exposure/evidence fields. Their compatibility `access_level` is conservative metadata-enumeration evidence; it is not proof that file content was opened or that a write would succeed.
 
 ### `GET /projects/{project_id}/inventory/endpoints`
 
@@ -274,6 +288,8 @@ Endpoint-level inventory view. Supports:
 
 - `q`
 - `query_dsl`
+- `provider`
+- `source`
 - `endpoint`
 - `run_ids`
 - `limit`

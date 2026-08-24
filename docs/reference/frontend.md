@@ -88,6 +88,7 @@ Main UX patterns:
 - progressive guided filters, run scope, and advanced query controls instead of a permanently expanded form
 - active filter chips with individual removal and a clear-all action
 - server-backed equals and exclude shortcuts on supported table values, plus copy-exact-value actions
+- provider, resource-type, exposure, and deletion filters with SharePoint-safe terminology; `USER_VISIBLE` is always explained as assessed-identity visibility rather than public exposure
 - a free-text DSL editor with examples, validation, and apply/clear actions
 - column pickers, compact/comfortable density, sticky headers, and optional size, allocation, timestamp, and file-attribute columns
 - compact observed-access summaries with expandable per-capability evidence; write/control observations remain visible even when a drop-box-style share denies listing
@@ -125,7 +126,7 @@ What each tab is for:
 
 Run-scoped saved search presets are browser-local and separate from project-shared inventory investigations.
 
-Run artifact provenance includes content type, size, and a copyable SHA-256 when supplied by the API. The run explorer shows the same compact, expandable share-access evidence as project inventory. Item views format collected size and modification timestamps when present. Project inventory additionally exposes optional allocation size, creation, last-access, metadata-change, and file-attribute columns.
+Run artifact provenance includes content type, size, and a copyable SHA-256 when supplied by the API. Provider-aware runs also show collection perspective, authentication type, assessed identity, discovery completeness, and snapshot semantics. The run explorer warns before comparing contexts that are not semantically equivalent and reports stable-ID path changes as moves/renames. It shows the same compact, expandable share-access and exposure evidence as project inventory. Item views format collected size and modification timestamps when present. Project inventory additionally exposes optional allocation size, creation, last-access, metadata-change, file-attribute, provider identity, canonical URL, and deletion columns.
 
 ## Settings
 

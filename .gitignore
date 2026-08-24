@@ -26,6 +26,7 @@ dist/
 dummy-scan-data*.json
 dummy-scan-data*.json.gz
 !examples/*.json
+!examples/*.ndjson
 
 # OS / editor
 .DS_Store
@@ -35,3 +36,7 @@ dummy-scan-data*.json.gz
 # Runtime data
 coverage/
 collector-output/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*

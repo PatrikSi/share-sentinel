@@ -77,9 +77,13 @@ The bundled collector is an external producer. It can write a compatible artifac
 
 ### 1. Collection
 
-The collector scans SMB and NFS targets and writes schema-v1 NDJSON by default, optionally gzip-compressed based on the output suffix. NDJSON records are spooled incrementally so one endpoint tree does not need to be rebuilt in memory; after collection finishes, the finalized artifact is streamed from disk during upload. Explicit `.json` and `.json.gz` outputs remain available as bounded compact-format compatibility exports.
+The infrastructure collector scans SMB and NFS targets and writes schema-v1 NDJSON by default, optionally gzip-compressed based on the output suffix. NDJSON records are spooled incrementally so one endpoint tree does not need to be rebuilt in memory; after collection finishes, the finalized artifact is streamed from disk during upload. Explicit `.json` and `.json.gz` outputs remain available as bounded compact-format compatibility exports.
 
 For SMB, each resource keeps a compatibility `access_level` plus independent observed-capability evidence. Directory listing provides list evidence; bounded handle opens request narrow rights for file reading, file/directory creation, existing-file modification, deletion, ACL changes, and ownership changes. The collector always uses `FILE_OPEN` against existing objects and closes the handle without performing the requested mutation. Authorization denials, transient/inconclusive failures, and untested capabilities remain distinct. NFS export discovery does not imply mount or content access and is therefore recorded as unknown.
+
+The SharePoint Online collector is a separate Microsoft Graph workflow with application and delegated assessment perspectives. It maps sites to endpoints, document libraries to resources, and drive items to items while retaining stable provider IDs separately from names and paths. It never requests document content. A local SQLite state database stores metadata snapshots and opaque per-library delta links; tokens are never stored there.
+
+Graph delta pages are staged before publication. Each successful run materializes the complete current library snapshot, including unchanged rows from local state, and advances both the item state and delta checkpoint only after the artifact is durable and any requested upload is accepted. Failed or truncated libraries retain their previous checkpoint and are reported as partial rather than silently appearing complete. This keeps run-to-run inventory semantics consistent while reducing steady-state Graph traffic.
 
 ### 2. Upload
 
@@ -175,6 +179,7 @@ Current caveats:
 - the default deployment uses a worker heartbeat file and container healthcheck instead of an HTTP health endpoint
 - the default Compose deployment is for local operation, not HA orchestration
 - inventory views can include data from `INGESTING` runs until ingest settles
+- delegated SharePoint discovery is security-trimmed and can be incomplete; its collection context is preserved with the run so it is not confused with an authoritative application inventory
 - synchronous diff has an explicit item envelope and bounded detail arrays; larger comparisons need an asynchronous/materialized workflow
 
 ## ADR-style decisions

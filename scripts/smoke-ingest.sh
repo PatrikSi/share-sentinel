@@ -54,9 +54,9 @@ elif [[ "$artifact_filename" == *.ndjson || "$artifact_filename" == *.jsonl ]]; 
   artifact_content_type="application/x-ndjson"
 fi
 
-expected_endpoints=2
-expected_resources=2
-expected_items=4
+expected_endpoints=3
+expected_resources=3
+expected_items=6
 expected_errors=1
 is_default_artifact="false"
 if [[ "$sample_artifact" -ef "$default_artifact" ]]; then
@@ -139,11 +139,15 @@ stats_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" "$api_base/pro
 jq -e --argjson endpoints "$expected_endpoints" --argjson resources "$expected_resources" \
   '.endpoints == $endpoints and .shares == $resources' <<<"$stats_response" >/dev/null
 if [[ "$is_default_artifact" == "true" ]]; then
-  jq -e '.files == 3 and .directories == 1' <<<"$stats_response" >/dev/null
+  jq -e '.files == 4 and .directories == 2' <<<"$stats_response" >/dev/null
   endpoints_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" "$api_base/projects/$project_id/runs/$run_id/endpoints")
   jq -e '(.items | map(select(.endpoint_key == "192.0.2.10:445" and .smb_signing == "required")) | length) == 1' <<<"$endpoints_response" >/dev/null
   items_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" "$api_base/projects/$project_id/inventory/items?q=retention.pdf&run_ids=$run_id")
   jq -e '(.items | length) == 1 and .items[0].size_bytes == 2048 and .items[0].mtime == "2026-01-15T09:30:00+00:00"' <<<"$items_response" >/dev/null
+  sharepoint_resources_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" "$api_base/projects/$project_id/inventory/resources?provider=sharepoint&resource_type=sharepoint_library&exposure=USER_VISIBLE&run_ids=$run_id")
+  jq -e '(.items | length) == 1 and .items[0].provider_resource_id == "b!synthetic-drive-id" and .items[0].access_level == "list_only"' <<<"$sharepoint_resources_response" >/dev/null
+  sharepoint_items_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" "$api_base/projects/$project_id/inventory/items?provider=sharepoint&exposure=USER_VISIBLE&run_ids=$run_id")
+  jq -e '(.items | length) == 2 and (.items | map(select(.provider_item_id == "synthetic-file-id" and .path == "/Records/quarterly-review.docx" and .deleted == false)) | length) == 1' <<<"$sharepoint_items_response" >/dev/null
   errors_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" "$api_base/projects/$project_id/runs/$run_id/errors")
   jq -e '(.items | length) == 1 and .items[0].code == "SYNTHETIC_PARTIAL_SCAN"' <<<"$errors_response" >/dev/null
 fi

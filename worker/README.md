@@ -32,6 +32,9 @@ That is not just a convenience setting. The API writes uploads to local filesyst
 - Resumed ingestion hydrates existing endpoint/resource identities before processing later item records, preserving checkpointed access metadata.
 - Final run counts are derived from normalized database rows rather than trusting producer-declared summary totals.
 - Optional item size and modification timestamps are normalized and retained when collectors provide them.
+- SharePoint sites, document libraries, and drive items retain bounded provider metadata and stable provider IDs separately from mutable names and paths. This lets resource renames and item moves update one normalized identity rather than creating false duplicates.
+- SharePoint collection context records the authentication perspective, tenant, assessed identity, discovery completeness, and materialized snapshot semantics. Secret-bearing keys, opaque delta links, and unsafe provider URLs are rejected at the ingest boundary.
+- Deleted provider records are retained as tombstones only when an artifact explicitly supplies them; current-inventory queries exclude tombstones by default.
 - SMB signing uses the canonical `smb.signing` string (`required` or `not_required`); legacy boolean `smb.signing_required` artifacts remain accepted.
 - Unexpected poison-record failures are terminalized with a redacted operator-facing error instead of being replayed forever.
 - Duplicate stream messages honor a future `next_retry_at`; they are acknowledged while the database recovery scan owns the due retry.

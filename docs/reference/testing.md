@@ -34,6 +34,8 @@ End-to-end smoke checks verify:
 - Auth login route is wired to API (not proxy 404)
 - A tracked artifact reaches `COMPLETE` through Redis and the worker
 - Normalized endpoint, resource, item, and warning counts match the fixture
+- Synthetic SharePoint provider IDs, library type, exposure evidence, canonical metadata, and provider filters survive end-to-end ingest
+- Two collector-shaped SharePoint snapshots retain assessment context and correlate stable IDs across folder/file moves, renames, and deletion
 - Project deletion requires an exact-name confirmation and cleans up its artifact
 - Production hides API docs, emits security headers, uses secure cookies, and allows only the configured CORS origin
 
@@ -43,8 +45,11 @@ Run:
 ./scripts/smoke-routes.sh http://localhost
 export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
 ./scripts/smoke-ingest.sh http://localhost admin@example.com
+./scripts/smoke-sharepoint-ingest.sh http://localhost admin@example.com
 unset SHARE_SENTINEL_SMOKE_PASSWORD
 ```
+
+The SharePoint smoke uploads the tracked full-sync and delta-shaped fixtures into one temporary project, verifies both runs reach `COMPLETE`, checks provider-filtered inventory, and asserts that run comparison reports two moves and one removal without treating the snapshot modes as different assessment perspectives.
 
 Against a production-style deployment, pass both the reachable gateway URL and the configured host router name:
 

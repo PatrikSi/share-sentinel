@@ -12,9 +12,9 @@ Use this checklist before publishing a public release of the current tree. It is
 - [x] Worker retry scheduling, stale-run recovery, and Docker health checks backed by heartbeat files
 - [x] Automated tests for API, worker, and collector components
 - [x] Local Docker Compose deployment with bootstrap, API, worker, UI, Postgres, Redis, and gateway services
-- [x] CI with dependency audits, UI production build, production/development Compose validation, all four application image builds, a live ingest, and a production-style security smoke test
+- [x] CI with dependency audits, Linux and Windows SharePoint collector tests, UI production build, production/development Compose validation, all four application image builds, live generic and SharePoint diff ingests, and a production-style security smoke test
 - [x] GHCR publication for main-branch `latest`, exact commit, and exact release image tags with high/critical vulnerability scans, provenance, and SBOM attestations
-- [x] Tracked synthetic ingest fixture at `examples/sample-artifact.json`
+- [x] Tracked synthetic ingest fixtures for mixed-provider inventory and SharePoint full-to-delta comparison
 - [x] Tag-driven source archives and SHA-256 checksums
 
 ## Per-release validation
@@ -25,6 +25,7 @@ Use this checklist before publishing a public release of the current tree. It is
 - [ ] Run `./scripts/smoke-routes.sh http://localhost`
 - [ ] Run `./scripts/doctor.sh --url http://localhost` and resolve every failure
 - [ ] Run `./scripts/smoke-ingest.sh http://localhost` with `SHARE_SENTINEL_SMOKE_PASSWORD` set
+- [ ] Run `./scripts/smoke-sharepoint-ingest.sh http://localhost` with `SHARE_SENTINEL_SMOKE_PASSWORD` set
 - [ ] Generate and ingest a representative streaming capacity artifact using `scripts/generate-capacity-artifact.py`; record host sizing, ingest rate, API latency, and worker memory
 - [ ] Run API tests: `docker compose exec -T api bash -lc "pip install -q -r requirements-dev.txt && pytest -q"`
 - [ ] Run worker tests: `cd worker && pip install -r requirements-dev.txt && pytest -q`

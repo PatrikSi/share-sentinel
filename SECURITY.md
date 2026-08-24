@@ -24,6 +24,7 @@ Do not send:
 
 - real collector artifacts
 - SMB or NFS credentials
+- Microsoft Graph access tokens, Entra client secrets, SharePoint URLs, or document paths
 - API tokens
 - browser cookies
 - real hostnames, share names, or file paths unless they are fully sanitized
@@ -78,6 +79,8 @@ The project does not currently provide:
 - `GET /healthz` is public; `/healthz/deep` and `/metrics` require sysadmin access.
 - Artifact validation at upload time is structural, not malware-aware.
 - Raw artifacts are stored on shared disk for worker access.
+- SharePoint collection artifacts and local delta state contain names, paths, URLs, and stable object identifiers even though document contents are never downloaded. Protect them as sensitive assessment data.
+- SharePoint collection is metadata-only by implementation, but `Sites.Read.All`, `Files.Read.All`, and imported Graph tokens can have broader document-read capability. Protect and rotate these credentials as high-impact secrets and prefer targeted `Sites.Selected` application grants when tenant-wide discovery is not required.
 - Share Sentinel does not provide application-layer encryption for raw artifacts; use encrypted storage and backups when required.
 - Upload throttling fails closed by default when Redis is unavailable. This can be changed with `RATE_LIMIT_FAIL_OPEN=true`, but the shipped default is `false`.
 

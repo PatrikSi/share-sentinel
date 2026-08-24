@@ -11,6 +11,7 @@ This folder is the long-form companion to the top-level [README](../README.md). 
 - [Security review](./security-review.md)
 - [Release readiness checklist](./release-readiness.md)
 - [Settings guide](./pages/settings.md)
+- [SharePoint Online collection](./sharepoint.md)
 
 ## Reference
 

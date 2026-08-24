@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/PatrikSi/share-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/PatrikSi/share-sentinel/actions/workflows/ci.yml)
 
-Share Sentinel is a self-hostable workspace for ingesting SMB and NFS collection artifacts, tracking project-scoped inventory, and reviewing run-to-run changes without losing analyst context.
+Share Sentinel is a self-hostable workspace for ingesting SMB, NFS, and SharePoint Online collection artifacts, tracking project-scoped inventory, and reviewing run-to-run changes without losing analyst context.
 
 Version 1.0.0 is the initial open-source release: the core local workflow is tested end to end, while HA operation, MFA, SSO, and turnkey internet-facing deployment are intentionally outside the current support boundary.
 
@@ -18,7 +18,7 @@ It is built around one loop:
 - `api/` FastAPI control plane for auth, RBAC, projects, runs, inventory, settings, and audit
 - `worker/` background ingestion worker fed by Redis Streams
 - `ui/` React + Vite single-page app
-- `collector/` Python CLI for SMB and NFS collection plus optional direct upload
+- `collector/` Python CLIs for SMB/NFS and Microsoft Graph-based SharePoint Online collection, plus optional direct upload
 - `docker-compose.yml` for a GHCR-backed single-host stack and `docker-compose.dev.yml` for local source builds
 
 ## Quick start
@@ -58,10 +58,11 @@ To verify the complete project, upload, worker-ingest, result, and cleanup lifec
 ```bash
 export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
 ./scripts/smoke-ingest.sh http://localhost admin@example.com
+./scripts/smoke-sharepoint-ingest.sh http://localhost admin@example.com
 unset SHARE_SENTINEL_SMOKE_PASSWORD
 ```
 
-The same tracked fixture is available at [`examples/sample-artifact.json`](./examples/sample-artifact.json) for manual testing through the Import page.
+The tracked mixed-provider fixture is available at [`examples/sample-artifact.json`](./examples/sample-artifact.json). The SharePoint smoke uses a full/delta-shaped fixture pair to validate assessment context and stable-ID move, rename, and deletion comparison end to end.
 
 The bundled Compose file keeps the gateway on `127.0.0.1:80` by default. That is intentional. If you expose the stack on a real network, put it behind TLS and review [SECURITY.md](./SECURITY.md) first.
 
@@ -83,11 +84,13 @@ Operators and admins can create a run, upload a JSON, NDJSON, JSONL, or gzip-com
 
 Project inventory supports three working views:
 
-- files and folders
-- shares
-- endpoints
+- `Files & Folders`
+- `Resources`
+- `Sites & Endpoints`
 
 The page supports guided filters, an optional query DSL, run scoping, and project-shared saved investigations. SMB results distinguish observed listing, file-read, create-file, create-directory, modify, delete, ACL-change, and ownership-change capabilities instead of treating every listable share as equally readable.
+
+SharePoint results retain stable site, library, and drive-item identities alongside display paths. Provider, resource type, exposure, collection perspective, and deleted-item filters make scheduled application inventories distinguishable from delegated user quick checks. A delegated `USER_VISIBLE` result means visible to the assessed identity; it does not mean public or anonymous.
 
 ### Run explorer
 
@@ -151,6 +154,8 @@ See the [deployment guide](./docs/deployment.md) for the production configuratio
 - MFA, SSO, and SCIM are not implemented.
 - SMB capability checks are bounded observations made with the scan identity, not a guarantee for every object or for future writes. They request rights on existing handles without creating or modifying content; quotas, read-only storage, security products, and object-specific ACLs can still affect a later operation.
 - NFS collection currently discovers advertised exports but does not mount them, so NFS access remains `unknown` unless a richer external artifact supplies evidence.
+- SharePoint Online collection is metadata-only and does not download document content. Application mode supports tenant-wide scheduled inventory; delegated modes are security-trimmed quick checks and are explicitly non-authoritative for tenant completeness.
+- Initial SharePoint exposure evidence distinguishes assessed-user visibility from public exposure. Exhaustive per-item sharing-link and permission expansion is not yet implemented, so the collector does not guess broad, external, or anonymous exposure from ordinary read visibility.
 - The project is best treated as actively evolving rather than as a locked compatibility surface.
 
 ## Documentation
@@ -167,6 +172,7 @@ See the [deployment guide](./docs/deployment.md) for the production configuratio
 - [Settings guide](./docs/pages/settings.md)
 - [API service README](./api/README.md)
 - [Collector README](./collector/README.md)
+- [SharePoint Online collection](./docs/sharepoint.md)
 - [Worker README](./worker/README.md)
 - [Security policy](./SECURITY.md)
 - [Contributing guide](./CONTRIBUTING.md)

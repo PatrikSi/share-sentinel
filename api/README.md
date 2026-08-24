@@ -23,6 +23,7 @@ FastAPI service for auth, project management, run lifecycle, artifact upload, an
 - Raw streaming artifact uploads with filename-aware JSON/NDJSON/gzip classification
 - Off-event-loop, short-lived database phases around long artifact streams
 - Bounded keyset collections and matching tenant/run pagination indexes
+- Provider-aware SharePoint inventory fields, stable resource/item identities, collection-context reporting, and evidence-based exposure filters
 
 ## Local run (without Docker)
 
@@ -58,6 +59,8 @@ API Postgres connections have explicit pool and query budgets. Defaults are a po
 Alembic bootstrap uses separate migration budgets: `MIGRATION_DATABASE_CONNECT_TIMEOUT_SECONDS` defaults to `10` and `MIGRATION_DATABASE_LOCK_TIMEOUT_MS` defaults to `60000`. Migration statements intentionally do not inherit the short API statement timeout because concurrent index builds may legitimately run for a long time after acquiring their locks.
 
 Synchronous run diff is intentionally bounded. `API_RUN_DIFF_MAX_ITEMS` defaults to `250000` total items across both runs; larger comparisons return an actionable `422` instead of risking process exhaustion. Detail arrays default to 500 records each (request maximum 2000), preserve exact aggregate counts, and return explicit truncation metadata.
+
+Provider-backed run diffs correlate items by stable provider identity within a resource. A path change is reported as a move/rename rather than one removal plus one addition. Diff responses also report whether collection perspectives are comparable; callers should treat a missing, partial, differently scoped, cross-tenant, or differently assessed identity context as a semantic warning even when structural differences are still returned.
 
 First-party artifact clients send the file itself as the request body to `POST /projects/{project_id}/runs/{run_id}/artifact` with:
 

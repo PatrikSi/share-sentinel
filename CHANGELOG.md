@@ -10,6 +10,19 @@ The project follows a simple release-first workflow:
 
 ## Unreleased
 
+### Added
+
+- Metadata-only SharePoint Online collection through Microsoft Graph, with unattended application inventory and delegated user quick-check perspectives, bounded paging/retries, and optional direct upload.
+- Durable per-library delta checkpoints and local SQLite metadata snapshots that materialize a complete artifact on every successful run while preserving stable site, library, and drive-item identities across moves and renames.
+- First-class SharePoint provider metadata, collection context, resource types, exposure evidence, inventory filters, and run-explorer presentation. Delegated `USER_VISIBLE` evidence is explicitly distinct from public, external, or anonymous exposure.
+- Collector-shaped full/delta SharePoint fixtures, an end-to-end stable-ID diff smoke test, and Windows unit/contract coverage for SharePoint collector authentication paths.
+
+### Operator notes
+
+- Migrations `0010` and `0011` add SharePoint/provider inventory fields and resumable concurrent identity indexes. Apply migrations before starting the updated API and worker.
+- SharePoint artifacts and collector state contain sensitive tenant metadata even though document contents and credentials are excluded. Protect and retain the collector state if efficient incremental collection is required.
+- Opaque-token rotation intentionally creates isolated retained state scopes. Use a dedicated/disposable state database and periodic rotation or archival for imported opaque tokens; size collector storage for state, the final artifact, and its temporary spool.
+
 ## [1.0.0] - 2026-08-24
 
 ### Added

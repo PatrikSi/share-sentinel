@@ -26,6 +26,7 @@ docker compose ps
 ./scripts/smoke-routes.sh http://localhost
 export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
 ./scripts/smoke-ingest.sh http://localhost admin@example.com
+./scripts/smoke-sharepoint-ingest.sh http://localhost admin@example.com
 unset SHARE_SENTINEL_SMOKE_PASSWORD
 ```
 
@@ -105,7 +106,7 @@ export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
 unset SHARE_SENTINEL_SMOKE_PASSWORD
 ```
 
-The production smoke verifies the public health route, hidden API docs, UI routing, secure browser cookies, response headers, and exact configured CORS origin. The ingest smoke creates and removes its own temporary project; a successful run reaches `COMPLETE`, shows two endpoints and two resources, and records the synthetic warning under run Issues.
+The production smoke verifies the public health route, hidden API docs, UI routing, secure browser cookies, response headers, and exact configured CORS origin. The generic ingest smoke creates and removes its own temporary project; a successful run reaches `COMPLETE`, shows three endpoints and three resources across SMB, NFS, and synthetic SharePoint data, and records the synthetic warning under run Issues. The SharePoint smoke imports two collector-shaped snapshots and verifies persisted assessment context plus stable-ID move, rename, and deletion comparison.
 
 Production-style API startup fails fast when secure cookies, proxy CIDRs, hostnames, secrets, or seed-admin settings are missing. Interactive API docs are disabled outside development/test environments.
 
@@ -123,9 +124,9 @@ Compose passes the database password through libpq's `PGPASSWORD` environment in
 
 Raw NDJSON ingestion limits each physical record to `INGEST_MAX_RECORD_BYTES` (default 8 MiB, maximum 16 MiB) before allocation. Compact JSON remains capped at 50 MiB by default and 128 MiB maximum; larger inventories must use streaming NDJSON. `INGEST_GZIP_MAX_BYTES` defaults to 10 GiB decompressed so the worker matches the collector and API's default 10 GiB artifact envelope, while the 200x expansion-ratio guard still rejects compressed bombs. Batch size and identity cache settings also have fail-fast upper bounds; see the worker configuration reference for exact ceilings. Oversized artifacts terminalize the run with a validation error, while unsafe worker configuration prevents startup.
 
-The collector independently caps its uncompressed NDJSON spool at 10 GiB with `--max-artifact-bytes`. Keep that value at or below the reviewed API upload and artifact-storage envelope; setting it to `0` disables the collector-side guard and should be an explicit operator decision.
+The collector independently caps its uncompressed NDJSON spool at 10 GiB with `--max-artifact-bytes`. Keep that value at or below the reviewed API upload and artifact-storage envelope; setting it to `0` disables the collector-side guard and should be an explicit operator decision. File outputs spool beside their destination before atomic replacement, while container stdout and upload-only collection use the persistent `/data` volume. Budget collector storage for the state database plus the final artifact and its in-progress spool.
 
-Compact `.json` and `.json.gz` are compatibility formats. The bundled collector caps compact reconstruction at 8 MiB per endpoint and 40 MiB total, while the worker caps compact JSON materialization at 50 MiB by default. Use `.ndjson`, `.jsonl`, or their gzip variants for normal and large collections.
+Compact `.json` and `.json.gz` are SMB/NFS collector compatibility formats; the SharePoint collector accepts only streaming `.ndjson`, `.jsonl`, or their gzip variants so provider metadata is preserved. The bundled SMB/NFS collector caps compact reconstruction at 8 MiB per endpoint and 40 MiB total, while the worker caps compact JSON materialization at 50 MiB by default. Use NDJSON/JSONL for normal and large collections.
 
 The prebuilt UI writes `/runtime-config.js` when its container starts, using `VITE_API_BASE_URL`, `VITE_CSRF_COOKIE_NAME`, and `VITE_CSRF_HEADER_NAME` from Compose. This keeps one published UI image compatible with deployment-specific API paths and CSRF names. Unsafe values fail container startup instead of being injected into JavaScript; keep the VITE CSRF values identical to the corresponding `AUTH_CSRF_*` API values.
 
@@ -136,7 +137,7 @@ The workflows build and publish these images:
 - `ghcr.io/patriksi/share-sentinel-api` — API runtime plus bootstrap/migrations
 - `ghcr.io/patriksi/share-sentinel-worker` — Redis ingest worker
 - `ghcr.io/patriksi/share-sentinel-ui` — static UI served by Nginx
-- `ghcr.io/patriksi/share-sentinel-collector` — standalone SMB/NFS collector CLI
+- `ghcr.io/patriksi/share-sentinel-collector` — standalone SMB/NFS and SharePoint Online collector CLIs
 
 Verified `main` commits receive an immutable `sha-<full-commit>` tag. The run that still matches the live branch head also advances `latest`; a superseded run deliberately skips that mutable tag. Verified release tags reuse the commit image set and add the exact `vX.Y.Z`; release jobs do not rebuild the SHA set or rewrite `latest`. Before publication, main runs tests, dependency audits, local image scans, local builds, a full ingest smoke, and a production-style security smoke. It then publishes staging candidates, pulls and revision-checks them, scans the registry artifacts, exercises a clean production stack from those candidates, and only then creates the commit tags. Main publication runs share one ordered lane and recheck the live branch head immediately before moving `latest`, so an older run cannot finish after a newer one and roll the tag backward. Existing commit and version tags are never overwritten: a rerun must resolve to the same runnable image identity and revision or fail, and registry inspection errors fail closed rather than being treated as absence. Release verification pulls, scans, and production-smokes the canonical commit set again before promoting `vX.Y.Z`. Final jobs verify every promoted tag resolves to the tested image identity. Published images include OCI source/revision labels, provenance, and an SBOM attestation.
 
@@ -149,8 +150,13 @@ Durable state is split across:
 - `pgdata`: authoritative users, projects, runs, inventory, tokens, and audit data
 - `artifacts`: raw uploaded artifacts required for ingest and retained run data
 - `redisdata`: stream and rate-limit state; Postgres-backed recovery can rediscover some queued runs, but Redis should still be treated as operational state
+- `collector_output`: optional collector artifacts and SharePoint delta/snapshot state when the `tools` profile is used
 
 Back up Postgres and the artifact volume as one operational recovery point. A database restore without matching artifacts can leave stored run metadata pointing to missing files. Encrypt backups when scan paths and host data are sensitive, and test restoration before relying on it.
+
+SharePoint delta state is an optimization as well as a checkpoint. Losing it does not corrupt server inventory, but the next collection must perform a bounded full Graph enumeration before it can publish a new complete snapshot. Do not share one state file between concurrent assessment identities or tenants. Opaque imported tokens intentionally use token-derived isolation scopes; token rotation retains the old scope and starts a safe full sync, so use a separate disposable state database and a documented rotation/archive policy for that mode.
+
+Before widening a SharePoint rollout, capture per-run item/artifact growth, Graph retry and reset counts, partial-library failures, collector volume headroom, worker ingest age, API/database latency, and Postgres storage growth. A few oversized libraries can dominate the workload; test tenant skew rather than relying only on average library size. Graph throttling should reduce throughput through bounded retries, safety limits should stop collection with an explicit partial result, and the worker queue should absorb only a measured bounded ingest burst—not an unlimited schedule backlog.
 
 Each upload attempt is stored under a new immutable artifact key before Postgres selects it for the run. A process or database failure before that pointer commit can leave an unreferenced file, but it cannot overwrite the previously committed artifact. Run and project deletion, plus cleanup of superseded uploads, remove files on a best-effort basis after the database change. Explicit request cancellation cleans up its in-progress upload, but a process kill or power loss can leave stale files under `.multipart`; failed post-commit deletions can also leave immutable-object orphans. This release does not include an automatic reconciler or retention job. Include periodic artifact-volume review of both referenced objects and `.multipart` files in the operator runbook.
 
