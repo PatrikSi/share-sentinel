@@ -11,6 +11,7 @@ CANONICAL_INVENTORY_QUERY_FIELDS = {
     "access",
     "provider",
     "resource_type",
+    "item_type",
     "exposure",
     "source",
 }
@@ -40,6 +41,11 @@ INVENTORY_QUERY_FIELD_ALIASES = {
     "resource_type": "resource_type",
     "resourcetype": "resource_type",
     "type": "resource_type",
+    "item_type": "item_type",
+    "itemtype": "item_type",
+    "entry_type": "item_type",
+    "entrytype": "item_type",
+    "kind": "item_type",
     "exposure": "exposure",
     "visibility": "exposure",
 }
@@ -130,26 +136,37 @@ def _tokenize_inventory_query(raw: str) -> list[str]:
     tokens: list[str] = []
     current: list[str] = []
     quote: str | None = None
+    normalized = raw.strip()
+    index = 0
 
-    for char in raw.strip():
+    while index < len(normalized):
+        char = normalized[index]
         if quote:
             if char == quote:
-                quote = None
+                if index + 1 < len(normalized) and normalized[index + 1] == quote:
+                    current.append(quote)
+                    index += 1
+                else:
+                    quote = None
             else:
                 current.append(char)
+            index += 1
             continue
 
         if char in {"'", '"'}:
             quote = char
+            index += 1
             continue
 
         if char.isspace():
             if current:
                 tokens.append("".join(current))
                 current = []
+            index += 1
             continue
 
         current.append(char)
+        index += 1
 
     if quote:
         raise HTTPException(status_code=400, detail="unterminated quoted value in inventory query")

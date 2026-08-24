@@ -88,9 +88,11 @@ Main UX patterns:
 - progressive guided filters, run scope, and advanced query controls instead of a permanently expanded form
 - active filter chips with individual removal and a clear-all action
 - server-backed equals and exclude shortcuts on supported table values, plus copy-exact-value actions
-- provider, resource-type, exposure, and deletion filters with SharePoint-safe terminology; `USER_VISIBLE` is always explained as assessed-identity visibility rather than public exposure
+- separate provider, resource-kind, file/directory, exposure, and deletion filters with SharePoint-safe terminology; `USER_VISIBLE` is always explained as assessed-identity visibility rather than public exposure
 - a free-text DSL editor with examples, validation, and apply/clear actions
 - column pickers, compact/comfortable density, sticky headers, and optional size, allocation, timestamp, and file-attribute columns
+- known-page number navigation over the scalable cursor API, plus browser-native CSV downloads backed by bounded-memory server batching so large exports stream to disk instead of accumulating in browser or API memory
+- visible copy actions for SMB/NFS connection paths and safe open/copy actions for canonical SharePoint HTTPS URLs; SMB file rows target their parent directory
 - compact observed-access summaries with expandable per-capability evidence; write/control observations remain visible even when a drop-box-style share denies listing
 - explicit loading, no-match, request-error, and partial-ingest states; failed requests do not relabel old rows as current results
 - complete filter, tab, query, and eligible run context in the URL for refreshes and shareable links

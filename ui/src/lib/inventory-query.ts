@@ -8,6 +8,7 @@ export type InventoryQueryField =
   | "provider"
   | "source"
   | "resource_type"
+  | "item_type"
   | "exposure";
 export type InventoryQueryOperator = "equals" | "contains" | "startswith";
 export type InventoryQueryClause = {
@@ -43,6 +44,11 @@ const FIELD_ALIASES: Record<string, InventoryQueryField> = {
   resource_type: "resource_type",
   resourcetype: "resource_type",
   type: "resource_type",
+  item_type: "item_type",
+  itemtype: "item_type",
+  entry_type: "item_type",
+  entrytype: "item_type",
+  kind: "item_type",
   exposure: "exposure",
   visibility: "exposure",
 };
@@ -105,11 +111,18 @@ function tokenizeInventoryQuery(raw: string): string[] {
   const tokens: string[] = [];
   let current = "";
   let quote: '"' | "'" | null = null;
+  const input = raw.trim();
 
-  for (const char of raw.trim()) {
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
     if (quote) {
       if (char === quote) {
-        quote = null;
+        if (input[index + 1] === quote) {
+          current += quote;
+          index += 1;
+        } else {
+          quote = null;
+        }
       } else {
         current += char;
       }

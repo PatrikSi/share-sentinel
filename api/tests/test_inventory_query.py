@@ -23,6 +23,25 @@ def test_parse_inventory_query_supports_verbose_compact_and_precedence() -> None
     ]
 
 
+def test_parse_inventory_query_supports_doubled_quotes_without_changing_backslashes() -> None:
+    groups = parse_inventory_query(
+        'search~"Bob\'s ""quarterly"" report" AND path^"\\\\HR\\Team"'
+    )
+
+    assert groups == [[
+        InventoryQueryClause(
+            field="search",
+            operator="contains",
+            value='Bob\'s "quarterly" report',
+        ),
+        InventoryQueryClause(
+            field="path",
+            operator="startswith",
+            value="\\\\HR\\Team",
+        ),
+    ]]
+
+
 def test_parse_inventory_query_normalizes_aliases_and_not_keyword() -> None:
     groups = parse_inventory_query("NOT hostname equals fs-01 !path startswith \\\\HR\\")
 
@@ -115,6 +134,40 @@ def test_parse_inventory_query_supports_provider_resource_type_exposure_and_sour
         InventoryQueryClause(field="exposure", operator="equals", value="ANONYMOUS"),
         InventoryQueryClause(field="source", operator="equals", value="sharepoint"),
     ]]
+
+
+def test_parse_inventory_query_supports_item_type_aliases() -> None:
+    assert parse_inventory_query("item_type=directory OR kind=file") == [
+        [InventoryQueryClause(field="item_type", operator="equals", value="directory")],
+        [InventoryQueryClause(field="item_type", operator="equals", value="file")],
+    ]
+
+
+def test_item_type_query_compiles_for_each_inventory_level() -> None:
+    clause = InventoryQueryClause(field="item_type", operator="equals", value="folder")
+
+    item_sql = str(
+        inventory_router._item_inventory_clause_expression(clause).compile(
+            compile_kwargs={"literal_binds": True}
+        )
+    ).lower()
+    resource_sql = str(
+        inventory_router._resource_inventory_clause_expression(clause).compile(
+            compile_kwargs={"literal_binds": True}
+        )
+    ).lower()
+    endpoint_sql = str(
+        inventory_router._endpoint_inventory_clause_expression(clause).compile(
+            compile_kwargs={"literal_binds": True}
+        )
+    ).lower()
+
+    assert "items.is_dir is true" in item_sql
+    assert "directory" in item_sql
+    assert "exists" in resource_sql
+    assert "items.is_dir is true" in resource_sql
+    assert "exists" in endpoint_sql
+    assert "items.is_dir is true" in endpoint_sql
 
 
 def test_parse_inventory_query_normalizes_visibility_to_exposure() -> None:

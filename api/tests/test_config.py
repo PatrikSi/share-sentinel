@@ -17,6 +17,9 @@ def test_api_database_capacity_defaults_are_bounded() -> None:
     assert settings.api_database_statement_timeout_ms == 30_000
     assert settings.api_database_lock_timeout_ms == 5_000
     assert settings.api_run_diff_max_items == 250_000
+    assert settings.api_inventory_export_max_concurrent == 4
+    assert settings.api_inventory_export_rate_limit == 12
+    assert settings.api_inventory_export_rate_window_seconds == 60
     assert settings.migration_database_connect_timeout_seconds == 10
     assert settings.migration_database_lock_timeout_ms == 60_000
 
@@ -34,6 +37,9 @@ def test_api_database_capacity_defaults_are_bounded() -> None:
         ("api_database_statement_timeout_ms", 3_600_001),
         ("api_database_lock_timeout_ms", 0),
         ("api_run_diff_max_items", 5_000_001),
+        ("api_inventory_export_max_concurrent", 101),
+        ("api_inventory_export_rate_limit", 86_401),
+        ("api_inventory_export_rate_window_seconds", 86_401),
         ("migration_database_connect_timeout_seconds", 301),
         ("migration_database_lock_timeout_ms", 3_600_001),
     ],
@@ -291,6 +297,9 @@ def test_default_api_token_expiry_can_be_zero_when_never_expiring_tokens_are_exp
         "auth_login_max_attempts",
         "auth_login_window_seconds",
         "auth_login_lockout_seconds",
+        "api_inventory_export_max_concurrent",
+        "api_inventory_export_rate_limit",
+        "api_inventory_export_rate_window_seconds",
     ],
 )
 @pytest.mark.parametrize("invalid", [0, -1])

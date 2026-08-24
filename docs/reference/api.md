@@ -262,6 +262,8 @@ Each item also inherits its resource's `access_level` and `access_capabilities`.
 
 Inventory pagination currently uses a stable server-defined order. Arbitrary column sorting is not part of the API contract yet; clients must not sort one fetched page and present it as a full-result sort.
 
+The shared `query_dsl` supports `item_type=file` and `item_type=directory` in addition to provider/resource fields. Resource and endpoint queries interpret item-type clauses through matching child items. Quoted values use doubled quote marks for a literal quote, for example `search~"Bob's ""quarterly"" report"`; backslashes remain literal.
+
 ### `GET /projects/{project_id}/inventory/resources`
 
 Share-level inventory view. Supports:
@@ -294,6 +296,21 @@ Endpoint-level inventory view. Supports:
 - `run_ids`
 - `limit`
 - `cursor`
+
+### `GET /projects/{project_id}/inventory/export.csv`
+
+Exports the filtered inventory scope as CSV. Supported parameters are:
+
+- `tab` (`items`, `resources`, or `endpoints`)
+- `query_dsl`
+- `run_ids`
+- `include_deleted` for item exports
+
+The export uses the same project/run and query-DSL semantics as the paginated inventory views and streams matching rows in descending keyset batches. It has no fixed row-count ceiling and keeps API and browser memory bounded independently of the total result count. Text fields that spreadsheet software could interpret as formulas are neutralized before CSV encoding.
+
+Consistency is explicitly `high-watermark-bounded-live-non-snapshot`: the first ordered page captures the highest matching row id, so later inserts are excluded, while updates, deletions, and `INGESTING` run-status changes can still affect pages fetched later. Responses expose this contract and frontier in `X-Share-Sentinel-Export-Consistency` and `X-Share-Sentinel-Export-High-Watermark`. A completed audit event means the server exhausted that live, high-watermark-bounded scope; it does not claim a point-in-time database snapshot or prove that a client durably saved every byte. Because a large export is streamed, a transport or database failure after response headers have been sent appears as an incomplete download and is recorded as failed or cancelled rather than being rewritten as a JSON error response.
+
+Export starts are subject to the configured Redis rate limit (`429`) and per-process concurrent-export capacity (`503`). Both rejection modes include `Retry-After` and occur before streaming headers are sent.
 
 ### `GET /projects/{project_id}/inventory/investigations`
 

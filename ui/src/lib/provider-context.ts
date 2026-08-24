@@ -149,7 +149,9 @@ export function metadataBoolean(metadata: ProviderMetadata | null | undefined, .
 export function safeExternalUrl(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const candidate = value.trim();
-  if (!candidate || candidate.length > 2_048) return null;
+  // Match the collector/worker URL contract so a valid long SharePoint item URL
+  // does not become unusable only after it reaches the browser.
+  if (!candidate || candidate.length > 8_192) return null;
   try {
     const parsed = new URL(candidate);
     if (parsed.protocol !== "https:" || parsed.username || parsed.password) return null;

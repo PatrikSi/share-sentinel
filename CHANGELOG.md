@@ -10,8 +10,14 @@ The project follows a simple release-first workflow:
 
 ## Unreleased
 
+### Added
+
+- Project inventory now exports filtered file, resource, or endpoint results as formula-safe, bounded-memory streaming CSV without the previous 20,000-row ceiling, with documented live high-watermark consistency and export admission controls.
+- Inventory tables now expose numbered cursor-page navigation, file/directory filtering with inline include/exclude shortcuts, and provider-aware connection actions for SMB, NFS, and SharePoint resources.
+
 ### Fixed
 
+- Browser sessions can now use their refresh cookie after the short-lived access cookie expires because the double-submit CSRF cookie remains available for the refresh lifetime.
 - The web shell now prevents stale deployment caching, returns a real 404 for missing hashed assets, validates every startup asset in deployment smokes, and shows an actionable browser-side error instead of an empty page when JavaScript cannot start.
 
 ## [1.1.0] - 2026-08-24

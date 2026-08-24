@@ -9,6 +9,12 @@ import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
+import {
+  endpointConnectionTarget,
+  itemConnectionTarget,
+  resourceConnectionTarget,
+  type InventoryConnectionTarget,
+} from "@/lib/inventory-connection";
 import { parseInventoryQuery, type InventoryQueryClause, type InventoryQueryField, type InventoryQueryGroup } from "@/lib/inventory-query";
 import {
   assessedIdentity,
@@ -25,6 +31,7 @@ import {
   type CollectionContext,
   type ProviderMetadata,
 } from "@/lib/provider-context";
+import { API_BASE } from "@/lib/runtime-config";
 
 type Project = { id: string; name: string };
 type RunOption = { id: string; name: string; status: string; created_at: string; collection_context?: CollectionContext | null };
@@ -116,6 +123,7 @@ type SavedInvestigationDefinition = {
     resource_access?: string;
     provider_filter?: string;
     resource_type_filter?: string;
+    item_type_filter?: string;
     exposure_filter?: string;
     include_deleted?: boolean;
   };
@@ -135,6 +143,7 @@ type SavedInvestigation = {
   updated_at: string;
 };
 type ItemColumnKey =
+  | "connection"
   | "path"
   | "name"
   | "resource_name"
@@ -165,6 +174,7 @@ type ItemColumnKey =
   | "drive_id"
   | "deleted";
 type ResourceColumnKey =
+  | "connection"
   | "name"
   | "provider"
   | "assessment_scope"
@@ -181,6 +191,7 @@ type ResourceColumnKey =
   | "provider_resource_id"
   | "site_id";
 type EndpointColumnKey =
+  | "connection"
   | "endpoint_key"
   | "provider"
   | "assessment_scope"
@@ -205,11 +216,12 @@ type QueryFilterReflection = {
 type Density = "compact" | "comfortable";
 type CellFilterField = InventoryQueryField | null;
 
-const DEFAULT_ITEM_COLUMNS: ItemColumnKey[] = ["path", "name", "provider", "resource_name", "access_level", "exposure", "size_bytes", "mtime", "run_name"];
-const DEFAULT_RESOURCE_COLUMNS: ResourceColumnKey[] = ["name", "provider", "resource_type", "exposure", "access_level", "hostname", "item_count", "run_name"];
-const DEFAULT_ENDPOINT_COLUMNS: EndpointColumnKey[] = ["endpoint_key", "provider", "site_name", "hostname", "resource_count", "item_count", "run_name"];
+const DEFAULT_ITEM_COLUMNS: ItemColumnKey[] = ["path", "name", "is_dir", "connection", "provider", "resource_name", "access_level", "exposure", "size_bytes", "mtime", "run_name"];
+const DEFAULT_RESOURCE_COLUMNS: ResourceColumnKey[] = ["name", "connection", "provider", "resource_type", "exposure", "access_level", "hostname", "item_count", "run_name"];
+const DEFAULT_ENDPOINT_COLUMNS: EndpointColumnKey[] = ["endpoint_key", "connection", "provider", "site_name", "hostname", "resource_count", "item_count", "run_name"];
 
 const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
+  { key: "connection", label: "Connection" },
   { key: "path", label: "Path" },
   { key: "name", label: "Name" },
   { key: "resource_name", label: "Share / Library" },
@@ -241,6 +253,7 @@ const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
   { key: "deleted", label: "Deleted" },
 ];
 const RESOURCE_COLUMN_OPTIONS: Array<{ key: ResourceColumnKey; label: string }> = [
+  { key: "connection", label: "Connection" },
   { key: "name", label: "Share / Library" },
   { key: "provider", label: "Source" },
   { key: "assessment_scope", label: "Assessment Scope" },
@@ -258,6 +271,7 @@ const RESOURCE_COLUMN_OPTIONS: Array<{ key: ResourceColumnKey; label: string }> 
   { key: "site_id", label: "SharePoint Site ID" },
 ];
 const ENDPOINT_COLUMN_OPTIONS: Array<{ key: EndpointColumnKey; label: string }> = [
+  { key: "connection", label: "Connection" },
   { key: "endpoint_key", label: "Source Key" },
   { key: "provider", label: "Source" },
   { key: "assessment_scope", label: "Assessment Scope" },
@@ -274,7 +288,7 @@ const ENDPOINT_COLUMN_OPTIONS: Array<{ key: EndpointColumnKey; label: string }> 
   { key: "run_name", label: "Run Name" },
   { key: "run_id", label: "Run ID" },
 ];
-const QUERYABLE_FIELDS: InventoryQueryField[] = ["search", "endpoint", "share", "path", "ext", "access", "provider", "source", "resource_type", "exposure"];
+const QUERYABLE_FIELDS: InventoryQueryField[] = ["search", "endpoint", "share", "path", "ext", "access", "provider", "source", "resource_type", "item_type", "exposure"];
 const MAX_EXPLICIT_RUN_SELECTIONS = 100;
 const ACCESS_QUERY_ALIASES: Record<string, string> = {
   no_access: "no_access",
@@ -316,7 +330,7 @@ function normalizeReflectionValue(field: InventoryQueryField, value: string): st
   if (field === "access") {
     return ACCESS_QUERY_ALIASES[trimmed.toLowerCase().replaceAll(" ", "_")] || trimmed.toLowerCase();
   }
-  if (field === "provider" || field === "source" || field === "resource_type") return trimmed.toLowerCase().replaceAll(" ", "_");
+  if (field === "provider" || field === "source" || field === "resource_type" || field === "item_type") return trimmed.toLowerCase().replaceAll(" ", "_");
   if (field === "exposure") {
     const normalized = trimmed.toLowerCase().replaceAll(" ", "_");
     return EXPOSURE_QUERY_ALIASES[normalized] || trimmed.toUpperCase();
@@ -370,6 +384,7 @@ function blankQueryFilterReflections(): Record<InventoryQueryField, QueryFilterR
     provider: { value: "", modeLabel: null, summary: null, selectValue: "" },
     source: { value: "", modeLabel: null, summary: null, selectValue: "" },
     resource_type: { value: "", modeLabel: null, summary: null, selectValue: "" },
+    item_type: { value: "", modeLabel: null, summary: null, selectValue: "" },
     exposure: { value: "", modeLabel: null, summary: null, selectValue: "" },
   };
 }
@@ -409,6 +424,7 @@ const QUERY_FIELD_LABELS: Record<InventoryQueryField, string> = {
   provider: "Source",
   source: "Run Source",
   resource_type: "Resource Type",
+  item_type: "Item Type",
   exposure: "Exposure",
 };
 
@@ -448,14 +464,24 @@ function readInitialRuns(): string[] {
   return readInitialRunSelection().ids;
 }
 
-function readStoredColumns<T extends string>(storageKey: string, options: Array<{ key: T }>, fallback: T[]): T[] {
+function readStoredColumns<T extends string>(
+  storageKey: string,
+  options: Array<{ key: T }>,
+  fallback: T[],
+  legacyStorageKey?: string,
+  migrationDefaults: T[] = [],
+): T[] {
   if (typeof window === "undefined") return fallback;
   try {
-    const parsed = JSON.parse(localStorage.getItem(storageKey) || "[]");
+    const stored = localStorage.getItem(storageKey);
+    const legacyStored = stored === null && legacyStorageKey ? localStorage.getItem(legacyStorageKey) : null;
+    const parsed = JSON.parse(stored ?? legacyStored ?? "[]");
     if (!Array.isArray(parsed)) return fallback;
     const allowed = new Set(options.map((option) => option.key));
     const selected = parsed.filter((value): value is T => typeof value === "string" && allowed.has(value as T));
-    return selected.length > 0 ? [...new Set(selected)] : fallback;
+    if (selected.length === 0) return fallback;
+    const migrated = legacyStored === null ? selected : [...selected, ...migrationDefaults];
+    return [...new Set(migrated)];
   } catch {
     return fallback;
   }
@@ -483,9 +509,7 @@ function persistInventoryPreference(storageKey: string, value: string): string |
 function quoteInventoryQueryValue(value: string): string | null {
   const normalized = value.replace(/[\r\n]+/g, " ").trim();
   if (!normalized) return null;
-  if (!normalized.includes('"')) return `"${normalized}"`;
-  if (!normalized.includes("'")) return `'${normalized}'`;
-  return null;
+  return `"${normalized.replaceAll('"', '""')}"`;
 }
 
 function serializeInventoryClause(clause: InventoryQueryClause): string | null {
@@ -537,6 +561,22 @@ function formatFileAttributes(value: string[] | null | undefined): string {
   return value
     .map((attribute) => attribute.replaceAll("_", " ").replace(/\b\w/g, (character) => character.toUpperCase()))
     .join(", ");
+}
+
+type PaginationMarker = number | "ellipsis";
+
+function paginationMarkers(currentPage: number, hasNextPage: boolean): PaginationMarker[] {
+  const visiblePages = new Set<number>([1, currentPage]);
+  for (let page = Math.max(1, currentPage - 2); page < currentPage; page += 1) visiblePages.add(page);
+  if (hasNextPage) visiblePages.add(currentPage + 1);
+  const orderedPages = [...visiblePages].sort((left, right) => left - right);
+  const markers: PaginationMarker[] = [];
+  for (const page of orderedPages) {
+    const previous = markers.at(-1);
+    if (typeof previous === "number" && page - previous > 1) markers.push("ellipsis");
+    markers.push(page);
+  }
+  return markers;
 }
 
 type InventoryCellProps = {
@@ -617,11 +657,55 @@ function InventoryCell({ text, label, content, filterField = null, filterScopeLa
   );
 }
 
+function ConnectionCell({
+  label,
+  target,
+  onCopy,
+}: {
+  label: string;
+  target: InventoryConnectionTarget | null;
+  onCopy: (value: string, label: string) => void;
+}) {
+  const connection = target?.kind === "url" ? safeExternalUrl(target.value) : target?.value || null;
+  if (!connection) {
+    return <span className="inventory-connection-unavailable">Unavailable</span>;
+  }
+  const isUrl = target?.kind === "url";
+  return (
+    <div className="inventory-connection-cell">
+      {isUrl ? (
+        <a
+          aria-label={`Open SharePoint URL for ${label}`}
+          className="inventory-external-link"
+          href={connection}
+          rel="noreferrer"
+          target="_blank"
+          title={connection}
+        >
+          Open <span aria-hidden="true">↗</span>
+        </a>
+      ) : (
+        <code title={connection}>{connection}</code>
+      )}
+      <button
+        aria-label={`Copy ${isUrl ? "URL" : "connection path"} for ${label}`}
+        onClick={() => onCopy(connection, isUrl ? "SharePoint URL" : "Connection path")}
+        title={`Copy ${isUrl ? "URL" : "connection path"}`}
+        type="button"
+      >
+        Copy
+      </button>
+    </div>
+  );
+}
+
 export function ProjectInventoryPage() {
   const { projectId } = useParams<{ projectId: string }>();
   const [, setSearchParams] = useSearchParams();
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const tableScrollRef = useRef<HTMLDivElement | null>(null);
   const copiedNoticeTimer = useRef<number | null>(null);
+  const exportResetTimer = useRef<number | null>(null);
   const initialDsl = useRef(readInitialSearchParam("queryDsl"));
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
@@ -648,6 +732,7 @@ export function ProjectInventoryPage() {
   const [resourceAccess, setResourceAccess] = useState(() => readInitialSearchParam("access"));
   const [providerFilter, setProviderFilter] = useState(() => readInitialSearchParam("provider"));
   const [resourceTypeFilter, setResourceTypeFilter] = useState(() => readInitialSearchParam("resourceType"));
+  const [itemTypeFilter, setItemTypeFilter] = useState(() => readInitialSearchParam("itemType"));
   const [exposureFilter, setExposureFilter] = useState(() => readInitialSearchParam("exposure"));
   const [includeDeleted, setIncludeDeleted] = useState(() => readInitialSearchParam("includeDeleted") === "1");
   const [inventoryQueryInput, setInventoryQueryInput] = useState(initialDsl.current);
@@ -674,6 +759,7 @@ export function ProjectInventoryPage() {
   const [error, setError] = useState<string | null>(null);
   const [inventoryError, setInventoryError] = useState<string | null>(null);
   const [inventoryLoading, setInventoryLoading] = useState(false);
+  const [exportingTab, setExportingTab] = useState<Tab | null>(null);
   const [lastLoadedAt, setLastLoadedAt] = useState<Date | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [projectContextNonce, setProjectContextNonce] = useState(0);
@@ -685,13 +771,31 @@ export function ProjectInventoryPage() {
   const [savingInvestigation, setSavingInvestigation] = useState(false);
   const [deletingInvestigationId, setDeletingInvestigationId] = useState<string | null>(null);
   const [itemColumns, setItemColumns] = useState<ItemColumnKey[]>(() =>
-    readStoredColumns("share_sentinel_inventory_item_columns", ITEM_COLUMN_OPTIONS, DEFAULT_ITEM_COLUMNS),
+    readStoredColumns(
+      "share_sentinel_inventory_item_columns_v2",
+      ITEM_COLUMN_OPTIONS,
+      DEFAULT_ITEM_COLUMNS,
+      "share_sentinel_inventory_item_columns",
+      ["is_dir", "connection"],
+    ),
   );
   const [resourceColumns, setResourceColumns] = useState<ResourceColumnKey[]>(() =>
-    readStoredColumns("share_sentinel_inventory_resource_columns", RESOURCE_COLUMN_OPTIONS, DEFAULT_RESOURCE_COLUMNS),
+    readStoredColumns(
+      "share_sentinel_inventory_resource_columns_v2",
+      RESOURCE_COLUMN_OPTIONS,
+      DEFAULT_RESOURCE_COLUMNS,
+      "share_sentinel_inventory_resource_columns",
+      ["connection"],
+    ),
   );
   const [endpointColumns, setEndpointColumns] = useState<EndpointColumnKey[]>(() =>
-    readStoredColumns("share_sentinel_inventory_endpoint_columns", ENDPOINT_COLUMN_OPTIONS, DEFAULT_ENDPOINT_COLUMNS),
+    readStoredColumns(
+      "share_sentinel_inventory_endpoint_columns_v2",
+      ENDPOINT_COLUMN_OPTIONS,
+      DEFAULT_ENDPOINT_COLUMNS,
+      "share_sentinel_inventory_endpoint_columns",
+      ["connection"],
+    ),
   );
   const [showAdvancedQuery, setShowAdvancedQuery] = useState(false);
   const [showGuidedFilters, setShowGuidedFilters] = useState(() =>
@@ -703,6 +807,7 @@ export function ProjectInventoryPage() {
       readInitialSearchParam("access"),
       readInitialSearchParam("provider"),
       readInitialSearchParam("resourceType"),
+      readInitialSearchParam("itemType"),
       readInitialSearchParam("exposure"),
     ].some(Boolean),
   );
@@ -720,6 +825,7 @@ export function ProjectInventoryPage() {
   const debouncedResourceAccess = useDebouncedValue(resourceAccess, 150);
   const debouncedProviderFilter = useDebouncedValue(providerFilter, 150);
   const debouncedResourceTypeFilter = useDebouncedValue(resourceTypeFilter, 150);
+  const debouncedItemTypeFilter = useDebouncedValue(itemTypeFilter, 150);
   const debouncedExposureFilter = useDebouncedValue(exposureFilter, 150);
   const queryModeActive = appliedInventoryQuery.trim().length > 0;
   const canImport = projectRole === "operator" || projectRole === "admin";
@@ -736,7 +842,7 @@ export function ProjectInventoryPage() {
   const activeRunCount = selectedRunIds.length;
   const includeDeletedApplies = activeTab === "items" && includeDeleted;
   const hasGuidedFilters =
-    [query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess, providerFilter, resourceTypeFilter, exposureFilter].some((value) => value.trim()) ||
+    [query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess, providerFilter, resourceTypeFilter, itemTypeFilter, exposureFilter].some((value) => value.trim()) ||
     includeDeletedApplies;
   const hasActiveFilters = queryModeActive || hasGuidedFilters || selectedRunIds.length > 0;
   const eligibleRuns = useMemo(() => runs.filter((run) => run.status === "COMPLETE" || run.status === "INGESTING"), [runs]);
@@ -790,6 +896,7 @@ export function ProjectInventoryPage() {
     setResourceAccess(reflections.access.selectValue);
     setProviderFilter(reflections.provider.selectValue);
     setResourceTypeFilter(reflections.resource_type.selectValue);
+    setItemTypeFilter(reflections.item_type.selectValue);
     setExposureFilter(reflections.exposure.selectValue);
     setQueryError(null);
   }
@@ -826,6 +933,7 @@ export function ProjectInventoryPage() {
     setResourceAccess("");
     setProviderFilter("");
     setResourceTypeFilter("");
+    setItemTypeFilter("");
     setExposureFilter("");
     setIncludeDeleted(false);
   }
@@ -851,6 +959,7 @@ export function ProjectInventoryPage() {
     if (resourceAccess.trim()) group.push({ field: "access", operator: "equals", value: resourceAccess.trim(), negated: false });
     if (providerFilter.trim()) group.push({ field: "provider", operator: "equals", value: providerFilter.trim(), negated: false });
     if (resourceTypeFilter.trim()) group.push({ field: "resource_type", operator: "equals", value: resourceTypeFilter.trim(), negated: false });
+    if (itemTypeFilter.trim()) group.push({ field: "item_type", operator: "equals", value: itemTypeFilter.trim(), negated: false });
     if (exposureFilter.trim()) group.push({ field: "exposure", operator: "equals", value: exposureFilter.trim(), negated: false });
     return group.length > 0 ? [group] : [];
   }
@@ -861,7 +970,7 @@ export function ProjectInventoryPage() {
     const nextGroups = baseGroups.length > 0 ? baseGroups.map((group) => [...group, clause]) : [[clause]];
     const serialized = serializeInventoryGroups(nextGroups);
     if (!serialized) {
-      setQueryError("This value contains both quote styles and cannot be represented safely in the inventory query.");
+      setQueryError("This value is empty after normalization and cannot be used as a filter.");
       return;
     }
     setInventoryQueryInput(serialized);
@@ -894,17 +1003,65 @@ export function ProjectInventoryPage() {
     if (field === "access") setResourceAccess("");
     if (field === "provider") setProviderFilter("");
     if (field === "resource_type") setResourceTypeFilter("");
+    if (field === "item_type") setItemTypeFilter("");
     if (field === "exposure") setExposureFilter("");
+  }
+
+  function showActionNotice(message: string) {
+    setCopiedNotice(message);
+    if (copiedNoticeTimer.current) window.clearTimeout(copiedNoticeTimer.current);
+    copiedNoticeTimer.current = window.setTimeout(() => setCopiedNotice(null), 2400);
   }
 
   async function copyExactValue(value: string, label: string) {
     try {
       await copyText(value);
-      setCopiedNotice(`${label} copied`);
-      if (copiedNoticeTimer.current) window.clearTimeout(copiedNoticeTimer.current);
-      copiedNoticeTimer.current = window.setTimeout(() => setCopiedNotice(null), 1800);
+      showActionNotice(`${label} copied`);
     } catch {
-      setCopiedNotice("Copy failed. Select the value and copy it manually.");
+      showActionNotice("Copy failed. Select the value and copy it manually.");
+    }
+  }
+
+  async function exportInventoryCsv() {
+    if (!projectId || exportingTab) return;
+    const targetTab = activeTab;
+    const targetProjectId = projectId;
+    setExportingTab(targetTab);
+    try {
+      // Refresh an expired access cookie before handing the large response to the
+      // browser's native downloader, which cannot use apiFetch's retry flow itself.
+      await apiFetch("/auth/me");
+      if (projectIdRef.current !== targetProjectId) return;
+
+      const queryParams = new URLSearchParams({ tab: targetTab });
+      if (runIdsParam) queryParams.set("run_ids", runIdsParam);
+      if (targetTab === "items" && includeDeleted) queryParams.set("include_deleted", "true");
+      const queryDsl = queryModeActive
+        ? appliedInventoryQuery.trim()
+        : serializeInventoryGroups(guidedFilterGroups());
+      if (queryDsl) queryParams.set("query_dsl", queryDsl);
+
+      // A native browser download streams the response to disk. Fetching a Blob here
+      // would retain the entire enterprise inventory in the browser's memory.
+      const link = document.createElement("a");
+      link.href = `${API_BASE}/projects/${encodeURIComponent(targetProjectId)}/inventory/export.csv?${queryParams.toString()}`;
+      link.download = `share-sentinel-${targetTab}.csv`;
+      link.hidden = true;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      showActionNotice(`${INVENTORY_TAB_COPY[targetTab].label} CSV export started`);
+
+      if (exportResetTimer.current) window.clearTimeout(exportResetTimer.current);
+      exportResetTimer.current = window.setTimeout(() => {
+        setExportingTab((current) => (current === targetTab ? null : current));
+        exportResetTimer.current = null;
+      }, 750);
+    } catch (err) {
+      setExportingTab((current) => (current === targetTab ? null : current));
+      if (!isAbortError(err)) {
+        showActionNotice("CSV export could not start. Check your connection and try again.");
+      }
     }
   }
 
@@ -919,6 +1076,7 @@ export function ProjectInventoryPage() {
       resourceAccess.trim() ? `access:${resourceAccess.trim()}` : null,
       providerFilter.trim() ? `provider:${providerFilter.trim()}` : null,
       resourceTypeFilter.trim() ? `resource_type:${resourceTypeFilter.trim()}` : null,
+      itemTypeFilter.trim() ? `item_type:${itemTypeFilter.trim()}` : null,
       exposureFilter.trim() ? `exposure:${exposureFilter.trim()}` : null,
       includeDeleted ? "include:deleted" : null,
     ]
@@ -939,6 +1097,7 @@ export function ProjectInventoryPage() {
         resource_access: resourceAccess,
         provider_filter: providerFilter,
         resource_type_filter: resourceTypeFilter,
+        item_type_filter: itemTypeFilter,
         exposure_filter: exposureFilter,
         include_deleted: includeDeleted,
       },
@@ -998,6 +1157,7 @@ export function ProjectInventoryPage() {
     setResourceAccess(typeof filters.resource_access === "string" ? filters.resource_access : "");
     setProviderFilter(typeof filters.provider_filter === "string" ? filters.provider_filter : "");
     setResourceTypeFilter(typeof filters.resource_type_filter === "string" ? filters.resource_type_filter : "");
+    setItemTypeFilter(typeof filters.item_type_filter === "string" ? filters.item_type_filter : "");
     setExposureFilter(typeof filters.exposure_filter === "string" ? filters.exposure_filter : "");
     setIncludeDeleted(filters.include_deleted === true);
     setInventoryQueryInput(draftQuery);
@@ -1136,24 +1296,25 @@ export function ProjectInventoryPage() {
       if (resourceAccess.trim()) next.set("access", resourceAccess.trim());
       if (providerFilter.trim()) next.set("provider", providerFilter.trim());
       if (resourceTypeFilter.trim()) next.set("resourceType", resourceTypeFilter.trim());
+      if (itemTypeFilter.trim()) next.set("itemType", itemTypeFilter.trim());
       if (exposureFilter.trim()) next.set("exposure", exposureFilter.trim());
     }
     if (includeDeleted) next.set("includeDeleted", "1");
     setSearchParams(next, { replace: true });
-  }, [activeTab, appliedInventoryQuery, endpointFilter, exposureFilter, extFilter, includeDeleted, pathPrefix, providerFilter, query, queryModeActive, resourceAccess, resourceTypeFilter, selectedRunIds, setSearchParams, shareFilter]);
+  }, [activeTab, appliedInventoryQuery, endpointFilter, exposureFilter, extFilter, includeDeleted, itemTypeFilter, pathPrefix, providerFilter, query, queryModeActive, resourceAccess, resourceTypeFilter, selectedRunIds, setSearchParams, shareFilter]);
 
   useEffect(() => {
-    const persistenceError = persistInventoryPreference("share_sentinel_inventory_item_columns", JSON.stringify(itemColumns));
+    const persistenceError = persistInventoryPreference("share_sentinel_inventory_item_columns_v2", JSON.stringify(itemColumns));
     if (persistenceError) setPreferenceWarning(persistenceError);
   }, [itemColumns]);
 
   useEffect(() => {
-    const persistenceError = persistInventoryPreference("share_sentinel_inventory_resource_columns", JSON.stringify(resourceColumns));
+    const persistenceError = persistInventoryPreference("share_sentinel_inventory_resource_columns_v2", JSON.stringify(resourceColumns));
     if (persistenceError) setPreferenceWarning(persistenceError);
   }, [resourceColumns]);
 
   useEffect(() => {
-    const persistenceError = persistInventoryPreference("share_sentinel_inventory_endpoint_columns", JSON.stringify(endpointColumns));
+    const persistenceError = persistInventoryPreference("share_sentinel_inventory_endpoint_columns_v2", JSON.stringify(endpointColumns));
     if (persistenceError) setPreferenceWarning(persistenceError);
   }, [endpointColumns]);
 
@@ -1178,6 +1339,7 @@ export function ProjectInventoryPage() {
   useEffect(
     () => () => {
       if (copiedNoticeTimer.current) window.clearTimeout(copiedNoticeTimer.current);
+      if (exportResetTimer.current) window.clearTimeout(exportResetTimer.current);
     },
     [],
   );
@@ -1203,6 +1365,9 @@ export function ProjectInventoryPage() {
     if (!projectId) return;
     let cancelled = false;
     const controller = new AbortController();
+    if (exportResetTimer.current) window.clearTimeout(exportResetTimer.current);
+    exportResetTimer.current = null;
+    setExportingTab(null);
     setProject(null);
     setRuns([]);
     setRunsLoaded(false);
@@ -1317,9 +1482,10 @@ export function ProjectInventoryPage() {
   }, [projectId, runIdsParam]);
 
   useEffect(() => {
+    tableScrollRef.current?.scrollTo({ top: 0 });
     setCursor(null);
     setCursorHistory([]);
-  }, [activeTab, appliedInventoryQuery, projectId, runIdsParam, debouncedQuery, debouncedEndpointFilter, debouncedShareFilter, debouncedPathPrefix, debouncedExtFilter, debouncedResourceAccess, debouncedProviderFilter, debouncedResourceTypeFilter, debouncedExposureFilter, includeDeleted]);
+  }, [activeTab, appliedInventoryQuery, projectId, runIdsParam, debouncedQuery, debouncedEndpointFilter, debouncedShareFilter, debouncedPathPrefix, debouncedExtFilter, debouncedResourceAccess, debouncedProviderFilter, debouncedResourceTypeFilter, debouncedItemTypeFilter, debouncedExposureFilter, includeDeleted]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -1339,6 +1505,7 @@ export function ProjectInventoryPage() {
       if (debouncedResourceAccess.trim()) guidedGroup.push({ field: "access", operator: "equals", value: debouncedResourceAccess.trim(), negated: false });
       if (debouncedProviderFilter.trim()) guidedGroup.push({ field: "provider", operator: "equals", value: debouncedProviderFilter.trim(), negated: false });
       if (debouncedResourceTypeFilter.trim()) guidedGroup.push({ field: "resource_type", operator: "equals", value: debouncedResourceTypeFilter.trim(), negated: false });
+      if (debouncedItemTypeFilter.trim()) guidedGroup.push({ field: "item_type", operator: "equals", value: debouncedItemTypeFilter.trim(), negated: false });
       if (debouncedExposureFilter.trim()) guidedGroup.push({ field: "exposure", operator: "equals", value: debouncedExposureFilter.trim(), negated: false });
       const serialized = serializeInventoryGroups(guidedGroup.length > 0 ? [guidedGroup] : []);
       if (serialized) queryParams.set("query_dsl", serialized);
@@ -1389,6 +1556,7 @@ export function ProjectInventoryPage() {
     debouncedQuery,
     debouncedResourceAccess,
     debouncedResourceTypeFilter,
+    debouncedItemTypeFilter,
     debouncedShareFilter,
     debouncedExposureFilter,
     includeDeleted,
@@ -1400,11 +1568,13 @@ export function ProjectInventoryPage() {
 
   function moveNext() {
     if (!nextCursor) return;
+    tableScrollRef.current?.scrollTo({ top: 0 });
     setCursorHistory((prev) => [...prev, cursor]);
     setCursor(nextCursor);
   }
 
   function movePrev() {
+    tableScrollRef.current?.scrollTo({ top: 0 });
     setCursorHistory((prev) => {
       if (prev.length === 0) return prev;
       const copy = [...prev];
@@ -1412,6 +1582,20 @@ export function ProjectInventoryPage() {
       setCursor(previous);
       return copy;
     });
+  }
+
+  function moveToPage(page: number) {
+    const currentPage = cursorHistory.length + 1;
+    if (page === currentPage || page < 1) return;
+    if (page === currentPage + 1) {
+      moveNext();
+      return;
+    }
+    if (page > currentPage) return;
+    const targetCursor = cursorHistory[page - 1] ?? null;
+    tableScrollRef.current?.scrollTo({ top: 0 });
+    setCursorHistory((previous) => previous.slice(0, page - 1));
+    setCursor(targetCursor);
   }
 
   function toggleItemColumn(column: ItemColumnKey) {
@@ -1500,6 +1684,26 @@ export function ProjectInventoryPage() {
     const siteName = metadataString(row.endpoint_metadata, "display_name", "displayName", "site_name", "siteName", "name");
     const driveId = metadataString(row.metadata, "drive_id", "driveId");
     const webUrl = safeExternalUrl(row.web_url);
+    if (column === "connection") {
+      return (
+        <ConnectionCell
+          label={row.name}
+          onCopy={copyExactValue}
+          target={itemConnectionTarget({
+            endpointKey: row.endpoint_key,
+            hostname: row.hostname,
+            ip: row.ip,
+            provider,
+            resourceType,
+            shareType: row.share_type,
+            resourceName: row.resource_name,
+            path: row.path,
+            isDirectory: row.is_dir,
+            webUrl: row.web_url,
+          })}
+        />
+      );
+    }
     if (column === "path") return <InventoryCell text={row.path} label={label} filterField="path" mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "name") {
       return (
@@ -1572,7 +1776,7 @@ export function ProjectInventoryPage() {
     if (column === "site_id") return <InventoryCell text={siteId || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "drive_id") return <InventoryCell text={driveId || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "deleted") return <InventoryCell text={row.deleted ? "Deleted" : "Current"} label={label} badge={row.deleted ? "warning" : "positive"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
-    return <InventoryCell text={row.is_dir ? "Directory" : "File"} label={label} badge="neutral" onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    return <InventoryCell text={row.is_dir ? "Directory" : "File"} label={label} badge="neutral" filterField="item_type" filterValue={row.is_dir ? "directory" : "file"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
   }
 
   function resourceCell(row: InventoryResource, column: ResourceColumnKey): ReactNode {
@@ -1583,6 +1787,23 @@ export function ProjectInventoryPage() {
     const siteId = metadataString(row.metadata, "site_id", "siteId");
     const siteName = metadataString(row.endpoint_metadata, "display_name", "displayName", "site_name", "siteName", "name");
     const webUrl = safeExternalUrl(row.web_url);
+    if (column === "connection") {
+      return (
+        <ConnectionCell
+          label={row.name}
+          onCopy={copyExactValue}
+          target={resourceConnectionTarget({
+            endpointKey: row.endpoint_key,
+            hostname: row.hostname,
+            provider,
+            resourceType,
+            shareType: row.share_type,
+            resourceName: row.name,
+            webUrl: row.web_url,
+          })}
+        />
+      );
+    }
     if (column === "name") return <InventoryCell text={row.name} label={label} filterField="share" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "provider") return <InventoryCell content={<ProviderBadge provider={provider} />} text={providerLabel(provider)} filterField="provider" filterValue={provider} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "assessment_scope") return assessmentScopeCell(row.run_id, label);
@@ -1618,6 +1839,21 @@ export function ProjectInventoryPage() {
     const siteId = metadataString(row.metadata, "site_id", "siteId");
     const provider = normalizedProvider(row.provider, metadataString(row.metadata, "provider"), siteId ? "sharepoint" : "network");
     const tenantId = metadataString(row.metadata, "tenant_id", "tenantId");
+    if (column === "connection") {
+      return (
+        <ConnectionCell
+          label={siteName || row.hostname || row.endpoint_key}
+          onCopy={copyExactValue}
+          target={endpointConnectionTarget({
+            endpointKey: row.endpoint_key,
+            hostname: row.hostname,
+            ip: row.ip,
+            provider,
+            webUrl: rawWebUrl,
+          })}
+        />
+      );
+    }
     if (column === "endpoint_key") return <InventoryCell text={row.endpoint_key} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "provider") return <InventoryCell content={<ProviderBadge provider={provider} />} text={providerLabel(provider)} filterField={provider === "network" ? undefined : "provider"} filterValue={provider} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "assessment_scope") return assessmentScopeCell(row.run_id, label);
@@ -1638,8 +1874,9 @@ export function ProjectInventoryPage() {
   const activeTabCopy = INVENTORY_TAB_COPY[activeTab];
   const guidedFilterCount = queryModeActive
     ? QUERYABLE_FIELDS.filter((field) => !!queryFilterReflections[field].summary).length + (includeDeletedApplies ? 1 : 0)
-    : [query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess, providerFilter, resourceTypeFilter, exposureFilter].filter((value) => value.trim()).length + (includeDeletedApplies ? 1 : 0);
+    : [query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess, providerFilter, resourceTypeFilter, itemTypeFilter, exposureFilter].filter((value) => value.trim()).length + (includeDeletedApplies ? 1 : 0);
   const currentPage = cursorHistory.length + 1;
+  const pageMarkers = paginationMarkers(currentPage, !!nextCursor);
 
   return (
     <section className="inventory-workspace">
@@ -1864,6 +2101,16 @@ export function ProjectInventoryPage() {
             Saved views {savedInvestigations.length > 0 ? <span className="inventory-toolbar-count">{savedInvestigations.length}</span> : null}
           </button>
 
+          <button
+            className="inventory-toolbar-button"
+            disabled={inventoryLoading || exportingTab !== null}
+            onClick={exportInventoryCsv}
+            title={`Stream all filtered ${activeTabCopy.label.toLowerCase()} as CSV`}
+            type="button"
+          >
+            {exportingTab ? "Starting export…" : "Export CSV"}
+          </button>
+
           {activeTab === "items" ? (
             <ColumnPicker options={ITEM_COLUMN_OPTIONS} selected={itemColumns} onToggle={toggleItemColumn} onMove={moveItemColumn} onReset={() => setItemColumns(DEFAULT_ITEM_COLUMNS)} />
           ) : null}
@@ -1919,6 +2166,7 @@ export function ProjectInventoryPage() {
                     ["access", "Access", resourceAccess],
                     ["provider", "Source", providerFilter],
                     ["resource_type", "Resource Type", resourceTypeFilter],
+                    ["item_type", "Item Type", itemTypeFilter],
                     ["exposure", "Exposure", exposureFilter],
                   ] as Array<[InventoryQueryField, string, string]>
                 ).map(([field, label, value]) =>
@@ -1991,14 +2239,24 @@ export function ProjectInventoryPage() {
                 </label>
               ) : null}
               <label className={FILTER_LABEL_CLASS}>
-                Resource type
+                Resource kind
                 <select className={FILTER_SELECT_CLASS} onChange={(event) => handleSimpleFilterChange(setResourceTypeFilter, event.target.value)} value={resourceTypeFilter}>
-                  <option value="">All resource types</option>
+                  <option value="">All resource kinds</option>
                   <option value="sharepoint_library">SharePoint library</option>
                   <option value="smb_share">SMB share</option>
                   <option value="nfs_share">NFS export</option>
                 </select>
               </label>
+              {activeTab === "items" ? (
+                <label className={FILTER_LABEL_CLASS}>
+                  Item type
+                  <select className={FILTER_SELECT_CLASS} onChange={(event) => handleSimpleFilterChange(setItemTypeFilter, event.target.value)} value={itemTypeFilter}>
+                    <option value="">Files and directories</option>
+                    <option value="directory">Directories only</option>
+                    <option value="file">Files only</option>
+                  </select>
+                </label>
+              ) : null}
               <label className={FILTER_LABEL_CLASS}>
                 Exposure
                 <select className={FILTER_SELECT_CLASS} onChange={(event) => handleSimpleFilterChange(setExposureFilter, event.target.value)} value={exposureFilter}>
@@ -2067,7 +2325,7 @@ export function ProjectInventoryPage() {
                 placeholder={'provider = "sharepoint" AND exposure = "ANONYMOUS"'}
                 value={inventoryQueryInput}
               />
-              <p id="inventory-query-help">Fields: search, endpoint, share, path, ext, access, provider, source, resource_type, exposure. Operators: = exact, ~ contains, ^ starts with, AND, OR, ! not.</p>
+              <p id="inventory-query-help">Fields: search, endpoint, share, path, ext, access, provider, source, resource_type, item_type, exposure. Operators: = exact, ~ contains, ^ starts with, AND, OR, ! not. Double a quote mark inside a quoted value.</p>
             </div>
             <div className="inventory-query-actions">
               <button className="inventory-button-primary" onClick={handleInventoryQueryApply} type="button">Apply query</button>
@@ -2085,7 +2343,7 @@ export function ProjectInventoryPage() {
             <h2 id="inventory-results-title">{activeTabCopy.label}</h2>
             <p>{activeTabCopy.description}</p>
           </div>
-          <span>{activeColumnCount} columns · server order</span>
+          <span>{activeColumnCount} columns · server order · CSV exports the filtered scope</span>
         </div>
 
         {inventoryError ? (
@@ -2113,7 +2371,7 @@ export function ProjectInventoryPage() {
         ) : null}
 
         {activeResultCount > 0 ? (
-          <div className={`inventory-table-scroll is-${density}`}>
+          <div className={`inventory-table-scroll is-${density}`} ref={tableScrollRef}>
             {inventoryLoading ? <div className="inventory-loading-strip" role="status">Refreshing results…</div> : null}
             {activeTab === "items" ? (
               <table className="inventory-table">
@@ -2140,11 +2398,30 @@ export function ProjectInventoryPage() {
         ) : null}
 
         <footer className="inventory-pagination">
-          <span>Page {currentPage} · up to 200 rows per page</span>
-          <div>
-            <button disabled={cursorHistory.length === 0 || inventoryLoading} onClick={movePrev} type="button">Previous</button>
-            <button disabled={!nextCursor || inventoryLoading} onClick={moveNext} type="button">Next</button>
-          </div>
+          <span>Page {currentPage} · up to 200 rows per page · numbers show known pages</span>
+          <nav aria-label="Inventory pages" className="inventory-page-controls">
+            <button aria-label="Go to previous page" disabled={cursorHistory.length === 0 || inventoryLoading} onClick={movePrev} type="button">Previous</button>
+            <span className="inventory-page-numbers">
+              {pageMarkers.map((marker, index) =>
+                marker === "ellipsis" ? (
+                  <span aria-hidden="true" className="inventory-page-ellipsis" key={`ellipsis-${index}`}>…</span>
+                ) : (
+                  <button
+                    aria-current={marker === currentPage ? "page" : undefined}
+                    aria-label={marker === currentPage ? `Page ${marker}, current page` : `Go to page ${marker}`}
+                    className={marker === currentPage ? "is-current" : ""}
+                    disabled={inventoryLoading || marker === currentPage}
+                    key={marker}
+                    onClick={() => moveToPage(marker)}
+                    type="button"
+                  >
+                    {marker}
+                  </button>
+                ),
+              )}
+            </span>
+            <button aria-label="Go to next page" disabled={!nextCursor || inventoryLoading} onClick={moveNext} type="button">Next</button>
+          </nav>
         </footer>
       </section>
 

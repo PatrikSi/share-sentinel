@@ -56,6 +56,8 @@ Atomic rate-limit expiry uses Redis `EVAL`. The bundled Redis image supports it;
 
 API Postgres connections have explicit pool and query budgets. Defaults are a pool of `10`, overflow of `20`, a 10-second pool wait, five-second connect, 30-second statement timeout, and five-second lock timeout. Configure them with the `API_DATABASE_*` settings and keep the aggregate pool across all API replicas below the Postgres connection budget.
 
+Inventory CSV exports are admitted at two levels before streaming: Redis limits each actor/client identity to `API_INVENTORY_EXPORT_RATE_LIMIT` starts per `API_INVENTORY_EXPORT_RATE_WINDOW_SECONDS` (defaults `12` per `60` seconds), and each API process permits `API_INVENTORY_EXPORT_MAX_CONCURRENT` active exports (default `4`). The process limit applies independently to every API replica; size the aggregate against database and egress capacity. Redis unavailability follows `RATE_LIMIT_FAIL_OPEN`, while local capacity exhaustion returns `503` with `Retry-After`.
+
 Alembic bootstrap uses separate migration budgets: `MIGRATION_DATABASE_CONNECT_TIMEOUT_SECONDS` defaults to `10` and `MIGRATION_DATABASE_LOCK_TIMEOUT_MS` defaults to `60000`. Migration statements intentionally do not inherit the short API statement timeout because concurrent index builds may legitimately run for a long time after acquiring their locks.
 
 Synchronous run diff is intentionally bounded. `API_RUN_DIFF_MAX_ITEMS` defaults to `250000` total items across both runs; larger comparisons return an actionable `422` instead of risking process exhaustion. Detail arrays default to 500 records each (request maximum 2000), preserve exact aggregate counts, and return explicit truncation metadata.

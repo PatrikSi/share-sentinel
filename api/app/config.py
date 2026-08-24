@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     api_database_statement_timeout_ms: int = 30_000
     api_database_lock_timeout_ms: int = 5_000
     api_run_diff_max_items: int = 250_000
+    api_inventory_export_max_concurrent: int = 4
+    api_inventory_export_rate_limit: int = 12
+    api_inventory_export_rate_window_seconds: int = 60
     migration_database_connect_timeout_seconds: int = 10
     migration_database_lock_timeout_ms: int = 60_000
     redis_url: str = "redis://redis:6379/0"
@@ -181,6 +184,9 @@ class Settings(BaseSettings):
         "api_database_statement_timeout_ms",
         "api_database_lock_timeout_ms",
         "api_run_diff_max_items",
+        "api_inventory_export_max_concurrent",
+        "api_inventory_export_rate_limit",
+        "api_inventory_export_rate_window_seconds",
         "migration_database_connect_timeout_seconds",
         "migration_database_lock_timeout_ms",
     )
@@ -240,6 +246,20 @@ class Settings(BaseSettings):
     def _validate_api_run_diff_max_items(cls, value: int) -> int:
         if value > 5_000_000:
             raise ValueError("api_run_diff_max_items must be 5000000 or less")
+        return value
+
+    @field_validator("api_inventory_export_max_concurrent")
+    @classmethod
+    def _validate_inventory_export_concurrency(cls, value: int) -> int:
+        if value > 100:
+            raise ValueError("api_inventory_export_max_concurrent must be 100 or less")
+        return value
+
+    @field_validator("api_inventory_export_rate_limit", "api_inventory_export_rate_window_seconds")
+    @classmethod
+    def _validate_inventory_export_rate_settings(cls, value: int, info) -> int:
+        if value > 86_400:
+            raise ValueError(f"{info.field_name} must be 86400 or less")
         return value
 
     @field_validator("api_token_last_used_update_interval_seconds")

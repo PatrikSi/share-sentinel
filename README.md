@@ -88,7 +88,7 @@ Project inventory supports three working views:
 - `Resources`
 - `Sites & Endpoints`
 
-The page supports guided filters, an optional query DSL, run scoping, and project-shared saved investigations. SMB results distinguish observed listing, file-read, create-file, create-directory, modify, delete, ACL-change, and ownership-change capabilities instead of treating every listable share as equally readable.
+The page supports guided filters, file/directory shortcuts, an optional query DSL, run scoping, numbered cursor pages, filtered streaming CSV export without a fixed row ceiling, copyable SMB/NFS connection paths, canonical SharePoint links, and project-shared saved investigations. SMB results distinguish observed listing, file-read, create-file, create-directory, modify, delete, ACL-change, and ownership-change capabilities instead of treating every listable share as equally readable.
 
 SharePoint results retain stable site, library, and drive-item identities alongside display paths. Provider, resource type, exposure, collection perspective, and deleted-item filters make scheduled application inventories distinguishable from delegated user quick checks. A delegated `USER_VISIBLE` result means visible to the assessed identity; it does not mean public or anonymous.
 
