@@ -312,33 +312,53 @@ export function AccessCapabilityCell({ accessLevel, capabilities, evidenceScope,
       </div>
 
       {exactValue && (onCopy || onFilter) ? (
-        <span className="inventory-cell-actions">
-          {onFilter ? (
-            <>
-              <button
-                aria-label={`Filter all results where the compatibility access value exactly matches ${exactValue}`}
-                onClick={() => onFilter(exactValue, false)}
-                title={`Filter compatibility access value: ${exactValue}`}
-                type="button"
-              >
-                =
+        <>
+          <span className="inventory-cell-actions">
+            {onFilter ? (
+              <>
+                <button
+                  aria-label={`Filter all results where the compatibility access value exactly matches ${exactValue}`}
+                  onClick={() => onFilter(exactValue, false)}
+                  title={`Filter compatibility access value: ${exactValue}`}
+                  type="button"
+                >
+                  =
+                </button>
+                <button
+                  aria-label={`Exclude all results where the compatibility access value exactly matches ${exactValue}`}
+                  onClick={() => onFilter(exactValue, true)}
+                  title={`Exclude compatibility access value: ${exactValue}`}
+                  type="button"
+                >
+                  ≠
+                </button>
+              </>
+            ) : null}
+            {onCopy ? (
+              <button aria-label="Copy compatibility access value" onClick={() => onCopy(exactValue, `${label} value`)} title="Copy compatibility access value" type="button">
+                Copy
               </button>
-              <button
-                aria-label={`Exclude all results where the compatibility access value exactly matches ${exactValue}`}
-                onClick={() => onFilter(exactValue, true)}
-                title={`Exclude compatibility access value: ${exactValue}`}
-                type="button"
-              >
-                ≠
-              </button>
-            </>
-          ) : null}
-          {onCopy ? (
-            <button aria-label="Copy compatibility access value" onClick={() => onCopy(exactValue, `${label} value`)} title="Copy compatibility access value" type="button">
-              Copy
-            </button>
-          ) : null}
-        </span>
+            ) : null}
+          </span>
+          <select
+            aria-label={`Actions for ${label}`}
+            className="inventory-cell-menu"
+            defaultValue=""
+            onChange={(event) => {
+              const action = event.currentTarget.value;
+              event.currentTarget.value = "";
+              if (action === "filter" && onFilter) onFilter(exactValue, false);
+              if (action === "exclude" && onFilter) onFilter(exactValue, true);
+              if (action === "copy" && onCopy) onCopy(exactValue, `${label} value`);
+            }}
+            title={`Actions for ${label}`}
+          >
+            <option disabled value="">•••</option>
+            {onFilter ? <option value="filter">Filter this value</option> : null}
+            {onFilter ? <option value="exclude">Exclude this value</option> : null}
+            {onCopy ? <option value="copy">Copy exact value</option> : null}
+          </select>
+        </>
       ) : null}
     </div>
   );

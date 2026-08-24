@@ -567,31 +567,51 @@ function InventoryCell({ text, label, content, filterField = null, filterScopeLa
         </span>
       )}
       {actionable ? (
-        <span className="inventory-cell-actions">
-          {filterField ? (
-            <>
-              <button
-                aria-label={`Filter all results where ${filterTarget} exactly matches ${exactValue}`}
-                onClick={() => onFilter(filterField, exactValue, false)}
-                title={`Filter all results: ${filterTarget} exact match`}
-                type="button"
-              >
-                =
-              </button>
-              <button
-                aria-label={`Exclude all results where ${filterTarget} exactly matches ${exactValue}`}
-                onClick={() => onFilter(filterField, exactValue, true)}
-                title={`Exclude all results: ${filterTarget} exact match`}
-                type="button"
-              >
-                ≠
-              </button>
-            </>
-          ) : null}
-          <button aria-label={`Copy ${label}`} onClick={() => onCopy(exactValue, label)} title="Copy exact value" type="button">
-            Copy
-          </button>
-        </span>
+        <>
+          <span className="inventory-cell-actions">
+            {filterField ? (
+              <>
+                <button
+                  aria-label={`Filter all results where ${filterTarget} exactly matches ${exactValue}`}
+                  onClick={() => onFilter(filterField, exactValue, false)}
+                  title={`Filter all results: ${filterTarget} exact match`}
+                  type="button"
+                >
+                  =
+                </button>
+                <button
+                  aria-label={`Exclude all results where ${filterTarget} exactly matches ${exactValue}`}
+                  onClick={() => onFilter(filterField, exactValue, true)}
+                  title={`Exclude all results: ${filterTarget} exact match`}
+                  type="button"
+                >
+                  ≠
+                </button>
+              </>
+            ) : null}
+            <button aria-label={`Copy ${label}`} onClick={() => onCopy(exactValue, label)} title="Copy exact value" type="button">
+              Copy
+            </button>
+          </span>
+          <select
+            aria-label={`Actions for ${label}`}
+            className="inventory-cell-menu"
+            defaultValue=""
+            onChange={(event) => {
+              const action = event.currentTarget.value;
+              event.currentTarget.value = "";
+              if (action === "filter" && filterField) onFilter(filterField, exactValue, false);
+              if (action === "exclude" && filterField) onFilter(filterField, exactValue, true);
+              if (action === "copy") onCopy(exactValue, label);
+            }}
+            title={`Actions for ${label}`}
+          >
+            <option disabled value="">•••</option>
+            {filterField ? <option value="filter">Filter this value</option> : null}
+            {filterField ? <option value="exclude">Exclude this value</option> : null}
+            <option value="copy">Copy exact value</option>
+          </select>
+        </>
       ) : null}
     </div>
   );

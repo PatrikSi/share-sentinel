@@ -78,15 +78,19 @@ export function TopNav() {
         </Link>
 
         <nav aria-label="Primary navigation" className="app-nav-links">
-          {navItems.map((item) => (
-            <Link
-              className={`app-nav-link ${location.pathname.startsWith(item.match) ? "is-active" : ""}`}
-              key={item.to}
-              to={item.to}
-            >
-              {item.label}
-            </Link>
-          ))}
+          {navItems.map((item) => {
+            const active = location.pathname.startsWith(item.match);
+            return (
+              <Link
+                aria-current={active ? "page" : undefined}
+                className={`app-nav-link ${active ? "is-active" : ""}`}
+                key={item.to}
+                to={item.to}
+              >
+                {item.label}
+              </Link>
+            );
+          })}
         </nav>
 
         {showDashboardControls ? (
@@ -155,7 +159,12 @@ export function TopNav() {
 
         <div className="app-nav-actions">
           <ThemeToggle />
-          <Link aria-current={location.pathname.startsWith("/account") ? "page" : undefined} className="app-account-link" to="/account">
+          <Link
+            aria-current={location.pathname.startsWith("/account") ? "page" : undefined}
+            aria-label={`Account: ${session.user?.email || "current user"}`}
+            className="app-account-link"
+            to="/account"
+          >
             <span aria-hidden="true">{session.user?.email?.slice(0, 1).toUpperCase() || "A"}</span>
             <span>{session.user?.email || "Account"}</span>
           </Link>

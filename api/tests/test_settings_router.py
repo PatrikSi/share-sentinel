@@ -273,6 +273,7 @@ def test_settings_project_delete_reports_artifact_failures(monkeypatch) -> None:
     ]
     assert fake_db.deleted == [project]
     assert fake_db.commit_count == 1
+    assert "pg_advisory_xact_lock" in str(fake_db.executed_statements[0][0])
     audit_event = next(obj for obj in fake_db.added if isinstance(obj, AuditEvent))
     assert audit_event.action == "SETTINGS_PROJECT_DELETED"
     assert audit_event.metadata_json["deleted_run_count"] == 2

@@ -18,6 +18,7 @@ from app.config import get_settings
 from app.db import SessionLocal, escape_like, get_db
 from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
 from app.enums import ErrorSeverity, ProjectRole, RunStatus
+from app.locking import lock_project_admin_guard
 from app.models import AuditEvent, Endpoint, IngestError, Item, Resource, ScanRun
 from app.pagination import (
     KeysetColumn,
@@ -967,6 +968,10 @@ def _commit_uploaded_artifact(
     previous_artifact_key: str | None = None
     authoritative_run_id = run_id
     try:
+        # Serialize artifact-pointer changes with project deletion. Keep the
+        # project-before-run ordering used by delete_project so concurrent
+        # upload, deletion, and worker activity cannot form a lock cycle.
+        lock_project_admin_guard(db, project_id)
         require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
         run = _get_run(db, project_id, run_id)
         if not _try_lock_run_for_mutation(db, run.id):
@@ -1322,6 +1327,10 @@ def create_run(
     _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
+    # Project deletion snapshots and locks the project's runs while holding
+    # this guard. Taking it before authorization ensures the role/project
+    # lookup is re-evaluated after any concurrent deletion commits.
+    lock_project_admin_guard(db, project_id)
     require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
 
     run = ScanRun(

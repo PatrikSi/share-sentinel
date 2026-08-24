@@ -8,6 +8,13 @@ import pytest
 from app.routers import runs as runs_router
 
 
+@pytest.fixture(autouse=True)
+def _stub_project_admin_guard(monkeypatch):
+    """Unit fakes do not implement PostgreSQL advisory locks by default."""
+
+    monkeypatch.setattr(runs_router, "lock_project_admin_guard", lambda *_args, **_kwargs: None)
+
+
 class _FakeFileReader:
     def __init__(self, chunks: list[bytes]):
         self._chunks = list(chunks)
@@ -588,9 +595,26 @@ def test_replacement_upload_clears_partial_inventory_before_selecting_new_artifa
         def close(self):
             events.append("close")
 
-    monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(runs_router, "_get_run", lambda *_args, **_kwargs: run)
-    monkeypatch.setattr(runs_router, "_try_lock_run_for_mutation", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        runs_router,
+        "lock_project_admin_guard",
+        lambda *_args, **_kwargs: events.append("project-lock"),
+    )
+    monkeypatch.setattr(
+        runs_router,
+        "require_project_role",
+        lambda *_args, **_kwargs: events.append("authorize"),
+    )
+    monkeypatch.setattr(
+        runs_router,
+        "_get_run",
+        lambda *_args, **_kwargs: (events.append("get-run"), run)[1],
+    )
+    monkeypatch.setattr(
+        runs_router,
+        "_try_lock_run_for_mutation",
+        lambda *_args, **_kwargs: (events.append("run-lock"), True)[1],
+    )
     monkeypatch.setattr(runs_router, "SessionLocal", _Db)
     monkeypatch.setattr(runs_router, "_clear_run_ingest_data", lambda *_args, **_kwargs: events.append("clear"))
     monkeypatch.setattr(runs_router, "_delete_superseded_artifact", lambda *_args: events.append("delete-old"))
@@ -610,7 +634,57 @@ def test_replacement_upload_clears_partial_inventory_before_selecting_new_artifa
 
     assert result == run_id
     assert run.artifact_key == "new-artifact.ndjson"
+    assert events[:5] == ["project-lock", "authorize", "get-run", "run-lock", "refresh"]
     assert events.index("clear") < events.index("commit") < events.index("close") < events.index("delete-old")
+
+
+def test_create_run_takes_project_guard_before_authorization_and_commit(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
+    payload = SimpleNamespace(
+        run_id=run_id,
+        name="Concurrent run",
+        description=None,
+        target_scope={},
+    )
+    events: list[str] = []
+
+    class _Db:
+        def add(self, _row):
+            events.append("add")
+
+        def commit(self):
+            events.append("commit")
+
+        def refresh(self, _row):
+            events.append("refresh")
+
+    monkeypatch.setattr(
+        runs_router,
+        "lock_project_admin_guard",
+        lambda *_args, **_kwargs: events.append("project-lock"),
+    )
+    monkeypatch.setattr(
+        runs_router,
+        "require_project_role",
+        lambda *_args, **_kwargs: events.append("authorize"),
+    )
+    monkeypatch.setattr(runs_router, "write_audit_event", lambda *_args, **_kwargs: events.append("audit"))
+    monkeypatch.setattr(runs_router, "request_meta", lambda _request: {})
+    monkeypatch.setattr(runs_router, "_to_run_out", lambda run: run)
+
+    result = runs_router.create_run(
+        project_id=project_id,
+        payload=payload,
+        request=SimpleNamespace(),
+        db=_Db(),
+        _=auth,
+        auth=auth,
+    )
+
+    assert result.id == run_id
+    assert events == ["project-lock", "authorize", "add", "audit", "commit", "refresh"]
 
 
 def test_upload_preflight_closes_its_session_before_streaming(monkeypatch) -> None:

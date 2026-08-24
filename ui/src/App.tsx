@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { Navigate, Route, Routes, useLocation, useParams } from "react-router-dom";
 
+import { AppFooter } from "@/components/app-footer";
 import { StatePanel } from "@/components/state-panel";
 import { TopNav } from "@/components/top-nav";
 import { bootstrapSession, resetSession, useSession } from "@/lib/auth";
@@ -123,7 +124,7 @@ export function App() {
   }, [location.pathname]);
 
   const appShell = (
-    <div className={showNav ? "app-shell" : ""}>
+    <div className={showNav ? "app-shell app-shell-authenticated" : "app-shell"}>
       <a className="skip-link" href="#main-content">
         Skip to main content
       </a>
@@ -212,6 +213,7 @@ export function App() {
           </Routes>
         </section>
       </main>
+      <AppFooter />
     </div>
   );
 

@@ -539,6 +539,7 @@ function describeRunStatus(run: RunInfo | null) {
 
 export function RunDetailPage() {
   const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
+  const runRouteKey = `${projectId || ""}:${runId || ""}`;
   const [, setSearchParams] = useSearchParams();
   const session = useSession();
   const lastEndpointRequestKey = useRef<string | null>(null);
@@ -547,8 +548,10 @@ export function RunDetailPage() {
   const lastGlobalSearchRequestKey = useRef<string | null>(null);
 
   const [run, setRun] = useState<RunInfo | null>(null);
+  const [runLoading, setRunLoading] = useState(true);
   const [projectRuns, setProjectRuns] = useState<RunCompareOption[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [errorRunRouteKey, setErrorRunRouteKey] = useState<string | null>(null);
   const [refreshWarning, setRefreshWarning] = useState<string | null>(null);
   const [baselineOptionsError, setBaselineOptionsError] = useState<string | null>(null);
   const [diffError, setDiffError] = useState<string | null>(null);
@@ -665,19 +668,40 @@ export function RunDetailPage() {
   }, [activeTab, setSearchParams]);
 
   useEffect(() => {
-    if (!projectId || !runId) return;
+    if (!projectId || !runId) {
+      setRun(null);
+      setRunLoading(false);
+      setErrorRunRouteKey(runRouteKey);
+      setError("The project or run identifier is missing from this route.");
+      return;
+    }
     const controller = new AbortController();
     setRun(null);
+    setRunLoading(true);
+    setErrorRunRouteKey(null);
     setError(null);
     apiFetch(`/projects/${projectId}/runs/${runId}`, { signal: controller.signal })
       .then((data) => {
-        if (!controller.signal.aborted) setRun(data as RunInfo);
+        if (controller.signal.aborted) return;
+        const fetchedRun = data as RunInfo | null;
+        if (!fetchedRun || fetchedRun.id.toLowerCase() !== runId.toLowerCase()) {
+          setErrorRunRouteKey(runRouteKey);
+          setError("The run response did not match the run requested by this route.");
+          return;
+        }
+        setRun(fetchedRun);
       })
       .catch((err) => {
-        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+        if (!controller.signal.aborted && !isAbortError(err)) {
+          setErrorRunRouteKey(runRouteKey);
+          setError(err instanceof Error ? err.message : "Run details could not be loaded.");
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setRunLoading(false);
       });
     return () => controller.abort();
-  }, [projectId, reloadNonce, runId]);
+  }, [projectId, reloadNonce, runId, runRouteKey]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -1181,6 +1205,7 @@ export function RunDetailPage() {
   }
 
   function retryRunData() {
+    setErrorRunRouteKey(null);
     setError(null);
     setRefreshWarning(null);
     setBaselineOptionsError(null);
@@ -1265,6 +1290,50 @@ export function RunDetailPage() {
       : runDiff?.baseline_run && !apiDiffCompatibility && diffContextCompatibility && !diffContextCompatibility.compatible
         ? diffContextCompatibility
         : null;
+
+  if (!run || run.id.toLowerCase() !== runId?.toLowerCase()) {
+    const activeError = errorRunRouteKey === runRouteKey ? error : null;
+    const displayingLoadingState = runLoading || !activeError;
+    return (
+      <section className="workspace">
+        <div className="workspace-header">
+          <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-950">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Run explorer</p>
+            <h1 className="mt-1 text-2xl font-semibold tracking-tight">{displayingLoadingState ? "Loading run details" : "Run details unavailable"}</h1>
+            <p className="mt-2 break-all text-sm text-slate-600 dark:text-slate-300">Run ID: {runId || "Not available"}</p>
+          </div>
+        </div>
+        <div className="workspace-section">
+          <StatePanel
+            actions={(
+              <div className="flex flex-wrap justify-center gap-2">
+                {activeError ? (
+                  <button className="rounded-md bg-emerald-700 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-600" onClick={retryRunData} type="button">
+                    Retry run details
+                  </button>
+                ) : null}
+                <Link className="rounded-md border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800" to="/projects">
+                  Open projects
+                </Link>
+                {projectId ? (
+                  <Link className="rounded-md border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800" to={`/projects/${projectId}/inventory`}>
+                    Open inventory
+                  </Link>
+                ) : null}
+              </div>
+            )}
+            description={
+              displayingLoadingState
+                ? "Fetching the run record and its collection context. Operational facts will appear after the record is confirmed."
+                : `${activeError || "The run record could not be loaded."} No run facts are being shown; retrying this read is safe.`
+            }
+            title={displayingLoadingState ? "Loading Run Details" : "Run Details Unavailable"}
+            tone={displayingLoadingState ? "neutral" : "error"}
+          />
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="workspace">
