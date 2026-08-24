@@ -1,0 +1,766 @@
+import io
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+import pytest
+from sharepoint.auth import GraphTokenContext
+from sharepoint.collection import (
+    ITEM_NAME_MAX_CHARACTERS,
+    ITEM_PATH_MAX_CHARACTERS,
+    ITEM_SELECT,
+    SharePointCollectionConfig,
+    SharePointCollector,
+    SharePointProgress,
+    SharePointStats,
+    collection_context_record,
+    discover_drives,
+    discover_sites,
+    normalize_drive_item,
+    resolve_target_site,
+)
+from sharepoint.graph import GraphAPIError, GraphProtocolError
+from sharepoint.state import SharePointStateStore
+
+SITE_ID = "contoso.sharepoint.com,site-guid,web-guid"
+DELTA_1 = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=1"
+DELTA_2 = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=2"
+INITIAL_DELTA_1 = f"drives/drive-1/root/delta?$select={ITEM_SELECT}"
+
+
+def _context(*, delegated: bool = True) -> GraphTokenContext:
+    return GraphTokenContext(
+        access_token="secret-token",
+        auth_mode="token" if delegated else "app",
+        auth_type="delegated" if delegated else "application",
+        tenant_id="tenant-1",
+        client_id="client-1",
+        user_id="user-1" if delegated else None,
+        user_principal_name="alice@example.com" if delegated else None,
+        scopes=("Sites.Read.All",) if delegated else (),
+        roles=() if delegated else ("Sites.Read.All",),
+        expires_at=datetime.now(tz=UTC) + timedelta(hours=1),
+    )
+
+
+def _site() -> dict[str, object]:
+    return {
+        "id": SITE_ID,
+        "name": "Finance",
+        "displayName": "Finance",
+        "webUrl": "https://contoso.sharepoint.com/sites/Finance",
+        "siteCollection": {"hostname": "contoso.sharepoint.com"},
+    }
+
+
+def _drive(drive_id: str = "drive-1", name: str = "Documents") -> dict[str, object]:
+    return {
+        "id": drive_id,
+        "name": name,
+        "driveType": "documentLibrary",
+        "webUrl": f"https://contoso.sharepoint.com/sites/Finance/{name}",
+    }
+
+
+def _file(item_id: str, name: str, parent: str = "/drives/drive-1/root:") -> dict[str, object]:
+    return {
+        "id": item_id,
+        "name": name,
+        "size": 42,
+        "file": {"mimeType": "text/plain"},
+        "parentReference": {"id": "parent-1", "path": parent},
+        "webUrl": f"https://contoso.sharepoint.com/{name}",
+        "createdDateTime": "2026-01-01T00:00:00Z",
+        "lastModifiedDateTime": "2026-01-02T00:00:00Z",
+        "eTag": "etag-1",
+        "cTag": "ctag-1",
+    }
+
+
+class MemoryWriter:
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+
+    def emit(self, record: dict[str, object]) -> None:
+        self.records.append(record)
+
+
+class FakeClient:
+    def __init__(self, routes: dict[str, object]) -> None:
+        self.routes = routes
+        self.max_pages = 100
+        self.retry_count = 0
+        self.calls: list[tuple[str, str]] = []
+
+    def iter_pages(self, url: str):
+        self.calls.append(("pages", url))
+        value = self.routes[url]
+        if isinstance(value, BaseException):
+            raise value
+        for page in value:
+            if isinstance(page, BaseException):
+                raise page
+            yield page
+
+    def get(self, url: str):
+        self.calls.append(("get", url))
+        value = self.routes[url]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def post(self, url: str, *, json_body):  # noqa: ARG002
+        self.calls.append(("post", url))
+        value = self.routes[url]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def validate_continuation_url(self, url: str) -> str:
+        if not url.startswith("https://graph.microsoft.com/v1.0/"):
+            raise GraphProtocolError(status_code=None, code="unsafe_continuation_url")
+        return url
+
+
+def _routes(delta_pages: object, *, delegated: bool = True, drives=None) -> dict[str, object]:
+    discovery = "sites?search=*" if delegated else "sites/getAllSites"
+    return {
+        discovery: [{"value": [_site()]}],
+        f"sites/{SITE_ID}/drives?$select=id,name,description,driveType,webUrl,createdDateTime,lastModifiedDateTime": [
+            {"value": drives or [_drive()]}
+        ],
+        INITIAL_DELTA_1: delta_pages,
+        DELTA_1: delta_pages,
+    }
+
+
+def _collector(tmp_path, routes, *, run_id="run-1", config=None, delegated=True):
+    writer = MemoryWriter()
+    state = SharePointStateStore(tmp_path / "state.sqlite3")
+    collector = SharePointCollector(
+        client=FakeClient(routes),
+        state=state,
+        writer=writer,
+        run_id=run_id,
+        context=_context(delegated=delegated),
+        config=config or SharePointCollectionConfig(concurrency=1, quiet=True),
+    )
+    return collector, state, writer
+
+
+def _commit(state, run_id: str, pending) -> None:
+    for drive in pending:
+        state.commit_drive(
+            session_id=run_id,
+            scope_key=drive.scope_key,
+            tenant_id=drive.tenant_id,
+            site_id=drive.site_id,
+            drive_id=drive.drive_id,
+        )
+
+
+def test_app_discovery_uses_paged_get_all_sites() -> None:
+    expected = "sites/getAllSites"
+    client = FakeClient({expected: [{"value": [_site()]}]})
+
+    sites, truncated = discover_sites(client, _context(delegated=False), SharePointCollectionConfig())
+
+    assert [site.site_id for site in sites] == [SITE_ID]
+    assert truncated is False
+    assert client.calls == [("pages", expected)]
+
+
+def test_delegated_discovery_is_explicitly_security_trimmed() -> None:
+    expected = "sites?search=*"
+    client = FakeClient({expected: [{"value": [_site()]}]})
+
+    sites, _ = discover_sites(client, _context(), SharePointCollectionConfig())
+    context = collection_context_record(
+        _context(),
+        SharePointCollectionConfig(),
+        status="success",
+        sync_mode="full",
+        partial=False,
+    )
+
+    assert sites[0].name == "Finance"
+    assert context["collection_mode"] == "delegated_user_view"
+    assert context["discovery_completeness"] == "security_trimmed"
+    assert context["materialized_snapshot"] is True
+
+
+@pytest.mark.parametrize(
+    ("reference", "graph_path"),
+    [
+        (
+            "https://contoso.sharepoint.com/sites/Finance%20Team",
+            "sites/contoso.sharepoint.com:/sites/Finance%20Team",
+        ),
+        (
+            "https://contoso.sharepoint.com/sites/Ünicode Team",
+            "sites/contoso.sharepoint.com:/sites/%C3%9Cnicode%20Team",
+        ),
+        (
+            "https://contoso.sharepoint.com/sites/R%2FD%3FArchive",
+            "sites/contoso.sharepoint.com:/sites/R%2FD%3FArchive",
+        ),
+    ],
+)
+def test_target_site_url_is_canonically_encoded_once(reference: str, graph_path: str) -> None:
+    client = FakeClient({graph_path: _site()})
+
+    site = resolve_target_site(client, reference)
+
+    assert site.site_id == SITE_ID
+    assert client.calls == [("get", graph_path)]
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "https://user@contoso.sharepoint.com/sites/Finance",
+        "https://contoso.sharepoint.com:443/sites/Finance",
+        "https://contoso.sharepoint.com/sites/Finance?view=all",
+        "https://contoso.sharepoint.com/sites/Finance#section",
+        "https://example.com/sites/Finance",
+        "https://contoso.sharepoint.com/sites/Bad%ZZ",
+        "https://contoso.sharepoint.com/" + ("x" * 8192),
+    ],
+)
+def test_target_site_url_rejects_unsupported_or_ambiguous_forms(reference: str) -> None:
+    with pytest.raises(GraphProtocolError, match="invalid_site_url"):
+        resolve_target_site(FakeClient({}), reference)
+
+
+@pytest.mark.parametrize("reference", ["x" * 513, "site-id\nforged"])
+def test_target_site_id_is_bounded_and_control_character_free(reference: str) -> None:
+    with pytest.raises(GraphProtocolError, match="invalid_site_id"):
+        resolve_target_site(FakeClient({}), reference)
+
+
+def test_progress_escapes_identity_and_remote_name_control_characters() -> None:
+    stream = io.StringIO()
+    progress = SharePointProgress(
+        SharePointStats(),
+        quiet=False,
+        verbosity=1,
+        interval_seconds=0,
+        stream=stream,
+    )
+    context = _context()
+    context = GraphTokenContext(
+        access_token=context.access_token,
+        auth_mode=context.auth_mode,
+        auth_type=context.auth_type,
+        tenant_id=context.tenant_id,
+        client_id=context.client_id,
+        user_id=context.user_id,
+        user_principal_name="alice\nforged\x1b[2J@example.com",
+        scopes=context.scopes,
+        roles=context.roles,
+        expires_at=context.expires_at,
+    )
+    drive = SimpleNamespace(
+        name="Documents\rforged",
+        site=SimpleNamespace(display_name="Finance\x1b[2J", name="Finance"),
+    )
+
+    progress.start(context, "delegated_user_view")
+    progress.library_finished(drive, succeeded=True)
+
+    output = stream.getvalue()
+    assert "alice\\u000aforged\\u001b[2J@example.com" in output
+    assert "Finance\\u001b[2J/Documents\\u000dforged" in output
+    assert "\x1b" not in output
+    assert "alice\nforged" not in output
+
+
+def test_zero_progress_interval_disables_periodic_reports_but_keeps_final_summary() -> None:
+    stream = io.StringIO()
+    progress = SharePointProgress(
+        SharePointStats(),
+        quiet=False,
+        verbosity=0,
+        interval_seconds=0,
+        stream=stream,
+    )
+
+    progress.set_library_total(1)
+    progress.report(force=True)
+    progress.finish(status="success", graph_retries=0)
+
+    output = stream.getvalue()
+    assert "progress:" not in output
+    assert "SharePoint collection finished: status=success" in output
+
+
+def test_periodic_progress_omits_ambiguous_retry_placeholder() -> None:
+    stream = io.StringIO()
+    progress = SharePointProgress(
+        SharePointStats(),
+        quiet=False,
+        verbosity=0,
+        interval_seconds=5,
+        stream=stream,
+    )
+
+    progress.report(force=True)
+
+    output = stream.getvalue()
+    assert "progress:" in output
+    assert "elapsed=" in output
+    assert "retries_pending" not in output
+
+
+def test_drive_search_supports_graphrunner_and_sharepoint_id_shapes() -> None:
+    parent_site_id = "contoso.sharepoint.com,parent-site,parent-web"
+    ids_site_id = "contoso.sharepoint.com,collection-guid,web-guid"
+    search_response = {
+        "value": [
+            {
+                "hitsContainers": [
+                    {
+                        "moreResultsAvailable": False,
+                        "hits": [
+                            {
+                                "resource": {
+                                    "driveType": "documentLibrary",
+                                    "parentReference": {"siteId": parent_site_id},
+                                }
+                            },
+                            {
+                                "resource": {
+                                    "driveType": "documentLibrary",
+                                    "sharePointIds": {
+                                        "siteId": "collection-guid",
+                                        "webId": "web-guid",
+                                        "siteUrl": "https://contoso.sharepoint.com/sites/Finance",
+                                    },
+                                }
+                            },
+                            {
+                                "resource": {
+                                    "driveType": "personal",
+                                    "sharePointIds": {
+                                        "siteId": "ignored",
+                                        "webId": "ignored",
+                                        "siteUrl": "https://contoso-my.sharepoint.com/personal/alice",
+                                    },
+                                }
+                            },
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    client = FakeClient(
+        {
+            "search/query": search_response,
+            f"sites/{parent_site_id}": {**_site(), "id": parent_site_id},
+            f"sites/{ids_site_id}": {**_site(), "id": ids_site_id},
+        }
+    )
+
+    sites, truncated = discover_sites(
+        client,
+        _context(),
+        SharePointCollectionConfig(discovery="drive-search"),
+    )
+
+    assert {site.site_id for site in sites} == {parent_site_id, ids_site_id}
+    assert truncated is False
+    assert not any("ignored" in url for _, url in client.calls)
+
+
+def test_drive_search_reports_document_library_without_site_identity() -> None:
+    client = FakeClient(
+        {
+            "search/query": {
+                "value": [
+                    {
+                        "hitsContainers": [
+                            {
+                                "moreResultsAvailable": False,
+                                "hits": [{"resource": {"driveType": "documentLibrary"}}],
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    )
+    errors: list[GraphAPIError] = []
+
+    sites, truncated = discover_sites(
+        client,
+        _context(),
+        SharePointCollectionConfig(discovery="drive-search"),
+        on_site_error=lambda _site, exc: errors.append(exc),
+    )
+
+    assert sites == []
+    assert truncated is False
+    assert errors[0].code == "search_hit_missing_site_identity"
+
+
+def test_drive_search_stops_immediately_at_site_limit() -> None:
+    site_id = "contoso.sharepoint.com,site-one,web-one"
+    client = FakeClient(
+        {
+            "search/query": {
+                "value": [
+                    {
+                        "hitsContainers": [
+                            {
+                                "moreResultsAvailable": True,
+                                "hits": [
+                                    {
+                                        "resource": {
+                                            "driveType": "documentLibrary",
+                                            "parentReference": {"siteId": site_id},
+                                        }
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            },
+            f"sites/{site_id}": {**_site(), "id": site_id},
+        }
+    )
+
+    sites, truncated = discover_sites(
+        client,
+        _context(),
+        SharePointCollectionConfig(discovery="drive-search", max_sites=1),
+    )
+
+    assert [site.site_id for site in sites] == [site_id]
+    assert truncated is True
+    assert [method for method, _url in client.calls].count("post") == 1
+
+
+def test_malformed_site_identity_is_skipped_without_inventing_one() -> None:
+    expected = "sites?search=*"
+    client = FakeClient({expected: [{"value": [{"id": {}, "name": []}, _site()]}]})
+    errors: list[GraphAPIError] = []
+
+    sites, _ = discover_sites(
+        client,
+        _context(),
+        SharePointCollectionConfig(),
+        on_site_error=lambda _site, exc: errors.append(exc),
+    )
+
+    assert [site.site_id for site in sites] == [SITE_ID]
+    assert errors[0].code == "site_missing_id"
+
+
+def test_non_object_site_and_drive_records_are_scoped_and_skipped() -> None:
+    site_discovery = "sites?search=*"
+    drive_discovery = (
+        f"sites/{SITE_ID}/drives?$select=id,name,description,driveType,webUrl,createdDateTime,lastModifiedDateTime"
+    )
+    client = FakeClient(
+        {
+            site_discovery: [{"value": ["malformed", _site()]}],
+            drive_discovery: [{"value": [[], _drive()]}],
+        }
+    )
+    site_errors: list[GraphAPIError] = []
+    drive_errors: list[GraphAPIError] = []
+
+    sites, _ = discover_sites(
+        client,
+        _context(),
+        SharePointCollectionConfig(),
+        on_site_error=lambda _site, exc: site_errors.append(exc),
+    )
+    drives, _ = discover_drives(
+        client,
+        sites,
+        max_libraries=0,
+        on_site_error=lambda _site, exc: site_errors.append(exc),
+        on_drive_error=lambda _site, exc: drive_errors.append(exc),
+    )
+
+    assert [site.site_id for site in sites] == [SITE_ID]
+    assert [drive.drive_id for drive in drives] == ["drive-1"]
+    assert site_errors[0].code == "malformed_page_item"
+    assert drive_errors[0].code == "malformed_page_item"
+
+
+def test_normalize_drive_items_preserves_stable_ids_paths_and_facets() -> None:
+    file_item = normalize_drive_item(
+        _file("item-1", "report.txt", "/drives/drive-1/root:/Folder"),
+        site_id=SITE_ID,
+        drive_id="drive-1",
+        exposure="USER_VISIBLE",
+        exposure_evidence={"basis": "delegated"},
+    )
+    folder_item = normalize_drive_item(
+        {
+            "id": "folder-1",
+            "name": "Plans",
+            "folder": {"childCount": 2},
+            "parentReference": {"path": "/drives/drive-1/root:/Folder"},
+        },
+        site_id=SITE_ID,
+        drive_id="drive-1",
+        exposure="USER_VISIBLE",
+        exposure_evidence={"basis": "delegated"},
+    )
+
+    assert file_item["path"] == "/Folder/report.txt"
+    assert file_item["provider_item_id"] == "item-1"
+    assert file_item["is_dir"] is False
+    assert file_item["mime_type"] == "text/plain"
+    assert folder_item["is_dir"] is True
+    assert folder_item["path"] == "/Folder/Plans"
+
+    whitespace_item = normalize_drive_item(
+        _file("space", " report .txt ", "/drives/drive-1/root:/ Folder "),
+        site_id=SITE_ID,
+        drive_id="drive-1",
+        exposure="USER_VISIBLE",
+        exposure_evidence={},
+    )
+    assert whitespace_item["name"] == " report .txt "
+    assert whitespace_item["path"] == "/ Folder / report .txt "
+
+
+def test_item_name_and_library_relative_path_bounds_are_not_truncated() -> None:
+    with pytest.raises(GraphProtocolError) as name_error:
+        normalize_drive_item(
+            _file("item", "x" * (ITEM_NAME_MAX_CHARACTERS + 1)),
+            site_id=SITE_ID,
+            drive_id="drive-1",
+            exposure="UNKNOWN",
+            exposure_evidence={},
+        )
+    assert name_error.value.code == "item_name_out_of_bounds"
+
+    parent = "/drives/drive-1/root:/" + "p" * ITEM_PATH_MAX_CHARACTERS
+    with pytest.raises(GraphProtocolError) as path_error:
+        normalize_drive_item(
+            _file("item", "x", parent),
+            site_id=SITE_ID,
+            drive_id="drive-1",
+            exposure="UNKNOWN",
+            exposure_evidence={},
+        )
+    assert path_error.value.code == "item_path_out_of_bounds"
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_code"),
+    [
+        ({"root": None}, "item_root_facet_invalid"),
+        ({"deleted": None}, "item_deleted_facet_invalid"),
+        ({"parentReference": []}, "item_parent_reference_invalid"),
+        ({"parentReference": {"id": []}}, "item_parent_id_invalid"),
+        ({"file": []}, "item_file_facet_invalid"),
+        ({"folder": []}, "item_folder_facet_invalid"),
+        ({"folder": {}, "file": {}}, "item_conflicting_facets"),
+    ],
+)
+def test_malformed_drive_item_facets_are_rejected(changes: dict[str, object], expected_code: str) -> None:
+    raw = {**_file("item", "report.txt"), **changes}
+
+    with pytest.raises(GraphProtocolError) as error:
+        normalize_drive_item(
+            raw,
+            site_id=SITE_ID,
+            drive_id="drive-1",
+            exposure="UNKNOWN",
+            exposure_evidence={},
+        )
+
+    assert error.value.code == expected_code
+
+
+def test_initial_then_incremental_collection_emits_full_materialized_snapshot(tmp_path) -> None:
+    first_routes = _routes([{"value": [_file("a", "a.txt"), _file("b", "b.txt")], "@odata.deltaLink": DELTA_1}])
+    first, state, first_writer = _collector(tmp_path, first_routes)
+    pending, status = first.collect()
+    assert status == "success"
+    assert len(pending) == 1
+    assert pending[0].sync_mode == "full"
+    assert ("pages", INITIAL_DELTA_1) in first.client.calls
+    _commit(state, "run-1", pending)
+
+    second_routes = _routes(
+        [
+            {
+                "value": [
+                    _file("a", "renamed.txt", "/drives/drive-1/root:/Moved"),
+                    {"id": "b", "deleted": {}},
+                    _file("c", "c.txt"),
+                ],
+                "@odata.deltaLink": DELTA_2,
+            }
+        ]
+    )
+    second, _, second_writer = _collector(tmp_path, second_routes, run_id="run-2")
+    pending2, status2 = second.collect()
+
+    items = [record for record in second_writer.records if record["type"] == "item"]
+    assert status2 == "success"
+    assert pending2[0].sync_mode == "delta"
+    assert ("pages", DELTA_1) in second.client.calls
+    assert not any(
+        url.startswith(DELTA_1) and "$select=" in url for method, url in second.client.calls if method == "pages"
+    )
+    assert {item["provider_item_id"] for item in items} == {"a", "c"}
+    assert next(item for item in items if item["provider_item_id"] == "a")["path"] == "/Moved/renamed.txt"
+    resource = next(record for record in first_writer.records if record["type"] == "resource")
+    assert resource["access_level"] == "list_only"
+    assert resource["exposure"] == "USER_VISIBLE"
+    assert resource["exposure_evidence"]["classification_scope"] == "visibility_not_public_exposure"
+
+
+def test_missing_parent_paths_and_folder_rename_materialize_correct_descendants(
+    tmp_path,
+) -> None:
+    folder = {
+        "id": "folder",
+        "name": "Folder",
+        "folder": {"childCount": 1},
+        "parentReference": {"id": "drive-root"},
+    }
+    child = {
+        **_file("child", "report.txt"),
+        "parentReference": {"id": "folder"},
+    }
+    first, state, first_writer = _collector(
+        tmp_path,
+        _routes([{"value": [folder, child], "@odata.deltaLink": DELTA_1}]),
+    )
+
+    pending, status = first.collect()
+
+    assert status == "success"
+    first_paths = {
+        record["provider_item_id"]: record["path"] for record in first_writer.records if record["type"] == "item"
+    }
+    assert first_paths == {"folder": "/Folder", "child": "/Folder/report.txt"}
+    _commit(state, "run-1", pending)
+
+    renamed_folder = {
+        **folder,
+        "name": "Renamed",
+    }
+    second, _, second_writer = _collector(
+        tmp_path,
+        _routes(
+            [
+                {
+                    "value": [renamed_folder],
+                    "@odata.deltaLink": DELTA_2,
+                }
+            ]
+        ),
+        run_id="run-2",
+    )
+
+    _, second_status = second.collect()
+
+    assert second_status == "success"
+    second_paths = {
+        record["provider_item_id"]: record["path"] for record in second_writer.records if record["type"] == "item"
+    }
+    assert second_paths == {
+        "folder": "/Renamed",
+        "child": "/Renamed/report.txt",
+    }
+
+
+def test_delta_410_recovers_full_without_making_complete_run_partial(tmp_path) -> None:
+    first, state, _ = _collector(
+        tmp_path,
+        _routes([{"value": [_file("a", "a.txt")], "@odata.deltaLink": DELTA_1}]),
+    )
+    pending, _ = first.collect()
+    _commit(state, "run-1", pending)
+
+    reset_url = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?reset=1"
+    routes = _routes(
+        GraphAPIError(
+            status_code=410,
+            code="resyncChangesApplyDifferences",
+            reset_url=reset_url,
+        )
+    )
+    routes[reset_url] = [{"value": [_file("new", "new.txt")], "@odata.deltaLink": DELTA_2}]
+    recovered, _, writer = _collector(tmp_path, routes, run_id="run-2")
+
+    pending2, status = recovered.collect()
+
+    assert status == "success"
+    assert pending2[0].sync_mode == "full"
+    assert any(record.get("code") == "DELTA_RESET" for record in writer.records)
+    assert recovered.stats.delta_resets == 1
+
+
+def test_one_inaccessible_library_does_not_abort_other_libraries(tmp_path) -> None:
+    routes = _routes(
+        [{"value": [_file("a", "a.txt")], "@odata.deltaLink": DELTA_1}],
+        drives=[_drive("drive-1", "Documents"), _drive("drive-2", "Restricted")],
+    )
+    routes[f"drives/drive-2/root/delta?$select={ITEM_SELECT}"] = GraphAPIError(status_code=403, code="accessDenied")
+    collector, _, writer = _collector(tmp_path, routes)
+
+    pending, status = collector.collect()
+
+    assert status == "partial"
+    assert len(pending) == 1
+    assert collector.stats.libraries_failed == 1
+    assert any(record.get("code") == "LIBRARY_PERMISSION_DENIED" for record in writer.records)
+
+
+def test_malformed_item_is_reported_without_advancing_checkpoint(tmp_path) -> None:
+    routes = _routes(
+        [
+            {
+                "value": [_file("valid", "valid.txt"), _file("bad", "x" * 256)],
+                "@odata.deltaLink": DELTA_1,
+            }
+        ]
+    )
+    collector, state, writer = _collector(tmp_path, routes)
+
+    pending, status = collector.collect()
+
+    assert status == "partial"
+    assert pending == []
+    assert any(record.get("provider_item_id") == "valid" for record in writer.records)
+    issue = next(record for record in writer.records if record.get("code") == "ITEM_METADATA_LIMIT")
+    assert "x" * 256 not in str(issue)
+    assert state.count_current_items(collector.scope_key, "tenant-1", SITE_ID, "drive-1") == 0
+
+
+def test_malformed_item_facet_is_reported_without_advancing_checkpoint(tmp_path) -> None:
+    malformed = {**_file("bad", "bad.txt"), "deleted": None}
+    routes = _routes([{"value": [_file("valid", "valid.txt"), malformed], "@odata.deltaLink": DELTA_1}])
+    collector, state, writer = _collector(tmp_path, routes)
+
+    pending, status = collector.collect()
+
+    assert status == "partial"
+    assert pending == []
+    assert any(record.get("code") == "ITEM_METADATA_INVALID" for record in writer.records)
+    assert state.get_drive_state(collector.scope_key, "tenant-1", SITE_ID, "drive-1").delta_link is None
+
+
+def test_site_limit_marks_app_discovery_non_authoritative() -> None:
+    context = collection_context_record(
+        _context(delegated=False),
+        SharePointCollectionConfig(max_sites=1),
+        status="partial",
+        sync_mode="full",
+        partial=True,
+    )
+
+    assert context["discovery_completeness"] == "partial"
+    assert context["metadata"]["discovery_authoritative"] is False

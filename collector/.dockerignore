@@ -13,3 +13,7 @@ tests
 *.ndjson
 *.ndjson.gz
 *.log
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*

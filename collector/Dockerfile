@@ -18,10 +18,13 @@ RUN groupadd --gid 10001 collector && \
     useradd --uid 10001 --gid collector --create-home --home-dir /home/collector collector && \
     mkdir -p /data && chown collector:collector /data
 
-COPY --chown=collector:collector share_sentinel_collector.py .
+ENV TMPDIR=/data
+
+COPY --chown=collector:collector collector_entrypoint.py share_sentinel_collector.py share_sentinel_sharepoint.py ./
+COPY --chown=collector:collector sharepoint ./sharepoint
 
 USER collector
 WORKDIR /data
 
-ENTRYPOINT ["python", "/opt/share-sentinel/share_sentinel_collector.py"]
+ENTRYPOINT ["python", "/opt/share-sentinel/collector_entrypoint.py"]
 CMD ["--help"]

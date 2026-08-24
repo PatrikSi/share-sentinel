@@ -1,0 +1,368 @@
+import json
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+
+import pytest
+import requests
+from sharepoint.auth import ExistingTokenAuthProvider, GraphTokenContext
+from sharepoint.graph import GraphAPIError, GraphClient, GraphProtocolError, iter_values
+
+
+class StaticProvider:
+    supports_refresh = False
+
+    def __init__(self, token: str = "sensitive-token") -> None:
+        self.calls = 0
+        self.context = GraphTokenContext(
+            access_token=token,
+            auth_mode="token",
+            auth_type="delegated",
+            tenant_id="tenant-1",
+            client_id="client-1",
+            user_id="user-1",
+            user_principal_name="alice@example.com",
+            scopes=("Sites.Read.All",),
+            roles=(),
+            expires_at=datetime.now(tz=UTC) + timedelta(hours=1),
+        )
+
+    def acquire_token(self) -> GraphTokenContext:
+        self.calls += 1
+        return self.context
+
+
+class FakeResponse:
+    def __init__(
+        self,
+        status_code: int,
+        payload: dict[str, object] | None = None,
+        *,
+        headers: dict[str, str] | None = None,
+        stream_error: BaseException | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._raw = json.dumps(payload or {}).encode()
+        self.stream_error = stream_error
+        self.closed = False
+
+    def iter_content(self, chunk_size: int):  # noqa: ARG002
+        if self.stream_error:
+            raise self.stream_error
+        yield self._raw
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeSession:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+def _client(session: FakeSession, **kwargs) -> GraphClient:
+    return GraphClient(StaticProvider(), session=session, sleep=lambda _delay: None, **kwargs)
+
+
+def test_graph_pagination_follows_absolute_next_links() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "value": [{"id": "1"}],
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/sites?page=2",
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "value": [{"id": "2"}],
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/sites?page=3",
+                },
+            ),
+            FakeResponse(200, {"value": [{"id": "3"}]}),
+        ]
+    )
+
+    values = list(iter_values(_client(session).iter_pages("sites")))
+
+    assert [value["id"] for value in values] == ["1", "2", "3"]
+    assert len(session.calls) == 3
+
+
+@pytest.mark.parametrize(
+    "next_link,code",
+    [
+        ("https://attacker.example/collect", "unsafe_continuation_url"),
+        ("http://graph.microsoft.com/v1.0/sites", "unsafe_continuation_url"),
+        ("https://graph.microsoft.com/beta/sites", "unsafe_continuation_path"),
+        ("https://graph.microsoft.com:444/v1.0/sites", "unsafe_continuation_url"),
+    ],
+)
+def test_continuation_links_cannot_exfiltrate_authorization(next_link: str, code: str) -> None:
+    session = FakeSession([FakeResponse(200, {"value": [], "@odata.nextLink": next_link})])
+    client = _client(session)
+
+    with pytest.raises(GraphProtocolError) as exc:
+        list(client.iter_pages("sites"))
+
+    assert exc.value.code == code
+    assert len(session.calls) == 1
+
+
+def test_graph_429_respects_retry_after_then_succeeds() -> None:
+    sleeps: list[float] = []
+    session = FakeSession(
+        [
+            FakeResponse(429, {"error": {"code": "tooManyRequests"}}, headers={"Retry-After": "7"}),
+            FakeResponse(200, {"value": []}),
+        ]
+    )
+    client = GraphClient(
+        StaticProvider(),
+        session=session,
+        sleep=sleeps.append,
+        random_source=lambda: 0.0,
+    )
+
+    assert client.get("sites") == {"value": []}
+    assert sleeps == [7.0]
+    assert client.retry_count == 1
+
+
+def test_retry_after_beyond_operator_budget_fails_without_early_retry() -> None:
+    session = FakeSession([FakeResponse(429, {}, headers={"Retry-After": "600", "request-id": "req-1"})])
+    client = _client(session, max_retry_delay=30)
+
+    with pytest.raises(GraphAPIError) as exc:
+        client.get("sites")
+
+    assert exc.value.code == "retry_after_exceeds_budget"
+    assert exc.value.retryable is True
+    assert len(session.calls) == 1
+
+
+def test_stream_failure_is_retried_and_sanitized() -> None:
+    secret_url = "https://graph.microsoft.com/v1.0/sites?$skiptoken=sensitive"
+    stream_error = requests.exceptions.ChunkedEncodingError(f"failed reading {secret_url}")
+    session = FakeSession(
+        [
+            FakeResponse(200, {}, stream_error=stream_error),
+            FakeResponse(200, {"value": []}),
+        ]
+    )
+    client = _client(session)
+
+    assert client.get("sites") == {"value": []}
+    assert len(session.calls) == 2
+
+    failing = _client(FakeSession([FakeResponse(200, {}, stream_error=stream_error)]), max_attempts=1)
+    with pytest.raises(GraphAPIError) as exc:
+        failing.get("sites")
+    assert "skiptoken" not in str(exc.value)
+    assert "sensitive-token" not in str(exc.value)
+
+
+def test_delta_410_preserves_reset_location_without_logging_it() -> None:
+    reset_url = "https://graph.microsoft.com/v1.0/drives/d/root/delta?$token=opaque"
+    client = _client(
+        FakeSession(
+            [
+                FakeResponse(
+                    410,
+                    {"error": {"code": "resyncChangesApplyDifferences"}},
+                    headers={"Location": reset_url},
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(GraphAPIError) as exc:
+        client.get("drives/d/root/delta")
+
+    assert exc.value.status_code == 410
+    assert exc.value.reset_url == reset_url
+    assert "opaque" not in str(exc.value)
+
+
+def test_single_attempt_401_reports_authentication_failure() -> None:
+    client = _client(
+        FakeSession([FakeResponse(401, {"error": {"code": "InvalidAuthenticationToken"}})]),
+        max_attempts=1,
+    )
+
+    with pytest.raises(GraphAPIError) as exc:
+        client.get("sites")
+
+    assert exc.value.status_code == 401
+    assert exc.value.code == "InvalidAuthenticationToken"
+
+
+def test_imported_one_shot_token_401_is_terminal_and_not_reread() -> None:
+    calls = 0
+
+    def one_shot_reader() -> str:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise AssertionError("imported token must not be reacquired after a Graph 401")
+        return "opaque-token"
+
+    provider = ExistingTokenAuthProvider(
+        one_shot_reader,
+        opaque_auth_type="delegated",
+        tenant_id="tenant.example",
+        assessed_identity="alice@example.com",
+    )
+    session = FakeSession([FakeResponse(401, {"error": {"code": "InvalidAuthenticationToken"}})])
+    client = GraphClient(provider, session=session, sleep=lambda _delay: None)
+
+    with pytest.raises(GraphAPIError) as exc:
+        client.get("sites")
+
+    assert exc.value.status_code == 401
+    assert calls == 1
+    assert len(session.calls) == 1
+
+
+def test_msal_managed_provider_refreshes_once_after_401() -> None:
+    provider = StaticProvider()
+    provider.supports_refresh = True
+    session = FakeSession(
+        [
+            FakeResponse(401, {"error": {"code": "InvalidAuthenticationToken"}}),
+            FakeResponse(401, {"error": {"code": "InvalidAuthenticationToken"}}),
+        ]
+    )
+    client = GraphClient(provider, session=session, sleep=lambda _delay: None)
+
+    with pytest.raises(GraphAPIError) as exc:
+        client.get("sites")
+
+    assert exc.value.status_code == 401
+    assert provider.calls == 2
+    assert len(session.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"tenant_id": "tenant-2"},
+        {"client_id": "client-2"},
+        {"user_id": "user-2"},
+        {"user_principal_name": "mallory@example.com"},
+        {"auth_type": "application"},
+        {"scopes": ("Sites.ReadWrite.All",)},
+        {"roles": ("Sites.Read.All",)},
+    ],
+)
+def test_refreshed_token_cannot_change_assessment_context(changes: dict[str, object]) -> None:
+    initial = StaticProvider().context
+    refreshed = replace(initial, access_token="replacement-token", **changes)
+
+    class RefreshingProvider:
+        supports_refresh = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def acquire_token(self) -> GraphTokenContext:
+            self.calls += 1
+            return refreshed
+
+    provider = RefreshingProvider()
+    session = FakeSession([FakeResponse(401, {"error": {"code": "InvalidAuthenticationToken"}})])
+    client = GraphClient(
+        provider,
+        initial_token_context=initial,
+        session=session,
+        sleep=lambda _delay: None,
+    )
+
+    with pytest.raises(GraphAPIError) as exc:
+        client.get("sites")
+
+    assert exc.value.code == "auth_context_changed"
+    assert exc.value.retryable is False
+    assert provider.calls == 1
+    assert len(session.calls) == 1
+    assert "sensitive-token" not in str(exc.value)
+    assert "replacement-token" not in str(exc.value)
+
+
+def test_near_expiry_imported_token_is_not_reacquired_or_sent() -> None:
+    reads = 0
+
+    def token_reader() -> str:
+        nonlocal reads
+        reads += 1
+        raise AssertionError("the imported token source must not be reread")
+
+    provider = ExistingTokenAuthProvider(
+        token_reader,
+        opaque_auth_type="delegated",
+        tenant_id="tenant-1",
+        assessed_identity="alice@example.com",
+    )
+    initial = replace(
+        StaticProvider().context,
+        access_token="imported-token",
+        expires_at=datetime.now(tz=UTC) + timedelta(seconds=30),
+    )
+    session = FakeSession([])
+    client = GraphClient(
+        provider,
+        initial_token_context=initial,
+        session=session,
+        sleep=lambda _delay: None,
+    )
+
+    with pytest.raises(GraphAPIError) as exc:
+        client.get("sites")
+
+    assert exc.value.code == "token_expiring"
+    assert exc.value.retryable is False
+    assert reads == 0
+    assert session.calls == []
+
+
+def test_pagination_cycle_and_page_limit_are_bounded() -> None:
+    repeated = "https://graph.microsoft.com/v1.0/sites?page=1"
+    cycle = _client(FakeSession([FakeResponse(200, {"value": [], "@odata.nextLink": repeated})]))
+    with pytest.raises(GraphProtocolError, match="pagination_cycle"):
+        list(cycle.iter_pages(repeated))
+
+    limited = _client(
+        FakeSession(
+            [
+                FakeResponse(
+                    200,
+                    {
+                        "value": [],
+                        "@odata.nextLink": "https://graph.microsoft.com/v1.0/sites?page=2",
+                    },
+                )
+            ]
+        ),
+        max_pages=1,
+    )
+    with pytest.raises(GraphProtocolError, match="page_limit_reached"):
+        list(limited.iter_pages("sites"))
+
+
+def test_response_size_is_bounded_before_json_decode() -> None:
+    response = FakeResponse(200, {"value": ["x" * 2048]}, headers={"Content-Length": "999999"})
+    client = _client(FakeSession([response]), max_response_bytes=1024)
+
+    with pytest.raises(GraphProtocolError, match="response_too_large"):
+        client.get("sites")
+    assert response.closed is True

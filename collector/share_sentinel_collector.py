@@ -139,6 +139,19 @@ SMB_DENIED_STATUS_LABELS = (
 )
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Make a completed atomic replace durable before callers advance state."""
+
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(os.fspath(directory), flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 @dataclass
 class Stats:
     endpoints: int = 0
@@ -212,10 +225,7 @@ class ProgressReporter:
         if self.quiet:
             return
         total = str(self.total_targets) if self.total_targets is not None else "unknown"
-        self._write(
-            "scan started: "
-            f"targets={total} workers={workers} protocols={','.join(share_types)}"
-        )
+        self._write(f"scan started: targets={total} workers={workers} protocols={','.join(share_types)}")
         if self.interval_seconds > 0:
             self._thread = threading.Thread(
                 target=self._periodic_loop,
@@ -308,8 +318,7 @@ class ProgressReporter:
             error_codes = list(self.stats.error_codes.most_common(5))
         issue_label = ",".join(f"{code}={count}" for code, count in error_codes) or "none"
         self._write(
-            f"collector finished ({status}): failed_targets={failed} "
-            f"cancelled_targets={cancelled} issues={issue_label}"
+            f"collector finished ({status}): failed_targets={failed} cancelled_targets={cancelled} issues={issue_label}"
         )
 
     def _periodic_loop(self) -> None:
@@ -417,7 +426,11 @@ class NDJSONWriter:
         self._gzip = bool(gzip_output and path is not None)
         self._artifact_format = _artifact_format_for_path(path)
         self._closed = False
-        self._buffer_dir = tempfile.mkdtemp(prefix="share-sentinel-buffer-")
+        buffer_parent = str(Path(path).expanduser().parent) if path is not None else None
+        self._buffer_dir = tempfile.mkdtemp(
+            prefix=".share-sentinel-buffer-",
+            dir=buffer_parent,
+        )
         self._endpoint_paths: dict[str, str] = {}
         self._run_meta: dict[str, object] | None = None
         self._run_end: dict[str, object] | None = None
@@ -561,6 +574,7 @@ class NDJSONWriter:
                     target_fp.flush()
                     os.fsync(target_fp.fileno())
             os.replace(temporary_path, destination)
+            _fsync_directory(destination.parent)
             committed = True
         finally:
             if not committed:
@@ -815,17 +829,17 @@ class NDJSONWriter:
             "auth": run_meta.get("auth"),
         }
         target_fp.write("{")
-        target_fp.write(f"\"schema_version\":{json.dumps(run_meta.get('schema_version', 1))}")
-        target_fp.write(",\"format\":\"share_sentinel_compact_json\"")
-        target_fp.write(",\"meta\":")
+        target_fp.write(f'"schema_version":{json.dumps(run_meta.get("schema_version", 1))}')
+        target_fp.write(',"format":"share_sentinel_compact_json"')
+        target_fp.write(',"meta":')
         json.dump(meta, target_fp, ensure_ascii=True, separators=(",", ":"))
-        target_fp.write(",\"collection\":")
+        target_fp.write(',"collection":')
         json.dump(collection, target_fp, ensure_ascii=True, separators=(",", ":"))
-        target_fp.write(",\"summary\":")
+        target_fp.write(',"summary":')
         json.dump(summary, target_fp, ensure_ascii=True, separators=(",", ":"))
-        target_fp.write(",\"issue_summary\":")
+        target_fp.write(',"issue_summary":')
         json.dump(self._serialized_issues(), target_fp, ensure_ascii=True, separators=(",", ":"))
-        target_fp.write(",\"endpoints\":[")
+        target_fp.write(',"endpoints":[')
 
         wrote_endpoint = False
         for endpoint_key in sorted(self._endpoint_paths):
@@ -1133,9 +1147,7 @@ def parse_hosts_file(hosts_file: str | None, max_hosts: int | None = None) -> li
                 break
             line_number += 1
             if len(raw_line.rstrip("\r\n")) > HOST_INPUT_MAX_LINE_CHARACTERS:
-                raise ValueError(
-                    f"hosts file line {line_number} exceeds {HOST_INPUT_MAX_LINE_CHARACTERS} characters"
-                )
+                raise ValueError(f"hosts file line {line_number} exceeds {HOST_INPUT_MAX_LINE_CHARACTERS} characters")
             line = raw_line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -1151,9 +1163,7 @@ def parse_hosts_file(hosts_file: str | None, max_hosts: int | None = None) -> li
             seen.add(key)
             hosts.append(target)
             if max_hosts is not None and max_hosts > 0 and len(hosts) > max_hosts:
-                raise ValueError(
-                    f"hosts file contains more than the reviewed --max-targets limit ({max_hosts})"
-                )
+                raise ValueError(f"hosts file contains more than the reviewed --max-targets limit ({max_hosts})")
     return hosts
 
 
@@ -1276,10 +1286,7 @@ def _legacy_access_level(capabilities: dict[str, dict[str, object]]) -> str:
     if int(capabilities["list"].get("allowed", 0)) > 0:
         return "list_only"
 
-    any_allowed = any(
-        int(capabilities[name].get("allowed", 0)) > 0
-        for name in SMB_CAPABILITY_NAMES
-    )
+    any_allowed = any(int(capabilities[name].get("allowed", 0)) > 0 for name in SMB_CAPABILITY_NAMES)
     tree_connect_denied = int(capabilities["tree_connect"].get("denied", 0)) > 0
     if tree_connect_denied and not any_allowed:
         return "no_access"
@@ -1360,9 +1367,8 @@ def _probe_smb_handle_access(
     cancel_event: threading.Event | None,
     probe_circuit: _SMBProbeCircuit | None = None,
 ) -> None:
-    if (
-        (cancel_event is not None and cancel_event.is_set())
-        or (probe_circuit is not None and probe_circuit.transport_failed)
+    if (cancel_event is not None and cancel_event.is_set()) or (
+        probe_circuit is not None and probe_circuit.transport_failed
     ):
         return
     open_file = getattr(conn, "openFile", None)
@@ -1564,9 +1570,7 @@ def _discover_smb_probe_candidates(
         queue.append(path)
         queued_paths.add(path_key)
 
-    directory_sample_keys = {
-        _smb_handle_path(path).casefold() for path in directory_samples
-    }
+    directory_sample_keys = {_smb_handle_path(path).casefold() for path in directory_samples}
     file_sample_keys = {_smb_handle_path(path).casefold() for path in file_samples}
     directory_candidates_seen = 0
     file_candidates_seen = 0
@@ -1574,12 +1578,7 @@ def _discover_smb_probe_candidates(
     inspected = 0
     limit_reached = False
 
-    while (
-        queue
-        and directory_attempts < probe_limit
-        and inspected < max_entries
-        and len(file_samples) < probe_limit
-    ):
+    while queue and directory_attempts < probe_limit and inspected < max_entries and len(file_samples) < probe_limit:
         if cancel_event is not None and cancel_event.is_set():
             break
 
@@ -1649,12 +1648,7 @@ def _discover_smb_probe_candidates(
             if len(file_samples) >= probe_limit:
                 break
 
-    if (
-        not limit_reached
-        and inspected >= max_entries
-        and queue
-        and len(file_samples) < probe_limit
-    ):
+    if not limit_reached and inspected >= max_entries and queue and len(file_samples) < probe_limit:
         limit_reached = True
     return directory_candidates_seen, file_candidates_seen, limit_reached, inspected
 
@@ -1840,9 +1834,7 @@ def _normalize_smb_identity(args: argparse.Namespace) -> None:
 
     detected_separators = [separator for separator in ("\\", "/", "@") if separator in username]
     if len(detected_separators) > 1:
-        raise SystemExit(
-            "ambiguous --username; use USER, DOMAIN\\USER, DOMAIN/USER, or USER@REALM"
-        )
+        raise SystemExit("ambiguous --username; use USER, DOMAIN\\USER, DOMAIN/USER, or USER@REALM")
 
     qualified_domain = ""
     if detected_separators:
@@ -1853,9 +1845,7 @@ def _normalize_smb_identity(args: argparse.Namespace) -> None:
             )
         left, right = (part.strip() for part in username.split(separator, 1))
         if not left or not right:
-            raise SystemExit(
-                "invalid --username; both the user and domain/realm components must be non-empty"
-            )
+            raise SystemExit("invalid --username; both the user and domain/realm components must be non-empty")
         if separator == "@":
             username, qualified_domain = left, right
         else:
@@ -2011,10 +2001,9 @@ def _validate_args(args: argparse.Namespace) -> None:
             if len(hash_parts) != 2:
                 raise SystemExit("--hashes must be in LMHASH:NTHASH format")
             lmhash, nthash = hash_parts
-            if (
-                (lmhash and re.fullmatch(r"[0-9a-fA-F]{32}", lmhash) is None)
-                or re.fullmatch(r"[0-9a-fA-F]{32}", nthash) is None
-            ):
+            if (lmhash and re.fullmatch(r"[0-9a-fA-F]{32}", lmhash) is None) or re.fullmatch(
+                r"[0-9a-fA-F]{32}", nthash
+            ) is None:
                 raise SystemExit(
                     "--hashes requires an optional 32-character hexadecimal LM hash and a 32-character hexadecimal NT hash"
                 )
@@ -2029,9 +2018,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         output = Path(output_path).expanduser()
         normalized_output = str(output).lower()
         if not normalized_output.endswith(SUPPORTED_ARTIFACT_SUFFIXES):
-            raise SystemExit(
-                "--output must end in .ndjson, .jsonl, .json, or the corresponding .gz suffix"
-            )
+            raise SystemExit("--output must end in .ndjson, .jsonl, .json, or the corresponding .gz suffix")
         gzip_output = bool(getattr(args, "gzip", False))
         if gzip_output and not normalized_output.endswith(".gz"):
             raise SystemExit("--gzip requires an --output filename ending in .gz")
@@ -2060,9 +2047,7 @@ def _validate_args(args: argparse.Namespace) -> None:
                 except FileNotFoundError:
                     pass
                 except OSError as exc:
-                    raise SystemExit(
-                        f"unable to clean output write check in {parent}: {_error_detail(exc)}"
-                    ) from exc
+                    raise SystemExit(f"unable to clean output write check in {parent}: {_error_detail(exc)}") from exc
         args.output = str(output)
     if bool(getattr(args, "gzip", False)) and not output_path and not upload:
         raise SystemExit("--gzip requires --output unless --upload is enabled")
@@ -2298,10 +2283,7 @@ def _validate_runtime_dependencies(selected_share_types: set[str]) -> tuple[set[
     fatals: list[str] = []
 
     if "smb" in selected_share_types and SMBConnection is None:
-        message = (
-            "SMB scanning requires the optional dependency `impacket`. "
-            "Install with `pip install impacket`."
-        )
+        message = "SMB scanning requires the optional dependency `impacket`. Install with `pip install impacket`."
         if selected_share_types == {"smb"}:
             fatals.append(message)
         else:
@@ -2311,7 +2293,9 @@ def _validate_runtime_dependencies(selected_share_types: set[str]) -> tuple[set[
     return disabled, warnings, fatals
 
 
-def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
+def scan_host_smb(
+    host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock
+) -> bool:
     endpoint_key = f"{host}:445"
     attempted_auth = _resolve_smb_auth_method(args)
     if SMBConnection is None:
@@ -2387,11 +2371,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
 
         excluded_shares = {s.upper() for s in args.exclude_share}
         include_shares = list(
-            dict.fromkeys(
-                str(share).strip()
-                for share in getattr(args, "include_share", [])
-                if str(share).strip()
-            )
+            dict.fromkeys(str(share).strip() for share in getattr(args, "include_share", []) if str(share).strip())
         )
         exclude_path_regex = getattr(args, "exclude_path_pattern", None)
         if exclude_path_regex is None and args.exclude_path_regex:
@@ -2465,8 +2445,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
 
         def _handle_list_limit(share_name: str, inspected: int, emitted: int) -> None:
             message = (
-                f"SMB share listing reached inspection cap for {share_name} "
-                f"(inspected={inspected}, emitted={emitted})."
+                f"SMB share listing reached inspection cap for {share_name} (inspected={inspected}, emitted={emitted})."
             )
             _emit_error(
                 writer,
@@ -2549,10 +2528,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
 
             def _capture_probe_directory_seed(path: str) -> None:
                 path_key = _smb_handle_path(path).casefold()
-                if (
-                    len(probe_directory_seeds) < probe_limit
-                    and path_key not in probe_directory_seed_keys
-                ):
+                if len(probe_directory_seeds) < probe_limit and path_key not in probe_directory_seed_keys:
                     probe_directory_seeds.append(path)
                     probe_directory_seed_keys.add(path_key)
 
@@ -2755,8 +2731,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             )
             _report_detail(
                 args,
-                f"host {host}: finished SMB share {share_name} "
-                f"(access={final_access_level}, probes={probe_limit})",
+                f"host {host}: finished SMB share {share_name} (access={final_access_level}, probes={probe_limit})",
             )
         return True
 
@@ -2831,7 +2806,9 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
     return False
 
 
-def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock) -> bool:
+def scan_host_nfs(
+    host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock
+) -> bool:
     endpoint_key = f"{host}:2049"
 
     if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
@@ -2960,7 +2937,9 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
     return True
 
 
-def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock):
+def scan_host(
+    host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWriter, stats: Stats, lock: threading.Lock
+):
     selected_share_types = _selected_share_types(args.share_types)
     disabled_share_types = getattr(args, "disabled_share_types", set())
     active_share_types = selected_share_types - set(disabled_share_types)
@@ -2976,10 +2955,7 @@ def scan_host(host: str, args: argparse.Namespace, run_id: str, writer: NDJSONWr
         succeeded = scan_host_smb(host, args, run_id, writer, stats, lock) or succeeded
         if cancel_event is not None and cancel_event.is_set():
             return SCAN_CANCELLED
-    if (
-        "nfs" in active_share_types
-        and not (cancel_event is not None and cancel_event.is_set())
-    ):
+    if "nfs" in active_share_types and not (cancel_event is not None and cancel_event.is_set()):
         succeeded = scan_host_nfs(host, args, run_id, writer, stats, lock) or succeeded
         if cancel_event is not None and cancel_event.is_set():
             return SCAN_CANCELLED
@@ -3015,7 +2991,8 @@ def upload_artifact(
         "run_id": run_id,
         "name": args.run_name,
         "description": "collector upload",
-        "target_scope": {
+        "target_scope": getattr(args, "target_scope_override", None)
+        or {
             "cidrs": args.cidr,
             "hosts": hosts,
         },
@@ -3075,10 +3052,7 @@ def upload_artifact(
                 upload_attempts=upload_attempts,
                 local_artifact_sha256=local_artifact_sha256,
                 run_id=run_id,
-                context=(
-                    "the artifact request ended without a definitive response "
-                    f"({_error_detail(upload_exc)})"
-                ),
+                context=(f"the artifact request ended without a definitive response ({_error_detail(upload_exc)})"),
             )
         except RuntimeError as reconciliation_exc:
             raise reconciliation_exc from upload_exc
@@ -3163,26 +3137,18 @@ def _reconcile_uploaded_artifact(
         run_resp.raise_for_status()
     except requests.RequestException as exc:
         raise RuntimeError(
-            "upload outcome is ambiguous: "
-            f"{context}; run reconciliation failed ({_error_detail(exc)})"
+            f"upload outcome is ambiguous: {context}; run reconciliation failed ({_error_detail(exc)})"
         ) from exc
 
     try:
         run_payload = run_resp.json()
     except ValueError as exc:
-        raise RuntimeError(
-            f"upload outcome is ambiguous: {context}; run reconciliation returned invalid JSON"
-        ) from exc
+        raise RuntimeError(f"upload outcome is ambiguous: {context}; run reconciliation returned invalid JSON") from exc
     if not isinstance(run_payload, dict):
-        raise RuntimeError(
-            f"upload outcome is ambiguous: {context}; run reconciliation returned an invalid payload"
-        )
+        raise RuntimeError(f"upload outcome is ambiguous: {context}; run reconciliation returned an invalid payload")
     remote_status = str(run_payload.get("status") or "").upper()
     remote_sha256 = str(run_payload.get("artifact_sha256") or "").lower()
-    if (
-        remote_status not in {"UPLOADED", "INGESTING", "COMPLETE"}
-        or remote_sha256 != local_artifact_sha256
-    ):
+    if remote_status not in {"UPLOADED", "INGESTING", "COMPLETE"} or remote_sha256 != local_artifact_sha256:
         raise RuntimeError(
             "upload outcome is ambiguous: "
             f"{context}; the API run does not confirm the same artifact "
@@ -3396,7 +3362,9 @@ def _scan_targets(
             result_was_cancelled = completed_future.cancelled()
             if not result_was_cancelled:
                 try:
-                    result_was_cancelled = completed_future.exception() is None and completed_future.result() is SCAN_CANCELLED
+                    result_was_cancelled = (
+                        completed_future.exception() is None and completed_future.result() is SCAN_CANCELLED
+                    )
                 except concurrent.futures.CancelledError:
                     result_was_cancelled = True
             host_failures += _handle_scan_result(
@@ -3567,7 +3535,9 @@ def main() -> int:
 
     args.exclude_path_pattern = re.compile(args.exclude_path_regex) if args.exclude_path_regex else None
     selected_share_types = sorted(_selected_share_types(args.share_types))
-    disabled_share_types, dependency_warnings, dependency_fatals = _validate_runtime_dependencies(set(selected_share_types))
+    disabled_share_types, dependency_warnings, dependency_fatals = _validate_runtime_dependencies(
+        set(selected_share_types)
+    )
     args.disabled_share_types = disabled_share_types
     smb_auth_method = _resolve_smb_auth_method(args) if "smb" in selected_share_types else "none"
 
@@ -3673,11 +3643,7 @@ def main() -> int:
             },
         },
         "auth": {
-            "mode": (
-                ("local" if args.local_auth else "domain")
-                if smb_auth_method in {"ntlm", "kerberos"}
-                else "none"
-            ),
+            "mode": (("local" if args.local_auth else "domain") if smb_auth_method in {"ntlm", "kerberos"} else "none"),
             "domain": (args.domain or None) if smb_auth_method in {"ntlm", "kerberos"} else None,
             "username": (args.username or None) if smb_auth_method in {"ntlm", "kerberos"} else None,
             "method": smb_auth_method,
@@ -3829,8 +3795,7 @@ def main() -> int:
     if finalization_interrupted:
         if writer_close_error is not None:
             print(
-                "output error: interrupted finalization could not be completed: "
-                f"{_error_detail(writer_close_error)}",
+                f"output error: interrupted finalization could not be completed: {_error_detail(writer_close_error)}",
                 file=sys.stderr,
             )
         artifact_label = output_path if keep_local_artifact else None

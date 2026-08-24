@@ -1,2 +1,4 @@
 impacket==0.13.1
+msal==1.37.0; sys_platform != "win32"
+msal[broker]==1.37.0; sys_platform == "win32"
 requests==2.34.2

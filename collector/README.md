@@ -1,6 +1,119 @@
-# Collector
+# Collectors
 
-The collector is a standalone Python CLI for scanning SMB and NFS targets, writing a Share Sentinel-compatible artifact, and optionally uploading that artifact into a project run.
+The collector image and Python package provide two isolated metadata-collection workflows that write Share Sentinel-compatible artifacts and can optionally upload them into a project run:
+
+- `share_sentinel_collector.py` scans explicitly authorized SMB and NFS targets.
+- `share_sentinel_sharepoint.py` inventories SharePoint Online sites, document libraries, folders, files, and metadata through Microsoft Graph without downloading document content.
+
+The SharePoint workflow inventories sites, document libraries, filenames, folders, stable Graph IDs, paths, sizes, timestamps, and URLs. It never downloads document content.
+
+## SharePoint Online
+
+Run the source script directly:
+
+```bash
+python share_sentinel_sharepoint.py --auth token --token-env GRAPH_ACCESS_TOKEN \
+  --output sharepoint.ndjson
+```
+
+The container has a small command dispatcher. Existing SMB/NFS arguments remain unchanged; prefix SharePoint commands with `sharepoint`:
+
+```bash
+docker volume create share-sentinel-collector-data
+docker run --rm -v share-sentinel-collector-data:/data --env GRAPH_ACCESS_TOKEN \
+  ghcr.io/patriksi/share-sentinel-collector:latest \
+  sharepoint --auth token --token-env GRAPH_ACCESS_TOKEN \
+  --state-path /data/sharepoint-state.sqlite3 \
+  --output /data/sharepoint.ndjson
+```
+
+Pass token environment variables through the container runtime's secret/environment support. Never put bearer tokens or client secrets in command-line arguments.
+
+### Continuous app assessment
+
+Configure an Entra application with read-only Microsoft Graph application permissions appropriate to the intended scope. Tenant-wide discovery uses paginated `sites/getAllSites`; `Sites.Read.All` is the initial broad-inventory permission. `Sites.Selected` can be used with targeted `--site` collection where the application has explicit site grants.
+
+```bash
+export SHARE_SENTINEL_GRAPH_TENANT_ID="00000000-0000-0000-0000-000000000000"
+export SHARE_SENTINEL_GRAPH_CLIENT_ID="00000000-0000-0000-0000-000000000000"
+export SHARE_SENTINEL_GRAPH_CLIENT_SECRET="..."
+
+python share_sentinel_sharepoint.py --auth app \
+  --output sharepoint-tenant.ndjson
+```
+
+Client-secret authentication is supported for the initial release. Certificate credentials are preferred for long-lived production deployments but are not implemented yet.
+
+### Quick delegated assessment
+
+Interactive browser authentication supports MFA and Conditional Access supported by the tenant. OAuth still authenticates a public client, so `--client-id` (or `SHARE_SENTINEL_GRAPH_CLIENT_ID`) must identify a registered public-client application. Share Sentinel does not yet publish a project-owned multi-tenant public-client registration; until it does, use a customer-approved public client or import an existing Graph access token.
+
+```bash
+python share_sentinel_sharepoint.py --auth interactive \
+  --tenant-id organizations --client-id "$PUBLIC_CLIENT_ID" \
+  --output delegated-view.ndjson
+```
+
+Imported tokens can come from an environment variable, stdin, or a user-only token file. Token-file mode rejects group/world-readable files on POSIX systems.
+
+```bash
+GRAPH_ACCESS_TOKEN="..." python share_sentinel_sharepoint.py \
+  --auth token --output delegated-view.ndjson
+
+printf '%s' "$GRAPH_ACCESS_TOKEN" | python share_sentinel_sharepoint.py \
+  --auth token --token-stdin --output delegated-view.ndjson
+```
+
+JWT metadata is decoded locally, where available, to check expiration, Microsoft Graph audience, tenant, delegated scopes/application roles, and assessment identity. This is metadata inspection, not cryptographic validation; Graph remains authoritative. Microsoft also issues tokens that clients must treat as opaque. Import those with explicit context so state cannot be mixed between identities:
+
+```bash
+GRAPH_ACCESS_TOKEN="..." python share_sentinel_sharepoint.py \
+  --auth token --token-type delegated \
+  --tenant-id 00000000-0000-0000-0000-000000000000 \
+  --assessed-identity alice@contoso.com \
+  --output delegated-view.ndjson
+```
+
+Opaque application tokens require `--token-type application`, a specific `--tenant-id`, and `--client-id`. Their audience, permissions, and expiration cannot be verified locally; Graph validates the token on the first request. Incorrect operator-supplied context is recorded as supplied rather than presented as JWT-derived evidence. Imported tokens are non-refreshable and must remain valid for the whole scan.
+
+Delegated discovery defaults to security-trimmed site search. `--discovery drive-search` provides a GraphRunner-style drive-search alternative, but wildcard Microsoft Search is not complete or tenant-authoritative. Use repeatable `--site <site-id-or-https-url>` for known-site assessment.
+
+### WAM and IWA
+
+`--auth wam` is Windows-only and uses MSAL broker support. It requires the public client's WAM redirect URI and a Windows MSAL broker runtime. It is intended for the actual interactive desktop user; `runas + WAM` is unsupported and unreliable.
+
+`--auth iwa --login-hint user@contoso.com` is a Windows compatibility path for supported federated/hybrid identities. IWA is not the recommended default, does not satisfy MFA prompts, and may be blocked by Conditional Access. No username/password or ROPC flow is implemented.
+
+### Delta and snapshot state
+
+Each Graph drive is initially enumerated through `driveItem/delta`. Later runs fetch only changes, apply tombstones and moves by stable `driveItem.id`, and emit a full materialized logical snapshot compatible with Share Sentinel's run-scoped inventory model.
+
+Metadata-only state (including filenames, paths, IDs, timestamps, and other inventory metadata, but no document bodies) is stored in a user-protected SQLite database (default `~/.local/state/share-sentinel/sharepoint-state.sqlite3`, or `SHARE_SENTINEL_GRAPH_STATE_PATH`). Mount a persistent state path when running the collector in a container. Delta links are opaque operational state and are never logged. Updates are staged per run and promoted atomically only after the artifact is durably finalized and, when requested, its direct upload is confirmed. Failed uploads, interrupted scans, malformed items, and conflicting concurrent scans do not advance checkpoints.
+
+Opaque-token rotation creates a new isolated state scope and a safe full sync. Stale opaque-token scopes are retained because the collector cannot prove them safe to delete; use a dedicated/disposable state database for this mode and rotate or archive it periodically. Keep long-lived application state separate.
+
+`--full-sync` ignores a working checkpoint for one safe replacement run. `--reset-delta` also requests a replacement full sync; neither deletes working state before the replacement artifact succeeds. HTTP 410 delta invalidation performs the same per-library recovery without failing unrelated libraries.
+
+Useful safety controls include `--max-sites`, `--max-libraries`, `--max-items`, `--max-pages`, `--graph-concurrency`, bounded response size, request timeouts, and bounded retry delay. Zero site/library/item limits mean unlimited. Graph `Retry-After` is respected; a delay beyond the configured budget fails that library as retriable/partial instead of retrying too early.
+
+Progress goes to stderr: the default emits start, periodic, and final summaries; `-v` adds per-library detail, repeated `-v` adds more request context, `--progress-interval 0` disables periodic summaries, and `--quiet` suppresses progress. Terminal failures still return a non-zero status and an actionable error.
+
+SharePoint exposure labels are evidence-based. A delegated result is `USER_VISIBLE`, meaning only that the collector enumerated its metadata in the assessed identity's Graph context. App-only inventory is `UNKNOWN` unless future permission analysis provides evidence. The initial collector neither opens content nor enumerates per-item permissions, and it never equates visibility with public, anonymous, external, or broad-internal exposure.
+
+Direct upload uses the same durable raw-body artifact workflow as the network-share collector:
+
+```bash
+export SHARE_SENTINEL_API_BASE="https://sentinel.example/api"
+export SHARE_SENTINEL_PROJECT_ID="..."
+export SHARE_SENTINEL_API_TOKEN="..."
+
+python share_sentinel_sharepoint.py --auth token --upload \
+  --state-path ./sharepoint-state.sqlite3
+```
+
+When no output path is given, a confirmed upload removes its protected temporary spool. A failed or ambiguous upload preserves the complete spool and prints its recovery path. A checkpoint conflict after a confirmed upload returns exit code `1` as an operator warning, but does not falsely mark the already-produced full snapshot as partial; the next scan safely replays from the older checkpoint. File outputs spool beside their destination; container stdout/upload-only runs spool under `/data`. Allow capacity for the final artifact and the temporary spool at the same time.
+
+Stdout-only file inventory is intentionally non-committing: the collector emits the complete NDJSON snapshot, withholds pending delta checkpoints, warns on stderr, and returns `1`. A `--no-files` run has no item checkpoint to advance. Use a file path or confirmed upload for scheduled incremental file scans.
 
 ## Prerequisites and installation
 
@@ -15,37 +128,43 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python share_sentinel_collector.py --help
+python share_sentinel_sharepoint.py --help
 ```
 
 The published container includes `showmount` and runs as an unprivileged user:
 
 ```bash
 docker run --rm ghcr.io/patriksi/share-sentinel-collector:latest --help
+docker run --rm ghcr.io/patriksi/share-sentinel-collector:latest sharepoint --help
 ```
 
 For repeatable use, replace `latest` with an exact `vX.Y.Z` or `sha-<full-commit>` tag. The root Compose file also exposes the collector through the optional `tools` profile and a persistent output volume. In a generated development environment, build it from the checkout on first use:
 
 ```bash
 docker compose --profile tools run --rm --build collector --help
+docker compose --profile tools run --rm --build collector sharepoint --help
 ```
 
 Production environments omit `--build`; Compose pulls the configured GHCR tag.
 
+See [SharePoint Online collection](../docs/sharepoint.md) for permissions, every authentication mode, state recovery, exposure terminology, scope limits, and current boundaries.
+
 ## What it produces
 
-Use `.ndjson` or `.jsonl` output for normal collection. These schema-v1 records
+Both collectors use `.ndjson` or `.jsonl` output for normal collection. These schema-v1 records
 are spooled once and copied to the final artifact as a bounded stream; this is
 also the format written to stdout and used for upload-only temporary artifacts.
 Add `.gz` and `--gzip` for streaming compression.
 
-`.json` remains available as a compact, nested compatibility format. Compact
+For SMB/NFS only, `.json` remains available as a compact, nested compatibility format. Compact
 assembly is deliberately limited to 8 MiB of flat records per endpoint and
 40 MiB in total because it must reconstruct one endpoint tree in memory. A
 larger compact run fails safely before assembly and tells you to rerun with
 `.ndjson`; it never replaces an existing destination with partial output.
 
-The filename and compression flag must agree: `.ndjson.gz`, `.jsonl.gz`, and
-`.json.gz` require `--gzip`, while a non-`.gz` filename rejects `--gzip`.
+For both workflows, the filename and compression flag must agree: `.ndjson.gz` and `.jsonl.gz`
+require `--gzip`, while a non-`.gz` filename rejects `--gzip`. The SMB/NFS-only
+`.json.gz` format follows the same rule.
 Other output suffixes are rejected so local files and API uploads cannot be
 misclassified.
 
