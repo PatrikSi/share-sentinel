@@ -1,5 +1,6 @@
 import gzip
 import io
+import json
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -96,7 +97,11 @@ def test_process_job_skips_failed_runs_without_touching_s3(monkeypatch) -> None:
     fake_conn = _FakeConn(run_row)
 
     monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
-    monkeypatch.setattr(main, "open_artifact_stream", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed runs must not fetch artifacts")))
+    monkeypatch.setattr(
+        main,
+        "open_artifact_stream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed runs must not fetch artifacts")),
+    )
 
     result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact-key"})
     assert fake_conn._unlocked is True
@@ -162,6 +167,75 @@ class _FakeBody:
         return None
 
 
+def _framed_lines(
+    run_id: str,
+    *records: str | bytes,
+    stats: dict[str, int] | None = None,
+) -> list[str | bytes]:
+    run_meta = (
+        f'{{"type":"run_meta","schema_version":1,"tool":"test-collector",'
+        f'"tool_version":"1.0.0","run_id":"{run_id}",'
+        '"started_at":"2026-01-01T00:00:00Z"}\n'
+    )
+    summary = stats or {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
+    run_end = (
+        f'{{"type":"run_end","run_id":"{run_id}","finished_at":"2026-01-01T00:00:01Z","stats":{json.dumps(summary)}}}\n'
+    )
+    return [run_meta, *records, run_end]
+
+
+def test_process_job_rejects_invalid_framing_before_inventory_and_clears_resume_state(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (
+        project_id,
+        "artifact.ndjson",
+        "INGESTING",
+        {"endpoints": 1, "resources": 1, "items": 8, "errors": 0},
+        {"line_offset": 10},
+        "application/x-ndjson",
+        256,
+    )
+    fake_conn = _FakeConn(run_row)
+    events: list[object] = []
+    trailing = f'{{"type":"endpoint","run_id":"{run_id}","endpoint_key":"host:445"}}\n'
+    invalid_lines = [*_framed_lines(run_id), trailing]
+
+    def _update(_conn, _run_id, status, offset, summary, last_error=None, **_kwargs):
+        events.append(("status", status, offset, dict(summary), last_error))
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "open_artifact_stream", lambda *_args: _FakeBody(invalid_lines))
+    monkeypatch.setattr(main, "clear_persisted_ingest_inventory", lambda *_args: events.append("cleared"))
+    monkeypatch.setattr(
+        main,
+        "upsert_endpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("preflight must run before inventory writes")),
+    )
+    monkeypatch.setattr(main, "update_run_status", _update)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+
+    assert result == "failed"
+    assert events[0][:4] == (
+        "status",
+        "INGESTING",
+        10,
+        {"endpoints": 1, "resources": 1, "items": 8, "errors": 0},
+    )
+    assert events[1] == "cleared"
+    assert events[2][0:4] == (
+        "status",
+        "FAILED",
+        0,
+        {"endpoints": 0, "resources": 0, "items": 0, "errors": 0},
+    )
+    assert "records follow run_end" in events[2][4]
+    assert fake_conn.rollback_calls == 1
+
+
 def test_process_job_rolls_back_before_marking_failed(monkeypatch) -> None:
     run_id = "11111111-1111-1111-1111-111111111111"
     project_id = "22222222-2222-2222-2222-222222222222"
@@ -186,14 +260,17 @@ def test_process_job_rolls_back_before_marking_failed(monkeypatch) -> None:
     monkeypatch.setattr(main, "update_run_status", _fake_update_run_status)
     monkeypatch.setattr(main, "write_audit", _fake_write_audit)
     monkeypatch.setattr(main, "upsert_endpoint", lambda *_args, **_kwargs: 7)
-    monkeypatch.setattr(main, "upsert_resource", lambda *_args, **_kwargs: (_ for _ in ()).throw(psycopg.DataError("bad access level")))
+    monkeypatch.setattr(
+        main, "upsert_resource", lambda *_args, **_kwargs: (_ for _ in ()).throw(psycopg.DataError("bad access level"))
+    )
     monkeypatch.setattr(
         main,
         "open_artifact_stream",
         lambda *_args, **_kwargs: _FakeBody(
-            [
-                '{"type":"resource","run_id":"11111111-1111-1111-1111-111111111111","endpoint_key":"host:445","name":"Finance","access_level":"read_write"}'
-            ]
+            _framed_lines(
+                run_id,
+                '{"type":"resource","run_id":"11111111-1111-1111-1111-111111111111","endpoint_key":"host:445","name":"Finance","access_level":"read_write"}',
+            )
         ),
     )
 
@@ -228,14 +305,17 @@ def test_process_job_persists_public_error_message_when_ingest_fails(monkeypatch
     monkeypatch.setattr(main, "update_run_status", _fake_update_run_status)
     monkeypatch.setattr(main, "write_audit", _fake_write_audit)
     monkeypatch.setattr(main, "upsert_endpoint", lambda *_args, **_kwargs: 7)
-    monkeypatch.setattr(main, "upsert_resource", lambda *_args, **_kwargs: (_ for _ in ()).throw(psycopg.DataError("bad access level")))
+    monkeypatch.setattr(
+        main, "upsert_resource", lambda *_args, **_kwargs: (_ for _ in ()).throw(psycopg.DataError("bad access level"))
+    )
     monkeypatch.setattr(
         main,
         "open_artifact_stream",
         lambda *_args, **_kwargs: _FakeBody(
-            [
-                '{"type":"resource","run_id":"11111111-1111-1111-1111-111111111111","endpoint_key":"host:445","name":"Finance","access_level":"read_write"}'
-            ]
+            _framed_lines(
+                run_id,
+                '{"type":"resource","run_id":"11111111-1111-1111-1111-111111111111","endpoint_key":"host:445","name":"Finance","access_level":"read_write"}',
+            )
         ),
     )
 
@@ -270,14 +350,17 @@ def test_process_job_schedules_retry_for_retryable_ingest_error(monkeypatch) -> 
     monkeypatch.setattr(main, "write_audit", _fake_write_audit)
     monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main, "upsert_endpoint", lambda *_args, **_kwargs: 7)
-    monkeypatch.setattr(main, "upsert_resource", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("artifact read failed")))
+    monkeypatch.setattr(
+        main, "upsert_resource", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("artifact read failed"))
+    )
     monkeypatch.setattr(
         main,
         "open_artifact_stream",
         lambda *_args, **_kwargs: _FakeBody(
-            [
-                '{"type":"resource","run_id":"11111111-1111-1111-1111-111111111111","endpoint_key":"host:445","name":"Finance","access_level":"read_write"}'
-            ]
+            _framed_lines(
+                run_id,
+                '{"type":"resource","run_id":"11111111-1111-1111-1111-111111111111","endpoint_key":"host:445","name":"Finance","access_level":"read_write"}',
+            )
         ),
     )
 
@@ -312,7 +395,7 @@ def test_process_job_uses_database_artifact_over_stale_queue_payload(monkeypatch
 
     def _open(key: str):
         opened_keys.append(key)
-        return _FakeBody([])
+        return _FakeBody(_framed_lines(run_id))
 
     def _audit(_conn, project_id, *_args, **_kwargs):
         audit_projects.append(project_id)
@@ -332,7 +415,7 @@ def test_process_job_uses_database_artifact_over_stale_queue_payload(monkeypatch
     )
 
     assert result == "complete"
-    assert opened_keys == ["current-artifact.ndjson"]
+    assert opened_keys == ["current-artifact.ndjson", "current-artifact.ndjson"]
     assert audit_projects == [database_project_id, database_project_id]
 
 
@@ -347,7 +430,9 @@ def test_process_job_terminalizes_unexpected_poison_exception(monkeypatch) -> No
         status_updates.append((status, kwargs.get("last_error")))
 
     monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
-    monkeypatch.setattr(main, "open_artifact_stream", lambda *_args, **_kwargs: (_ for _ in ()).throw(AttributeError("poison")))
+    monkeypatch.setattr(
+        main, "open_artifact_stream", lambda *_args, **_kwargs: (_ for _ in ()).throw(AttributeError("poison"))
+    )
     monkeypatch.setattr(main, "update_run_status", _update)
     monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
@@ -444,7 +529,7 @@ def test_process_job_resume_uses_existing_resource_without_downgrading_access(mo
         "artifact.ndjson",
         "UPLOADED",
         {"endpoints": 1, "resources": 1, "items": 0, "errors": 0},
-        {"line_offset": 2, "attempt_count": 1},
+        {"line_offset": 3, "attempt_count": 1},
         "application/x-ndjson",
         256,
     )
@@ -460,10 +545,14 @@ def test_process_job_resume_uses_existing_resource_without_downgrading_access(mo
     monkeypatch.setattr(
         main,
         "upsert_resource",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("existing readable resource must not be overwritten")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("existing readable resource must not be overwritten")
+        ),
     )
     monkeypatch.setattr(main, "flush_item_batch", _flush_items)
-    monkeypatch.setattr(main, "load_persisted_summary", lambda *_args: {"endpoints": 1, "resources": 1, "items": 1, "errors": 0})
+    monkeypatch.setattr(
+        main, "load_persisted_summary", lambda *_args: {"endpoints": 1, "resources": 1, "items": 1, "errors": 0}
+    )
     monkeypatch.setattr(main, "update_run_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
@@ -471,11 +560,12 @@ def test_process_job_resume_uses_existing_resource_without_downgrading_access(mo
         main,
         "open_artifact_stream",
         lambda *_args: _FakeBody(
-            [
+            _framed_lines(
+                run_id,
                 f'{{"type":"endpoint","run_id":"{run_id}","endpoint_key":"{endpoint_key}"}}\n',
                 f'{{"type":"resource","run_id":"{run_id}","endpoint_key":"{endpoint_key}","name":"Finance","resource_type":"smb_share","access_level":"readable"}}\n',
                 f'{{"type":"item","run_id":"{run_id}","endpoint_key":"{endpoint_key}","resource_name":"Finance","resource_type":"smb_share","path":"\\\\report.txt","name":"report.txt","is_dir":false}}\n',
-            ]
+            )
         ),
     )
 
@@ -484,6 +574,82 @@ def test_process_job_resume_uses_existing_resource_without_downgrading_access(mo
     assert result == "complete"
     assert len(inserted_item_rows) == 1
     assert inserted_item_rows[0][1] == 8
+
+
+def test_process_job_routes_out_of_order_sharepoint_item_by_drive_identity(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    endpoint_key = "sharepoint:site-1"
+    run_row = (
+        project_id,
+        "artifact.ndjson",
+        "UPLOADED",
+        {},
+        {"line_offset": 0},
+        "application/x-ndjson",
+        256,
+    )
+    fake_conn = _FakeConn(run_row)
+    resource_calls: list[dict[str, Any]] = []
+    item_rows: list[tuple] = []
+    error_rows: list[tuple] = []
+
+    def _upsert_resource(_conn, _run_id, _endpoint_id, record):
+        resource_calls.append(dict(record))
+        return 8
+
+    def _flush_items(_conn, rows):
+        item_rows.extend(rows)
+        rows.clear()
+
+    def _flush_errors(_conn, rows):
+        error_rows.extend(rows)
+        rows.clear()
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "upsert_endpoint", lambda *_args, **_kwargs: 7)
+    monkeypatch.setattr(main, "upsert_resource", _upsert_resource)
+    monkeypatch.setattr(main, "flush_item_batch", _flush_items)
+    monkeypatch.setattr(main, "flush_error_batch", _flush_errors)
+    monkeypatch.setattr(
+        main,
+        "load_persisted_summary",
+        lambda *_args: {"endpoints": 1, "resources": 1, "items": 1, "errors": 0},
+    )
+    monkeypatch.setattr(main, "update_run_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "open_artifact_stream",
+        lambda *_args: _FakeBody(
+            _framed_lines(
+                run_id,
+                (
+                    f'{{"type":"item","run_id":"{run_id}",'
+                    f'"endpoint_key":"{endpoint_key}","resource_name":"Documents",'
+                    '"share_type":"sharepoint","provider":"sharepoint",'
+                    '"provider_resource_id":"drive-1","provider_item_id":"item-1",'
+                    '"path":"/report.txt","name":"report.txt","is_dir":false}\n'
+                ),
+                (
+                    f'{{"type":"resource","run_id":"{run_id}",'
+                    f'"endpoint_key":"{endpoint_key}","name":"Documents",'
+                    '"share_type":"sharepoint","provider":"sharepoint",'
+                    '"provider_resource_id":"drive-1","access_level":"list_only"}\n'
+                ),
+            )
+        ),
+    )
+
+    result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+
+    assert result == "complete"
+    assert error_rows == []
+    assert [record["provider_resource_id"] for record in resource_calls] == ["drive-1", "drive-1"]
+    assert len(item_rows) == 1
+    assert item_rows[0][1] == 8
+    assert item_rows[0][13] == "item-1"
 
 
 def test_process_job_records_invalid_utf8_without_persisting_corrupted_inventory(monkeypatch) -> None:
@@ -498,10 +664,20 @@ def test_process_job_records_invalid_utf8_without_persisting_corrupted_inventory
         rows.clear()
 
     monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
-    monkeypatch.setattr(main, "open_artifact_stream", lambda *_args: _FakeBody([b'{"type":"endpoint","hostname":"bad\xff"}\n']))
-    monkeypatch.setattr(main, "upsert_endpoint", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invalid UTF-8 must not be persisted")))
+    monkeypatch.setattr(
+        main,
+        "open_artifact_stream",
+        lambda *_args: _FakeBody(_framed_lines(run_id, b'{"type":"endpoint","hostname":"bad\xff"}\n')),
+    )
+    monkeypatch.setattr(
+        main,
+        "upsert_endpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invalid UTF-8 must not be persisted")),
+    )
     monkeypatch.setattr(main, "flush_error_batch", _flush_errors)
-    monkeypatch.setattr(main, "load_persisted_summary", lambda *_args: {"endpoints": 0, "resources": 0, "items": 0, "errors": 1})
+    monkeypatch.setattr(
+        main, "load_persisted_summary", lambda *_args: {"endpoints": 0, "resources": 0, "items": 0, "errors": 1}
+    )
     monkeypatch.setattr(main, "update_run_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
@@ -538,11 +714,12 @@ def test_process_job_checkpoints_and_heartbeats_for_every_consumed_ndjson_line(m
         main,
         "open_artifact_stream",
         lambda *_args: _FakeBody(
-            [
+            _framed_lines(
+                run_id,
                 b'{"type":"endpoint","hostname":"bad\xff"}\n',
                 b"   \n",
                 b"{not-json}\n",
-            ]
+            )
         ),
     )
     monkeypatch.setattr(main, "PROGRESS_EVERY_LINES", 1)
@@ -566,13 +743,20 @@ def test_process_job_checkpoints_and_heartbeats_for_every_consumed_ndjson_line(m
         ("INGESTING", 1),
         ("INGESTING", 2),
         ("INGESTING", 3),
-        ("COMPLETE", 3),
+        ("INGESTING", 4),
+        ("INGESTING", 5),
+        ("COMPLETE", 5),
     ]
-    assert heartbeats == [
+    # The framing preflight now emits additional offset-zero heartbeats. The
+    # processing pass must still report every durable physical-line offset.
+    assert len(heartbeats) > 7
+    assert heartbeats[-7:] == [
         ("processing", 0),
         ("processing", 1),
         ("processing", 2),
         ("processing", 3),
+        ("processing", 4),
+        ("processing", 5),
         ("idle", None),
     ]
 
@@ -598,10 +782,11 @@ def test_process_job_records_non_object_ndjson_and_continues(monkeypatch) -> Non
         main,
         "open_artifact_stream",
         lambda *_args: _FakeBody(
-            [
+            _framed_lines(
+                run_id,
                 "[1,2,3]\n",
                 f'{{"type":"endpoint","run_id":"{run_id}","endpoint_key":"host:445"}}\n',
-            ]
+            )
         ),
     )
     monkeypatch.setattr(main, "upsert_endpoint", _upsert_endpoint)
@@ -641,9 +826,10 @@ def test_process_job_uses_persisted_summary_instead_of_producer_claim(monkeypatc
         main,
         "open_artifact_stream",
         lambda *_args: _FakeBody(
-                [
-                    f'{{"type":"run_end","run_id":"{run_id}","finished_at":"2026-01-01T00:00:00Z","stats":{{"endpoints":999,"resources":999,"items":999,"errors":999}}}}\n'
-                ]
+            _framed_lines(
+                run_id,
+                stats={"endpoints": 999, "resources": 999, "items": 999, "errors": 999},
+            )
         ),
     )
     monkeypatch.setattr(main, "load_persisted_summary", lambda *_args: authoritative)
@@ -703,6 +889,7 @@ def test_process_job_checkpoints_without_failure_on_worker_shutdown(monkeypatch)
     fake_conn = _FakeConn(run_row)
     status_updates: list[tuple[str, int, dict[str, Any]]] = []
     audit_actions: list[str] = []
+    artifact_open_calls = 0
 
     def _update(_conn, _run_id, status, line_offset, _summary, **kwargs):
         status_updates.append((status, line_offset, kwargs.get("extra_progress", {})))
@@ -710,15 +897,20 @@ def test_process_job_checkpoints_without_failure_on_worker_shutdown(monkeypatch)
     def _audit(_conn, _project_id, action, *_args, **_kwargs):
         audit_actions.append(action)
 
+    def _open_artifact(*_args):
+        nonlocal artifact_open_calls
+        artifact_open_calls += 1
+        return _FakeBody(
+            _framed_lines(run_id, f'{{"type":"endpoint","run_id":"{run_id}","endpoint_key":"host:445"}}\n')
+        )
+
     monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(main, "open_artifact_stream", _open_artifact)
     monkeypatch.setattr(
         main,
-        "open_artifact_stream",
-        lambda *_args: _FakeBody(
-            [f'{{"type":"endpoint","run_id":"{run_id}","endpoint_key":"host:445"}}\n']
-        ),
+        "upsert_endpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("shutdown must happen before the next record")),
     )
-    monkeypatch.setattr(main, "upsert_endpoint", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("shutdown must happen before the next record")))
     monkeypatch.setattr(main, "update_run_status", _update)
     monkeypatch.setattr(main, "write_audit", _audit)
     monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
@@ -733,6 +925,7 @@ def test_process_job_checkpoints_without_failure_on_worker_shutdown(monkeypatch)
     assert [(status, offset) for status, offset, _ in status_updates] == [("INGESTING", 0), ("UPLOADED", 0)]
     assert status_updates[-1][2]["pause_reason"] == "worker_shutdown"
     assert audit_actions == ["INGEST_STARTED", "INGEST_PAUSED"]
+    assert artifact_open_calls == 1
     assert fake_conn.commit_calls == 2
     assert fake_conn.rollback_calls == 0
     assert fake_conn._unlocked is True

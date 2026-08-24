@@ -34,8 +34,10 @@ class _FakeDb:
     added: list[object] = field(default_factory=list)
     deleted: list[object] = field(default_factory=list)
     commit_count: int = 0
+    statements: list[object] = field(default_factory=list)
 
     def execute(self, _statement):
+        self.statements.append(_statement)
         if not self.execute_queue:
             raise AssertionError("unexpected execute() call")
         return self.execute_queue.pop(0)
@@ -168,6 +170,7 @@ def test_inventory_resources_accepts_unknown_and_exposes_access_capabilities(mon
                         run_name="Access probe",
                         endpoint_key="host:445",
                         hostname="host",
+                        endpoint_metadata={"display_name": "File server"},
                         name="Finance",
                         remark=None,
                         access_level="unknown",
@@ -190,6 +193,132 @@ def test_inventory_resources_accepts_unknown_and_exposes_access_capabilities(mon
     assert response.status_code == 200
     assert response.json()["items"][0]["access_level"] == "unknown"
     assert response.json()["items"][0]["access_capabilities"] == capabilities
+    assert response.json()["items"][0]["provider"] == "smb"
+    assert response.json()["items"][0]["endpoint_metadata"]["display_name"] == "File server"
+
+
+def test_inventory_items_exposes_sharepoint_provider_identity_and_exposure(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    fake_db = _FakeDb(
+        execute_queue=[
+            _ExecuteResult(
+                [
+                    SimpleNamespace(
+                        id=11,
+                        run_id=run_id,
+                        run_name="Delegated view",
+                        endpoint_key="sharepoint:site-1",
+                        hostname="contoso.sharepoint.com",
+                        ip=None,
+                        endpoint_metadata={"display_name": "Finance site"},
+                        resource_name="Documents",
+                        access_level="list_only",
+                        access_capabilities={},
+                        resource_type="sharepoint_library",
+                        resource_provider="sharepoint",
+                        path="/Budgets/FY26.xlsx",
+                        name="FY26.xlsx",
+                        is_dir=False,
+                        size_bytes=184933,
+                        allocation_size_bytes=None,
+                        mtime=None,
+                        created_at=None,
+                        accessed_at=None,
+                        changed_at=None,
+                        file_attributes=[],
+                        provider="sharepoint",
+                        provider_item_id="item-1",
+                        provider_parent_id="parent-1",
+                        web_url="https://contoso.sharepoint.com/sites/Finance/FY26.xlsx",
+                        mime_type="application/vnd.test",
+                        deleted=False,
+                        provider_metadata={"site_id": "site-1", "drive_id": "drive-1"},
+                        exposure="USER_VISIBLE",
+                        exposure_evidence={"basis": "delegated_visibility"},
+                    )
+                ]
+            )
+        ]
+    )
+    monkeypatch.setattr(inventory_router, "require_project_role", lambda *_args, **_kwargs: None)
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get(
+            f"/projects/{project_id}/inventory/items",
+            params={
+                "provider": "sharepoint",
+                "resource_type": "sharepoint_library",
+                "exposure": "USER_VISIBLE",
+            },
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["share_type"] == "sharepoint"
+    assert item["resource_type"] == "sharepoint_library"
+    assert item["provider_item_id"] == "item-1"
+    assert item["provider_parent_id"] == "parent-1"
+    assert item["metadata"]["drive_id"] == "drive-1"
+    assert item["exposure"] == "USER_VISIBLE"
+    assert item["deleted"] is False
+    assert item["endpoint_metadata"]["display_name"] == "Finance site"
+    assert "items.deleted IS false" in str(fake_db.statements[0])
+
+
+def test_inventory_endpoints_provider_filter_includes_legacy_endpoint_via_resources(
+    monkeypatch,
+) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    fake_db = _FakeDb(
+        execute_queue=[
+            _ExecuteResult(
+                [
+                    SimpleNamespace(
+                        id=17,
+                        run_id=run_id,
+                        run_name="Legacy SMB scan",
+                        endpoint_key="fileserver:445",
+                        ip="10.0.0.17",
+                        hostname="fileserver",
+                        domain="CONTOSO",
+                        smb_signing="required",
+                        provider=None,
+                        provider_metadata={},
+                        resource_count=2,
+                        item_count=12,
+                    )
+                ]
+            )
+        ]
+    )
+    monkeypatch.setattr(inventory_router, "require_project_role", lambda *_args, **_kwargs: None)
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get(
+            f"/projects/{project_id}/inventory/endpoints",
+            params={"provider": "smb", "q": "Finance Site"},
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["endpoint_key"] == "fileserver:445"
+    sql = str(
+        fake_db.statements[0].compile(compile_kwargs={"literal_binds": True})
+    ).lower()
+    assert "endpoints.provider" in sql
+    assert "resources.provider" in sql
+    assert "resources.resource_type" in sql
+    assert "exists" in sql
+    assert "count(distinct" in sql
+    assert "display_name" in sql
+    assert "site_name" in sql
 
 
 def test_inventory_saved_investigations_update(monkeypatch) -> None:

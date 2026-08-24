@@ -108,6 +108,11 @@ class ScanRun(Base):
         nullable=False,
         server_default=sa.text("jsonb_build_object('line_offset', 0)"),
     )
+    collection_context: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=sa.text("'{}'::jsonb"),
+    )
 
 
 class Endpoint(Base):
@@ -127,14 +132,38 @@ class Endpoint(Base):
     smb_dialect: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
     smb_signing: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
     auth_method: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    provider: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
+    provider_metadata: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=sa.text("'{}'::jsonb"),
+    )
 
 
 class Resource(Base):
     __tablename__ = "resources"
     __table_args__ = (
-        UniqueConstraint("run_id", "endpoint_id", "resource_type", "name", name="uq_resources_run_endpoint_type_name"),
+        Index(
+            "uq_resources_run_endpoint_type_name_legacy",
+            "run_id",
+            "endpoint_id",
+            "resource_type",
+            "name",
+            unique=True,
+            postgresql_where=sa.text("provider_resource_id IS NULL"),
+        ),
+        Index(
+            "uq_resources_run_endpoint_provider_id",
+            "run_id",
+            "endpoint_id",
+            "resource_type",
+            "provider_resource_id",
+            unique=True,
+            postgresql_where=sa.text("provider_resource_id IS NOT NULL"),
+        ),
         Index("ix_resources_run_id", "run_id", "id"),
         Index("ix_resources_run_endpoint_id", "run_id", "endpoint_id", "id"),
+        Index("ix_resources_run_provider_exposure_id", "run_id", "provider", "exposure", "id"),
     )
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
@@ -145,15 +174,45 @@ class Resource(Base):
     remark: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     access_level: Mapped[AccessLevel] = mapped_column(value_enum(AccessLevel, name="access_level"), nullable=False)
     access_capabilities: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    provider: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
+    provider_resource_id: Mapped[str | None] = mapped_column(sa.String(512), nullable=True)
+    web_url: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    provider_metadata: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=sa.text("'{}'::jsonb"),
+    )
+    exposure: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
+    exposure_evidence: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=sa.text("'{}'::jsonb"),
+    )
 
 
 class Item(Base):
     __tablename__ = "items"
     __table_args__ = (
-        UniqueConstraint("run_id", "resource_id", "path", name="uq_items_run_resource_path"),
+        Index(
+            "uq_items_run_resource_path_legacy",
+            "run_id",
+            "resource_id",
+            "path",
+            unique=True,
+            postgresql_where=sa.text("provider_item_id IS NULL"),
+        ),
+        Index(
+            "uq_items_run_resource_provider_id",
+            "run_id",
+            "resource_id",
+            "provider_item_id",
+            unique=True,
+            postgresql_where=sa.text("provider_item_id IS NOT NULL"),
+        ),
         Index("ix_items_run_name", "run_id", "name"),
         Index("ix_items_run_id", "run_id", "id"),
         Index("ix_items_run_resource_id", "run_id", "resource_id", "id"),
+        Index("ix_items_run_provider_exposure_id", "run_id", "provider", "exposure", "id"),
     )
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
@@ -169,6 +228,23 @@ class Item(Base):
     accessed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     changed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     file_attributes: Mapped[list[str]] = mapped_column(JSONB, nullable=False, server_default=sa.text("'[]'::jsonb"))
+    provider: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
+    provider_item_id: Mapped[str | None] = mapped_column(sa.String(512), nullable=True)
+    provider_parent_id: Mapped[str | None] = mapped_column(sa.String(512), nullable=True)
+    web_url: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
+    deleted: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
+    provider_metadata: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=sa.text("'{}'::jsonb"),
+    )
+    exposure: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
+    exposure_evidence: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=sa.text("'{}'::jsonb"),
+    )
 
 
 class IngestError(Base):

@@ -91,6 +91,53 @@ def test_build_run_diff_returns_empty_summary_for_identical_snapshots() -> None:
     assert payload["item_churn"] == []
 
 
+def test_build_run_diff_reports_access_level_only_change_without_item_churn_counts() -> None:
+    resource_key = ("10.0.0.10:445", "smb_share", "Finance")
+    baseline = {
+        resource_key: {
+            "endpoint_key": "10.0.0.10:445",
+            "hostname": "fs-01",
+            "ip": "10.0.0.10",
+            "share_name": "Finance",
+            "share_type": "smb",
+            "access_level": "list_only",
+            "item_paths": {"\\Budget.xlsx"},
+        }
+    }
+    current = {
+        resource_key: {
+            **baseline[resource_key],
+            "access_level": "read_write",
+        }
+    }
+
+    payload = runs_router._build_run_diff(current, baseline)
+
+    assert payload["summary"] == {
+        "new_shares": 0,
+        "disappeared_shares": 0,
+        "changed_shares": 1,
+        "added_items": 0,
+        "removed_items": 0,
+    }
+    assert payload["item_churn"] == [
+        {
+            "endpoint_key": "10.0.0.10:445",
+            "hostname": "fs-01",
+            "ip": "10.0.0.10",
+            "share_name": "Finance",
+            "share_type": "smb",
+            "access_level": "read_write",
+            "access_level_changed": True,
+            "previous_access_level": "list_only",
+            "added_items": 0,
+            "removed_items": 0,
+            "added_examples": [],
+            "removed_examples": [],
+        }
+    ]
+
+
 def test_build_run_diff_from_iters_matches_snapshot_builder() -> None:
     baseline_snapshot = {
         ("10.0.0.10:445", "smb_share", "Finance"): {
@@ -209,6 +256,299 @@ def test_set_difference_summary_counts_all_items_but_bounds_examples() -> None:
 
     assert count == 3
     assert examples == ["a.txt", "m.txt"]
+
+
+def test_run_diff_correlates_sharepoint_move_by_provider_item_id() -> None:
+    resource_key = (
+        "sharepoint:site-1",
+        "sharepoint_library",
+        "provider:drive-1",
+    )
+    baseline = {
+        resource_key: {
+            "endpoint_key": "sharepoint:site-1",
+            "hostname": "contoso.sharepoint.com",
+            "ip": None,
+            "share_name": "Documents",
+            "share_type": "sharepoint",
+            "access_level": "list_only",
+            "provider_resource_id": "drive-1",
+            "item_paths": {"/Finance/Budget.xlsx"},
+            "item_identities": {"provider:item-1": "/Finance/Budget.xlsx"},
+        }
+    }
+    current = {
+        resource_key: {
+            "endpoint_key": "sharepoint:site-1",
+            "hostname": "contoso.sharepoint.com",
+            "ip": None,
+            "share_name": "Renamed Documents",
+            "share_type": "sharepoint",
+            "access_level": "list_only",
+            "provider_resource_id": "drive-1",
+            "item_paths": {"/Public/FY26-Budget.xlsx"},
+            "item_identities": {"provider:item-1": "/Public/FY26-Budget.xlsx"},
+        }
+    }
+
+    payload = runs_router._build_run_diff(current, baseline)
+
+    assert payload["summary"] == {
+        "new_shares": 0,
+        "disappeared_shares": 0,
+        "changed_shares": 1,
+        "added_items": 0,
+        "removed_items": 0,
+        "moved_items": 1,
+    }
+    assert payload["item_churn"][0]["share_name"] == "Renamed Documents"
+    assert payload["item_churn"][0]["provider_resource_id"] == "drive-1"
+    assert payload["item_churn"][0]["moved_examples"] == [
+        {
+            "provider_item_id": "item-1",
+            "from_path": "/Finance/Budget.xlsx",
+            "to_path": "/Public/FY26-Budget.xlsx",
+        }
+    ]
+
+
+def test_run_diff_compatibility_rejects_missing_and_cross_tenant_context() -> None:
+    run_without_context = SimpleNamespace(collection_context={})
+    sharepoint_run = SimpleNamespace(
+        collection_context={
+            "source": "sharepoint",
+            "provider": "sharepoint",
+            "collection_mode": "tenant_inventory",
+            "auth_mode": "app",
+            "auth_type": "application",
+            "tenant_id": "tenant-1",
+            "client_id": "client-1",
+            "roles": ["Sites.Read.All"],
+            "discovery_completeness": "complete",
+            "materialized_snapshot": True,
+            "sync_mode": "full",
+            "partial": False,
+            "metadata": {
+                "files_included": True,
+                "discovery_strategy": "getAllSites",
+                "discovery_authoritative": True,
+            },
+        }
+    )
+
+    unknown = runs_router._run_diff_compatibility(run_without_context, run_without_context)
+    cross_tenant = runs_router._run_diff_compatibility(
+        sharepoint_run,
+        SimpleNamespace(
+            collection_context={
+                **sharepoint_run.collection_context,
+                "tenant_id": "tenant-2",
+            }
+        ),
+    )
+    identical = runs_router._run_diff_compatibility(sharepoint_run, sharepoint_run)
+
+    assert unknown["compatible"] is False
+    assert "missing" in unknown["warning"].lower()
+    assert cross_tenant["compatible"] is False
+    assert "tenant_id" in cross_tenant["mismatched_fields"]
+    assert identical == {"compatible": True, "warning": None, "mismatched_fields": []}
+
+
+def test_run_diff_compatibility_rejects_incomplete_context_and_no_files_mismatch() -> None:
+    complete_context = {
+        "source": "sharepoint",
+        "provider": "sharepoint",
+        "collection_mode": "tenant_inventory",
+        "auth_mode": "app",
+        "auth_type": "application",
+        "tenant_id": "tenant-1",
+        "client_id": "client-1",
+        "roles": ["Sites.Read.All"],
+        "discovery_completeness": "complete_for_granted_scope",
+        "materialized_snapshot": True,
+        "sync_mode": "full",
+        "metadata": {
+            "files_included": True,
+            "discovery_strategy": "getAllSites",
+            "discovery_authoritative": True,
+        },
+    }
+    incomplete = runs_router._run_diff_compatibility(
+        SimpleNamespace(collection_context={"source": "sharepoint"}),
+        SimpleNamespace(collection_context=complete_context),
+    )
+    no_files = runs_router._run_diff_compatibility(
+        SimpleNamespace(collection_context=complete_context),
+        SimpleNamespace(
+            collection_context={
+                **complete_context,
+                "metadata": {**complete_context["metadata"], "files_included": False},
+            }
+        ),
+    )
+
+    assert incomplete["compatible"] is False
+    assert any(field.startswith("unknown:current.") for field in incomplete["mismatched_fields"])
+    assert "unknown or missing" in incomplete["warning"].lower()
+    assert no_files["compatible"] is False
+    assert "metadata.files_included" in no_files["mismatched_fields"]
+
+
+def test_run_diff_treats_full_to_delta_materialized_snapshots_as_compatible() -> None:
+    full_context = {
+        "source": "sharepoint",
+        "provider": "sharepoint",
+        "collection_mode": "tenant_inventory",
+        "auth_mode": "app",
+        "auth_type": "application",
+        "tenant_id": "tenant-1",
+        "client_id": "client-1",
+        "roles": ["Sites.Read.All"],
+        "discovery_completeness": "complete_for_granted_scope",
+        "materialized_snapshot": True,
+        "sync_mode": "full",
+        "metadata": {
+            "files_included": True,
+            "discovery_strategy": "getAllSites",
+            "discovery_authoritative": True,
+            "permissions_assessed": False,
+        },
+    }
+    delta_context = {**full_context, "sync_mode": "delta"}
+
+    result = runs_router._run_diff_compatibility(
+        SimpleNamespace(collection_context=delta_context),
+        SimpleNamespace(collection_context=full_context),
+    )
+
+    assert result == {"compatible": True, "warning": None, "mismatched_fields": []}
+
+
+def test_run_diff_compares_effective_target_sites_not_order_or_safety_caps() -> None:
+    base_context = {
+        "source": "sharepoint",
+        "provider": "sharepoint",
+        "collection_mode": "tenant_inventory",
+        "auth_mode": "app",
+        "auth_type": "application",
+        "tenant_id": "tenant-1",
+        "client_id": "client-1",
+        "roles": ["Sites.Read.All"],
+        "discovery_completeness": "targeted_scope",
+        "materialized_snapshot": True,
+        "sync_mode": "full",
+        "metadata": {
+            "files_included": True,
+            "discovery_strategy": "targeted",
+            "discovery_authoritative": False,
+            "permissions_assessed": False,
+        },
+    }
+
+    def context(sites: list[str], *, max_sites: int) -> dict:
+        return {
+            **base_context,
+            "metadata": {
+                **base_context["metadata"],
+                "collection": {
+                    "target_scope": {
+                        "provider": "sharepoint",
+                        "targeted_sites": sites,
+                        "max_sites": max_sites,
+                        "max_libraries": max_sites * 2,
+                        "max_items": max_sites * 100,
+                    }
+                },
+            },
+        }
+
+    current = context(
+        [" SITE-B ", "https://Contoso.SharePoint.com/sites/Finance"],
+        max_sites=10,
+    )
+    baseline = context(
+        ["https://contoso.sharepoint.com/sites/finance/", "site-b/"],
+        max_sites=100,
+    )
+
+    compatible = runs_router._run_diff_compatibility(
+        SimpleNamespace(collection_context=current),
+        SimpleNamespace(collection_context=baseline),
+    )
+    different_target = runs_router._run_diff_compatibility(
+        SimpleNamespace(collection_context=current),
+        SimpleNamespace(collection_context=context(["site-c"], max_sites=10)),
+    )
+
+    assert compatible == {"compatible": True, "warning": None, "mismatched_fields": []}
+    assert different_target["compatible"] is False
+    assert "metadata.collection.target_scope" in different_target["mismatched_fields"]
+
+
+def test_run_diff_rejects_same_attribution_opaque_token_permissions_as_unverifiable() -> None:
+    opaque_context = {
+        "source": "sharepoint",
+        "provider": "sharepoint",
+        "collection_mode": "delegated_user_view",
+        "auth_mode": "token",
+        "auth_type": "delegated",
+        "tenant_id": "tenant-1",
+        "client_id": "client-1",
+        "assessed_identity": "alice@example.com",
+        "scopes": [],
+        "roles": [],
+        "jwt_inspection": "opaque_token_context_supplied_by_operator",
+        "discovery_completeness": "security_trimmed",
+        "materialized_snapshot": True,
+        "sync_mode": "full",
+        "metadata": {
+            "files_included": True,
+            "discovery_strategy": "site-search",
+            "discovery_authoritative": False,
+            "permissions_assessed": False,
+        },
+    }
+
+    result = runs_router._run_diff_compatibility(
+        SimpleNamespace(collection_context=opaque_context),
+        SimpleNamespace(collection_context=opaque_context),
+    )
+
+    assert result["compatible"] is False
+    assert "permissions cannot be verified" in result["warning"].lower()
+    assert "unknown:current.permissions" in result["mismatched_fields"]
+    assert "unknown:baseline.permissions" in result["mismatched_fields"]
+
+
+def test_run_diff_preserves_case_sensitive_provider_resource_identity() -> None:
+    def record(provider_id: str) -> tuple[tuple[str, str, str], dict]:
+        return (
+            (
+                "sharepoint:site-1",
+                "sharepoint_library",
+                f"provider:{provider_id}",
+            ),
+            {
+                "endpoint_key": "sharepoint:site-1",
+                "hostname": "contoso.sharepoint.com",
+                "ip": None,
+                "share_name": "Documents",
+                "share_type": "sharepoint",
+                "access_level": "list_only",
+                "provider_resource_id": provider_id,
+                "item_paths": set(),
+                "item_identities": {},
+            },
+        )
+
+    current = [record("Drive-A")]
+    baseline = [record("drive-a")]
+    payload = runs_router._build_run_diff_from_iters(current, baseline)
+
+    assert payload["summary"]["new_shares"] == 1
+    assert payload["summary"]["disappeared_shares"] == 1
+    assert payload["summary"]["changed_shares"] == 0
 
 
 def test_run_diff_bounds_each_detail_section_without_losing_summary_counts() -> None:

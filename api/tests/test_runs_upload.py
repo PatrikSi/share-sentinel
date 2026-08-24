@@ -205,6 +205,7 @@ def test_clear_run_ingest_data_resets_summary_and_progress() -> None:
         id=uuid.uuid4(),
         summary={"endpoints": 2, "resources": 3, "items": 5, "errors": 1},
         ingest_progress={"line_offset": 42, "last_error": "boom"},
+        collection_context={"source": "sharepoint", "assessed_identity": "old@example.test"},
     )
     fake_db = _FakeDb()
 
@@ -213,6 +214,7 @@ def test_clear_run_ingest_data_resets_summary_and_progress() -> None:
     assert len(fake_db.calls) == 4
     assert run.summary == runs_router.EMPTY_RUN_SUMMARY
     assert run.ingest_progress == {"line_offset": 0}
+    assert run.collection_context == {}
 
 
 def test_delete_artifact_quietly_ignores_missing_files(monkeypatch) -> None:

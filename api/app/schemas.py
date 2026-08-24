@@ -220,6 +220,7 @@ class RunOut(BaseModel):
     artifact_content_type: str | None
     ingest_progress: dict[str, Any]
     summary: dict[str, Any]
+    collection_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class IngestErrorOut(BaseModel):

@@ -3,12 +3,13 @@ import hashlib
 import heapq
 import logging
 import time
+import unicodedata
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
-from sqlalchemy import String, cast, delete, func, or_, select, text
+from sqlalchemy import String, and_, case, cast, delete, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -84,6 +85,59 @@ MAX_RUN_DIFF_DETAIL_RECORDS = 2000
 DEFAULT_RUN_DIFF_DETAIL_RECORDS = 500
 
 
+def _provider_from_resource_type_expression():
+    resource_type = func.lower(cast(Resource.resource_type, String))
+    return case(
+        (resource_type == "smb_share", "smb"),
+        (resource_type == "nfs_share", "nfs"),
+        (resource_type == "sharepoint_library", "sharepoint"),
+        else_=None,
+    )
+
+
+def _resource_provider_expression():
+    return func.coalesce(Resource.provider, _provider_from_resource_type_expression())
+
+
+def _item_provider_expression():
+    resource_provider = (
+        select(_resource_provider_expression())
+        .where(
+            Resource.run_id == Item.run_id,
+            Resource.id == Item.resource_id,
+        )
+        .correlate(Item)
+        .scalar_subquery()
+    )
+    return func.coalesce(Item.provider, resource_provider)
+
+
+def _resource_provider_equals_expression(value: str):
+    return or_(
+        Resource.provider == value,
+        and_(
+            Resource.provider.is_(None),
+            _provider_from_resource_type_expression() == value,
+        ),
+    )
+
+
+def _item_provider_equals_expression(value: str):
+    inferred_provider = (
+        select(_resource_provider_expression())
+        .where(
+            Resource.run_id == Item.run_id,
+            Resource.id == Item.resource_id,
+        )
+        .correlate(Item)
+        .scalar_subquery()
+    )
+    return or_(
+        Item.provider == value,
+        and_(Item.provider.is_(None), inferred_provider == value),
+    )
+
+
 def _run_lock_key(run_id: uuid.UUID) -> int:
     return run_id.int % (2**63 - 1)
 
@@ -124,9 +178,9 @@ def _require_resource(
     project_id: uuid.UUID,
     run_id: uuid.UUID,
     resource_id: int,
-) -> None:
+) -> Resource:
     resource = db.execute(
-        select(Resource.id)
+        select(Resource)
         .join(ScanRun, ScanRun.id == Resource.run_id)
         .where(
             Resource.id == resource_id,
@@ -136,6 +190,7 @@ def _require_resource(
     ).scalar_one_or_none()
     if resource is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="resource not found in run")
+    return resource
 
 
 def _to_run_out(run: ScanRun) -> RunOut:
@@ -152,6 +207,7 @@ def _to_run_out(run: ScanRun) -> RunOut:
         artifact_content_type=run.artifact_content_type,
         ingest_progress=run.ingest_progress,
         summary=run.summary,
+        collection_context=getattr(run, "collection_context", None) or {},
     )
 
 
@@ -161,6 +217,168 @@ def _run_summary_payload(run: ScanRun) -> dict:
         "name": run.name,
         "created_at": run.created_at.isoformat() if run.created_at else None,
         "status": run.status.value if hasattr(run.status, "value") else run.status,
+        "collection_context": getattr(run, "collection_context", None) or {},
+    }
+
+
+def _run_diff_compatibility(current_run: ScanRun, baseline_run: ScanRun | None) -> dict:
+    if baseline_run is None:
+        return {
+            "compatible": False,
+            "warning": "No baseline run is available for comparison.",
+            "mismatched_fields": [],
+        }
+
+    current = getattr(current_run, "collection_context", None) or {}
+    baseline = getattr(baseline_run, "collection_context", None) or {}
+    if not current or not baseline:
+        return {
+            "compatible": False,
+            "warning": "Collection context is missing for at least one run; comparison semantics are unknown.",
+            "mismatched_fields": [],
+        }
+
+    fields = (
+        "source",
+        "provider",
+        "collection_mode",
+        "auth_mode",
+        "auth_type",
+        "tenant_id",
+        "client_id",
+        "assessed_identity",
+        "scopes",
+        "roles",
+        "discovery_completeness",
+        "materialized_snapshot",
+    )
+    if not (current.get("materialized_snapshot") is True and baseline.get("materialized_snapshot") is True):
+        fields += ("sync_mode",)
+
+    def comparison_value(context: dict, field: str):
+        value = context.get(field)
+        if field in {"scopes", "roles"} and isinstance(value, list):
+            return sorted(str(item) for item in value)
+        return value
+
+    mismatched = [field for field in fields if comparison_value(current, field) != comparison_value(baseline, field)]
+    current_metadata = current.get("metadata") if isinstance(current.get("metadata"), dict) else {}
+    baseline_metadata = baseline.get("metadata") if isinstance(baseline.get("metadata"), dict) else {}
+    for field in (
+        "discovery_strategy",
+        "discovery_authoritative",
+        "files_included",
+        "permissions_assessed",
+    ):
+        if current_metadata.get(field) != baseline_metadata.get(field):
+            mismatched.append(f"metadata.{field}")
+    current_collection = (
+        current_metadata.get("collection") if isinstance(current_metadata.get("collection"), dict) else {}
+    )
+    baseline_collection = (
+        baseline_metadata.get("collection") if isinstance(baseline_metadata.get("collection"), dict) else {}
+    )
+
+    def effective_targeted_sites(collection: dict) -> tuple[str, ...]:
+        target_scope = collection.get("target_scope") if isinstance(collection.get("target_scope"), dict) else {}
+        raw_sites = target_scope.get("targeted_sites")
+        if raw_sites is None:
+            return ()
+        if not isinstance(raw_sites, list):
+            return ("<invalid-targeted-sites>",)
+        normalized: set[str] = set()
+        for site in raw_sites:
+            if not isinstance(site, str) or not site.strip():
+                continue
+            value = unicodedata.normalize("NFC", site).strip()
+            if value != "/":
+                value = value.rstrip("/")
+            normalized.add(value.casefold())
+        if any(not isinstance(site, str) for site in raw_sites):
+            normalized.add("<invalid-targeted-site>")
+        return tuple(sorted(normalized))
+
+    if effective_targeted_sites(current_collection) != effective_targeted_sites(baseline_collection):
+        mismatched.append("metadata.collection.target_scope")
+
+    warnings: list[str] = []
+    is_sharepoint_comparison = any(
+        str(context.get(field) or "").strip().lower() == "sharepoint"
+        for context in (current, baseline)
+        for field in ("source", "provider")
+    )
+    unknown_fields: list[str] = []
+    if is_sharepoint_comparison:
+        common_required = (
+            "source",
+            "provider",
+            "collection_mode",
+            "auth_mode",
+            "auth_type",
+            "tenant_id",
+            "client_id",
+            "discovery_completeness",
+            "materialized_snapshot",
+            "sync_mode",
+        )
+
+        def value_is_known(context: dict, field: str) -> bool:
+            value = context.get(field)
+            if field == "materialized_snapshot":
+                return isinstance(value, bool)
+            return isinstance(value, str) and bool(value.strip())
+
+        for label, context, metadata in (
+            ("current", current, current_metadata),
+            ("baseline", baseline, baseline_metadata),
+        ):
+            for field in common_required:
+                if not value_is_known(context, field):
+                    unknown_fields.append(f"{label}.{field}")
+            auth_type = str(context.get("auth_type") or "").strip().lower()
+            if auth_type == "delegated":
+                if not value_is_known(context, "assessed_identity"):
+                    unknown_fields.append(f"{label}.assessed_identity")
+                if not isinstance(context.get("scopes"), list):
+                    unknown_fields.append(f"{label}.scopes")
+            elif auth_type == "application" and not isinstance(context.get("roles"), list):
+                unknown_fields.append(f"{label}.roles")
+            if not isinstance(metadata.get("files_included"), bool):
+                unknown_fields.append(f"{label}.metadata.files_included")
+            if (
+                not isinstance(metadata.get("discovery_strategy"), str)
+                or not str(metadata.get("discovery_strategy")).strip()
+            ):
+                unknown_fields.append(f"{label}.metadata.discovery_strategy")
+            if not isinstance(metadata.get("discovery_authoritative"), bool):
+                unknown_fields.append(f"{label}.metadata.discovery_authoritative")
+    if unknown_fields:
+        mismatched.extend(f"unknown:{field}" for field in unknown_fields)
+        warnings.append(
+            "Required SharePoint comparison context is unknown or missing: " + ", ".join(unknown_fields) + "."
+        )
+    if is_sharepoint_comparison:
+        opaque_labels = [
+            label
+            for label, context in (("current", current), ("baseline", baseline))
+            if str(context.get("jwt_inspection") or "").strip().casefold()
+            == "opaque_token_context_supplied_by_operator"
+        ]
+        if opaque_labels:
+            mismatched.extend(f"unknown:{label}.permissions" for label in opaque_labels)
+            warnings.append("Microsoft Graph permissions cannot be verified for opaque imported-token SharePoint runs.")
+    if mismatched:
+        differing = [field for field in mismatched if not field.startswith("unknown:")]
+        if differing:
+            warnings.append("Collection perspectives differ: " + ", ".join(differing) + ".")
+    if current.get("partial") is True or baseline.get("partial") is True:
+        warnings.append("At least one run reports partial collection coverage.")
+    if current.get("materialized_snapshot") is False or baseline.get("materialized_snapshot") is False:
+        warnings.append("At least one run is not a materialized point-in-time snapshot.")
+    return {
+        "compatible": not warnings,
+        "warning": " ".join(warnings) if warnings else None,
+        "mismatched_fields": mismatched,
     }
 
 
@@ -171,6 +389,7 @@ def _clear_run_ingest_data(db: Session, run: ScanRun) -> None:
     db.execute(delete(IngestError).where(IngestError.run_id == run.id))
     run.summary = dict(EMPTY_RUN_SUMMARY)
     run.ingest_progress = {"line_offset": 0}
+    run.collection_context = {}
 
 
 def _require_uploadable_run(run: ScanRun) -> None:
@@ -208,16 +427,24 @@ def _delete_superseded_artifact(previous_key: str | None, current_key: str) -> N
         _delete_artifact_quietly(previous_key)
 
 
-def _resource_identity(endpoint_key: str, resource_type: str, share_name: str) -> tuple[str, str, str]:
-    return (endpoint_key or "", resource_type or "", share_name or "")
+def _resource_identity(
+    endpoint_key: str,
+    resource_type: str,
+    share_name: str,
+    provider_resource_id: str | None = None,
+) -> tuple[str, str, str]:
+    stable_identity = f"provider:{provider_resource_id}" if provider_resource_id else share_name or ""
+    return (endpoint_key or "", resource_type or "", stable_identity)
 
 
 def _sorted_resource_keys(keys: Iterable[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
-    return sorted(keys, key=lambda value: (value[0].lower(), value[2].lower(), value[1].lower()))
+    return sorted(keys, key=_normalized_resource_key)
 
 
 def _normalized_resource_key(key: tuple[str, str, str]) -> tuple[str, str, str]:
-    return (key[0].lower(), key[2].lower(), key[1].lower())
+    identity = key[2]
+    normalized_identity = identity if identity.startswith("provider:") else identity.lower()
+    return (key[0].lower(), normalized_identity, key[1].lower())
 
 
 def _resource_diff_record(
@@ -228,8 +455,9 @@ def _resource_diff_record(
     resource_type: str,
     access_level: str | None,
     item_paths: set[str] | None = None,
+    provider_resource_id: str | None = None,
 ) -> dict:
-    return {
+    record = {
         "endpoint_key": endpoint_key,
         "hostname": hostname,
         "ip": ip,
@@ -239,6 +467,10 @@ def _resource_diff_record(
         "access_level": access_level,
         "item_paths": item_paths or set(),
     }
+    if provider_resource_id:
+        record["provider_resource_id"] = provider_resource_id
+        record["item_identities"] = {}
+    return record
 
 
 def _load_run_diff_snapshot(db: Session, run_id: uuid.UUID) -> dict[tuple[str, str, str], dict]:
@@ -250,6 +482,7 @@ def _load_run_diff_snapshot(db: Session, run_id: uuid.UUID) -> dict[tuple[str, s
             Endpoint.endpoint_key,
             Endpoint.hostname,
             Endpoint.ip,
+            Resource.provider_resource_id,
         )
         .select_from(Resource)
         .join(Endpoint, (Endpoint.id == Resource.endpoint_id) & (Endpoint.run_id == Resource.run_id))
@@ -260,7 +493,13 @@ def _load_run_diff_snapshot(db: Session, run_id: uuid.UUID) -> dict[tuple[str, s
     for row in resource_rows:
         resource_type = row.resource_type.value if hasattr(row.resource_type, "value") else str(row.resource_type)
         access_level = row.access_level.value if hasattr(row.access_level, "value") else row.access_level
-        identity = _resource_identity(row.endpoint_key, resource_type, row.name)
+        provider_resource_id = getattr(row, "provider_resource_id", None)
+        identity = _resource_identity(
+            row.endpoint_key,
+            resource_type,
+            row.name,
+            provider_resource_id,
+        )
         snapshot[identity] = {
             "endpoint_key": row.endpoint_key,
             "hostname": row.hostname,
@@ -271,6 +510,9 @@ def _load_run_diff_snapshot(db: Session, run_id: uuid.UUID) -> dict[tuple[str, s
             "access_level": access_level,
             "item_paths": set(),
         }
+        if provider_resource_id:
+            snapshot[identity]["provider_resource_id"] = provider_resource_id
+            snapshot[identity]["item_identities"] = {}
 
     item_rows = db.execute(
         select(
@@ -278,16 +520,25 @@ def _load_run_diff_snapshot(db: Session, run_id: uuid.UUID) -> dict[tuple[str, s
             Resource.resource_type,
             Endpoint.endpoint_key,
             Item.path,
+            Resource.provider_resource_id,
+            Item.provider_item_id,
+            Item.deleted,
         )
         .select_from(Item)
         .join(Resource, (Resource.id == Item.resource_id) & (Resource.run_id == Item.run_id))
         .join(Endpoint, (Endpoint.id == Resource.endpoint_id) & (Endpoint.run_id == Resource.run_id))
-        .where(Item.run_id == run_id)
+        .where(Item.run_id == run_id, Item.deleted.is_(False))
     ).all()
 
     for row in item_rows:
         resource_type = row.resource_type.value if hasattr(row.resource_type, "value") else str(row.resource_type)
-        identity = _resource_identity(row.endpoint_key, resource_type, row.name)
+        provider_resource_id = getattr(row, "provider_resource_id", None)
+        identity = _resource_identity(
+            row.endpoint_key,
+            resource_type,
+            row.name,
+            provider_resource_id,
+        )
         record = snapshot.get(identity)
         if record is None:
             record = {
@@ -300,8 +551,14 @@ def _load_run_diff_snapshot(db: Session, run_id: uuid.UUID) -> dict[tuple[str, s
                 "access_level": None,
                 "item_paths": set(),
             }
+            if provider_resource_id:
+                record["provider_resource_id"] = provider_resource_id
+                record["item_identities"] = {}
             snapshot[identity] = record
         record["item_paths"].add(row.path)
+        provider_item_id = getattr(row, "provider_item_id", None)
+        if provider_item_id:
+            record.setdefault("item_identities", {})[f"provider:{provider_item_id}"] = row.path
 
     return snapshot
 
@@ -315,15 +572,27 @@ def _iter_run_diff_resources(db: Session, run_id: uuid.UUID):
             Resource.name,
             Resource.resource_type,
             Resource.access_level,
+            Resource.provider_resource_id,
             Item.path,
+            Item.provider_item_id,
+            Item.deleted,
         )
         .select_from(Resource)
         .join(Endpoint, (Endpoint.id == Resource.endpoint_id) & (Endpoint.run_id == Resource.run_id))
-        .outerjoin(Item, (Item.resource_id == Resource.id) & (Item.run_id == Resource.run_id))
+        .outerjoin(
+            Item,
+            (Item.resource_id == Resource.id) & (Item.run_id == Resource.run_id) & (Item.deleted.is_(False)),
+        )
         .where(Resource.run_id == run_id)
         .order_by(
             func.lower(Endpoint.endpoint_key),
-            func.lower(cast(Resource.name, String)),
+            case(
+                (
+                    Resource.provider_resource_id.is_not(None),
+                    "provider:" + Resource.provider_resource_id,
+                ),
+                else_=func.lower(Resource.name),
+            ),
             func.lower(cast(Resource.resource_type, String)),
             Item.path.asc().nulls_last(),
         )
@@ -334,7 +603,13 @@ def _iter_run_diff_resources(db: Session, run_id: uuid.UUID):
     for row in db.execute(stmt.execution_options(yield_per=1000)):
         resource_type = row.resource_type.value if hasattr(row.resource_type, "value") else str(row.resource_type)
         access_level = row.access_level.value if hasattr(row.access_level, "value") else row.access_level
-        key = _resource_identity(row.endpoint_key, resource_type, row.name)
+        provider_resource_id = getattr(row, "provider_resource_id", None)
+        key = _resource_identity(
+            row.endpoint_key,
+            resource_type,
+            row.name,
+            provider_resource_id,
+        )
         if key != current_key:
             if current_key is not None and current_record is not None:
                 yield current_key, current_record
@@ -346,9 +621,13 @@ def _iter_run_diff_resources(db: Session, run_id: uuid.UUID):
                 share_name=row.name,
                 resource_type=resource_type,
                 access_level=access_level,
+                provider_resource_id=provider_resource_id,
             )
         if row.path is not None and current_record is not None:
             current_record["item_paths"].add(row.path)
+            provider_item_id = getattr(row, "provider_item_id", None)
+            if provider_item_id:
+                current_record.setdefault("item_identities", {})[f"provider:{provider_item_id}"] = row.path
 
     if current_key is not None and current_record is not None:
         yield current_key, current_record
@@ -362,15 +641,30 @@ def _next_resource_record(iterator):
 
 
 def _serialize_diff_resource(resource: dict) -> dict:
-    return {
+    serialized = {
         "endpoint_key": resource["endpoint_key"],
         "hostname": resource["hostname"],
         "ip": resource["ip"],
         "share_name": resource["share_name"],
         "share_type": resource["share_type"],
         "access_level": resource["access_level"],
-        "item_count": len(resource["item_paths"]),
+        "item_count": len(_item_identity_map(resource)),
     }
+    if resource.get("provider_resource_id"):
+        serialized["provider_resource_id"] = resource["provider_resource_id"]
+    return serialized
+
+
+def _item_identity_map(resource: dict) -> dict[str, str]:
+    identities = resource.get("item_identities")
+    if isinstance(identities, dict):
+        normalized = {str(identity): str(path) for identity, path in identities.items()}
+        identified_paths = set(normalized.values())
+        for path in resource.get("item_paths", set()):
+            if str(path) not in identified_paths:
+                normalized[f"path:{path}"] = str(path)
+        return normalized
+    return {f"path:{path}": str(path) for path in resource.get("item_paths", set())}
 
 
 def _set_difference_summary(left: set[str], right: set[str], example_limit: int) -> tuple[int, list[str]]:
@@ -385,6 +679,33 @@ def _set_difference_summary(left: set[str], right: set[str], example_limit: int)
 
     examples = heapq.nsmallest(example_limit, iter_difference())
     return count, examples
+
+
+def _identity_difference_summary(
+    left: dict[str, str],
+    right: dict[str, str],
+    example_limit: int,
+) -> tuple[int, list[str]]:
+    identities = left.keys() - right.keys()
+    return len(identities), heapq.nsmallest(example_limit, (left[identity] for identity in identities))
+
+
+def _moved_item_summary(
+    current: dict[str, str],
+    baseline: dict[str, str],
+    example_limit: int,
+) -> tuple[int, list[dict[str, str]]]:
+    moved = [
+        {
+            "provider_item_id": identity.removeprefix("provider:"),
+            "from_path": baseline[identity],
+            "to_path": current[identity],
+        }
+        for identity in current.keys() & baseline.keys()
+        if identity.startswith("provider:") and current[identity] != baseline[identity]
+    ]
+    moved.sort(key=lambda item: (item["to_path"].lower(), item["from_path"].lower(), item["provider_item_id"]))
+    return len(moved), moved[:example_limit]
 
 
 def _build_run_diff_from_iters(
@@ -405,6 +726,7 @@ def _build_run_diff_from_iters(
     changed_share_count = 0
     added_item_count = 0
     removed_item_count = 0
+    moved_item_count = 0
 
     def append_bounded(items: list[dict], record: dict) -> None:
         if detail_limit is None or len(items) < detail_limit:
@@ -418,6 +740,7 @@ def _build_run_diff_from_iters(
         nonlocal changed_share_count
         nonlocal added_item_count
         nonlocal removed_item_count
+        nonlocal moved_item_count
 
         while current_entry is not None or baseline_entry is not None:
             if baseline_entry is None:
@@ -448,38 +771,61 @@ def _build_run_diff_from_iters(
                 baseline_entry = _next_resource_record(baseline_iter)
                 continue
 
-            added_items, added_examples = _set_difference_summary(
-                current_resource["item_paths"],
-                baseline_resource["item_paths"],
+            current_items = _item_identity_map(current_resource)
+            baseline_items = _item_identity_map(baseline_resource)
+            added_items, added_examples = _identity_difference_summary(
+                current_items,
+                baseline_items,
                 example_limit,
             )
-            removed_items, removed_examples = _set_difference_summary(
-                baseline_resource["item_paths"],
-                current_resource["item_paths"],
+            removed_items, removed_examples = _identity_difference_summary(
+                baseline_items,
+                current_items,
                 example_limit,
             )
-            if added_items or removed_items:
+            moved_items, moved_examples = _moved_item_summary(
+                current_items,
+                baseline_items,
+                example_limit,
+            )
+            current_access_level = current_resource.get("access_level")
+            baseline_access_level = baseline_resource.get("access_level")
+            access_level_changed = current_access_level != baseline_access_level
+            if added_items or removed_items or moved_items or access_level_changed:
                 changed_share_count += 1
                 added_item_count += added_items
                 removed_item_count += removed_items
-                yield {
+                moved_item_count += moved_items
+                churn_record = {
                     "endpoint_key": current_resource["endpoint_key"],
                     "hostname": current_resource["hostname"] or baseline_resource["hostname"],
                     "ip": current_resource["ip"] or baseline_resource["ip"],
                     "share_name": current_resource["share_name"],
                     "share_type": current_resource["share_type"],
-                    "access_level": current_resource["access_level"] or baseline_resource["access_level"],
+                    "access_level": current_access_level or baseline_access_level,
+                    "access_level_changed": access_level_changed,
                     "added_items": added_items,
                     "removed_items": removed_items,
                     "added_examples": added_examples,
                     "removed_examples": removed_examples,
                 }
+                if access_level_changed:
+                    churn_record["previous_access_level"] = baseline_access_level
+                provider_resource_id = current_resource.get("provider_resource_id") or baseline_resource.get(
+                    "provider_resource_id"
+                )
+                if provider_resource_id:
+                    churn_record["provider_resource_id"] = provider_resource_id
+                if moved_items:
+                    churn_record["moved_items"] = moved_items
+                    churn_record["moved_examples"] = moved_examples
+                yield churn_record
 
             current_entry = _next_resource_record(current_iter)
             baseline_entry = _next_resource_record(baseline_iter)
 
     churn_sort_key = lambda item: (  # noqa: E731
-        -(item["added_items"] + item["removed_items"]),
+        -(item["added_items"] + item["removed_items"] + item.get("moved_items", 0)),
         item["endpoint_key"].lower(),
         item["share_name"].lower(),
     )
@@ -501,6 +847,8 @@ def _build_run_diff_from_iters(
         "disappeared_shares": disappeared_shares,
         "item_churn": item_churn,
     }
+    if moved_item_count:
+        payload["summary"]["moved_items"] = moved_item_count
     if detail_limit is not None:
         sections = {
             "new_shares": new_share_count > len(new_shares),
@@ -515,83 +863,14 @@ def _build_run_diff_from_iters(
     return payload
 
 
-def _build_run_diff(current_snapshot: dict[tuple[str, str, str], dict], baseline_snapshot: dict[tuple[str, str, str], dict], example_limit: int = 5) -> dict:
-    current_keys = set(current_snapshot)
-    baseline_keys = set(baseline_snapshot)
-
-    new_shares = []
-    for key in _sorted_resource_keys(current_keys - baseline_keys):
-        resource = current_snapshot[key]
-        new_shares.append(
-            {
-                "endpoint_key": resource["endpoint_key"],
-                "hostname": resource["hostname"],
-                "ip": resource["ip"],
-                "share_name": resource["share_name"],
-                "share_type": resource["share_type"],
-                "access_level": resource["access_level"],
-                "item_count": len(resource["item_paths"]),
-            }
-        )
-
-    disappeared_shares = []
-    for key in _sorted_resource_keys(baseline_keys - current_keys):
-        resource = baseline_snapshot[key]
-        disappeared_shares.append(
-            {
-                "endpoint_key": resource["endpoint_key"],
-                "hostname": resource["hostname"],
-                "ip": resource["ip"],
-                "share_name": resource["share_name"],
-                "share_type": resource["share_type"],
-                "access_level": resource["access_level"],
-                "item_count": len(resource["item_paths"]),
-            }
-        )
-
-    item_churn = []
-    for key in _sorted_resource_keys(current_keys & baseline_keys):
-        current_resource = current_snapshot[key]
-        baseline_resource = baseline_snapshot[key]
-        added_paths = sorted(current_resource["item_paths"] - baseline_resource["item_paths"])
-        removed_paths = sorted(baseline_resource["item_paths"] - current_resource["item_paths"])
-        if not added_paths and not removed_paths:
-            continue
-        item_churn.append(
-            {
-                "endpoint_key": current_resource["endpoint_key"],
-                "hostname": current_resource["hostname"] or baseline_resource["hostname"],
-                "ip": current_resource["ip"] or baseline_resource["ip"],
-                "share_name": current_resource["share_name"],
-                "share_type": current_resource["share_type"],
-                "access_level": current_resource["access_level"] or baseline_resource["access_level"],
-                "added_items": len(added_paths),
-                "removed_items": len(removed_paths),
-                "added_examples": added_paths[:example_limit],
-                "removed_examples": removed_paths[:example_limit],
-            }
-        )
-
-    item_churn.sort(
-        key=lambda item: (
-            -(item["added_items"] + item["removed_items"]),
-            item["endpoint_key"].lower(),
-            item["share_name"].lower(),
-        )
-    )
-
-    return {
-        "summary": {
-            "new_shares": len(new_shares),
-            "disappeared_shares": len(disappeared_shares),
-            "changed_shares": len(item_churn),
-            "added_items": sum(item["added_items"] for item in item_churn),
-            "removed_items": sum(item["removed_items"] for item in item_churn),
-        },
-        "new_shares": new_shares,
-        "disappeared_shares": disappeared_shares,
-        "item_churn": item_churn,
-    }
+def _build_run_diff(
+    current_snapshot: dict[tuple[str, str, str], dict],
+    baseline_snapshot: dict[tuple[str, str, str], dict],
+    example_limit: int = 5,
+) -> dict:
+    current_iter = ((key, current_snapshot[key]) for key in _sorted_resource_keys(current_snapshot))
+    baseline_iter = ((key, baseline_snapshot[key]) for key in _sorted_resource_keys(baseline_snapshot))
+    return _build_run_diff_from_iters(current_iter, baseline_iter, example_limit=example_limit)
 
 
 def _default_baseline_run(db: Session, project_id: uuid.UUID, run: ScanRun) -> ScanRun | None:
@@ -613,7 +892,9 @@ def _run_diff_item_count(db: Session, run: ScanRun) -> int:
     # The summary is an ingest-time convenience value and can be stale on
     # legacy, repaired, or partially replayed runs. This count is an OOM guard,
     # so only authoritative persisted rows are safe to trust.
-    return int(db.execute(select(func.count(Item.id)).where(Item.run_id == run.id)).scalar() or 0)
+    return int(
+        db.execute(select(func.count(Item.id)).where(Item.run_id == run.id, Item.deleted.is_(False))).scalar() or 0
+    )
 
 
 def _enforce_run_diff_item_limit(db: Session, current_run: ScanRun, baseline_run: ScanRun) -> int:
@@ -636,10 +917,7 @@ def _require_complete_run_for_diff(run: ScanRun, label: str) -> None:
     if status_value != RunStatus.COMPLETE.value:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"run diff requires a COMPLETE {label} run; "
-                f"{label} run status is {status_value}"
-            ),
+            detail=(f"run diff requires a COMPLETE {label} run; {label} run status is {status_value}"),
         )
 
 
@@ -973,21 +1251,29 @@ def _validate_artifact_upload_headers(content_type: str | None, filename: str | 
     lowered_filename = (filename or "").lower()
 
     if normalized_content_type not in ALLOWED_ARTIFACT_CONTENT_TYPES:
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="unsupported artifact content type")
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="unsupported artifact content type"
+        )
     if lowered_filename and not any(lowered_filename.endswith(suffix) for suffix in ALLOWED_ARTIFACT_SUFFIXES):
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="unsupported artifact filename")
     if not lowered_filename and normalized_content_type in {"", "application/octet-stream"}:
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="content type required for raw artifact upload")
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="content type required for raw artifact upload"
+        )
 
 
 def _validate_artifact_signature(kind: str, sample: bytes, final: bool = False) -> bool:
     if kind == "gzip":
         if len(sample) < 2:
             if final:
-                raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="artifact does not match gzip payload")
+                raise HTTPException(
+                    status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="artifact does not match gzip payload"
+                )
             return False
         if not sample.startswith(b"\x1f\x8b"):
-            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="artifact does not match gzip payload")
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="artifact does not match gzip payload"
+            )
         return True
 
     stripped = sample.lstrip(b" \t\r\n")
@@ -999,7 +1285,9 @@ def _validate_artifact_signature(kind: str, sample: bytes, final: bool = False) 
             )
         return False
     if stripped[:1] not in {b"{", b"["}:
-        raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="artifact does not look like JSON")
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="artifact does not look like JSON"
+        )
     return True
 
 
@@ -1259,7 +1547,11 @@ def diff_run(
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     current_run = _get_run(db, project_id, run_id)
     _require_complete_run_for_diff(current_run, "current")
-    baseline_run = _get_run(db, project_id, baseline_run_id) if baseline_run_id else _default_baseline_run(db, project_id, current_run)
+    baseline_run = (
+        _get_run(db, project_id, baseline_run_id)
+        if baseline_run_id
+        else _default_baseline_run(db, project_id, current_run)
+    )
     if baseline_run is not None:
         _require_complete_run_for_diff(baseline_run, "baseline")
 
@@ -1278,7 +1570,14 @@ def diff_run(
         return {
             "current_run": _run_summary_payload(current_run),
             "baseline_run": None,
-            "summary": {"new_shares": 0, "disappeared_shares": 0, "changed_shares": 0, "added_items": 0, "removed_items": 0},
+            "comparison_compatibility": _run_diff_compatibility(current_run, None),
+            "summary": {
+                "new_shares": 0,
+                "disappeared_shares": 0,
+                "changed_shares": 0,
+                "added_items": 0,
+                "removed_items": 0,
+            },
             "new_shares": [],
             "disappeared_shares": [],
             "item_churn": [],
@@ -1301,6 +1600,7 @@ def diff_run(
     )
     payload["current_run"] = _run_summary_payload(current_run)
     payload["baseline_run"] = _run_summary_payload(baseline_run)
+    payload["comparison_compatibility"] = _run_diff_compatibility(current_run, baseline_run)
 
     _write_read_audit(
         db,
@@ -1365,7 +1665,9 @@ async def upload_artifact(
     await _check_upload_rate_limit(request, actor_key)
 
     settings = get_settings()
-    content_type = _normalize_content_type(file.content_type if file else request.headers.get("content-type", "application/octet-stream"))
+    content_type = _normalize_content_type(
+        file.content_type if file else request.headers.get("content-type", "application/octet-stream")
+    )
     filename = file.filename if file else _raw_artifact_filename(request)
     _validate_artifact_upload_headers(content_type, filename)
     suffix = _artifact_suffix(content_type, filename)
@@ -1418,6 +1720,7 @@ def list_endpoints(
     run_id: uuid.UUID,
     request: Request,
     search: str | None = Query(default=None, max_length=MAX_SEARCH_CHARS),
+    provider: str | None = Query(default=None, max_length=32),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -1428,6 +1731,25 @@ def list_endpoints(
     _get_run(db, project_id, run_id)
 
     stmt = select(Endpoint).where(Endpoint.run_id == run_id)
+    if provider:
+        normalized_provider = provider.strip().lower()
+        child_provider_match = (
+            select(1)
+            .select_from(Resource)
+            .where(
+                Resource.run_id == Endpoint.run_id,
+                Resource.endpoint_id == Endpoint.id,
+                _resource_provider_equals_expression(normalized_provider),
+            )
+            .correlate(Endpoint)
+            .exists()
+        )
+        stmt = stmt.where(
+            or_(
+                Endpoint.provider == normalized_provider,
+                child_provider_match,
+            )
+        )
     if search:
         escaped = escape_like(search)
         pattern = f"%{escaped}%"
@@ -1437,6 +1759,18 @@ def list_endpoints(
                 Endpoint.ip.ilike(pattern, escape="\\"),
                 Endpoint.hostname.ilike(pattern, escape="\\"),
                 Endpoint.domain.ilike(pattern, escape="\\"),
+                Endpoint.provider_metadata["display_name"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
+                Endpoint.provider_metadata["site_name"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
+                Endpoint.provider_metadata["web_url"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
             )
         )
 
@@ -1451,7 +1785,13 @@ def list_endpoints(
         action="ENDPOINTS_LISTED",
         object_type="scan_run",
         object_id=str(run_id),
-        metadata={"search": search, "limit": limit, "cursor": cursor, "result_count": len(rows)},
+        metadata={
+            "search": search,
+            "provider": provider,
+            "limit": limit,
+            "cursor": cursor,
+            "result_count": len(rows),
+        },
     )
     db.commit()
 
@@ -1466,6 +1806,8 @@ def list_endpoints(
                 "smb_dialect": r.smb_dialect,
                 "smb_signing": r.smb_signing,
                 "auth_method": r.auth_method,
+                "provider": getattr(r, "provider", None),
+                "metadata": getattr(r, "provider_metadata", None) or {},
             }
             for r in rows
         ],
@@ -1479,6 +1821,9 @@ def endpoint_resources(
     run_id: uuid.UUID,
     endpoint_id: int,
     request: Request,
+    provider: str | None = Query(default=None, max_length=32),
+    resource_type: str | None = Query(default=None, max_length=64),
+    exposure: str | None = Query(default=None, max_length=32),
     limit: int = Query(default=200, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -1489,6 +1834,12 @@ def endpoint_resources(
     _require_endpoint(db, project_id, run_id, endpoint_id)
 
     stmt = select(Resource).where(Resource.run_id == run_id, Resource.endpoint_id == endpoint_id)
+    if provider:
+        stmt = stmt.where(_resource_provider_equals_expression(provider.strip().lower()))
+    if resource_type:
+        stmt = stmt.where(func.lower(cast(Resource.resource_type, String)) == resource_type.strip().lower())
+    if exposure:
+        stmt = stmt.where(Resource.exposure == exposure.strip().upper())
     stmt = apply_keyset_pagination(stmt, RUN_RESOURCE_CURSOR, cursor, limit)
     resources, next_cursor = paginate_rows(
         db.execute(stmt).scalars().all(),
@@ -1506,6 +1857,9 @@ def endpoint_resources(
         object_id=str(endpoint_id),
         metadata={
             "run_id": str(run_id),
+            "provider": provider,
+            "resource_type": resource_type,
+            "exposure": exposure,
             "limit": limit,
             "cursor": cursor,
             "result_count": len(resources),
@@ -1523,6 +1877,12 @@ def endpoint_resources(
                 "remark": r.remark,
                 "access_level": r.access_level.value if hasattr(r.access_level, "value") else r.access_level,
                 "access_capabilities": r.access_capabilities or {},
+                "provider": getattr(r, "provider", None) or share_type_from_resource_type(r.resource_type),
+                "provider_resource_id": getattr(r, "provider_resource_id", None),
+                "web_url": getattr(r, "web_url", None),
+                "metadata": getattr(r, "provider_metadata", None) or {},
+                "exposure": getattr(r, "exposure", None),
+                "exposure_evidence": getattr(r, "exposure_evidence", None) or {},
             }
             for r in resources
         ],
@@ -1538,6 +1898,9 @@ def resource_items(
     request: Request,
     search: str | None = Query(default=None, max_length=MAX_SEARCH_CHARS),
     path_prefix: str | None = Query(default=None, max_length=MAX_PATH_PREFIX_CHARS),
+    provider: str | None = Query(default=None, max_length=32),
+    exposure: str | None = Query(default=None, max_length=32),
+    include_deleted: bool = Query(default=False),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -1545,9 +1908,16 @@ def resource_items(
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
-    _require_resource(db, project_id, run_id, resource_id)
+    resource = _require_resource(db, project_id, run_id, resource_id)
+    resource_provider = getattr(resource, "provider", None) or share_type_from_resource_type(resource.resource_type)
 
     stmt = select(Item).where(Item.run_id == run_id, Item.resource_id == resource_id)
+    if not include_deleted:
+        stmt = stmt.where(Item.deleted.is_(False))
+    if provider:
+        stmt = stmt.where(_item_provider_equals_expression(provider.strip().lower()))
+    if exposure:
+        stmt = stmt.where(Item.exposure == exposure.strip().upper())
     if search:
         escaped = escape_like(search)
         stmt = stmt.where(Item.name.ilike(f"%{escaped}%", escape="\\"))
@@ -1570,6 +1940,9 @@ def resource_items(
             "run_id": str(run_id),
             "search": search,
             "path_prefix": path_prefix,
+            "provider": provider,
+            "exposure": exposure,
+            "include_deleted": include_deleted,
             "limit": limit,
             "cursor": cursor,
             "result_count": len(items),
@@ -1591,6 +1964,15 @@ def resource_items(
                 "accessed_at": i.accessed_at.isoformat() if i.accessed_at else None,
                 "changed_at": i.changed_at.isoformat() if i.changed_at else None,
                 "file_attributes": i.file_attributes or [],
+                "provider": getattr(i, "provider", None) or resource_provider,
+                "provider_item_id": getattr(i, "provider_item_id", None),
+                "provider_parent_id": getattr(i, "provider_parent_id", None),
+                "web_url": getattr(i, "web_url", None),
+                "mime_type": getattr(i, "mime_type", None),
+                "deleted": bool(getattr(i, "deleted", False)),
+                "metadata": getattr(i, "provider_metadata", None) or {},
+                "exposure": getattr(i, "exposure", None),
+                "exposure_evidence": getattr(i, "exposure_evidence", None) or {},
             }
             for i in items
         ],
@@ -1605,6 +1987,9 @@ def search_items(
     request: Request,
     q: str | None = Query(default=None, max_length=MAX_SEARCH_CHARS),
     ext: str | None = Query(default=None, max_length=MAX_SEARCH_CHARS),
+    provider: str | None = Query(default=None, max_length=32),
+    exposure: str | None = Query(default=None, max_length=32),
+    include_deleted: bool = Query(default=False),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -1614,16 +1999,95 @@ def search_items(
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     _get_run(db, project_id, run_id)
 
-    stmt = select(Item).where(Item.run_id == run_id)
+    effective_provider = func.coalesce(
+        Item.provider,
+        Resource.provider,
+        _provider_from_resource_type_expression(),
+    )
+    stmt = (
+        select(
+            Item.id,
+            Item.resource_id,
+            Item.path,
+            Item.name,
+            Item.is_dir,
+            Item.size_bytes,
+            Item.allocation_size_bytes,
+            Item.mtime,
+            Item.created_at,
+            Item.accessed_at,
+            Item.changed_at,
+            Item.file_attributes,
+            effective_provider.label("provider"),
+            Item.provider_item_id,
+            Item.provider_parent_id,
+            Item.web_url,
+            Item.mime_type,
+            Item.deleted,
+            Item.provider_metadata,
+            Item.exposure,
+            Item.exposure_evidence,
+            Resource.name.label("resource_name"),
+            Resource.resource_type,
+            Resource.provider_resource_id,
+            Endpoint.endpoint_key,
+            Endpoint.hostname,
+            Endpoint.provider_metadata.label("endpoint_metadata"),
+        )
+        .select_from(Item)
+        .join(
+            Resource,
+            (Resource.id == Item.resource_id) & (Resource.run_id == Item.run_id),
+        )
+        .join(
+            Endpoint,
+            (Endpoint.id == Resource.endpoint_id) & (Endpoint.run_id == Resource.run_id),
+        )
+        .where(Item.run_id == run_id)
+    )
+    if not include_deleted:
+        stmt = stmt.where(Item.deleted.is_(False))
+    if provider:
+        normalized_provider = provider.strip().lower()
+        stmt = stmt.where(
+            or_(
+                Item.provider == normalized_provider,
+                and_(
+                    Item.provider.is_(None),
+                    _resource_provider_equals_expression(normalized_provider),
+                ),
+            )
+        )
+    if exposure:
+        stmt = stmt.where(Item.exposure == exposure.strip().upper())
     if q:
         escaped = escape_like(q)
-        stmt = stmt.where(or_(Item.name.ilike(f"%{escaped}%", escape="\\"), cast(Item.path, String).ilike(f"%{escaped}%", escape="\\")))
+        pattern = f"%{escaped}%"
+        stmt = stmt.where(
+            or_(
+                Item.name.ilike(pattern, escape="\\"),
+                cast(Item.path, String).ilike(pattern, escape="\\"),
+                Item.provider_item_id.ilike(pattern, escape="\\"),
+                Item.web_url.ilike(pattern, escape="\\"),
+                Resource.name.ilike(pattern, escape="\\"),
+                Resource.provider_resource_id.ilike(pattern, escape="\\"),
+                Endpoint.endpoint_key.ilike(pattern, escape="\\"),
+                Endpoint.provider_metadata["display_name"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
+                Endpoint.provider_metadata["site_name"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
+            )
+        )
     if ext:
         ext = ext if ext.startswith(".") else f".{ext}"
         stmt = stmt.where(func.lower(Item.name).like(f"%{escape_like(ext.lower())}", escape="\\"))
 
     stmt = apply_keyset_pagination(stmt, RUN_ITEM_CURSOR, cursor, limit)
-    items, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), RUN_ITEM_CURSOR, limit)
+    items, next_cursor = paginate_rows(db.execute(stmt).all(), RUN_ITEM_CURSOR, limit)
 
     _write_read_audit(
         db,
@@ -1633,7 +2097,16 @@ def search_items(
         action="ITEMS_SEARCHED",
         object_type="scan_run",
         object_id=str(run_id),
-        metadata={"q": q, "ext": ext, "limit": limit, "cursor": cursor, "result_count": len(items)},
+        metadata={
+            "q": q,
+            "ext": ext,
+            "provider": provider,
+            "exposure": exposure,
+            "include_deleted": include_deleted,
+            "limit": limit,
+            "cursor": cursor,
+            "result_count": len(items),
+        },
     )
     db.commit()
 
@@ -1642,6 +2115,13 @@ def search_items(
             {
                 "id": i.id,
                 "resource_id": i.resource_id,
+                "resource_name": i.resource_name,
+                "resource_type": i.resource_type.value if hasattr(i.resource_type, "value") else i.resource_type,
+                "share_type": share_type_from_resource_type(i.resource_type),
+                "provider_resource_id": getattr(i, "provider_resource_id", None),
+                "endpoint_key": i.endpoint_key,
+                "hostname": i.hostname,
+                "endpoint_metadata": getattr(i, "endpoint_metadata", None) or {},
                 "path": i.path,
                 "name": i.name,
                 "is_dir": i.is_dir,
@@ -1652,6 +2132,15 @@ def search_items(
                 "accessed_at": i.accessed_at.isoformat() if i.accessed_at else None,
                 "changed_at": i.changed_at.isoformat() if i.changed_at else None,
                 "file_attributes": i.file_attributes or [],
+                "provider": getattr(i, "provider", None),
+                "provider_item_id": getattr(i, "provider_item_id", None),
+                "provider_parent_id": getattr(i, "provider_parent_id", None),
+                "web_url": getattr(i, "web_url", None),
+                "mime_type": getattr(i, "mime_type", None),
+                "deleted": bool(getattr(i, "deleted", False)),
+                "metadata": getattr(i, "provider_metadata", None) or {},
+                "exposure": getattr(i, "exposure", None),
+                "exposure_evidence": getattr(i, "exposure_evidence", None) or {},
             }
             for i in items
         ],

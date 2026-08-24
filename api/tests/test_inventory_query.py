@@ -97,3 +97,86 @@ def test_endpoint_query_groups_compile_when_or_clauses_mix_share_and_item_predic
     )
 
     assert "exists" in compiled.lower()
+
+
+def test_parse_inventory_query_supports_provider_resource_type_exposure_and_source() -> None:
+    groups = parse_inventory_query(
+        "provider=sharepoint resource_type=sharepoint_library "
+        "exposure=ANONYMOUS source=sharepoint"
+    )
+
+    assert groups == [[
+        InventoryQueryClause(field="provider", operator="equals", value="sharepoint"),
+        InventoryQueryClause(
+            field="resource_type",
+            operator="equals",
+            value="sharepoint_library",
+        ),
+        InventoryQueryClause(field="exposure", operator="equals", value="ANONYMOUS"),
+        InventoryQueryClause(field="source", operator="equals", value="sharepoint"),
+    ]]
+
+
+def test_parse_inventory_query_normalizes_visibility_to_exposure() -> None:
+    assert parse_inventory_query("visibility=EXTERNAL") == [[
+        InventoryQueryClause(field="exposure", operator="equals", value="EXTERNAL"),
+    ]]
+
+
+def test_sharepoint_inventory_query_fields_compile_against_provider_columns() -> None:
+    clauses = [
+        InventoryQueryClause(field="provider", operator="equals", value="sharepoint"),
+        InventoryQueryClause(
+            field="resource_type",
+            operator="equals",
+            value="sharepoint_library",
+        ),
+        InventoryQueryClause(field="exposure", operator="equals", value="ANONYMOUS"),
+        InventoryQueryClause(field="source", operator="equals", value="sharepoint"),
+    ]
+
+    item_sql = " ".join(
+        str(inventory_router._item_inventory_clause_expression(clause)) for clause in clauses
+    ).lower()
+    resource_sql = " ".join(
+        str(inventory_router._resource_inventory_clause_expression(clause)) for clause in clauses
+    ).lower()
+    endpoint_sql = " ".join(
+        str(inventory_router._endpoint_inventory_clause_expression(clause)) for clause in clauses
+    ).lower()
+
+    assert "items.provider" in item_sql
+    assert "resources.resource_type" in item_sql
+    assert "items.exposure" in item_sql
+    assert "collection_context" in item_sql
+    assert "resources.provider" in resource_sql
+    assert "resources.resource_type" in resource_sql
+    assert "resources.exposure" in resource_sql
+    assert "endpoints.provider" in endpoint_sql
+    assert "exists" in endpoint_sql
+
+
+def test_endpoint_provider_query_matches_direct_or_child_resource_provider() -> None:
+    sql = str(
+        inventory_router._endpoint_inventory_clause_expression(
+            InventoryQueryClause(field="provider", operator="equals", value="smb")
+        ).compile(compile_kwargs={"literal_binds": True})
+    ).lower()
+
+    assert "endpoints.provider" in sql
+    assert "resources.provider" in sql
+    assert "exists" in sql
+    assert " or " in sql
+
+
+def test_endpoint_search_query_includes_sharepoint_site_metadata() -> None:
+    sql = str(
+        inventory_router._endpoint_inventory_clause_expression(
+            InventoryQueryClause(field="search", operator="contains", value="Finance")
+        ).compile(compile_kwargs={"literal_binds": True})
+    ).lower()
+
+    assert "provider_metadata" in sql
+    assert "display_name" in sql
+    assert "site_name" in sql
+    assert "web_url" in sql

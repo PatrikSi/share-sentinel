@@ -32,8 +32,10 @@ class _ExecuteResult:
 class _FakeDb:
     execute_queue: list[_ExecuteResult] = field(default_factory=list)
     commit_count: int = 0
+    statements: list[Any] = field(default_factory=list)
 
     def execute(self, _statement):
+        self.statements.append(_statement)
         if not self.execute_queue:
             raise AssertionError("unexpected execute() call")
         return self.execute_queue.pop(0)
@@ -71,6 +73,11 @@ def test_to_run_out_includes_ingest_progress() -> None:
         artifact_content_type="application/x-ndjson",
         ingest_progress={"line_offset": 2048},
         summary={"endpoints": 2, "resources": 5, "items": 100, "errors": 1},
+        collection_context={
+            "source": "sharepoint",
+            "collection_mode": "delegated_user_view",
+            "assessed_identity": "alice@contoso.example",
+        },
     )
 
     payload = runs_router._to_run_out(run)
@@ -78,6 +85,8 @@ def test_to_run_out_includes_ingest_progress() -> None:
     assert payload.ingest_progress == {"line_offset": 2048}
     assert payload.artifact_sha256 == "a" * 64
     assert payload.artifact_content_type == "application/x-ndjson"
+    assert payload.collection_context["source"] == "sharepoint"
+    assert payload.collection_context["assessed_identity"] == "alice@contoso.example"
 
 
 def test_list_run_errors_returns_issue_rows(monkeypatch) -> None:
@@ -202,6 +211,49 @@ def test_endpoint_resources_uses_bounded_keyset_pagination(monkeypatch) -> None:
     assert fake_db.commit_count == 1
 
 
+def test_run_endpoints_searches_sharepoint_site_metadata_and_legacy_provider(
+    monkeypatch,
+) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    fake_run = SimpleNamespace(id=run_id, project_id=project_id)
+    endpoint = SimpleNamespace(
+        id=7,
+        endpoint_key="sharepoint:site-1",
+        ip=None,
+        hostname="contoso.sharepoint.com",
+        domain=None,
+        smb_dialect=None,
+        smb_signing=None,
+        auth_method="app",
+        provider="sharepoint",
+        provider_metadata={"display_name": "Finance site"},
+    )
+    fake_db = _FakeDb(
+        execute_queue=[_ExecuteResult([fake_run]), _ExecuteResult([endpoint])]
+    )
+    monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runs_router, "write_audit_event", lambda *_args, **_kwargs: None)
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get(
+            f"/projects/{project_id}/runs/{run_id}/endpoints",
+            params={"search": "Finance site", "provider": "sharepoint"},
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    sql = str(
+        fake_db.statements[1].compile(compile_kwargs={"literal_binds": True})
+    ).lower()
+    assert "display_name" in sql
+    assert "site_name" in sql
+    assert "resources.resource_type" in sql
+    assert "resources.provider =" in sql
+
+
 def test_endpoint_resources_rejects_endpoint_outside_project_run(monkeypatch) -> None:
     project_id = uuid.uuid4()
     run_id = uuid.uuid4()
@@ -218,3 +270,65 @@ def test_endpoint_resources_rejects_endpoint_outside_project_run(monkeypatch) ->
 
     assert response.status_code == 404
     assert response.json()["detail"] == "endpoint not found in run"
+
+
+def test_run_item_search_returns_sharepoint_resource_and_site_context(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    fake_run = SimpleNamespace(id=run_id, project_id=project_id)
+    item = SimpleNamespace(
+        id=22,
+        resource_id=9,
+        resource_name="Shared Documents",
+        resource_type="sharepoint_library",
+        provider_resource_id="drive-1",
+        endpoint_key="sharepoint:site-1",
+        hostname="contoso.sharepoint.com",
+        endpoint_metadata={"display_name": "Finance site", "site_id": "site-1"},
+        path="/Budgets/FY26.xlsx",
+        name="FY26.xlsx",
+        is_dir=False,
+        size_bytes=1024,
+        allocation_size_bytes=None,
+        mtime=None,
+        created_at=None,
+        accessed_at=None,
+        changed_at=None,
+        file_attributes=[],
+        provider="sharepoint",
+        provider_item_id="item-1",
+        provider_parent_id="folder-1",
+        web_url="https://contoso.sharepoint.com/sites/finance/Budgets/FY26.xlsx",
+        mime_type="application/vnd.test",
+        deleted=False,
+        provider_metadata={"site_id": "site-1", "drive_id": "drive-1"},
+        exposure="USER_VISIBLE",
+        exposure_evidence={"basis": "delegated_visibility"},
+    )
+    fake_db = _FakeDb(
+        execute_queue=[_ExecuteResult([fake_run]), _ExecuteResult([item])]
+    )
+    monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runs_router, "write_audit_event", lambda *_args, **_kwargs: None)
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get(
+            f"/projects/{project_id}/runs/{run_id}/search/items",
+            params={"q": "Finance site", "provider": "sharepoint"},
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    payload = response.json()["items"][0]
+    assert payload["resource_name"] == "Shared Documents"
+    assert payload["provider_resource_id"] == "drive-1"
+    assert payload["endpoint_key"] == "sharepoint:site-1"
+    assert payload["endpoint_metadata"]["display_name"] == "Finance site"
+    sql = str(
+        fake_db.statements[1].compile(compile_kwargs={"literal_binds": True})
+    ).lower()
+    assert "items.provider =" in sql
+    assert "items.deleted is false" in sql
+    assert "display_name" in sql

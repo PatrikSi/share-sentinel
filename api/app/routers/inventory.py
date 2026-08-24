@@ -1,7 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import String, and_, cast, func, not_, or_, select
+from sqlalchemy import String, and_, case, cast, func, not_, or_, select
 from sqlalchemy.orm import Session
 
 from app.db import escape_like, get_db
@@ -76,6 +76,71 @@ def _base_project_filters(project_id: uuid.UUID):
     return (
         ScanRun.project_id == project_id,
         ScanRun.status.in_([RunStatus.COMPLETE, RunStatus.INGESTING]),
+    )
+
+
+def _provider_from_resource_type_expression():
+    resource_type = func.lower(cast(Resource.resource_type, String))
+    return case(
+        (resource_type == "smb_share", "smb"),
+        (resource_type == "nfs_share", "nfs"),
+        (resource_type == "sharepoint_library", "sharepoint"),
+        else_=None,
+    )
+
+
+def _resource_provider_expression(*, include_endpoint: bool = True):
+    candidates = [Resource.provider]
+    if include_endpoint:
+        candidates.append(Endpoint.provider)
+    candidates.append(_provider_from_resource_type_expression())
+    return func.coalesce(*candidates)
+
+
+def _item_provider_expression():
+    return func.coalesce(
+        Item.provider,
+        Resource.provider,
+        Endpoint.provider,
+        _provider_from_resource_type_expression(),
+    )
+
+
+def _resource_provider_equals_expression(value: str, *, include_endpoint: bool = True):
+    inferred = _provider_from_resource_type_expression()
+    branches = [Resource.provider == value]
+    if include_endpoint:
+        branches.extend(
+            (
+                and_(Resource.provider.is_(None), Endpoint.provider == value),
+                and_(
+                    Resource.provider.is_(None),
+                    Endpoint.provider.is_(None),
+                    inferred == value,
+                ),
+            )
+        )
+    else:
+        branches.append(and_(Resource.provider.is_(None), inferred == value))
+    return or_(*branches)
+
+
+def _item_provider_equals_expression(value: str):
+    inferred = _provider_from_resource_type_expression()
+    return or_(
+        Item.provider == value,
+        and_(Item.provider.is_(None), Resource.provider == value),
+        and_(
+            Item.provider.is_(None),
+            Resource.provider.is_(None),
+            Endpoint.provider == value,
+        ),
+        and_(
+            Item.provider.is_(None),
+            Resource.provider.is_(None),
+            Endpoint.provider.is_(None),
+            inferred == value,
+        ),
     )
 
 
@@ -179,20 +244,65 @@ def _item_inventory_clause_expression(clause: InventoryQueryClause):
     ext_expr = func.lower(func.substring(Item.name, r"\.[^.]+$"))
     if clause.field == "search":
         expression = _multi_column_string_match(
-            (Item.name, Item.path, Resource.name, Endpoint.endpoint_key, Endpoint.hostname, Endpoint.ip),
+            (
+                Item.name,
+                Item.path,
+                Item.provider_item_id,
+                Item.provider_parent_id,
+                Item.web_url,
+                Resource.name,
+                Resource.provider_resource_id,
+                Resource.web_url,
+                Endpoint.endpoint_key,
+                Endpoint.hostname,
+                Endpoint.ip,
+                Endpoint.provider_metadata["display_name"].astext,
+                Endpoint.provider_metadata["site_name"].astext,
+            ),
             clause.operator,
             clause.value,
         )
     elif clause.field == "endpoint":
-        expression = _multi_column_string_match((Endpoint.endpoint_key, Endpoint.hostname, Endpoint.ip), clause.operator, clause.value)
+        expression = _multi_column_string_match(
+            (
+                Endpoint.endpoint_key,
+                Endpoint.hostname,
+                Endpoint.ip,
+                Endpoint.provider_metadata["display_name"].astext,
+                Endpoint.provider_metadata["site_name"].astext,
+                Endpoint.provider_metadata["web_url"].astext,
+            ),
+            clause.operator,
+            clause.value,
+        )
     elif clause.field == "share":
         expression = _string_match_expression(Resource.name, clause.operator, clause.value)
     elif clause.field == "path":
         expression = _string_match_expression(Item.path, clause.operator, clause.value)
     elif clause.field == "ext":
         expression = _ext_match_expression(ext_expr, clause.operator, clause.value)
-    else:
+    elif clause.field == "access":
         expression = _access_match_expression(Resource.access_level, clause.operator, clause.value)
+    elif clause.field == "provider":
+        expression = (
+            _item_provider_equals_expression(clause.value.strip().lower())
+            if clause.operator == "equals"
+            else _string_match_expression(
+                _item_provider_expression(),
+                clause.operator,
+                clause.value,
+            )
+        )
+    elif clause.field == "resource_type":
+        expression = _string_match_expression(Resource.resource_type, clause.operator, clause.value)
+    elif clause.field == "exposure":
+        expression = _string_match_expression(Item.exposure, clause.operator, clause.value)
+    else:
+        expression = _string_match_expression(
+            ScanRun.collection_context["source"].astext,
+            clause.operator,
+            clause.value,
+        )
     return not_(expression) if clause.negated else expression
 
 
@@ -200,14 +310,33 @@ def _resource_inventory_clause_expression(clause: InventoryQueryClause):
     ext_expr = func.lower(func.substring(Item.name, r"\.[^.]+$"))
     if clause.field == "search":
         expression = _multi_column_string_match(
-            (Resource.name, Resource.remark, Endpoint.endpoint_key, Endpoint.hostname),
+            (
+                Resource.name,
+                Resource.remark,
+                Resource.provider_resource_id,
+                Resource.web_url,
+                Endpoint.endpoint_key,
+                Endpoint.hostname,
+                Endpoint.provider_metadata["display_name"].astext,
+                Endpoint.provider_metadata["site_name"].astext,
+            ),
             clause.operator,
             clause.value,
         )
         return not_(expression) if clause.negated else expression
 
     if clause.field == "endpoint":
-        expression = _multi_column_string_match((Endpoint.endpoint_key, Endpoint.hostname), clause.operator, clause.value)
+        expression = _multi_column_string_match(
+            (
+                Endpoint.endpoint_key,
+                Endpoint.hostname,
+                Endpoint.provider_metadata["display_name"].astext,
+                Endpoint.provider_metadata["site_name"].astext,
+                Endpoint.provider_metadata["web_url"].astext,
+            ),
+            clause.operator,
+            clause.value,
+        )
         return not_(expression) if clause.negated else expression
 
     if clause.field == "share":
@@ -218,7 +347,44 @@ def _resource_inventory_clause_expression(clause: InventoryQueryClause):
         expression = _access_match_expression(Resource.access_level, clause.operator, clause.value)
         return not_(expression) if clause.negated else expression
 
-    item_subquery = select(1).select_from(Item).where(Item.run_id == Resource.run_id, Item.resource_id == Resource.id).correlate(Resource)
+    if clause.field == "provider":
+        expression = (
+            _resource_provider_equals_expression(clause.value.strip().lower())
+            if clause.operator == "equals"
+            else _string_match_expression(
+                _resource_provider_expression(),
+                clause.operator,
+                clause.value,
+            )
+        )
+        return not_(expression) if clause.negated else expression
+
+    if clause.field == "resource_type":
+        expression = _string_match_expression(Resource.resource_type, clause.operator, clause.value)
+        return not_(expression) if clause.negated else expression
+
+    if clause.field == "exposure":
+        expression = _string_match_expression(Resource.exposure, clause.operator, clause.value)
+        return not_(expression) if clause.negated else expression
+
+    if clause.field == "source":
+        expression = _string_match_expression(
+            ScanRun.collection_context["source"].astext,
+            clause.operator,
+            clause.value,
+        )
+        return not_(expression) if clause.negated else expression
+
+    item_subquery = (
+        select(1)
+        .select_from(Item)
+        .where(
+            Item.run_id == Resource.run_id,
+            Item.resource_id == Resource.id,
+            Item.deleted.is_(False),
+        )
+        .correlate(Resource)
+    )
     if clause.field == "path":
         item_subquery = item_subquery.where(_string_match_expression(Item.path, clause.operator, clause.value))
     else:
@@ -232,14 +398,33 @@ def _endpoint_inventory_clause_expression(clause: InventoryQueryClause):
     ext_expr = func.lower(func.substring(Item.name, r"\.[^.]+$"))
     if clause.field == "search":
         expression = _multi_column_string_match(
-            (Endpoint.endpoint_key, Endpoint.ip, Endpoint.hostname, Endpoint.domain),
+            (
+                Endpoint.endpoint_key,
+                Endpoint.ip,
+                Endpoint.hostname,
+                Endpoint.domain,
+                Endpoint.provider_metadata["display_name"].astext,
+                Endpoint.provider_metadata["site_name"].astext,
+                Endpoint.provider_metadata["web_url"].astext,
+            ),
             clause.operator,
             clause.value,
         )
         return not_(expression) if clause.negated else expression
 
     if clause.field == "endpoint":
-        expression = _multi_column_string_match((Endpoint.endpoint_key, Endpoint.ip, Endpoint.hostname), clause.operator, clause.value)
+        expression = _multi_column_string_match(
+            (
+                Endpoint.endpoint_key,
+                Endpoint.ip,
+                Endpoint.hostname,
+                Endpoint.provider_metadata["display_name"].astext,
+                Endpoint.provider_metadata["site_name"].astext,
+                Endpoint.provider_metadata["web_url"].astext,
+            ),
+            clause.operator,
+            clause.value,
+        )
         return not_(expression) if clause.negated else expression
 
     if clause.field == "share":
@@ -270,11 +455,66 @@ def _endpoint_inventory_clause_expression(clause: InventoryQueryClause):
         )
         return not_(expression) if clause.negated else expression
 
+    if clause.field == "provider":
+        child_match = (
+            select(1)
+            .select_from(Resource)
+            .where(
+                Resource.run_id == Endpoint.run_id,
+                Resource.endpoint_id == Endpoint.id,
+                (
+                    _resource_provider_equals_expression(
+                        clause.value.strip().lower(),
+                        include_endpoint=False,
+                    )
+                    if clause.operator == "equals"
+                    else _string_match_expression(
+                        _resource_provider_expression(include_endpoint=False),
+                        clause.operator,
+                        clause.value,
+                    )
+                ),
+            )
+            .correlate(Endpoint)
+            .exists()
+        )
+        direct_match = (
+            Endpoint.provider == clause.value.strip().lower()
+            if clause.operator == "equals"
+            else _string_match_expression(Endpoint.provider, clause.operator, clause.value)
+        )
+        expression = or_(direct_match, child_match)
+        return not_(expression) if clause.negated else expression
+
+    if clause.field == "source":
+        expression = _string_match_expression(
+            ScanRun.collection_context["source"].astext,
+            clause.operator,
+            clause.value,
+        )
+        return not_(expression) if clause.negated else expression
+
+    if clause.field in {"resource_type", "exposure"}:
+        column = Resource.resource_type if clause.field == "resource_type" else Resource.exposure
+        expression = (
+            select(1)
+            .select_from(Resource)
+            .where(
+                Resource.run_id == Endpoint.run_id,
+                Resource.endpoint_id == Endpoint.id,
+                _string_match_expression(column, clause.operator, clause.value),
+            )
+            .correlate(Endpoint)
+            .exists()
+        )
+        return not_(expression) if clause.negated else expression
+
     item_subquery = (
         select(1)
         .select_from(Resource)
         .join(Item, (Item.resource_id == Resource.id) & (Item.run_id == Resource.run_id))
         .where(Resource.run_id == Endpoint.run_id, Resource.endpoint_id == Endpoint.id)
+        .where(Item.deleted.is_(False))
         .correlate(Endpoint)
     )
     if clause.field == "path":
@@ -492,7 +732,7 @@ def inventory_stats(
             func.count(func.distinct(func.lower(func.substring(Item.name, r"\.[^.]+$")))).filter(
                 Item.is_dir.is_(False),
             ),
-        ).where(Item.run_id.in_(scope_run_ids))
+        ).where(Item.run_id.in_(scope_run_ids), Item.deleted.is_(False))
     ).one()
     items_total = int(item_totals[0] or 0)
     files_total = int(item_totals[1] or 0)
@@ -542,7 +782,12 @@ def inventory_extensions(
         select(ext_expr.label("ext"), func.count(Item.id).label("count"))
         .select_from(Item)
         .join(ScanRun, ScanRun.id == Item.run_id)
-        .where(*_base_project_filters(project_id), Item.is_dir.is_(False), ext_expr.is_not(None))
+        .where(
+            *_base_project_filters(project_id),
+            Item.is_dir.is_(False),
+            Item.deleted.is_(False),
+            ext_expr.is_not(None),
+        )
         .group_by(ext_expr)
         .order_by(func.count(Item.id).desc(), ext_expr.asc())
         .limit(limit)
@@ -575,8 +820,13 @@ def inventory_items(
     endpoint: str | None = Query(default=None, max_length=MAX_FILTER_CHARS),
     share: str | None = Query(default=None, max_length=MAX_FILTER_CHARS),
     path_prefix: str | None = Query(default=None, max_length=MAX_PATH_FILTER_CHARS),
+    provider: str | None = Query(default=None, max_length=32),
+    resource_type: str | None = Query(default=None, max_length=64),
+    exposure: str | None = Query(default=None, max_length=32),
+    source: str | None = Query(default=None, max_length=64),
     run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
     is_dir: bool | None = Query(default=None),
+    include_deleted: bool = Query(default=False),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -595,6 +845,7 @@ def inventory_items(
             Endpoint.endpoint_key,
             Endpoint.hostname,
             Endpoint.ip,
+            Endpoint.provider_metadata.label("endpoint_metadata"),
             Resource.name.label("resource_name"),
             Resource.access_level,
             Resource.access_capabilities,
@@ -609,6 +860,15 @@ def inventory_items(
             Item.accessed_at,
             Item.changed_at,
             Item.file_attributes,
+            _item_provider_expression().label("provider"),
+            Item.provider_item_id,
+            Item.provider_parent_id,
+            Item.web_url,
+            Item.mime_type,
+            Item.deleted,
+            Item.provider_metadata,
+            Item.exposure,
+            Item.exposure_evidence,
         )
         .select_from(Item)
         .join(Resource, (Resource.id == Item.resource_id) & (Resource.run_id == Item.run_id))
@@ -619,6 +879,8 @@ def inventory_items(
 
     if run_id_list:
         stmt = stmt.where(Item.run_id.in_(run_id_list))
+    if not include_deleted:
+        stmt = stmt.where(Item.deleted.is_(False))
     if is_dir is not None:
         stmt = stmt.where(Item.is_dir.is_(is_dir))
     if path_prefix:
@@ -631,6 +893,14 @@ def inventory_items(
         escaped = _escape_like(endpoint.strip())
         pattern = f"%{escaped}%"
         stmt = stmt.where(or_(Endpoint.endpoint_key.ilike(pattern, escape="\\"), Endpoint.hostname.ilike(pattern, escape="\\"), Endpoint.ip.ilike(pattern, escape="\\")))
+    if provider:
+        stmt = stmt.where(_item_provider_equals_expression(provider.strip().lower()))
+    if resource_type:
+        stmt = stmt.where(func.lower(cast(Resource.resource_type, String)) == resource_type.strip().lower())
+    if exposure:
+        stmt = stmt.where(Item.exposure == exposure.strip().upper())
+    if source:
+        stmt = stmt.where(func.lower(ScanRun.collection_context["source"].astext) == source.strip().lower())
     if q:
         escaped = _escape_like(q.strip())
         pattern = f"%{escaped}%"
@@ -638,10 +908,23 @@ def inventory_items(
             or_(
                 Item.name.ilike(pattern, escape="\\"),
                 Item.path.ilike(pattern, escape="\\"),
+                Item.provider_item_id.ilike(pattern, escape="\\"),
+                Item.provider_parent_id.ilike(pattern, escape="\\"),
+                Item.web_url.ilike(pattern, escape="\\"),
                 Resource.name.ilike(pattern, escape="\\"),
+                Resource.provider_resource_id.ilike(pattern, escape="\\"),
+                Resource.web_url.ilike(pattern, escape="\\"),
                 Endpoint.endpoint_key.ilike(pattern, escape="\\"),
                 Endpoint.hostname.ilike(pattern, escape="\\"),
                 Endpoint.ip.ilike(pattern, escape="\\"),
+                Endpoint.provider_metadata["display_name"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
+                Endpoint.provider_metadata["site_name"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
             )
         )
     if ext:
@@ -663,10 +946,12 @@ def inventory_items(
             "endpoint_key": row.endpoint_key,
             "hostname": row.hostname,
             "ip": row.ip,
+            "endpoint_metadata": getattr(row, "endpoint_metadata", None) or {},
             "resource_name": row.resource_name,
             "access_level": row.access_level.value if hasattr(row.access_level, "value") else row.access_level,
             "access_capabilities": row.access_capabilities or {},
             "share_type": share_type_from_resource_type(row.resource_type),
+            "resource_type": row.resource_type.value if hasattr(row.resource_type, "value") else row.resource_type,
             "path": row.path,
             "name": row.name,
             "is_dir": bool(row.is_dir),
@@ -677,6 +962,16 @@ def inventory_items(
             "accessed_at": row.accessed_at.isoformat() if row.accessed_at else None,
             "changed_at": row.changed_at.isoformat() if row.changed_at else None,
             "file_attributes": row.file_attributes or [],
+            "provider": getattr(row, "provider", None)
+            or share_type_from_resource_type(row.resource_type),
+            "provider_item_id": getattr(row, "provider_item_id", None),
+            "provider_parent_id": getattr(row, "provider_parent_id", None),
+            "web_url": getattr(row, "web_url", None),
+            "mime_type": getattr(row, "mime_type", None),
+            "deleted": bool(getattr(row, "deleted", False)),
+            "metadata": getattr(row, "provider_metadata", None) or {},
+            "exposure": getattr(row, "exposure", None),
+            "exposure_evidence": getattr(row, "exposure_evidence", None) or {},
         }
         for row in rows
     ]
@@ -694,6 +989,11 @@ def inventory_items(
             "endpoint": endpoint,
             "share": share,
             "path_prefix": path_prefix,
+            "provider": provider,
+            "resource_type": resource_type,
+            "exposure": exposure,
+            "source": source,
+            "include_deleted": include_deleted,
             "run_ids": run_ids,
             "limit": limit,
         },
@@ -710,6 +1010,10 @@ def inventory_resources(
     query_dsl: str | None = Query(default=None, max_length=MAX_QUERY_DSL_CHARS),
     endpoint: str | None = Query(default=None, max_length=MAX_FILTER_CHARS),
     access_level: str | None = Query(default=None),
+    provider: str | None = Query(default=None, max_length=32),
+    resource_type: str | None = Query(default=None, max_length=64),
+    exposure: str | None = Query(default=None, max_length=32),
+    source: str | None = Query(default=None, max_length=64),
     run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
@@ -723,7 +1027,11 @@ def inventory_resources(
 
     item_count_subquery = (
         select(func.count(Item.id))
-        .where(Item.run_id == Resource.run_id, Item.resource_id == Resource.id)
+        .where(
+            Item.run_id == Resource.run_id,
+            Item.resource_id == Resource.id,
+            Item.deleted.is_(False),
+        )
         .correlate(Resource)
         .scalar_subquery()
     )
@@ -734,11 +1042,18 @@ def inventory_resources(
             ScanRun.name.label("run_name"),
             Endpoint.endpoint_key,
             Endpoint.hostname,
+            Endpoint.provider_metadata.label("endpoint_metadata"),
             Resource.name,
             Resource.remark,
             Resource.access_level,
             Resource.access_capabilities,
             Resource.resource_type,
+            _resource_provider_expression().label("provider"),
+            Resource.provider_resource_id,
+            Resource.web_url,
+            Resource.provider_metadata,
+            Resource.exposure,
+            Resource.exposure_evidence,
             item_count_subquery.label("item_count"),
         )
         .select_from(Resource)
@@ -758,10 +1073,34 @@ def inventory_resources(
         escaped = _escape_like(endpoint.strip())
         pattern = f"%{escaped}%"
         stmt = stmt.where(or_(Endpoint.endpoint_key.ilike(pattern, escape="\\"), Endpoint.hostname.ilike(pattern, escape="\\")))
+    if provider:
+        stmt = stmt.where(_resource_provider_equals_expression(provider.strip().lower()))
+    if resource_type:
+        stmt = stmt.where(func.lower(cast(Resource.resource_type, String)) == resource_type.strip().lower())
+    if exposure:
+        stmt = stmt.where(Resource.exposure == exposure.strip().upper())
+    if source:
+        stmt = stmt.where(func.lower(ScanRun.collection_context["source"].astext) == source.strip().lower())
     if q:
         escaped = _escape_like(q.strip())
         pattern = f"%{escaped}%"
-        stmt = stmt.where(or_(Resource.name.ilike(pattern, escape="\\"), Resource.remark.ilike(pattern, escape="\\"), Endpoint.endpoint_key.ilike(pattern, escape="\\")))
+        stmt = stmt.where(
+            or_(
+                Resource.name.ilike(pattern, escape="\\"),
+                Resource.remark.ilike(pattern, escape="\\"),
+                Resource.provider_resource_id.ilike(pattern, escape="\\"),
+                Resource.web_url.ilike(pattern, escape="\\"),
+                Endpoint.endpoint_key.ilike(pattern, escape="\\"),
+                Endpoint.provider_metadata["display_name"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
+                Endpoint.provider_metadata["site_name"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
+            )
+        )
     if query_groups:
         stmt = _apply_inventory_query_groups(stmt, query_groups, _resource_inventory_clause_expression)
 
@@ -774,11 +1113,20 @@ def inventory_resources(
             "run_name": row.run_name,
             "endpoint_key": row.endpoint_key,
             "hostname": row.hostname,
+            "endpoint_metadata": getattr(row, "endpoint_metadata", None) or {},
             "name": row.name,
             "remark": row.remark,
             "access_level": row.access_level.value if hasattr(row.access_level, "value") else row.access_level,
             "access_capabilities": row.access_capabilities or {},
             "share_type": share_type_from_resource_type(row.resource_type),
+            "resource_type": row.resource_type.value if hasattr(row.resource_type, "value") else row.resource_type,
+            "provider": getattr(row, "provider", None)
+            or share_type_from_resource_type(row.resource_type),
+            "provider_resource_id": getattr(row, "provider_resource_id", None),
+            "web_url": getattr(row, "web_url", None),
+            "metadata": getattr(row, "provider_metadata", None) or {},
+            "exposure": getattr(row, "exposure", None),
+            "exposure_evidence": getattr(row, "exposure_evidence", None) or {},
             "item_count": int(row.item_count or 0),
         }
         for row in rows
@@ -795,6 +1143,10 @@ def inventory_resources(
             "query_dsl": query_dsl,
             "endpoint": endpoint,
             "access_level": access_level,
+            "provider": provider,
+            "resource_type": resource_type,
+            "exposure": exposure,
+            "source": source,
             "run_ids": run_ids,
             "limit": limit,
         },
@@ -809,6 +1161,8 @@ def inventory_endpoints(
     request: Request,
     q: str | None = Query(default=None, max_length=MAX_FILTER_CHARS),
     query_dsl: str | None = Query(default=None, max_length=MAX_QUERY_DSL_CHARS),
+    provider: str | None = Query(default=None, max_length=32),
+    source: str | None = Query(default=None, max_length=64),
     run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
@@ -830,7 +1184,26 @@ def inventory_endpoints(
         select(func.count(Item.id))
         .select_from(Resource)
         .join(Item, (Item.resource_id == Resource.id) & (Item.run_id == Resource.run_id))
-        .where(Resource.run_id == Endpoint.run_id, Resource.endpoint_id == Endpoint.id)
+        .where(
+            Resource.run_id == Endpoint.run_id,
+            Resource.endpoint_id == Endpoint.id,
+            Item.deleted.is_(False),
+        )
+        .correlate(Endpoint)
+        .scalar_subquery()
+    )
+    child_provider = _resource_provider_expression(include_endpoint=False)
+    inferred_provider_subquery = (
+        select(
+            case(
+                (func.count(func.distinct(child_provider)) == 1, func.min(child_provider)),
+                else_=None,
+            )
+        )
+        .where(
+            Resource.run_id == Endpoint.run_id,
+            Resource.endpoint_id == Endpoint.id,
+        )
         .correlate(Endpoint)
         .scalar_subquery()
     )
@@ -844,6 +1217,8 @@ def inventory_endpoints(
             Endpoint.hostname,
             Endpoint.domain,
             Endpoint.smb_signing,
+            func.coalesce(Endpoint.provider, inferred_provider_subquery).label("provider"),
+            Endpoint.provider_metadata,
             resource_count_subquery.label("resource_count"),
             item_count_subquery.label("item_count"),
         )
@@ -854,6 +1229,30 @@ def inventory_endpoints(
 
     if run_id_list:
         stmt = stmt.where(Endpoint.run_id.in_(run_id_list))
+    if provider:
+        normalized_provider = provider.strip().lower()
+        child_provider_match = (
+            select(1)
+            .select_from(Resource)
+            .where(
+                Resource.run_id == Endpoint.run_id,
+                Resource.endpoint_id == Endpoint.id,
+                _resource_provider_equals_expression(
+                    normalized_provider,
+                    include_endpoint=False,
+                ),
+            )
+            .correlate(Endpoint)
+            .exists()
+        )
+        stmt = stmt.where(
+            or_(
+                Endpoint.provider == normalized_provider,
+                child_provider_match,
+            )
+        )
+    if source:
+        stmt = stmt.where(func.lower(ScanRun.collection_context["source"].astext) == source.strip().lower())
     if q:
         escaped = _escape_like(q.strip())
         pattern = f"%{escaped}%"
@@ -863,6 +1262,18 @@ def inventory_endpoints(
                 Endpoint.ip.ilike(pattern, escape="\\"),
                 Endpoint.hostname.ilike(pattern, escape="\\"),
                 Endpoint.domain.ilike(pattern, escape="\\"),
+                Endpoint.provider_metadata["display_name"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
+                Endpoint.provider_metadata["site_name"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
+                Endpoint.provider_metadata["web_url"].astext.ilike(
+                    pattern,
+                    escape="\\",
+                ),
             )
         )
     if query_groups:
@@ -880,6 +1291,8 @@ def inventory_endpoints(
             "hostname": row.hostname,
             "domain": row.domain,
             "smb_signing": row.smb_signing,
+            "provider": getattr(row, "provider", None),
+            "metadata": getattr(row, "provider_metadata", None) or {},
             "resource_count": int(row.resource_count or 0),
             "item_count": int(row.item_count or 0),
         }
@@ -892,7 +1305,14 @@ def inventory_endpoints(
         auth,
         project_id,
         action="PROJECT_INVENTORY_ENDPOINTS_LISTED",
-        metadata={"q": q, "query_dsl": query_dsl, "run_ids": run_ids, "limit": limit},
+        metadata={
+            "q": q,
+            "query_dsl": query_dsl,
+            "provider": provider,
+            "source": source,
+            "run_ids": run_ids,
+            "limit": limit,
+        },
     )
     db.commit()
     return {"items": items, "next_cursor": next_cursor}

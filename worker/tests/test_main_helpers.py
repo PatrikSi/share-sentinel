@@ -162,8 +162,12 @@ def test_load_json_records_rejects_invalid_utf8_without_replacement() -> None:
 
 
 def test_public_ingest_error_redacts_internal_failure_types() -> None:
-    assert main._public_ingest_error(ValueError("unsupported JSON artifact format")) == "unsupported JSON artifact format"
-    assert main._public_ingest_error(ValueError(main.GZIP_DECOMPRESSED_LIMIT_ERROR)) == main.GZIP_DECOMPRESSED_LIMIT_ERROR
+    assert (
+        main._public_ingest_error(ValueError("unsupported JSON artifact format")) == "unsupported JSON artifact format"
+    )
+    assert (
+        main._public_ingest_error(ValueError(main.GZIP_DECOMPRESSED_LIMIT_ERROR)) == main.GZIP_DECOMPRESSED_LIMIT_ERROR
+    )
     assert main._public_ingest_error(TypeError("bad shape")) == "artifact contained an unexpected record shape"
     assert main._public_ingest_error(RuntimeError("oops")) == "unexpected ingest failure"
 
@@ -184,6 +188,25 @@ def test_update_run_status_persists_heartbeat_timestamp() -> None:
     assert "heartbeat_at" in ingest_progress
 
 
+def test_clear_persisted_ingest_inventory_removes_all_resumable_rows() -> None:
+    statements: list[tuple[str, tuple[str, ...]]] = []
+
+    class _Conn:
+        def execute(self, query, params):
+            statements.append((" ".join(query.split()), params))
+
+    main.clear_persisted_ingest_inventory(_Conn(), "run-1")
+
+    assert [statement for statement, _params in statements] == [
+        "DELETE FROM items WHERE run_id = %s",
+        "DELETE FROM resources WHERE run_id = %s",
+        "DELETE FROM endpoints WHERE run_id = %s",
+        "DELETE FROM ingest_errors WHERE run_id = %s",
+        "UPDATE scan_runs SET collection_context = '{}'::jsonb WHERE id = %s",
+    ]
+    assert all(params == ("run-1",) for _statement, params in statements)
+
+
 def test_read_json_compat_bytes_rejects_gzip_payloads_over_limit() -> None:
     payload = gzip.compress(b'{"hello":"' + (b"a" * 32) + b'"}')
 
@@ -194,11 +217,14 @@ def test_read_json_compat_bytes_rejects_gzip_payloads_over_limit() -> None:
 def test_limited_reader_rejects_gzip_payloads_over_limit() -> None:
     payload = gzip.compress(b"a" * 33)
 
-    with gzip.GzipFile(fileobj=io.BytesIO(payload)) as gzip_reader, main._LimitedReader(
-        gzip_reader,
-        max_bytes=32,
-        error_message=main.GZIP_DECOMPRESSED_LIMIT_ERROR,
-    ) as limited_reader:
+    with (
+        gzip.GzipFile(fileobj=io.BytesIO(payload)) as gzip_reader,
+        main._LimitedReader(
+            gzip_reader,
+            max_bytes=32,
+            error_message=main.GZIP_DECOMPRESSED_LIMIT_ERROR,
+        ) as limited_reader,
+    ):
         with pytest.raises(ValueError, match=main.GZIP_DECOMPRESSED_LIMIT_ERROR):
             limited_reader.read()
 
@@ -207,11 +233,14 @@ def test_limited_reader_does_not_double_count_repeated_streamable_json_passes() 
     raw = b'{"meta":{"tool":"collector"},"endpoints":[]}'
     payload = gzip.compress(raw)
 
-    with gzip.GzipFile(fileobj=io.BytesIO(payload)) as gzip_reader, main._LimitedReader(
-        gzip_reader,
-        max_bytes=len(raw),
-        error_message=main.GZIP_DECOMPRESSED_LIMIT_ERROR,
-    ) as limited_reader:
+    with (
+        gzip.GzipFile(fileobj=io.BytesIO(payload)) as gzip_reader,
+        main._LimitedReader(
+            gzip_reader,
+            max_bytes=len(raw),
+            error_message=main.GZIP_DECOMPRESSED_LIMIT_ERROR,
+        ) as limited_reader,
+    ):
         assert limited_reader.read() == raw
         limited_reader.seek(0)
         assert limited_reader.read() == raw
@@ -226,8 +255,51 @@ def test_bounded_ndjson_reader_rejects_limit_plus_one_without_unbounded_read() -
     assert reader.tell() == 9
 
 
+@pytest.mark.parametrize(
+    "records",
+    [
+        [{"type": "run_end"}],
+        [{"type": "run_meta"}],
+        [{"type": "run_meta"}, {"type": "run_meta"}, {"type": "run_end"}],
+        [{"type": "run_meta"}, {"type": "run_end"}, {"type": "endpoint"}],
+        [{"type": "run_meta"}, {"type": "run_end"}, {"type": "run_end"}],
+    ],
+)
+def test_ndjson_framing_requires_one_header_and_one_terminal_footer(records) -> None:
+    payload = b"".join(json.dumps(record).encode("utf-8") + b"\n" for record in records)
+
+    with pytest.raises(main.ArtifactFramingError, match="exactly one run_meta"):
+        main._validate_ndjson_framing(io.BytesIO(payload))
+
+
+def test_ndjson_framing_allows_blank_and_malformed_middle_records() -> None:
+    payload = b"\n".join(
+        [
+            b'{"type":"run_meta"}',
+            b"{malformed}",
+            b'{"type":"run_end"}',
+            b"",
+        ]
+    )
+
+    progress_calls = 0
+
+    def report_progress() -> None:
+        nonlocal progress_calls
+        progress_calls += 1
+
+    main._validate_ndjson_framing(
+        io.BytesIO(payload),
+        progress_callback=report_progress,
+    )
+
+    assert progress_calls >= 4
+
+
 def test_gzip_decompressed_limit_scales_from_artifact_size() -> None:
-    assert main._gzip_decompressed_limit(1024) == max(main.JSON_COMPAT_MAX_BYTES, 1024 * main.GZIP_DECOMPRESSED_MAX_RATIO)
+    assert main._gzip_decompressed_limit(1024) == max(
+        main.JSON_COMPAT_MAX_BYTES, 1024 * main.GZIP_DECOMPRESSED_MAX_RATIO
+    )
 
 
 def test_parse_offset_returns_zero_for_non_numeric_values() -> None:
@@ -478,6 +550,223 @@ def test_validate_record_normalizes_share_type_and_resource_type() -> None:
     assert item_reason is None
     assert item_record["share_type"] == "nfs"
     assert item_record["resource_type"] == "nfs_share"
+
+
+def test_validate_record_normalizes_first_class_sharepoint_metadata() -> None:
+    resource_record = {
+        "type": "resource",
+        "run_id": "run-1",
+        "endpoint_key": "sharepoint:site-1",
+        "name": "Documents",
+        "share_type": "sharepoint",
+        "provider_resource_id": "drive-1",
+        "web_url": "https://contoso.sharepoint.com/sites/Finance/Documents",
+        "exposure": "user visible",
+        "exposure_evidence": {"basis": "delegated_visibility"},
+        "metadata": {"tenant_id": "tenant-1", "site_id": "site-1", "drive_id": "drive-1"},
+    }
+    item_record = {
+        "type": "item",
+        "run_id": "run-1",
+        "endpoint_key": "sharepoint:site-1",
+        "resource_name": "Documents",
+        "share_type": "sharepoint",
+        "provider_resource_id": "drive-1",
+        "provider_item_id": "item-1",
+        "provider_parent_id": "parent-1",
+        "path": "/Budgets/FY26.xlsx",
+        "name": "FY26.xlsx",
+        "is_dir": False,
+        "size": 184933,
+        "modified_at": "2026-08-23T12:34:56Z",
+        "web_url": "https://contoso.sharepoint.com/sites/Finance/Documents/Budgets/FY26.xlsx",
+        "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "etag": '"etag-1"',
+        "ctag": '"ctag-1"',
+        "exposure": "USER_VISIBLE",
+        "metadata": {"site_id": "site-1", "drive_id": "drive-1"},
+    }
+
+    assert main.validate_record(resource_record) == (True, None)
+    assert main.validate_record(item_record) == (True, None)
+    assert resource_record["resource_type"] == "sharepoint_library"
+    assert resource_record["provider"] == "sharepoint"
+    assert resource_record["exposure"] == "USER_VISIBLE"
+    assert item_record["resource_type"] == "sharepoint_library"
+    assert item_record["size_bytes"] == 184933
+    assert item_record["mtime"].isoformat() == "2026-08-23T12:34:56+00:00"
+    assert item_record["provider_metadata"]["etag"] == '"etag-1"'
+    assert item_record["provider_metadata"]["ctag"] == '"ctag-1"'
+
+
+@pytest.mark.parametrize(
+    ("record", "message"),
+    [
+        (
+            {
+                "type": "resource",
+                "run_id": "run-1",
+                "endpoint_key": "sharepoint:site-1",
+                "name": "Documents",
+                "share_type": "sharepoint",
+            },
+            "provider_resource_id",
+        ),
+        (
+            {
+                "type": "item",
+                "run_id": "run-1",
+                "endpoint_key": "sharepoint:site-1",
+                "resource_name": "Documents",
+                "share_type": "sharepoint",
+                "provider_item_id": "item-1",
+                "path": "/file.txt",
+            },
+            "provider_resource_id",
+        ),
+        (
+            {
+                "type": "item",
+                "run_id": "run-1",
+                "endpoint_key": "sharepoint:site-1",
+                "resource_name": "Documents",
+                "share_type": "sharepoint",
+                "provider_resource_id": "drive-1",
+                "path": "/file.txt",
+            },
+            "provider_item_id",
+        ),
+    ],
+)
+def test_validate_record_requires_sharepoint_stable_ids(record, message) -> None:
+    valid, reason = main.validate_record(record)
+
+    assert valid is False
+    assert message in str(reason)
+
+
+def test_validate_record_rejects_explicit_unknown_resource_types_instead_of_smb_fallback() -> None:
+    record = {
+        "type": "resource",
+        "run_id": "run-1",
+        "endpoint_key": "host",
+        "name": "resource",
+        "share_type": "future-provider",
+    }
+
+    valid, reason = main.validate_record(record)
+
+    assert valid is False
+    assert reason == "unsupported share_type: future-provider"
+    assert main._normalize_share_type(None, None) == "smb"
+
+
+@pytest.mark.parametrize(
+    "web_url",
+    [
+        "javascript:alert(1)",
+        "http://contoso.sharepoint.com/sites/Finance",
+        "https://user:secret@contoso.sharepoint.com/sites/Finance",
+    ],
+)
+def test_validate_record_rejects_unsafe_sharepoint_urls(web_url: str) -> None:
+    record = {
+        "type": "resource",
+        "run_id": "run-1",
+        "endpoint_key": "sharepoint:site-1",
+        "name": "Documents",
+        "share_type": "sharepoint",
+        "provider_resource_id": "drive-1",
+        "web_url": web_url,
+    }
+
+    valid, reason = main.validate_record(record)
+
+    assert valid is False
+    assert "web_url" in str(reason)
+
+
+@pytest.mark.parametrize(
+    "secret_key",
+    ["accessToken", "clientSecret", "authorization_header", "refresh-token", "privateKey"],
+)
+def test_validate_record_rejects_secret_key_variants(secret_key: str) -> None:
+    record = {
+        "type": "endpoint",
+        "run_id": "run-1",
+        "endpoint_key": "sharepoint:site-1",
+        "provider": "sharepoint",
+        "metadata": {"nested": {secret_key: "must-not-survive"}},
+    }
+
+    valid, reason = main.validate_record(record)
+
+    assert valid is False
+    assert "secret or sensitive operational state" in str(reason)
+
+
+def test_validate_record_bounds_unicode_sharepoint_names_and_paths_without_truncation() -> None:
+    boundary_name = "é" * 255
+    boundary_path = "/" + ("😀" * 397) + "/x"
+    record = {
+        "type": "item",
+        "run_id": "run-1",
+        "endpoint_key": "sharepoint:site-1",
+        "resource_name": "Documents",
+        "share_type": "sharepoint",
+        "provider_resource_id": "drive-1",
+        "provider_item_id": "item-1",
+        "path": boundary_path,
+        "name": boundary_name,
+    }
+
+    assert main.validate_record(record) == (True, None)
+    assert record["name"] == boundary_name
+    assert record["path"] == boundary_path
+
+    record["path"] += "x"
+    valid, reason = main.validate_record(record)
+    assert valid is False
+    assert "400 characters" in str(reason)
+
+
+def test_validate_record_normalizes_canonical_collection_context() -> None:
+    record = {
+        "type": "run_meta",
+        "schema_version": 1,
+        "tool": "share-sentinel-sharepoint-collector",
+        "tool_version": "1.0.0",
+        "run_id": "run-1",
+        "started_at": "2026-08-24T00:00:00Z",
+        "collection_context": {
+            "source": "sharepoint",
+            "collection_mode": "delegated_user_view",
+            "assessed_identity": "alice@contoso.example",
+            "partial": False,
+            "auth_context": {
+                "auth_mode": "interactive",
+                "auth_type": "delegated",
+                "tenant_id": "tenant-1",
+                "user_principal_name": "alice@contoso.example",
+                "scopes": ["Sites.Read.All", "Sites.Read.All"],
+                "jwt_inspection": "unverified_metadata_only",
+            },
+            "metadata": {
+                "snapshot_materialized": True,
+                "discovery_authoritative": False,
+            },
+        },
+    }
+
+    assert main.validate_record(record) == (True, None)
+    context = record["collection_context"]
+    assert context["source"] == "sharepoint"
+    assert context["provider"] == "sharepoint"
+    assert context["auth_type"] == "delegated"
+    assert context["tenant_id"] == "tenant-1"
+    assert context["scopes"] == ["Sites.Read.All"]
+    assert context["materialized_snapshot"] is True
+    assert context["discovery_completeness"] == "non_authoritative"
 
 
 def test_validate_record_normalizes_access_level_aliases() -> None:
@@ -731,10 +1020,73 @@ def test_upsert_resource_does_not_downgrade_existing_access_or_capability_eviden
     )
 
     assert resource_id == 9
-    assert captured["params"][1] == "readable"
-    persisted_capabilities = json.loads(captured["params"][2])
+    assert captured["params"][2] == "readable"
+    persisted_capabilities = json.loads(captured["params"][3])
     assert persisted_capabilities["read_file"]["status"] == "allowed"
     assert persisted_capabilities["_metadata"]["coverage"] == "bounded_sample"
+
+
+def test_upsert_resource_renames_same_provider_resource_instead_of_duplicating() -> None:
+    captured: dict[str, object] = {}
+
+    class _Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class _Conn:
+        def execute(self, query, params):
+            if "provider_resource_id = %s" in query:
+                captured["select_params"] = params
+                return _Result((9, "list_only", {}, {"drive_id": "drive-1"}, "UNKNOWN", {}))
+            if "UPDATE resources" in query:
+                captured["update_params"] = params
+                return _Result((9,))
+            raise AssertionError(f"unexpected query: {query}")
+
+    resource_id = main.upsert_resource(
+        _Conn(),
+        "run-1",
+        7,
+        {
+            "resource_type": "sharepoint_library",
+            "name": "Renamed Documents",
+            "provider": "sharepoint",
+            "provider_resource_id": "drive-1",
+            "access_level": "list_only",
+            "provider_metadata": {"site_id": "site-1"},
+            "exposure": "USER_VISIBLE",
+            "exposure_evidence": {"basis": "delegated_visibility"},
+        },
+    )
+
+    assert resource_id == 9
+    assert captured["select_params"][-1] == "drive-1"
+    assert captured["update_params"][0] == "Renamed Documents"
+    assert captured["update_params"][5] == "drive-1"
+
+
+def test_update_run_collection_context_persists_only_normalized_public_context() -> None:
+    captured: dict[str, object] = {}
+
+    class _Conn:
+        def execute(self, query, params):
+            captured["query"] = query
+            captured["params"] = params
+
+    context = {
+        "source": "sharepoint",
+        "collection_mode": "delegated_user_view",
+        "assessed_identity": "alice@contoso.example",
+    }
+
+    main.update_run_collection_context(_Conn(), "run-1", context)
+
+    assert "collection_context" in str(captured["query"])
+    assert json.loads(captured["params"][0]) == context
+    assert captured["params"][1] == "run-1"
 
 
 def test_write_only_capability_evidence_corrects_stale_no_access_summary() -> None:
@@ -755,14 +1107,20 @@ def test_write_only_capability_evidence_corrects_stale_no_access_summary() -> No
 
 
 def test_capability_evidence_upgrades_legacy_access_summary() -> None:
-    assert main._reconcile_access_level_with_capabilities(
-        "no_access",
-        {"read_file": {"status": "allowed"}},
-    ) == "readable"
-    assert main._reconcile_access_level_with_capabilities(
-        "unknown",
-        {"list": {"status": "mixed"}},
-    ) == "list_only"
+    assert (
+        main._reconcile_access_level_with_capabilities(
+            "no_access",
+            {"read_file": {"status": "allowed"}},
+        )
+        == "readable"
+    )
+    assert (
+        main._reconcile_access_level_with_capabilities(
+            "unknown",
+            {"list": {"status": "mixed"}},
+        )
+        == "list_only"
+    )
 
 
 def test_normalize_smb_signing_accepts_canonical_and_legacy_fields() -> None:
@@ -865,7 +1223,61 @@ def test_flush_item_batch_upserts_optional_metadata() -> None:
     assert "DO UPDATE SET" in str(captured["query"])
     assert "allocation_size_bytes" in str(captured["query"])
     assert "file_attributes" in str(captured["query"])
-    assert len(captured["params"][0]) == 12
+    assert len(captured["params"][0]) == 21
+    assert rows == []
+
+
+def test_flush_item_batch_uses_stable_provider_identity_for_move_and_deletion_updates() -> None:
+    captured: dict[str, object] = {}
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def executemany(self, query, params):
+            captured["query"] = query
+            captured["params"] = list(params)
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    rows = [
+        (
+            "run-1",
+            7,
+            "/Renamed/report.xlsx",
+            "report.xlsx",
+            False,
+            1024,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "[]",
+            "sharepoint",
+            "item-1",
+            "parent-2",
+            "https://contoso.sharepoint.com/report.xlsx",
+            "application/vnd.test",
+            False,
+            '{"drive_id":"drive-1"}',
+            "USER_VISIBLE",
+            '{"basis":"delegated_visibility"}',
+        )
+    ]
+
+    main.flush_item_batch(_Conn(), rows)
+
+    query = str(captured["query"])
+    assert "ON CONFLICT (run_id, resource_id, provider_item_id)" in query
+    assert "path = CASE WHEN EXCLUDED.deleted" in query
+    assert "is_dir = CASE WHEN EXCLUDED.deleted" in query
+    assert captured["params"][0][13] == "item-1"
     assert rows == []
 
 
@@ -902,7 +1314,9 @@ def test_records_from_nested_json_preserves_share_type() -> None:
                         {
                             "name": "/srv/public",
                             "share_type": "nfs",
-                            "entries": [{"name": "docs", "is_dir": True, "children": [{"name": "file.txt", "is_dir": False}]}],
+                            "entries": [
+                                {"name": "docs", "is_dir": True, "children": [{"name": "file.txt", "is_dir": False}]}
+                            ],
                         }
                     ],
                 }
@@ -914,6 +1328,10 @@ def test_records_from_nested_json_preserves_share_type() -> None:
     resource = next(record for record in records if record.get("type") == "resource")
     item = next(record for record in records if record.get("type") == "item")
 
+    assert records[0]["type"] == "run_meta"
+    assert records[-1]["type"] == "run_end"
+    assert records[-1]["run_id"] == run_id
+    assert records[-1]["stats"] == {}
     assert resource["share_type"] == "nfs"
     assert resource["resource_type"] == "nfs_share"
     assert resource["access_level"] == "unknown"
@@ -1039,7 +1457,10 @@ def test_read_json_compat_bytes_rejects_oversized_input() -> None:
 
 
 def test_public_ingest_error_redacts_storage_and_database_details() -> None:
-    assert main._public_ingest_error(main.psycopg.DataError("bad access level")) == "database operation failed during ingest"
+    assert (
+        main._public_ingest_error(main.psycopg.DataError("bad access level"))
+        == "database operation failed during ingest"
+    )
     assert main._public_ingest_error(OSError("disk missing")) == "artifact storage read failed during ingest"
 
 

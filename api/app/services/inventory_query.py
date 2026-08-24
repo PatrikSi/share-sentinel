@@ -9,6 +9,10 @@ CANONICAL_INVENTORY_QUERY_FIELDS = {
     "path",
     "ext",
     "access",
+    "provider",
+    "resource_type",
+    "exposure",
+    "source",
 }
 
 INVENTORY_QUERY_FIELD_ALIASES = {
@@ -31,6 +35,13 @@ INVENTORY_QUERY_FIELD_ALIASES = {
     "accesslevel": "access",
     "share_access": "access",
     "shareaccess": "access",
+    "provider": "provider",
+    "source": "source",
+    "resource_type": "resource_type",
+    "resourcetype": "resource_type",
+    "type": "resource_type",
+    "exposure": "exposure",
+    "visibility": "exposure",
 }
 
 INVENTORY_QUERY_WORD_OPERATORS = {
@@ -237,8 +248,5 @@ def _validate_inventory_query_value(value: str) -> None:
     if len(value) > MAX_INVENTORY_QUERY_VALUE_CHARS:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "inventory query value is too long; "
-                f"maximum is {MAX_INVENTORY_QUERY_VALUE_CHARS} characters"
-            ),
+            detail=(f"inventory query value is too long; maximum is {MAX_INVENTORY_QUERY_VALUE_CHARS} characters"),
         )

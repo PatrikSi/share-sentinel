@@ -24,6 +24,7 @@ class RunStatus(str, Enum):
 class ResourceType(str, Enum):
     SMB_SHARE = "smb_share"
     NFS_SHARE = "nfs_share"
+    SHAREPOINT_LIBRARY = "sharepoint_library"
 
 
 class AccessLevel(str, Enum):

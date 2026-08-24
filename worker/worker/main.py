@@ -12,9 +12,11 @@ import time
 import uuid
 import zlib
 from collections import OrderedDict
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 import ijson
 import psycopg
@@ -93,9 +95,9 @@ def _read_float_env(
 
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://share_sentinel:share_sentinel@db:5432/share_sentinel").replace(
-    "postgresql+psycopg://", "postgresql://"
-)
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", "postgresql+psycopg://share_sentinel:share_sentinel@db:5432/share_sentinel"
+).replace("postgresql+psycopg://", "postgresql://")
 ARTIFACT_STORAGE_PATH = os.getenv("ARTIFACT_STORAGE_PATH", "/artifacts")
 
 STREAM_NAME = "ingest_jobs"
@@ -204,6 +206,7 @@ redis_client = redis.Redis.from_url(
 SHARE_TYPE_TO_RESOURCE_TYPE = {
     "smb": "smb_share",
     "nfs": "nfs_share",
+    "sharepoint": "sharepoint_library",
 }
 RESOURCE_TYPE_TO_SHARE_TYPE = {value: key for key, value in SHARE_TYPE_TO_RESOURCE_TYPE.items()}
 ACCESS_LEVEL_ALIASES = {
@@ -272,16 +275,85 @@ NDJSON_RECORD_TOO_LARGE_ERROR = "NDJSON record exceeds configured size limit"
 INVALID_GZIP_ARTIFACT_ERROR = "invalid gzip artifact"
 JSON_COMPAT_LIMIT_ERROR = "JSON artifact exceeds non-streamable compatibility limit"
 INVALID_UTF8_ARTIFACT_ERROR = "artifact contains invalid UTF-8"
+ARTIFACT_FRAMING_ERROR = (
+    "artifact must contain exactly one run_meta as its first record and exactly one run_end as its last record"
+)
 ENDPOINT_KEY_MAX_LENGTH = 255
 RESOURCE_NAME_MAX_LENGTH = 255
 ITEM_NAME_MAX_LENGTH = 255
 # items.path participates in a PostgreSQL btree uniqueness constraint. Keep
 # enough headroom for the other indexed columns and multibyte text overhead.
 ITEM_PATH_MAX_BYTES = 2000
+PROVIDER_ITEM_PATH_MAX_BYTES = 2000
+SHAREPOINT_ITEM_PATH_MAX_CHARACTERS = 400
 INGEST_ERROR_CODE_MAX_LENGTH = 128
 INGEST_ERROR_MESSAGE_MAX_LENGTH = 4096
 INGEST_ERROR_PATH_MAX_LENGTH = 4096
 ERROR_SEVERITIES = {"warn", "error"}
+PROVIDER_MAX_LENGTH = 32
+PROVIDER_ID_MAX_LENGTH = 512
+PROVIDER_URL_MAX_BYTES = 8192
+PROVIDER_METADATA_MAX_BYTES = 64 * 1024
+PROVIDER_METADATA_MAX_DEPTH = 6
+PROVIDER_METADATA_MAX_ENTRIES = 512
+PROVIDER_METADATA_MAX_LIST_ITEMS = 128
+PROVIDER_METADATA_MAX_KEY_LENGTH = 128
+PROVIDER_METADATA_MAX_TEXT_LENGTH = 4096
+MIME_TYPE_MAX_LENGTH = 255
+EXPOSURE_CLASSIFICATIONS = {
+    "USER_VISIBLE",
+    "BROAD_INTERNAL",
+    "EXTERNAL",
+    "ANONYMOUS",
+    "RESTRICTED",
+    "UNKNOWN",
+}
+FORBIDDEN_PROVIDER_METADATA_KEYS = {
+    "access_token",
+    "authorization",
+    "bearer_token",
+    "client_secret",
+    "delta_link",
+    "password",
+    "private_key",
+    "refresh_token",
+    "token",
+    "token_value",
+}
+FORBIDDEN_PROVIDER_METADATA_KEY_FINGERPRINTS = {
+    "accesstoken",
+    "authorization",
+    "authorizationheader",
+    "bearertoken",
+    "clientsecret",
+    "clientsecretvalue",
+    "deltalink",
+    "password",
+    "privatekey",
+    "refreshtoken",
+    "token",
+    "tokenvalue",
+}
+AUTH_CONTEXT_TEXT_FIELDS = {
+    "auth_mode",
+    "auth_type",
+    "tenant_id",
+    "tenant_name",
+    "user_id",
+    "user_principal_name",
+    "client_id",
+    "token_expiration",
+    "jwt_inspection",
+}
+COLLECTION_CONTEXT_TEXT_FIELDS = {
+    "source",
+    "provider",
+    "collection_mode",
+    "assessed_identity",
+    "status",
+    "discovery_completeness",
+    "sync_mode",
+}
 
 _CacheKey = TypeVar("_CacheKey")
 
@@ -387,7 +459,9 @@ def open_artifact_stream(key: str):
     return open(_artifact_key_to_path(key), "rb")
 
 
-def write_audit(conn: psycopg.Connection, project_id: str, action: str, object_type: str, object_id: str, metadata: dict[str, Any]):
+def write_audit(
+    conn: psycopg.Connection, project_id: str, action: str, object_type: str, object_id: str, metadata: dict[str, Any]
+):
     conn.execute(
         """
         INSERT INTO audit_events (project_id, action, object_type, object_id, metadata)
@@ -397,13 +471,29 @@ def write_audit(conn: psycopg.Connection, project_id: str, action: str, object_t
     )
 
 
+def update_run_collection_context(conn: psycopg.Connection, run_id: str, context: dict[str, Any]) -> None:
+    if not context:
+        return
+    conn.execute(
+        """
+        UPDATE scan_runs
+        SET collection_context = COALESCE(collection_context, '{}'::jsonb) || %s::jsonb
+        WHERE id = %s
+        """,
+        (json.dumps(context), run_id),
+    )
+
+
 def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) -> int:
     smb = rec.get("smb") if isinstance(rec.get("smb"), dict) else {}
     auth = rec.get("auth") if isinstance(rec.get("auth"), dict) else {}
     row = conn.execute(
         """
-        INSERT INTO endpoints (run_id, endpoint_key, ip, hostname, domain, smb_dialect, smb_signing, auth_method)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO endpoints (
+            run_id, endpoint_key, ip, hostname, domain, smb_dialect, smb_signing,
+            auth_method, provider, provider_metadata
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (run_id, endpoint_key)
         DO UPDATE SET
             ip = COALESCE(EXCLUDED.ip, endpoints.ip),
@@ -411,7 +501,9 @@ def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) 
             domain = COALESCE(EXCLUDED.domain, endpoints.domain),
             smb_dialect = COALESCE(EXCLUDED.smb_dialect, endpoints.smb_dialect),
             smb_signing = COALESCE(EXCLUDED.smb_signing, endpoints.smb_signing),
-            auth_method = COALESCE(EXCLUDED.auth_method, endpoints.auth_method)
+            auth_method = COALESCE(EXCLUDED.auth_method, endpoints.auth_method),
+            provider = COALESCE(EXCLUDED.provider, endpoints.provider),
+            provider_metadata = endpoints.provider_metadata || EXCLUDED.provider_metadata
         RETURNING id
         """,
         (
@@ -423,6 +515,8 @@ def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) 
             smb.get("dialect"),
             _normalize_smb_signing(smb),
             auth.get("method"),
+            rec.get("provider"),
+            json.dumps(rec.get("provider_metadata") or {}),
         ),
     ).fetchone()
     return int(row[0])
@@ -431,32 +525,69 @@ def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) 
 def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec: dict[str, Any]) -> int:
     resource_type = rec.get("resource_type", "smb_share")
     resource_name = rec.get("name")
+    provider_resource_id = rec.get("provider_resource_id")
     incoming_capabilities = _normalize_access_capabilities(rec.get("access_capabilities"))
     incoming_access = _reconcile_access_level_with_capabilities(
         _normalize_access_level(rec.get("access_level")),
         incoming_capabilities,
     )
 
-    existing = conn.execute(
-        """
-        SELECT id, access_level::text, access_capabilities
-        FROM resources
-        WHERE run_id = %s
-          AND endpoint_id = %s
-          AND resource_type = %s
-          AND name = %s
-        FOR UPDATE
-        """,
-        (run_id, endpoint_id, resource_type, resource_name),
-    ).fetchone()
+    if provider_resource_id:
+        existing = conn.execute(
+            """
+            SELECT id, access_level::text, access_capabilities, provider_metadata,
+                   exposure, exposure_evidence
+            FROM resources
+            WHERE run_id = %s
+              AND endpoint_id = %s
+              AND resource_type = %s
+              AND provider_resource_id = %s
+            FOR UPDATE
+            """,
+            (run_id, endpoint_id, resource_type, provider_resource_id),
+        ).fetchone()
+        if existing is None:
+            # Upgrade an earlier legacy/out-of-order placeholder instead of
+            # creating a duplicate for the same named resource.
+            existing = conn.execute(
+                """
+                SELECT id, access_level::text, access_capabilities, provider_metadata,
+                       exposure, exposure_evidence
+                FROM resources
+                WHERE run_id = %s
+                  AND endpoint_id = %s
+                  AND resource_type = %s
+                  AND provider_resource_id IS NULL
+                  AND name = %s
+                FOR UPDATE
+                """,
+                (run_id, endpoint_id, resource_type, resource_name),
+            ).fetchone()
+    else:
+        existing = conn.execute(
+            """
+            SELECT id, access_level::text, access_capabilities, provider_metadata,
+                   exposure, exposure_evidence
+            FROM resources
+            WHERE run_id = %s
+              AND endpoint_id = %s
+              AND resource_type = %s
+              AND provider_resource_id IS NULL
+              AND name = %s
+            FOR UPDATE
+            """,
+            (run_id, endpoint_id, resource_type, resource_name),
+        ).fetchone()
 
     if existing is None:
         row = conn.execute(
             """
             INSERT INTO resources (
-                run_id, endpoint_id, resource_type, name, remark, access_level, access_capabilities
+                run_id, endpoint_id, resource_type, name, remark, access_level,
+                access_capabilities, provider, provider_resource_id, web_url,
+                provider_metadata, exposure, exposure_evidence
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -467,25 +598,64 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
                 rec.get("remark"),
                 incoming_access,
                 json.dumps(incoming_capabilities),
+                rec.get("provider"),
+                provider_resource_id,
+                rec.get("web_url"),
+                json.dumps(rec.get("provider_metadata") or {}),
+                rec.get("exposure"),
+                json.dumps(rec.get("exposure_evidence") or {}),
             ),
         ).fetchone()
     else:
-        existing_id, existing_access, existing_capabilities = existing
+        existing_id, existing_access, existing_capabilities = existing[:3]
+        existing_metadata = existing[3] if len(existing) > 3 and isinstance(existing[3], dict) else {}
+        existing_exposure = existing[4] if len(existing) > 4 else None
+        existing_exposure_evidence = existing[5] if len(existing) > 5 and isinstance(existing[5], dict) else {}
         merged_capabilities = _merge_access_capabilities(existing_capabilities, incoming_capabilities)
         merged_access = _reconcile_access_level_with_capabilities(
             _stronger_access_level(existing_access, incoming_access),
             merged_capabilities,
         )
+        incoming_exposure = rec.get("exposure")
+        merged_exposure = (
+            existing_exposure
+            if incoming_exposure in {None, "UNKNOWN"} and existing_exposure not in {None, "UNKNOWN"}
+            else incoming_exposure or existing_exposure
+        )
+        merged_metadata = {**existing_metadata, **(rec.get("provider_metadata") or {})}
+        merged_exposure_evidence = {
+            **existing_exposure_evidence,
+            **(rec.get("exposure_evidence") or {}),
+        }
         row = conn.execute(
             """
             UPDATE resources
-            SET remark = COALESCE(%s, remark),
+            SET name = %s,
+                remark = COALESCE(%s, remark),
                 access_level = %s,
-                access_capabilities = %s
+                access_capabilities = %s,
+                provider = COALESCE(%s, provider),
+                provider_resource_id = COALESCE(%s, provider_resource_id),
+                web_url = COALESCE(%s, web_url),
+                provider_metadata = %s,
+                exposure = %s,
+                exposure_evidence = %s
             WHERE id = %s
             RETURNING id
             """,
-            (rec.get("remark"), merged_access, json.dumps(merged_capabilities), existing_id),
+            (
+                resource_name,
+                rec.get("remark"),
+                merged_access,
+                json.dumps(merged_capabilities),
+                rec.get("provider"),
+                provider_resource_id,
+                rec.get("web_url"),
+                json.dumps(merged_metadata),
+                merged_exposure,
+                json.dumps(merged_exposure_evidence),
+                existing_id,
+            ),
         ).fetchone()
     return int(row[0])
 
@@ -493,31 +663,72 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
 def flush_item_batch(conn: psycopg.Connection, rows: list[tuple]) -> None:
     if not rows:
         return
-    with conn.cursor() as cur:
-        cur.executemany(
-            """
-            INSERT INTO items (
-                run_id, resource_id, path, name, is_dir, size_bytes, allocation_size_bytes,
-                mtime, created_at, accessed_at, changed_at, file_attributes
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (run_id, resource_id, path)
-            DO UPDATE SET
-                name = EXCLUDED.name,
-                is_dir = EXCLUDED.is_dir,
-                size_bytes = COALESCE(EXCLUDED.size_bytes, items.size_bytes),
-                allocation_size_bytes = COALESCE(EXCLUDED.allocation_size_bytes, items.allocation_size_bytes),
-                mtime = COALESCE(EXCLUDED.mtime, items.mtime),
-                created_at = COALESCE(EXCLUDED.created_at, items.created_at),
-                accessed_at = COALESCE(EXCLUDED.accessed_at, items.accessed_at),
-                changed_at = COALESCE(EXCLUDED.changed_at, items.changed_at),
-                file_attributes = CASE
-                    WHEN EXCLUDED.file_attributes = '[]'::jsonb THEN items.file_attributes
-                    ELSE EXCLUDED.file_attributes
-                END
-            """,
-            rows,
+    padded_rows = [
+        row + (None, None, None, None, None, False, "{}", None, "{}") if len(row) == 12 else row for row in rows
+    ]
+    provider_rows = [row for row in padded_rows if row[13] is not None]
+    legacy_rows = [row for row in padded_rows if row[13] is None]
+
+    insert_sql = """
+        INSERT INTO items (
+            run_id, resource_id, path, name, is_dir, size_bytes, allocation_size_bytes,
+            mtime, created_at, accessed_at, changed_at, file_attributes, provider,
+            provider_item_id, provider_parent_id, web_url, mime_type, deleted,
+            provider_metadata, exposure, exposure_evidence
         )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+    """
+    common_updates = """
+            is_dir = CASE WHEN EXCLUDED.deleted THEN items.is_dir ELSE EXCLUDED.is_dir END,
+            size_bytes = COALESCE(EXCLUDED.size_bytes, items.size_bytes),
+            allocation_size_bytes = COALESCE(EXCLUDED.allocation_size_bytes, items.allocation_size_bytes),
+            mtime = COALESCE(EXCLUDED.mtime, items.mtime),
+            created_at = COALESCE(EXCLUDED.created_at, items.created_at),
+            accessed_at = COALESCE(EXCLUDED.accessed_at, items.accessed_at),
+            changed_at = COALESCE(EXCLUDED.changed_at, items.changed_at),
+            file_attributes = CASE
+                WHEN EXCLUDED.file_attributes = '[]'::jsonb THEN items.file_attributes
+                ELSE EXCLUDED.file_attributes
+            END,
+            provider = COALESCE(EXCLUDED.provider, items.provider),
+            provider_parent_id = COALESCE(EXCLUDED.provider_parent_id, items.provider_parent_id),
+            web_url = COALESCE(EXCLUDED.web_url, items.web_url),
+            mime_type = COALESCE(EXCLUDED.mime_type, items.mime_type),
+            deleted = EXCLUDED.deleted,
+            provider_metadata = items.provider_metadata || EXCLUDED.provider_metadata,
+            exposure = CASE
+                WHEN EXCLUDED.exposure IS NULL OR EXCLUDED.exposure = 'UNKNOWN'
+                THEN items.exposure
+                ELSE EXCLUDED.exposure
+            END,
+            exposure_evidence = items.exposure_evidence || EXCLUDED.exposure_evidence
+    """
+    with conn.cursor() as cur:
+        if legacy_rows:
+            cur.executemany(
+                insert_sql
+                + """
+                ON CONFLICT (run_id, resource_id, path) WHERE provider_item_id IS NULL
+                DO UPDATE SET name = EXCLUDED.name,
+                """
+                + common_updates,
+                legacy_rows,
+            )
+        if provider_rows:
+            cur.executemany(
+                insert_sql
+                + """
+                ON CONFLICT (run_id, resource_id, provider_item_id) WHERE provider_item_id IS NOT NULL
+                DO UPDATE SET
+                    path = CASE WHEN EXCLUDED.deleted THEN items.path ELSE EXCLUDED.path END,
+                    name = CASE WHEN EXCLUDED.deleted THEN items.name ELSE EXCLUDED.name END,
+                """
+                + common_updates,
+                provider_rows,
+            )
     rows.clear()
 
 
@@ -536,6 +747,24 @@ def flush_error_batch(conn: psycopg.Connection, rows: list[tuple]) -> None:
     rows.clear()
 
 
+def _resource_cache_key(
+    endpoint_key: Any,
+    resource_name: Any,
+    resource_type: Any,
+    provider_resource_id: Any = None,
+) -> tuple[str, str, str]:
+    identity = (
+        f"provider:{provider_resource_id}"
+        if isinstance(provider_resource_id, str) and provider_resource_id
+        else str(resource_name or "")
+    )
+    return (
+        str(endpoint_key or ""),
+        identity,
+        str(resource_type or "smb_share"),
+    )
+
+
 def load_resume_caches(
     conn: psycopg.Connection,
     run_id: str,
@@ -544,7 +773,7 @@ def load_resume_caches(
     resource_cache = _BoundedLRUCache[tuple[str, str, str]](INGEST_IDENTITY_CACHE_SIZE)
     rows = conn.execute(
         """
-        SELECT e.id, e.endpoint_key, r.id, r.resource_type, r.name
+        SELECT e.id, e.endpoint_key, r.id, r.resource_type, r.name, r.provider_resource_id
         FROM endpoints AS e
         LEFT JOIN resources AS r
           ON r.run_id = e.run_id
@@ -555,15 +784,18 @@ def load_resume_caches(
         """,
         (run_id, INGEST_IDENTITY_CACHE_SIZE),
     ).fetchall()
-    for endpoint_id, endpoint_key, resource_id, resource_type, resource_name in rows:
+    for row in rows:
+        endpoint_id, endpoint_key, resource_id, resource_type, resource_name = row[:5]
+        provider_resource_id = row[5] if len(row) > 5 else None
         normalized_endpoint_key = str(endpoint_key or "")
         endpoint_cache[normalized_endpoint_key] = int(endpoint_id)
         if resource_id is not None:
             resource_cache[
-                (
+                _resource_cache_key(
                     normalized_endpoint_key,
-                    str(resource_name or ""),
-                    str(resource_type or "smb_share"),
+                    resource_name,
+                    resource_type,
+                    provider_resource_id,
                 )
             ] = int(resource_id)
     return endpoint_cache, resource_cache
@@ -694,6 +926,19 @@ def update_run_status(
     )
 
 
+def clear_persisted_ingest_inventory(conn: psycopg.Connection, run_id: str) -> None:
+    """Remove any resumable partial inventory after terminal framing rejection."""
+
+    conn.execute("DELETE FROM items WHERE run_id = %s", (run_id,))
+    conn.execute("DELETE FROM resources WHERE run_id = %s", (run_id,))
+    conn.execute("DELETE FROM endpoints WHERE run_id = %s", (run_id,))
+    conn.execute("DELETE FROM ingest_errors WHERE run_id = %s", (run_id,))
+    conn.execute(
+        "UPDATE scan_runs SET collection_context = '{}'::jsonb WHERE id = %s",
+        (run_id,),
+    )
+
+
 def parse_summary(raw: Any) -> dict[str, int]:
     base = {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
     if not isinstance(raw, dict):
@@ -758,18 +1003,26 @@ def _normalize_share_type(raw_share_type: Any, raw_resource_type: Any = None) ->
         normalized = raw_share_type.strip().lower()
         if normalized in SHARE_TYPE_TO_RESOURCE_TYPE:
             return normalized
+        if normalized:
+            raise ValueError(f"unsupported share_type: {raw_share_type}")
 
     if isinstance(raw_resource_type, str):
         normalized_resource_type = raw_resource_type.strip().lower()
         share_type = RESOURCE_TYPE_TO_SHARE_TYPE.get(normalized_resource_type)
         if share_type:
             return share_type
+        if normalized_resource_type:
+            raise ValueError(f"unsupported resource_type: {raw_resource_type}")
 
+    # Artifacts produced before share_type existed represented SMB only.
     return "smb"
 
 
 def _resource_type_from_share_type(share_type: str) -> str:
-    return SHARE_TYPE_TO_RESOURCE_TYPE.get(share_type, "smb_share")
+    try:
+        return SHARE_TYPE_TO_RESOURCE_TYPE[share_type]
+    except KeyError as exc:
+        raise ValueError(f"unsupported share_type: {share_type}") from exc
 
 
 def _normalize_access_level(raw_access_level: Any) -> str:
@@ -1088,7 +1341,9 @@ def _reconcile_access_level_with_capabilities(access_level: str, capabilities: A
         )
     )
     tree_connection_observed = _is_observed("tree_connect")
-    if (tree_connection_observed or non_listing_access_observed) and _normalize_access_level(access_level) == "no_access":
+    if (tree_connection_observed or non_listing_access_observed) and _normalize_access_level(
+        access_level
+    ) == "no_access":
         # The legacy enum has no connected-but-not-listable or write-only state.
         # Either observation disproves the old no-access label.
         return "unknown"
@@ -1138,6 +1393,293 @@ def _normalize_file_attributes(raw_attributes: Any) -> list[str]:
             continue
         normalized.append(attribute)
     return normalized
+
+
+def _normalize_provider(raw_provider: Any, share_type: str | None = None) -> str | None:
+    if isinstance(raw_provider, str):
+        provider = raw_provider.strip().lower().replace("-", "_").replace(" ", "_")
+        if provider:
+            if len(provider) > PROVIDER_MAX_LENGTH:
+                raise ValueError(f"field provider exceeds {PROVIDER_MAX_LENGTH} characters")
+            return provider
+    if share_type in SHARE_TYPE_TO_RESOURCE_TYPE:
+        return share_type
+    return None
+
+
+def _normalize_boolean(raw_value: Any, *, field: str, default: bool = False) -> bool:
+    if raw_value is None:
+        return default
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, int) and raw_value in {0, 1}:
+        return bool(raw_value)
+    if isinstance(raw_value, str):
+        normalized = raw_value.strip().lower()
+        if normalized in {"true", "yes", "1"}:
+            return True
+        if normalized in {"false", "no", "0"}:
+            return False
+    raise ValueError(f"field {field} must be a boolean")
+
+
+def _normalize_optional_provider_text(raw_value: Any, max_length: int) -> str | None:
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, str):
+        raise ValueError("must be a string")
+    value = raw_value.strip()
+    if not value:
+        return None
+    if "\x00" in value:
+        raise ValueError("contains a null character")
+    if len(value) > max_length:
+        raise ValueError(f"exceeds {max_length} characters")
+    return value
+
+
+def _normalize_web_url(raw_value: Any, *, provider: str | None) -> str | None:
+    value = _normalize_optional_provider_text(raw_value, PROVIDER_URL_MAX_BYTES)
+    if value is None:
+        return None
+    if len(value.encode("utf-8")) > PROVIDER_URL_MAX_BYTES:
+        raise ValueError(f"field web_url exceeds {PROVIDER_URL_MAX_BYTES} UTF-8 bytes")
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ValueError("field web_url is not a valid URL") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("field web_url must be an absolute http(s) URL")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("field web_url must not contain credentials or a fragment")
+    if provider == "sharepoint" and parsed.scheme != "https":
+        raise ValueError("field web_url must use https for SharePoint")
+    return value
+
+
+def _provider_metadata_key_fingerprint(raw_key: str) -> str:
+    return "".join(character for character in raw_key.lower() if character.isalnum())
+
+
+def _is_forbidden_provider_metadata_key(raw_key: str) -> bool:
+    normalized = raw_key.strip().lower().replace("-", "_").replace(" ", "_")
+    fingerprint = _provider_metadata_key_fingerprint(raw_key)
+    if normalized in FORBIDDEN_PROVIDER_METADATA_KEYS:
+        return True
+    if fingerprint in FORBIDDEN_PROVIDER_METADATA_KEY_FINGERPRINTS:
+        return True
+    return fingerprint.startswith(
+        (
+            "accesstoken",
+            "authorizationheader",
+            "bearertoken",
+            "clientsecret",
+            "privatekey",
+            "refreshtoken",
+        )
+    )
+
+
+def _reject_secret_keys(raw_value: Any, *, field: str, depth: int = 0) -> None:
+    if depth > PROVIDER_METADATA_MAX_DEPTH:
+        return
+    if isinstance(raw_value, dict):
+        for raw_key, value in raw_value.items():
+            if isinstance(raw_key, str) and _is_forbidden_provider_metadata_key(raw_key):
+                raise ValueError(f"field {field}.{raw_key} is secret or sensitive operational state")
+            _reject_secret_keys(value, field=field, depth=depth + 1)
+    elif isinstance(raw_value, list):
+        for value in raw_value[: PROVIDER_METADATA_MAX_LIST_ITEMS + 1]:
+            _reject_secret_keys(value, field=field, depth=depth + 1)
+
+
+def _normalize_provider_metadata(raw_metadata: Any, *, field: str = "metadata") -> dict[str, Any]:
+    if raw_metadata is None:
+        return {}
+    if not isinstance(raw_metadata, dict):
+        raise ValueError(f"field {field} must be an object")
+
+    entry_count = 0
+
+    def normalize(value: Any, depth: int, path: str) -> Any:
+        nonlocal entry_count
+        if depth > PROVIDER_METADATA_MAX_DEPTH:
+            raise ValueError(f"field {field} exceeds maximum nesting depth")
+        if value is None or isinstance(value, bool | int):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError(f"field {path} must be finite")
+            return value
+        if isinstance(value, str):
+            if "\x00" in value:
+                raise ValueError(f"field {path} contains a null character")
+            if len(value) > PROVIDER_METADATA_MAX_TEXT_LENGTH:
+                raise ValueError(f"field {path} exceeds {PROVIDER_METADATA_MAX_TEXT_LENGTH} characters")
+            return value
+        if isinstance(value, list):
+            if len(value) > PROVIDER_METADATA_MAX_LIST_ITEMS:
+                raise ValueError(f"field {path} exceeds {PROVIDER_METADATA_MAX_LIST_ITEMS} list items")
+            return [normalize(item, depth + 1, f"{path}[]") for item in value]
+        if isinstance(value, dict):
+            normalized: dict[str, Any] = {}
+            for raw_key, nested_value in value.items():
+                if not isinstance(raw_key, str) or not raw_key.strip():
+                    raise ValueError(f"field {path} contains an invalid key")
+                key = raw_key.strip()
+                if _is_forbidden_provider_metadata_key(key):
+                    raise ValueError(f"field {path}.{key} is secret or sensitive operational state")
+                if len(key) > PROVIDER_METADATA_MAX_KEY_LENGTH:
+                    raise ValueError(f"field {path} key exceeds {PROVIDER_METADATA_MAX_KEY_LENGTH} characters")
+                entry_count += 1
+                if entry_count > PROVIDER_METADATA_MAX_ENTRIES:
+                    raise ValueError(f"field {field} exceeds {PROVIDER_METADATA_MAX_ENTRIES} entries")
+                normalized[key] = normalize(nested_value, depth + 1, f"{path}.{key}")
+            return normalized
+        raise ValueError(f"field {path} contains unsupported JSON value")
+
+    normalized = normalize(raw_metadata, 0, field)
+    try:
+        encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (RecursionError, TypeError, UnicodeEncodeError, ValueError) as exc:
+        raise ValueError(f"field {field} is not valid bounded JSON") from exc
+    if len(encoded) > PROVIDER_METADATA_MAX_BYTES:
+        raise ValueError(f"field {field} exceeds {PROVIDER_METADATA_MAX_BYTES} UTF-8 bytes")
+    return normalized
+
+
+def _normalize_exposure(raw_exposure: Any, *, provider: str | None) -> str | None:
+    if raw_exposure is None:
+        return "UNKNOWN" if provider == "sharepoint" else None
+    if not isinstance(raw_exposure, str):
+        raise ValueError("field exposure must be a string")
+    exposure = raw_exposure.strip().upper().replace("-", "_").replace(" ", "_")
+    if exposure not in EXPOSURE_CLASSIFICATIONS:
+        allowed = ", ".join(sorted(EXPOSURE_CLASSIFICATIONS))
+        raise ValueError(f"field exposure must be one of: {allowed}")
+    return exposure
+
+
+def _normalize_auth_context(raw_auth: Any) -> dict[str, Any]:
+    if raw_auth is None:
+        return {}
+    if not isinstance(raw_auth, dict):
+        raise ValueError("field auth_context must be an object")
+
+    normalized: dict[str, Any] = {}
+    for field in AUTH_CONTEXT_TEXT_FIELDS:
+        raw_value = raw_auth.get(field)
+        if raw_value is None:
+            continue
+        value = _normalize_optional_provider_text(raw_value, PROVIDER_METADATA_MAX_TEXT_LENGTH)
+        if value is not None:
+            normalized[field] = value
+    for field in ("scopes", "roles"):
+        raw_values = raw_auth.get(field)
+        if raw_values is None:
+            continue
+        if not isinstance(raw_values, list) or len(raw_values) > PROVIDER_METADATA_MAX_LIST_ITEMS:
+            raise ValueError(
+                f"field auth_context.{field} must be a list with at most {PROVIDER_METADATA_MAX_LIST_ITEMS} values"
+            )
+        values: list[str] = []
+        for raw_value in raw_values:
+            value = _normalize_optional_provider_text(raw_value, 512)
+            if value and value not in values:
+                values.append(value)
+        normalized[field] = values
+    return normalized
+
+
+def _normalize_collection_context(rec: dict[str, Any]) -> dict[str, Any]:
+    raw_context = rec.get("collection_context") if isinstance(rec.get("collection_context"), dict) else {}
+    raw_collection = rec.get("collection") if isinstance(rec.get("collection"), dict) else {}
+    raw_auth = rec.get("auth_context")
+    if raw_auth is None:
+        raw_auth = raw_context.get("auth_context")
+    if raw_auth is None and any(field in raw_context for field in AUTH_CONTEXT_TEXT_FIELDS | {"scopes", "roles"}):
+        raw_auth = raw_context
+    if raw_auth is None:
+        raw_auth = rec.get("auth")
+    auth = _normalize_auth_context(raw_auth)
+
+    context: dict[str, Any] = {}
+    for field in COLLECTION_CONTEXT_TEXT_FIELDS:
+        raw_value = rec.get(field)
+        if raw_value is None:
+            raw_value = raw_context.get(field)
+        if raw_value is None:
+            raw_value = raw_collection.get(field)
+        value = _normalize_optional_provider_text(raw_value, PROVIDER_METADATA_MAX_TEXT_LENGTH)
+        if value is not None:
+            context[field] = value
+
+    for canonical_field, aliases in {
+        "status": ("collection_status",),
+        "discovery_completeness": ("completeness",),
+        "sync_mode": ("snapshot_type",),
+    }.items():
+        if canonical_field in context:
+            continue
+        raw_value = None
+        for container in (rec, raw_context, raw_collection):
+            for alias in aliases:
+                if container.get(alias) is not None:
+                    raw_value = container.get(alias)
+                    break
+            if raw_value is not None:
+                break
+        value = _normalize_optional_provider_text(raw_value, PROVIDER_METADATA_MAX_TEXT_LENGTH)
+        if value is not None:
+            context[canonical_field] = value
+
+    if "provider" not in context and context.get("source"):
+        context["provider"] = str(context["source"])
+    if "source" not in context and context.get("provider"):
+        context["source"] = str(context["provider"])
+
+    for field in ("partial", "materialized_snapshot"):
+        raw_value = rec.get(field)
+        if raw_value is None:
+            raw_value = raw_context.get(field)
+        if raw_value is None:
+            raw_value = raw_collection.get(field)
+        if raw_value is not None:
+            if not isinstance(raw_value, bool):
+                raise ValueError(f"field {field} must be a boolean")
+            context[field] = raw_value
+
+    context.update(auth)
+    if "assessed_identity" not in context and auth.get("user_principal_name"):
+        context["assessed_identity"] = auth["user_principal_name"]
+
+    metadata_input = rec.get("metadata")
+    if metadata_input is None:
+        metadata_input = raw_context.get("metadata")
+    if metadata_input is None:
+        metadata_input = {}
+    elif isinstance(metadata_input, dict):
+        metadata_input = dict(metadata_input)
+    if raw_collection and isinstance(metadata_input, dict):
+        legacy_collection_metadata = {
+            key: value
+            for key, value in raw_collection.items()
+            if key not in COLLECTION_CONTEXT_TEXT_FIELDS and key not in {"partial", "materialized_snapshot"}
+        }
+        if legacy_collection_metadata:
+            metadata_input.setdefault("collection", legacy_collection_metadata)
+    metadata = _normalize_provider_metadata(metadata_input, field="collection_context.metadata")
+    if metadata:
+        context["metadata"] = metadata
+    if "materialized_snapshot" not in context and isinstance(metadata.get("snapshot_materialized"), bool):
+        context["materialized_snapshot"] = metadata["snapshot_materialized"]
+    if "discovery_completeness" not in context and isinstance(metadata.get("discovery_authoritative"), bool):
+        context["discovery_completeness"] = (
+            "authoritative" if metadata["discovery_authoritative"] else "non_authoritative"
+        )
+    if "sync_mode" not in context and isinstance(metadata.get("sync_mode"), str):
+        context["sync_mode"] = metadata["sync_mode"]
+    return context
 
 
 def _bind_record_to_ingest_run(rec: dict[str, Any], run_id: str) -> dict[str, Any]:
@@ -1196,6 +1738,24 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
     rec_type = rec.get("type")
     if rec_type not in {"run_meta", "endpoint", "resource", "item", "error", "run_end"}:
         return False, "unknown record type"
+    try:
+        _reject_secret_keys(rec, field="record")
+    except ValueError as exc:
+        return False, str(exc)
+
+    if rec_type == "item":
+        try:
+            rec["deleted"] = _normalize_boolean(rec.get("deleted"), field="deleted")
+        except ValueError as exc:
+            return False, str(exc)
+        provider_item_id = rec.get("provider_item_id")
+        if rec["deleted"] and not rec.get("path") and isinstance(provider_item_id, str) and provider_item_id.strip():
+            # Graph tombstones can contain only the stable driveItem ID. Keep a
+            # deterministic non-live row for history without pretending this is
+            # its former pathname.
+            digest = hashlib.sha256(provider_item_id.strip().encode("utf-8", errors="replace")).hexdigest()[:24]
+            rec["path"] = f"/__deleted__/{digest}"
+            rec.setdefault("name", "[deleted item]")
 
     required: dict[str, tuple[str, ...]] = {
         "run_meta": ("schema_version", "tool", "tool_version", "run_id", "started_at"),
@@ -1220,6 +1780,10 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
                 return False, "unsupported schema_version"
         except (TypeError, ValueError):
             return False, "invalid schema_version"
+        try:
+            rec["collection_context"] = _normalize_collection_context(rec)
+        except ValueError as exc:
+            return False, str(exc)
 
     if rec_type == "endpoint":
         reason = _validate_text_value(
@@ -1245,6 +1809,19 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
                 )
                 if reason:
                     return False, reason
+        try:
+            rec["provider"] = _normalize_provider(rec.get("provider"))
+            rec["provider_metadata"] = _normalize_provider_metadata(
+                rec.get("provider_metadata", rec.get("metadata")),
+                field="metadata",
+            )
+            if rec["provider_metadata"].get("web_url") is not None:
+                rec["provider_metadata"]["web_url"] = _normalize_web_url(
+                    rec["provider_metadata"]["web_url"],
+                    provider=rec["provider"],
+                )
+        except ValueError as exc:
+            return False, str(exc)
 
     if rec_type in {"resource", "item"}:
         reason = _validate_text_value(
@@ -1275,16 +1852,40 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
             reason = _validate_text_value(rec.get(field), field, max_characters=max_length)
             if reason:
                 return False, reason
-        reason = _validate_text_value(rec.get("path"), "path", max_bytes=ITEM_PATH_MAX_BYTES)
+        raw_share_type = str(rec.get("share_type") or "").strip().lower()
+        raw_resource_type = str(rec.get("resource_type") or "").strip().lower()
+        uses_provider_identity = (
+            bool(rec.get("provider_item_id"))
+            or raw_share_type == "sharepoint"
+            or raw_resource_type == "sharepoint_library"
+        )
+        path_max_bytes = PROVIDER_ITEM_PATH_MAX_BYTES if uses_provider_identity else ITEM_PATH_MAX_BYTES
+        path_max_characters = (
+            SHAREPOINT_ITEM_PATH_MAX_CHARACTERS
+            if raw_share_type == "sharepoint" or raw_resource_type == "sharepoint_library"
+            else None
+        )
+        reason = _validate_text_value(
+            rec.get("path"),
+            "path",
+            max_characters=path_max_characters,
+            max_bytes=path_max_bytes,
+        )
         if reason:
             return False, reason
-        rec["size_bytes"] = _normalize_item_size(rec.get("size_bytes"))
+        raw_size = rec.get("size_bytes") if rec.get("size_bytes") is not None else rec.get("size")
+        rec["size_bytes"] = _normalize_item_size(raw_size)
         rec["allocation_size_bytes"] = _normalize_item_size(rec.get("allocation_size_bytes"))
-        rec["mtime"] = _normalize_item_mtime(rec.get("mtime"))
+        raw_mtime = rec.get("mtime") if rec.get("mtime") is not None else rec.get("modified_at")
+        rec["mtime"] = _normalize_item_mtime(raw_mtime)
         rec["created_at"] = _normalize_item_mtime(rec.get("created_at"))
         rec["accessed_at"] = _normalize_item_mtime(rec.get("accessed_at"))
         rec["changed_at"] = _normalize_item_mtime(rec.get("changed_at"))
         rec["file_attributes"] = _normalize_file_attributes(rec.get("file_attributes"))
+        try:
+            rec["is_dir"] = _normalize_boolean(rec.get("is_dir"), field="is_dir")
+        except ValueError as exc:
+            return False, str(exc)
 
     if rec_type == "error":
         severity = rec.get("severity")
@@ -1305,9 +1906,65 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
             return False, reason
 
     if rec_type in {"resource", "item"}:
-        share_type = _normalize_share_type(rec.get("share_type"), rec.get("resource_type"))
+        try:
+            share_type = _normalize_share_type(rec.get("share_type"), rec.get("resource_type"))
+        except ValueError as exc:
+            return False, str(exc)
         rec["share_type"] = share_type
         rec["resource_type"] = _resource_type_from_share_type(share_type)
+        try:
+            provider = _normalize_provider(rec.get("provider"), share_type)
+            rec["provider"] = provider
+            if rec_type == "resource":
+                rec["provider_resource_id"] = _normalize_optional_provider_text(
+                    rec.get("provider_resource_id"),
+                    PROVIDER_ID_MAX_LENGTH,
+                )
+                if share_type == "sharepoint" and not rec["provider_resource_id"]:
+                    return False, "SharePoint resource requires provider_resource_id (Graph drive ID)"
+            else:
+                rec["provider_resource_id"] = _normalize_optional_provider_text(
+                    rec.get("provider_resource_id"),
+                    PROVIDER_ID_MAX_LENGTH,
+                )
+                rec["provider_item_id"] = _normalize_optional_provider_text(
+                    rec.get("provider_item_id"),
+                    PROVIDER_ID_MAX_LENGTH,
+                )
+                rec["provider_parent_id"] = _normalize_optional_provider_text(
+                    rec.get("provider_parent_id"),
+                    PROVIDER_ID_MAX_LENGTH,
+                )
+                rec["mime_type"] = _normalize_optional_provider_text(
+                    rec.get("mime_type"),
+                    MIME_TYPE_MAX_LENGTH,
+                )
+                if share_type == "sharepoint" and not rec["provider_resource_id"]:
+                    return False, "SharePoint item requires provider_resource_id (Graph drive ID)"
+                if share_type == "sharepoint" and not rec["provider_item_id"]:
+                    return False, "SharePoint item requires provider_item_id (Graph driveItem ID)"
+                if share_type == "sharepoint":
+                    if not str(rec.get("path") or "").startswith("/"):
+                        return False, "SharePoint item path must be an absolute provider-relative path"
+                    if "\\" in str(rec.get("path") or ""):
+                        return False, "SharePoint item path must use forward slashes"
+            rec["web_url"] = _normalize_web_url(rec.get("web_url"), provider=provider)
+            raw_metadata = rec.get("provider_metadata", rec.get("metadata"))
+            if raw_metadata is None:
+                raw_metadata = {}
+            elif isinstance(raw_metadata, dict):
+                raw_metadata = dict(raw_metadata)
+            for metadata_field in ("etag", "ctag"):
+                if rec.get(metadata_field) is not None and isinstance(raw_metadata, dict):
+                    raw_metadata.setdefault(metadata_field, rec.get(metadata_field))
+            rec["provider_metadata"] = _normalize_provider_metadata(raw_metadata, field="metadata")
+            rec["exposure"] = _normalize_exposure(rec.get("exposure"), provider=provider)
+            rec["exposure_evidence"] = _normalize_provider_metadata(
+                rec.get("exposure_evidence"),
+                field="exposure_evidence",
+            )
+        except ValueError as exc:
+            return False, str(exc)
     if rec_type == "resource":
         rec["access_level"] = _normalize_access_level(rec.get("access_level"))
         rec["access_capabilities"] = _normalize_access_capabilities(rec.get("access_capabilities"))
@@ -1333,6 +1990,19 @@ def _join_windows_path(parent: Any, name: Any) -> str:
     return base.rstrip("\\") + "\\" + leaf
 
 
+def _join_sharepoint_path(parent: Any, name: Any) -> str:
+    raw_parent = str(parent or "/").replace("\\", "/").strip()
+    base = "/" + raw_parent.strip("/") if raw_parent.strip("/") else "/"
+    leaf = str(name or "").strip().strip("/")
+    if not leaf:
+        return base
+    if PurePosixPath(base).name == leaf:
+        return base
+    if base == "/":
+        return f"/{leaf}"
+    return f"{base.rstrip('/')}/{leaf}"
+
+
 def _iter_items_from_entries(
     run_id: str,
     endpoint_key: str,
@@ -1340,6 +2010,7 @@ def _iter_items_from_entries(
     entries: list[Any],
     share_type: str = "smb",
     parent_path: str = "\\",
+    provider_resource_id: str | None = None,
 ):
     resource_type = _resource_type_from_share_type(share_type)
     for raw_entry in entries:
@@ -1348,7 +2019,10 @@ def _iter_items_from_entries(
 
         name = str(raw_entry.get("name") or "").strip()
         is_dir = bool(raw_entry.get("is_dir", False))
-        full_path = _join_windows_path(raw_entry.get("path") or parent_path, name)
+        if share_type == "sharepoint":
+            full_path = _join_sharepoint_path(raw_entry.get("path") or parent_path, name)
+        else:
+            full_path = _join_windows_path(raw_entry.get("path") or parent_path, name)
         if not name:
             name = PurePosixPath(full_path.replace("\\", "/")).name or full_path
 
@@ -1369,11 +2043,35 @@ def _iter_items_from_entries(
             "accessed_at": raw_entry.get("accessed_at"),
             "changed_at": raw_entry.get("changed_at"),
             "file_attributes": raw_entry.get("file_attributes"),
+            "provider": raw_entry.get("provider") or ("sharepoint" if share_type == "sharepoint" else None),
+            "provider_resource_id": raw_entry.get("provider_resource_id")
+            or raw_entry.get("drive_id")
+            or provider_resource_id,
+            "provider_item_id": raw_entry.get("provider_item_id"),
+            "provider_parent_id": raw_entry.get("provider_parent_id"),
+            "web_url": raw_entry.get("web_url"),
+            "mime_type": raw_entry.get("mime_type"),
+            "deleted": raw_entry.get("deleted", False),
+            "exposure": raw_entry.get("exposure"),
+            "exposure_evidence": raw_entry.get("exposure_evidence"),
+            "metadata": raw_entry.get("metadata"),
+            "size": raw_entry.get("size"),
+            "modified_at": raw_entry.get("modified_at"),
+            "etag": raw_entry.get("etag"),
+            "ctag": raw_entry.get("ctag"),
         }
 
         children = raw_entry.get("children")
         if is_dir and isinstance(children, list):
-            yield from _iter_items_from_entries(run_id, endpoint_key, resource_name, children, share_type, full_path)
+            yield from _iter_items_from_entries(
+                run_id,
+                endpoint_key,
+                resource_name,
+                children,
+                share_type,
+                full_path,
+                provider_resource_id,
+            )
 
 
 def _records_from_endpoint_payload(raw_endpoint: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
@@ -1394,6 +2092,8 @@ def _records_from_endpoint_payload(raw_endpoint: dict[str, Any], run_id: str) ->
             "auth": raw_endpoint.get("auth") if isinstance(raw_endpoint.get("auth"), dict) else None,
             "smb": raw_endpoint.get("smb") if isinstance(raw_endpoint.get("smb"), dict) else None,
             "nfs": raw_endpoint.get("nfs") if isinstance(raw_endpoint.get("nfs"), dict) else None,
+            "provider": raw_endpoint.get("provider"),
+            "metadata": raw_endpoint.get("metadata"),
         }
     ]
 
@@ -1421,12 +2121,28 @@ def _records_from_endpoint_payload(raw_endpoint: dict[str, Any], run_id: str) ->
                 "remark": raw_share.get("remark"),
                 "access_level": raw_share.get("access_level", "unknown"),
                 "access_capabilities": raw_share.get("access_capabilities"),
+                "provider": raw_share.get("provider"),
+                "provider_resource_id": raw_share.get("provider_resource_id") or raw_share.get("drive_id"),
+                "web_url": raw_share.get("web_url"),
+                "metadata": raw_share.get("metadata"),
+                "exposure": raw_share.get("exposure"),
+                "exposure_evidence": raw_share.get("exposure_evidence"),
             }
         )
 
         raw_entries = raw_share.get("entries")
         if isinstance(raw_entries, list):
-            records.extend(_iter_items_from_entries(run_id, endpoint_key, share_name, raw_entries, share_type=share_type))
+            records.extend(
+                _iter_items_from_entries(
+                    run_id,
+                    endpoint_key,
+                    share_name,
+                    raw_entries,
+                    share_type=share_type,
+                    parent_path="/" if share_type == "sharepoint" else "\\",
+                    provider_resource_id=raw_share.get("provider_resource_id") or raw_share.get("drive_id"),
+                )
+            )
 
     return records
 
@@ -1440,6 +2156,7 @@ def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str
     meta_raw = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
     run_raw = doc.get("run") if isinstance(doc.get("run"), dict) else {}
     collection_raw = doc.get("collection") if isinstance(doc.get("collection"), dict) else {}
+    collection_context_raw = doc.get("collection_context") if isinstance(doc.get("collection_context"), dict) else {}
     schema_version = doc.get("schema_version", 1)
     started_at = meta_raw.get("started_at") or run_raw.get("created_at") or now_iso()
     finished_at = meta_raw.get("finished_at") or now_iso()
@@ -1455,6 +2172,15 @@ def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str
             "operator_label": meta_raw.get("operator_label"),
             "collection": collection_raw or None,
             "auth": meta_raw.get("auth") if isinstance(meta_raw.get("auth"), dict) else None,
+            "auth_context": meta_raw.get("auth_context") if isinstance(meta_raw.get("auth_context"), dict) else None,
+            "collection_context": collection_context_raw or None,
+            "source": meta_raw.get("source") or collection_raw.get("source"),
+            "provider": meta_raw.get("provider") or collection_raw.get("provider"),
+            "collection_mode": meta_raw.get("collection_mode") or collection_raw.get("collection_mode"),
+            "assessed_identity": meta_raw.get("assessed_identity") or collection_raw.get("assessed_identity"),
+            "collection_status": meta_raw.get("collection_status") or collection_raw.get("collection_status"),
+            "partial": meta_raw.get("partial") if "partial" in meta_raw else collection_raw.get("partial"),
+            "metadata": meta_raw.get("metadata") if isinstance(meta_raw.get("metadata"), dict) else None,
         }
     )
 
@@ -1480,15 +2206,14 @@ def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str
         records.extend(_records_from_endpoint_payload(raw_endpoint, run_id))
 
     summary_raw = doc.get("summary")
-    if isinstance(summary_raw, dict):
-        records.append(
-            {
-                "type": "run_end",
-                "run_id": run_id,
-                "finished_at": finished_at,
-                "stats": summary_raw,
-            }
-        )
+    records.append(
+        {
+            "type": "run_end",
+            "run_id": run_id,
+            "finished_at": finished_at,
+            "stats": summary_raw if isinstance(summary_raw, dict) else {},
+        }
+    )
 
     return records
 
@@ -1553,14 +2278,26 @@ def _iter_records_from_streamable_json_file(fp, run_id: str):
     meta_raw = _load_first_json_item(fp, "meta")
     run_raw = _load_first_json_item(fp, "run")
     collection_raw = _load_first_json_item(fp, "collection")
+    collection_context_raw = _load_first_json_item(fp, "collection_context")
     summary_raw = _load_first_json_item(fp, "summary")
     schema_version = _load_first_json_item(fp, "schema_version")
+    first_issue = _load_first_json_item(fp, "issue_summary.item")
+    first_endpoint = _load_first_json_item(fp, "endpoints.item")
     started_at = (meta_raw or {}).get("started_at") if isinstance(meta_raw, dict) else None
     started_at = started_at or ((run_raw or {}).get("created_at") if isinstance(run_raw, dict) else None) or now_iso()
     finished_at = (meta_raw or {}).get("finished_at") if isinstance(meta_raw, dict) else None
     finished_at = finished_at or now_iso()
 
-    if isinstance(meta_raw, dict) or isinstance(run_raw, dict) or isinstance(collection_raw, dict) or isinstance(summary_raw, dict):
+    recognized = (
+        isinstance(meta_raw, dict)
+        or isinstance(run_raw, dict)
+        or isinstance(collection_raw, dict)
+        or isinstance(collection_context_raw, dict)
+        or isinstance(summary_raw, dict)
+        or isinstance(first_issue, dict)
+        or isinstance(first_endpoint, dict)
+    )
+    if recognized:
         yield {
             "type": "run_meta",
             "schema_version": int(schema_version) if isinstance(schema_version, int) else 1,
@@ -1570,7 +2307,20 @@ def _iter_records_from_streamable_json_file(fp, run_id: str):
             "started_at": started_at,
             "operator_label": (meta_raw or {}).get("operator_label") if isinstance(meta_raw, dict) else None,
             "collection": collection_raw if isinstance(collection_raw, dict) else None,
-            "auth": (meta_raw or {}).get("auth") if isinstance(meta_raw, dict) and isinstance((meta_raw or {}).get("auth"), dict) else None,
+            "auth": (meta_raw or {}).get("auth")
+            if isinstance(meta_raw, dict) and isinstance((meta_raw or {}).get("auth"), dict)
+            else None,
+            "auth_context": (meta_raw or {}).get("auth_context")
+            if isinstance(meta_raw, dict) and isinstance((meta_raw or {}).get("auth_context"), dict)
+            else None,
+            "collection_context": collection_context_raw if isinstance(collection_context_raw, dict) else None,
+            "source": (meta_raw or {}).get("source") if isinstance(meta_raw, dict) else None,
+            "provider": (meta_raw or {}).get("provider") if isinstance(meta_raw, dict) else None,
+            "collection_mode": (meta_raw or {}).get("collection_mode") if isinstance(meta_raw, dict) else None,
+            "assessed_identity": (meta_raw or {}).get("assessed_identity") if isinstance(meta_raw, dict) else None,
+            "collection_status": (meta_raw or {}).get("collection_status") if isinstance(meta_raw, dict) else None,
+            "partial": (meta_raw or {}).get("partial") if isinstance(meta_raw, dict) else None,
+            "metadata": (meta_raw or {}).get("metadata") if isinstance(meta_raw, dict) else None,
         }
 
     issue_seen = False
@@ -1597,15 +2347,15 @@ def _iter_records_from_streamable_json_file(fp, run_id: str):
         for record in _records_from_endpoint_payload(raw_endpoint, run_id):
             yield record
 
-    if isinstance(summary_raw, dict):
+    if recognized:
         yield {
             "type": "run_end",
             "run_id": run_id,
             "finished_at": finished_at,
-            "stats": summary_raw,
+            "stats": summary_raw if isinstance(summary_raw, dict) else {},
         }
 
-    if not endpoint_seen and not issue_seen and not isinstance(meta_raw, dict) and not isinstance(run_raw, dict) and not isinstance(summary_raw, dict):
+    if not recognized and not endpoint_seen and not issue_seen:
         raise ValueError("unsupported JSON artifact format")
 
 
@@ -1714,7 +2464,150 @@ def _iter_bounded_ndjson_lines(reader, max_record_bytes: int | None = None):
         yield raw_line
 
 
+class ArtifactFramingError(ValueError):
+    """The artifact does not have the required schema-v1 outer framing."""
+
+
+class _ArtifactFramingState:
+    def __init__(self) -> None:
+        self.record_count = 0
+        self.run_meta_count = 0
+        self.run_end_count = 0
+        self.run_end_seen = False
+
+    def observe(self, record_type: object) -> None:
+        if self.run_end_seen:
+            raise ArtifactFramingError(f"{ARTIFACT_FRAMING_ERROR}; records follow run_end")
+        if self.record_count == 0 and record_type != "run_meta":
+            raise ArtifactFramingError(f"{ARTIFACT_FRAMING_ERROR}; first record is not run_meta")
+        if record_type == "run_meta":
+            self.run_meta_count += 1
+            if self.run_meta_count > 1:
+                raise ArtifactFramingError(f"{ARTIFACT_FRAMING_ERROR}; duplicate run_meta")
+        elif record_type == "run_end":
+            self.run_end_count += 1
+            if self.run_end_count > 1:
+                raise ArtifactFramingError(f"{ARTIFACT_FRAMING_ERROR}; duplicate run_end")
+            self.run_end_seen = True
+        self.record_count += 1
+
+    def finish(self) -> None:
+        if self.run_meta_count != 1 or self.run_end_count != 1:
+            raise ArtifactFramingError(ARTIFACT_FRAMING_ERROR)
+
+
+def _validate_record_iter_framing(
+    records,
+    *,
+    progress_callback: Callable[[], None] | None = None,
+) -> None:
+    framing = _ArtifactFramingState()
+    if progress_callback is not None:
+        progress_callback()
+    for record in records:
+        if progress_callback is not None:
+            progress_callback()
+        record_type = record.get("type") if isinstance(record, dict) else None
+        framing.observe(record_type)
+    framing.finish()
+
+
+def _validate_ndjson_framing(
+    reader,
+    *,
+    progress_callback: Callable[[], None] | None = None,
+) -> None:
+    framing = _ArtifactFramingState()
+    if progress_callback is not None:
+        progress_callback()
+    for raw_line in _iter_bounded_ndjson_lines(reader):
+        if progress_callback is not None:
+            progress_callback()
+        try:
+            line = raw_line.decode("utf-8").strip() if isinstance(raw_line, bytes) else str(raw_line).strip()
+        except UnicodeDecodeError:
+            line = "<invalid-utf8>"
+            record_type = None
+        else:
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except (TypeError, ValueError):
+                record_type = None
+            else:
+                record_type = record.get("type") if isinstance(record, dict) else None
+        framing.observe(record_type)
+    framing.finish()
+
+
+def _validate_artifact_framing(
+    artifact_key: str,
+    content_type: str,
+    artifact_size: int | None,
+    run_id: str,
+    *,
+    progress_callback: Callable[[], None] | None = None,
+) -> None:
+    """Validate framing in a read-only pass before any inventory is persisted."""
+
+    json_candidate = _is_json_artifact(artifact_key, content_type)
+    gzip_input = artifact_key.endswith(".gz")
+    if not json_candidate:
+        with open_artifact_stream(artifact_key) as body:
+            if gzip_input:
+                with (
+                    gzip.GzipFile(fileobj=body) as gzip_reader,
+                    _LimitedReader(
+                        gzip_reader,
+                        _gzip_decompressed_limit(artifact_size),
+                        GZIP_DECOMPRESSED_LIMIT_ERROR,
+                    ) as reader,
+                ):
+                    _validate_ndjson_framing(reader, progress_callback=progress_callback)
+            else:
+                _validate_ndjson_framing(body, progress_callback=progress_callback)
+        return
+
+    try:
+        with open_artifact_stream(artifact_key) as body:
+            if gzip_input:
+                with (
+                    gzip.GzipFile(fileobj=body) as gzip_reader,
+                    _LimitedReader(gzip_reader, JSON_COMPAT_MAX_BYTES, JSON_COMPAT_LIMIT_ERROR) as json_reader,
+                ):
+                    _validate_record_iter_framing(
+                        _iter_records_from_streamable_json_file(json_reader, run_id),
+                        progress_callback=progress_callback,
+                    )
+            else:
+                with _LimitedReader(body, JSON_COMPAT_MAX_BYTES, JSON_COMPAT_LIMIT_ERROR) as json_reader:
+                    _validate_record_iter_framing(
+                        _iter_records_from_streamable_json_file(json_reader, run_id),
+                        progress_callback=progress_callback,
+                    )
+        return
+    except ArtifactFramingError:
+        raise
+    except ValueError as exc:
+        if str(exc) == JSON_COMPAT_LIMIT_ERROR:
+            raise
+
+    with open_artifact_stream(artifact_key) as body:
+        raw_json = _read_json_compat_bytes(
+            body,
+            gzip_input=gzip_input,
+            max_bytes=JSON_COMPAT_MAX_BYTES,
+        )
+    json_records = _load_json_records_from_bytes(raw_json, run_id)
+    if json_records is None:
+        raise ValueError("unsupported JSON artifact format")
+    _validate_record_iter_framing(json_records, progress_callback=progress_callback)
+
+
 def _public_ingest_error(exc: BaseException) -> str:
+    if isinstance(exc, ArtifactFramingError):
+        return str(exc)
     if isinstance(exc, (gzip.BadGzipFile, EOFError, zlib.error)):
         return INVALID_GZIP_ARTIFACT_ERROR
     if isinstance(exc, psycopg.Error):
@@ -1797,8 +2690,7 @@ def _write_worker_heartbeat(status: str, run_id: str | None = None, line_offset:
 
 def connect_database():
     options = (
-        f"-c statement_timeout={WORKER_DATABASE_STATEMENT_TIMEOUT_MS} "
-        f"-c lock_timeout={WORKER_DATABASE_LOCK_TIMEOUT_MS}"
+        f"-c statement_timeout={WORKER_DATABASE_STATEMENT_TIMEOUT_MS} -c lock_timeout={WORKER_DATABASE_LOCK_TIMEOUT_MS}"
     )
     return psycopg.connect(
         DATABASE_URL,
@@ -1909,7 +2801,9 @@ def process_job(fields: dict[str, str]) -> str:
                 logger.warning("run not found run_id=%s", run_id)
                 return "ignored"
 
-            db_project_id, db_artifact_key, status, summary_raw, progress_raw, artifact_content_type, artifact_size = row
+            db_project_id, db_artifact_key, status, summary_raw, progress_raw, artifact_content_type, artifact_size = (
+                row
+            )
             authoritative_row_loaded = True
             project_id = db_project_id
             artifact_key = db_artifact_key
@@ -1928,7 +2822,14 @@ def process_job(fields: dict[str, str]) -> str:
                     db_artifact_key,
                 )
             if not artifact_key:
-                update_run_status(conn, run_id, "FAILED", parse_offset(progress_raw), parse_summary(summary_raw), "missing artifact key")
+                update_run_status(
+                    conn,
+                    run_id,
+                    "FAILED",
+                    parse_offset(progress_raw),
+                    parse_summary(summary_raw),
+                    "missing artifact key",
+                )
                 conn.commit()
                 return "failed"
             if status in {"COMPLETE", "FAILED"}:
@@ -1953,7 +2854,9 @@ def process_job(fields: dict[str, str]) -> str:
                     last_worker_heartbeat = now
 
             emit_processing_heartbeat(force=True)
-            update_run_status(conn, run_id, "INGESTING", line_offset, counts, extra_progress={"attempt_count": attempt_count})
+            update_run_status(
+                conn, run_id, "INGESTING", line_offset, counts, extra_progress={"attempt_count": attempt_count}
+            )
             write_audit(
                 conn,
                 project_id,
@@ -1964,15 +2867,8 @@ def process_job(fields: dict[str, str]) -> str:
             )
             conn.commit()
 
-            endpoint_cache: dict[str, int] = _BoundedLRUCache[str](INGEST_IDENTITY_CACHE_SIZE)
-            resource_cache: dict[tuple[str, str, str], int] = _BoundedLRUCache[tuple[str, str, str]](
-                INGEST_IDENTITY_CACHE_SIZE
-            )
-            if line_offset > 0:
-                endpoint_cache, resource_cache = load_resume_caches(conn, run_id)
             item_batch: list[tuple] = []
             error_batch: list[tuple] = []
-            producer_run_end_counts: dict[str, int] | None = None
 
             def checkpoint_shutdown_if_requested() -> None:
                 nonlocal last_line_offset, last_counts
@@ -2010,6 +2906,26 @@ def process_job(fields: dict[str, str]) -> str:
                 last_counts = counts.copy()
                 _write_worker_heartbeat("shutting_down", run_id=run_id, line_offset=line_offset)
                 raise _GracefulWorkerShutdown
+
+            def report_preflight_progress() -> None:
+                checkpoint_shutdown_if_requested()
+                emit_processing_heartbeat()
+
+            _validate_artifact_framing(
+                artifact_key,
+                str(artifact_content_type or "").lower(),
+                artifact_size,
+                run_id,
+                progress_callback=report_preflight_progress,
+            )
+
+            endpoint_cache: dict[str, int] = _BoundedLRUCache[str](INGEST_IDENTITY_CACHE_SIZE)
+            resource_cache: dict[tuple[str, str, str], int] = _BoundedLRUCache[tuple[str, str, str]](
+                INGEST_IDENTITY_CACHE_SIZE
+            )
+            if line_offset > 0:
+                endpoint_cache, resource_cache = load_resume_caches(conn, run_id)
+            producer_run_end_counts: dict[str, int] | None = None
 
             def process_record(rec: dict[str, Any]) -> None:
                 nonlocal counts, producer_run_end_counts
@@ -2051,7 +2967,9 @@ def process_job(fields: dict[str, str]) -> str:
 
                 rec_type = rec.get("type")
 
-                if rec_type == "endpoint":
+                if rec_type == "run_meta":
+                    update_run_collection_context(conn, run_id, rec.get("collection_context") or {})
+                elif rec_type == "endpoint":
                     endpoint_id = upsert_endpoint(conn, run_id, rec)
                     endpoint_cache[rec.get("endpoint_key", "")] = endpoint_id
                     counts["endpoints"] += 1
@@ -2064,13 +2982,25 @@ def process_job(fields: dict[str, str]) -> str:
                         endpoint_id = upsert_endpoint(conn, run_id, {"endpoint_key": endpoint_key})
                         endpoint_cache[endpoint_key] = endpoint_id
                     resource_id = upsert_resource(conn, run_id, endpoint_id, rec)
-                    resource_cache[(endpoint_key, resource_name, resource_type)] = resource_id
+                    resource_cache[
+                        _resource_cache_key(
+                            endpoint_key,
+                            resource_name,
+                            resource_type,
+                            rec.get("provider_resource_id"),
+                        )
+                    ] = resource_id
                     counts["resources"] += 1
                 elif rec_type == "item":
                     endpoint_key = rec.get("endpoint_key", "")
                     resource_name = rec.get("resource_name", "")
                     resource_type = str(rec.get("resource_type") or "smb_share")
-                    key = (endpoint_key, resource_name, resource_type)
+                    key = _resource_cache_key(
+                        endpoint_key,
+                        resource_name,
+                        resource_type,
+                        rec.get("provider_resource_id"),
+                    )
                     resource_id = resource_cache.get(key)
                     if resource_id is None:
                         endpoint_id = endpoint_cache.get(endpoint_key)
@@ -2087,6 +3017,11 @@ def process_job(fields: dict[str, str]) -> str:
                                 "remark": None,
                                 "access_level": "unknown",
                                 "access_capabilities": {},
+                                "provider": rec.get("provider"),
+                                "provider_resource_id": rec.get("provider_resource_id"),
+                                "provider_metadata": {},
+                                "exposure": None,
+                                "exposure_evidence": {},
                             },
                         )
                         resource_cache[key] = resource_id
@@ -2104,6 +3039,15 @@ def process_job(fields: dict[str, str]) -> str:
                             rec.get("accessed_at"),
                             rec.get("changed_at"),
                             json.dumps(rec.get("file_attributes") or []),
+                            rec.get("provider"),
+                            rec.get("provider_item_id"),
+                            rec.get("provider_parent_id"),
+                            rec.get("web_url"),
+                            rec.get("mime_type"),
+                            bool(rec.get("deleted", False)),
+                            json.dumps(rec.get("provider_metadata") or {}),
+                            rec.get("exposure"),
+                            json.dumps(rec.get("exposure_evidence") or {}),
                         )
                     )
                     counts["items"] += 1
@@ -2125,8 +3069,8 @@ def process_job(fields: dict[str, str]) -> str:
                     if len(error_batch) >= BATCH_SIZE:
                         flush_error_batch(conn, error_batch)
                 elif rec_type == "run_end":
-                    incoming = rec.get("stats") or {}
-                    if isinstance(incoming, dict):
+                    incoming = rec.get("stats")
+                    if isinstance(incoming, dict) and incoming:
                         producer_run_end_counts = parse_summary(incoming)
 
             def persist_periodic_progress() -> None:
@@ -2230,11 +3174,14 @@ def process_job(fields: dict[str, str]) -> str:
                 try:
                     with open_artifact_stream(artifact_key) as body:
                         if gzip_input:
-                            with gzip.GzipFile(fileobj=body) as gzip_reader, _LimitedReader(
-                                gzip_reader,
-                                JSON_COMPAT_MAX_BYTES,
-                                JSON_COMPAT_LIMIT_ERROR,
-                            ) as json_reader:
+                            with (
+                                gzip.GzipFile(fileobj=body) as gzip_reader,
+                                _LimitedReader(
+                                    gzip_reader,
+                                    JSON_COMPAT_MAX_BYTES,
+                                    JSON_COMPAT_LIMIT_ERROR,
+                                ) as json_reader,
+                            ):
                                 process_record_iter(_iter_records_from_streamable_json_file(json_reader, run_id))
                         else:
                             with _LimitedReader(body, JSON_COMPAT_MAX_BYTES, JSON_COMPAT_LIMIT_ERROR) as json_reader:
@@ -2254,11 +3201,14 @@ def process_job(fields: dict[str, str]) -> str:
             else:
                 with open_artifact_stream(artifact_key) as body:
                     if gzip_input:
-                        with gzip.GzipFile(fileobj=body) as gzip_reader, _LimitedReader(
-                            gzip_reader,
-                            _gzip_decompressed_limit(artifact_size),
-                            GZIP_DECOMPRESSED_LIMIT_ERROR,
-                        ) as reader:
+                        with (
+                            gzip.GzipFile(fileobj=body) as gzip_reader,
+                            _LimitedReader(
+                                gzip_reader,
+                                _gzip_decompressed_limit(artifact_size),
+                                GZIP_DECOMPRESSED_LIMIT_ERROR,
+                            ) as reader,
+                        ):
                             process_ndjson_lines(reader)
                     else:
                         process_ndjson_lines(body)
@@ -2312,6 +3262,10 @@ def process_job(fields: dict[str, str]) -> str:
             except psycopg.Error:
                 logger.exception("failed to rollback aborted ingest transaction run_id=%s", run_id)
             try:
+                if isinstance(exc, ArtifactFramingError):
+                    clear_persisted_ingest_inventory(conn, run_id)
+                    last_line_offset = 0
+                    last_counts = {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
                 if retryable and attempt_count <= INGEST_MAX_RETRIES:
                     retry_delay_seconds = _retry_backoff_seconds(attempt_count, jitter_key=run_id)
                     next_retry_at = datetime.now(tz=UTC) + timedelta(seconds=retry_delay_seconds)
