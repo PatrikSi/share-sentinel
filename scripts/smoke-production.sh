@@ -5,6 +5,7 @@ base_url="${1:?usage: smoke-production.sh BASE_URL HOSTNAME [ADMIN_EMAIL]}"
 hostname="${2:?usage: smoke-production.sh BASE_URL HOSTNAME [ADMIN_EMAIL]}"
 admin_email="${3:-admin@example.com}"
 admin_password="${SHARE_SENTINEL_SMOKE_PASSWORD:?set SHARE_SENTINEL_SMOKE_PASSWORD}"
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 curl_args=(--connect-timeout 3 --max-time 10)
 temp_dir=$(mktemp -d)
 
@@ -44,6 +45,7 @@ docs_status=$(curl "${curl_args[@]}" -sS -o "$temp_dir/docs.json" -w "%{http_cod
 ui_status=$(curl "${curl_args[@]}" -sS -o "$temp_dir/ui.html" -w "%{http_code}" -H "Host: $hostname" "${base_url%/}/projects")
 [[ "$ui_status" == "200" ]]
 grep -qi '<!doctype html>' "$temp_dir/ui.html"
+"$script_dir/check-ui-shell.sh" "$base_url" "$hostname"
 
 login_payload=$(jq -nc --arg email "$admin_email" --arg password "$admin_password" '{email: $email, password: $password}')
 login_status=$(curl "${curl_args[@]}" -sS -o "$temp_dir/login.json" -D "$temp_dir/login-headers.txt" -w "%{http_code}" -H "Host: $hostname" -H "content-type: application/json" --data-binary @- "${base_url%/}/api/auth/login" <<<"$login_payload")

@@ -10,7 +10,9 @@ The project follows a simple release-first workflow:
 
 ## Unreleased
 
-No user-visible changes yet.
+### Fixed
+
+- The web shell now prevents stale deployment caching, returns a real 404 for missing hashed assets, validates every startup asset in deployment smokes, and shows an actionable browser-side error instead of an empty page when JavaScript cannot start.
 
 ## [1.1.0] - 2026-08-24
 

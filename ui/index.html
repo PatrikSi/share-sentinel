@@ -4,10 +4,51 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Share Sentinel</title>
+    <style>
+      #share-sentinel-boot {
+        align-items: center;
+        background: #edf2f7;
+        box-sizing: border-box;
+        color: #334155;
+        display: flex;
+        flex-direction: column;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        gap: 0.5rem;
+        justify-content: center;
+        min-height: 100vh;
+        padding: 2rem;
+        text-align: center;
+      }
+      #share-sentinel-boot strong {
+        color: #065f46;
+        font-size: 1rem;
+      }
+      #share-sentinel-boot p {
+        font-size: 0.875rem;
+        line-height: 1.5;
+        margin: 0;
+        max-width: 38rem;
+      }
+      @media (prefers-color-scheme: dark) {
+        #share-sentinel-boot {
+          background: #020617;
+          color: #cbd5e1;
+        }
+        #share-sentinel-boot strong {
+          color: #6ee7b7;
+        }
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <main aria-live="polite" id="share-sentinel-boot" role="status">
+        <strong>Starting Share Sentinel</strong>
+        <p id="share-sentinel-boot-detail">Loading the application interface.</p>
+      </main>
+    </div>
     <script src="/runtime-config.js"></script>
+    <script src="/startup-check.js"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

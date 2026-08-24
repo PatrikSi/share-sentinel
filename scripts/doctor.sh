@@ -142,6 +142,11 @@ else
   check_http "API liveness" "$base_url/api/healthz" '"ok":true'
   check_http "API readiness" "$base_url/api/healthz/ready" '"ok":true'
   check_http "UI shell" "$base_url/" ""
+  if ui_check_output=$("$root_dir/scripts/check-ui-shell.sh" "$base_url" "$host_header" 2>&1); then
+    pass "$ui_check_output"
+  else
+    fail "UI browser startup validation failed: $(tr '\n' ' ' <<<"$ui_check_output")"
+  fi
 fi
 
 if [[ "$check_compose" == "true" ]]; then

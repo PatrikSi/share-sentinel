@@ -2,6 +2,7 @@
 set -euo pipefail
 
 base_url="${1:-http://localhost}"
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 curl_args=(--connect-timeout 3 --max-time 10)
 temp_dir=$(mktemp -d)
 
@@ -59,6 +60,7 @@ ui_status=$(request_with_retries "$base_url/projects" "GET" "" "" "200" "$temp_d
 ui_body=$(cat "$temp_dir/ui.out" 2>/dev/null || true)
 assert_contains "$ui_status" "200" "UI /projects should return 200"
 assert_contains "$ui_body" "<!doctype html>" "UI should return app shell"
+"$script_dir/check-ui-shell.sh" "$base_url"
 
 settings_ui_status=$(request_with_retries "$base_url/settings/projects" "GET" "" "" "200" "$temp_dir/settings-ui.out")
 settings_ui_body=$(cat "$temp_dir/settings-ui.out" 2>/dev/null || true)
