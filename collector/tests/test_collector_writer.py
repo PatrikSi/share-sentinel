@@ -264,6 +264,46 @@ def test_ndjson_spool_failure_is_sticky_and_reported_at_close(tmp_path) -> None:
     assert not (tmp_path / "collector.ndjson").exists()
 
 
+def test_ndjson_writer_aborts_before_exceeding_local_spool_budget(tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "collector.ndjson"
+    writer = collector.NDJSONWriter(
+        path=str(output_path),
+        gzip_output=False,
+        max_spool_bytes=180,
+    )
+    writer.emit({"type": "run_meta", "schema_version": 1, "run_id": "abc"})
+
+    with pytest.raises(collector.ArtifactSpoolLimitError, match="--max-artifact-bytes"):
+        writer.emit(
+            {
+                "type": "endpoint",
+                "run_id": "abc",
+                "endpoint_key": "host:445",
+                "padding": "x" * 300,
+            }
+        )
+
+    assert writer.write_failed is True
+    with pytest.raises(collector.ArtifactSpoolLimitError, match="--max-artifact-bytes"):
+        writer.close()
+    assert not output_path.exists()
+
+
+def test_ndjson_writer_allows_explicitly_unbounded_spool(tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "collector.ndjson"
+    writer = collector.NDJSONWriter(
+        path=str(output_path),
+        gzip_output=False,
+        max_spool_bytes=0,
+    )
+    writer.emit({"type": "endpoint", "run_id": "abc", "endpoint_key": "host:445", "padding": "x" * 1000})
+    writer.close()
+
+    assert output_path.exists()
+
+
 def test_artifact_format_selection_uses_streaming_for_stdout_and_line_suffixes() -> None:
     collector = _load_collector_module()
 

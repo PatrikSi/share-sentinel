@@ -4,14 +4,17 @@ import json
 import logging
 import math
 import os
+import signal
 import socket
 import sys
+import threading
 import time
 import uuid
 import zlib
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, TypeVar
 
 import ijson
 import psycopg
@@ -24,34 +27,68 @@ logging.basicConfig(
 logger = logging.getLogger("share_sentinel.worker")
 
 
-def _read_int_env(name: str, default: int, min_value: int = 1) -> int:
+def _read_int_env(
+    name: str,
+    default: int,
+    min_value: int = 1,
+    max_value: int | None = None,
+    *,
+    strict: bool = False,
+) -> int:
     raw = os.getenv(name, str(default))
     try:
         value = int(raw)
     except (TypeError, ValueError):
+        if strict:
+            raise ValueError(f"{name} must be an integer; got {raw!r}") from None
         logger.warning("invalid integer value for %s=%r; using default=%s", name, raw, default)
         return default
 
     if value < min_value:
+        if strict:
+            raise ValueError(f"{name} must be at least {min_value}; got {value}")
         logger.warning("value for %s=%s is below min=%s; using min", name, value, min_value)
         return min_value
+    if max_value is not None and value > max_value:
+        if strict:
+            raise ValueError(f"{name} must be at most {max_value}; got {value}")
+        logger.warning("value for %s=%s exceeds max=%s; using max", name, value, max_value)
+        return max_value
     return value
 
 
-def _read_float_env(name: str, default: float, min_value: float = 0.1) -> float:
+def _read_float_env(
+    name: str,
+    default: float,
+    min_value: float = 0.1,
+    max_value: float | None = None,
+    *,
+    strict: bool = False,
+) -> float:
     raw = os.getenv(name, str(default))
     try:
         value = float(raw)
     except (TypeError, ValueError):
+        if strict:
+            raise ValueError(f"{name} must be numeric; got {raw!r}") from None
         logger.warning("invalid numeric value for %s=%r; using default=%s", name, raw, default)
         return default
 
     if not math.isfinite(value):
+        if strict:
+            raise ValueError(f"{name} must be finite; got {raw!r}")
         logger.warning("non-finite numeric value for %s=%r; using default=%s", name, raw, default)
         return default
     if value < min_value:
+        if strict:
+            raise ValueError(f"{name} must be at least {min_value}; got {value}")
         logger.warning("value for %s=%s is below min=%s; using min", name, value, min_value)
         return min_value
+    if max_value is not None and value > max_value:
+        if strict:
+            raise ValueError(f"{name} must be at most {max_value}; got {value}")
+        logger.warning("value for %s=%s exceeds max=%s; using max", name, value, max_value)
+        return max_value
     return value
 
 
@@ -65,25 +102,97 @@ STREAM_NAME = "ingest_jobs"
 GROUP_NAME = "ingest_workers"
 CONSUMER_NAME = f"{socket.gethostname()}-{os.getpid()}"
 
-BATCH_SIZE = _read_int_env("INGEST_BATCH_SIZE", 5000, min_value=1)
+MAX_INGEST_BATCH_SIZE = 10_000
+MAX_INGEST_RECORD_BYTES = 16 * 1024 * 1024
+MAX_INGEST_JSON_COMPAT_BYTES = 128 * 1024 * 1024
+MAX_INGEST_GZIP_DECOMPRESSED_BYTES = 100 * 1024 * 1024 * 1024
+MAX_INGEST_GZIP_EXPANSION_RATIO = 1000
+MAX_INGEST_IDENTITY_CACHE_SIZE = 100_000
+MAX_INGEST_RETRIES = 100
+
+BATCH_SIZE = _read_int_env(
+    "INGEST_BATCH_SIZE",
+    5000,
+    min_value=1,
+    max_value=MAX_INGEST_BATCH_SIZE,
+    strict=True,
+)
 PROGRESS_EVERY_LINES = _read_int_env("INGEST_PROGRESS_EVERY_LINES", 2000, min_value=1)
 RECOVERY_SCAN_SECONDS = _read_int_env("INGEST_RECOVERY_SCAN_SECONDS", 8, min_value=1)
 RECOVERY_SCAN_LIMIT = _read_int_env("INGEST_RECOVERY_SCAN_LIMIT", 8, min_value=1)
 PENDING_IDLE_MS = _read_int_env("INGEST_PENDING_IDLE_MS", 60000, min_value=1)
-JSON_COMPAT_MAX_BYTES = _read_int_env("INGEST_JSON_COMPAT_MAX_BYTES", 50 * 1024 * 1024, min_value=1024)
-INGEST_MAX_RECORD_BYTES = _read_int_env("INGEST_MAX_RECORD_BYTES", 8 * 1024 * 1024, min_value=1024)
-GZIP_DECOMPRESSED_MAX_BYTES = _read_int_env("INGEST_GZIP_MAX_BYTES", 4 * 1024 * 1024 * 1024, min_value=1024)
-GZIP_DECOMPRESSED_MAX_RATIO = _read_int_env("INGEST_GZIP_MAX_EXPANSION_RATIO", 200, min_value=1)
+JSON_COMPAT_MAX_BYTES = _read_int_env(
+    "INGEST_JSON_COMPAT_MAX_BYTES",
+    50 * 1024 * 1024,
+    min_value=1024,
+    max_value=MAX_INGEST_JSON_COMPAT_BYTES,
+    strict=True,
+)
+INGEST_MAX_RECORD_BYTES = _read_int_env(
+    "INGEST_MAX_RECORD_BYTES",
+    8 * 1024 * 1024,
+    min_value=1024,
+    max_value=MAX_INGEST_RECORD_BYTES,
+    strict=True,
+)
+GZIP_DECOMPRESSED_MAX_BYTES = _read_int_env(
+    "INGEST_GZIP_MAX_BYTES",
+    10 * 1024 * 1024 * 1024,
+    min_value=1024,
+    max_value=MAX_INGEST_GZIP_DECOMPRESSED_BYTES,
+    strict=True,
+)
+GZIP_DECOMPRESSED_MAX_RATIO = _read_int_env(
+    "INGEST_GZIP_MAX_EXPANSION_RATIO",
+    200,
+    min_value=1,
+    max_value=MAX_INGEST_GZIP_EXPANSION_RATIO,
+    strict=True,
+)
 STALE_INGESTING_SECONDS = _read_int_env("INGEST_STALE_RUN_SECONDS", 300, min_value=30)
-INGEST_MAX_RETRIES = _read_int_env("INGEST_MAX_RETRIES", 4, min_value=0)
+INGEST_MAX_RETRIES = _read_int_env(
+    "INGEST_MAX_RETRIES",
+    4,
+    min_value=0,
+    max_value=MAX_INGEST_RETRIES,
+    strict=True,
+)
 INGEST_RETRY_BASE_SECONDS = _read_int_env("INGEST_RETRY_BASE_SECONDS", 30, min_value=1)
 INGEST_RETRY_MAX_SECONDS = _read_int_env("INGEST_RETRY_MAX_SECONDS", 900, min_value=1)
+INGEST_RETRY_JITTER_RATIO = _read_float_env(
+    "INGEST_RETRY_JITTER_RATIO",
+    0.2,
+    min_value=0.0,
+    max_value=1.0,
+    strict=True,
+)
+INGEST_IDENTITY_CACHE_SIZE = _read_int_env(
+    "INGEST_IDENTITY_CACHE_SIZE",
+    10000,
+    min_value=1,
+    max_value=MAX_INGEST_IDENTITY_CACHE_SIZE,
+    strict=True,
+)
 WORKER_HEARTBEAT_PATH = os.getenv("WORKER_HEARTBEAT_PATH", "/tmp/share-sentinel-worker-heartbeat.json")
 WORKER_HEARTBEAT_INTERVAL_SECONDS = _read_int_env("WORKER_HEARTBEAT_INTERVAL_SECONDS", 15, min_value=1)
 WORKER_HEALTH_TIMEOUT_SECONDS = _read_int_env("WORKER_HEALTH_TIMEOUT_SECONDS", 45, min_value=5)
 REDIS_CONNECT_TIMEOUT_SECONDS = _read_float_env("REDIS_CONNECT_TIMEOUT_SECONDS", 3.0)
 REDIS_SOCKET_TIMEOUT_SECONDS = _read_float_env("REDIS_SOCKET_TIMEOUT_SECONDS", 5.0)
-DATABASE_CONNECT_TIMEOUT_SECONDS = _read_int_env("DATABASE_CONNECT_TIMEOUT_SECONDS", 5, min_value=1)
+WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS = _read_int_env(
+    "WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS",
+    5,
+    min_value=1,
+)
+WORKER_DATABASE_STATEMENT_TIMEOUT_MS = _read_int_env(
+    "WORKER_DATABASE_STATEMENT_TIMEOUT_MS",
+    120000,
+    min_value=1000,
+)
+WORKER_DATABASE_LOCK_TIMEOUT_MS = _read_int_env(
+    "WORKER_DATABASE_LOCK_TIMEOUT_MS",
+    15000,
+    min_value=100,
+)
 
 redis_client = redis.Redis.from_url(
     REDIS_URL,
@@ -163,6 +272,46 @@ NDJSON_RECORD_TOO_LARGE_ERROR = "NDJSON record exceeds configured size limit"
 INVALID_GZIP_ARTIFACT_ERROR = "invalid gzip artifact"
 JSON_COMPAT_LIMIT_ERROR = "JSON artifact exceeds non-streamable compatibility limit"
 INVALID_UTF8_ARTIFACT_ERROR = "artifact contains invalid UTF-8"
+ENDPOINT_KEY_MAX_LENGTH = 255
+RESOURCE_NAME_MAX_LENGTH = 255
+ITEM_NAME_MAX_LENGTH = 255
+# items.path participates in a PostgreSQL btree uniqueness constraint. Keep
+# enough headroom for the other indexed columns and multibyte text overhead.
+ITEM_PATH_MAX_BYTES = 2000
+INGEST_ERROR_CODE_MAX_LENGTH = 128
+INGEST_ERROR_MESSAGE_MAX_LENGTH = 4096
+INGEST_ERROR_PATH_MAX_LENGTH = 4096
+ERROR_SEVERITIES = {"warn", "error"}
+
+_CacheKey = TypeVar("_CacheKey")
+
+
+class _BoundedLRUCache(OrderedDict[_CacheKey, int]):
+    """Small identity map that cannot grow with the full artifact cardinality."""
+
+    def __init__(self, max_size: int):
+        super().__init__()
+        self.max_size = max(1, int(max_size))
+
+    def __setitem__(self, key: _CacheKey, value: int) -> None:
+        if key in self:
+            super().move_to_end(key)
+        super().__setitem__(key, value)
+        while len(self) > self.max_size:
+            self.popitem(last=False)
+
+    def get(self, key: _CacheKey, default=None):
+        value = super().get(key, default)
+        if key in self:
+            super().move_to_end(key)
+        return value
+
+
+class _GracefulWorkerShutdown(Exception):
+    """Internal control flow used after a durable shutdown checkpoint."""
+
+
+_shutdown_event = threading.Event()
 
 
 def _safe_run_id(fields: dict[str, str] | None) -> str | None:
@@ -190,6 +339,34 @@ def should_ack_stream_result(result: str) -> bool:
 
 def now_iso() -> str:
     return datetime.now(tz=UTC).isoformat()
+
+
+def _handle_shutdown_signal(signum: int, _frame: Any) -> None:
+    try:
+        signal_name = signal.Signals(signum).name
+    except ValueError:
+        signal_name = str(signum)
+    if not _shutdown_event.is_set():
+        logger.info("shutdown requested signal=%s; checkpointing active work", signal_name)
+    _shutdown_event.set()
+
+
+def _install_shutdown_signal_handlers() -> dict[int, Any]:
+    previous_handlers: dict[int, Any] = {}
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous_handlers[signum] = signal.signal(signum, _handle_shutdown_signal)
+        except ValueError:
+            logger.warning("unable to install shutdown signal handler signal=%s", signum)
+    return previous_handlers
+
+
+def _restore_shutdown_signal_handlers(previous_handlers: dict[int, Any]) -> None:
+    for signum, previous_handler in previous_handlers.items():
+        try:
+            signal.signal(signum, previous_handler)
+        except ValueError:
+            logger.warning("unable to restore shutdown signal handler signal=%s", signum)
 
 
 def advisory_lock_key(run_id: str) -> int:
@@ -222,6 +399,7 @@ def write_audit(conn: psycopg.Connection, project_id: str, action: str, object_t
 
 def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) -> int:
     smb = rec.get("smb") if isinstance(rec.get("smb"), dict) else {}
+    auth = rec.get("auth") if isinstance(rec.get("auth"), dict) else {}
     row = conn.execute(
         """
         INSERT INTO endpoints (run_id, endpoint_key, ip, hostname, domain, smb_dialect, smb_signing, auth_method)
@@ -244,7 +422,7 @@ def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) 
             rec.get("domain"),
             smb.get("dialect"),
             _normalize_smb_signing(smb),
-            (rec.get("auth") or {}).get("method"),
+            auth.get("method"),
         ),
     ).fetchone()
     return int(row[0])
@@ -361,9 +539,9 @@ def flush_error_batch(conn: psycopg.Connection, rows: list[tuple]) -> None:
 def load_resume_caches(
     conn: psycopg.Connection,
     run_id: str,
-) -> tuple[dict[str, int], dict[tuple[str, str, str], int]]:
-    endpoint_cache: dict[str, int] = {}
-    resource_cache: dict[tuple[str, str, str], int] = {}
+) -> tuple[_BoundedLRUCache[str], _BoundedLRUCache[tuple[str, str, str]]]:
+    endpoint_cache = _BoundedLRUCache[str](INGEST_IDENTITY_CACHE_SIZE)
+    resource_cache = _BoundedLRUCache[tuple[str, str, str]](INGEST_IDENTITY_CACHE_SIZE)
     rows = conn.execute(
         """
         SELECT e.id, e.endpoint_key, r.id, r.resource_type, r.name
@@ -372,8 +550,10 @@ def load_resume_caches(
           ON r.run_id = e.run_id
          AND r.endpoint_id = e.id
         WHERE e.run_id = %s
+        ORDER BY COALESCE(r.id, 0) DESC, e.id DESC
+        LIMIT %s
         """,
-        (run_id,),
+        (run_id, INGEST_IDENTITY_CACHE_SIZE),
     ).fetchall()
     for endpoint_id, endpoint_key, resource_id, resource_type, resource_name in rows:
         normalized_endpoint_key = str(endpoint_key or "")
@@ -437,6 +617,21 @@ def _ingest_error_fingerprint(
     return digest.hexdigest()
 
 
+def _truncate_text(value: Any, max_length: int) -> str:
+    text = str(value or "").replace("\x00", "�")
+    text = text.encode("utf-8", errors="replace").decode("utf-8")
+    if len(text) <= max_length:
+        return text
+    return text[: max(0, max_length - 1)] + "…"
+
+
+def _truncate_optional_text(value: Any, max_length: int) -> str | None:
+    if value is None:
+        return None
+    text = _truncate_text(value, max_length).strip()
+    return text or None
+
+
 def build_ingest_error_row(
     run_id: str,
     severity: str,
@@ -446,15 +641,30 @@ def build_ingest_error_row(
     resource_name: str | None,
     path: str | None,
 ) -> tuple[str, str, str, str, str | None, str | None, str | None, str]:
+    normalized_severity = str(severity or "error").strip().lower()
+    if normalized_severity not in ERROR_SEVERITIES:
+        normalized_severity = "error"
+    normalized_code = _truncate_text(code or "UNKNOWN", INGEST_ERROR_CODE_MAX_LENGTH).strip() or "UNKNOWN"
+    normalized_message = _truncate_text(message, INGEST_ERROR_MESSAGE_MAX_LENGTH)
+    normalized_endpoint_key = _truncate_optional_text(endpoint_key, ENDPOINT_KEY_MAX_LENGTH)
+    normalized_resource_name = _truncate_optional_text(resource_name, RESOURCE_NAME_MAX_LENGTH)
+    normalized_path = _truncate_optional_text(path, INGEST_ERROR_PATH_MAX_LENGTH)
     return (
         run_id,
-        severity,
-        code,
-        message,
-        endpoint_key,
-        resource_name,
-        path,
-        _ingest_error_fingerprint(severity, code, message, endpoint_key, resource_name, path),
+        normalized_severity,
+        normalized_code,
+        normalized_message,
+        normalized_endpoint_key,
+        normalized_resource_name,
+        normalized_path,
+        _ingest_error_fingerprint(
+            normalized_severity,
+            normalized_code,
+            normalized_message,
+            normalized_endpoint_key,
+            normalized_resource_name,
+            normalized_path,
+        ),
     )
 
 
@@ -939,6 +1149,49 @@ def _bind_record_to_ingest_run(rec: dict[str, Any], run_id: str) -> dict[str, An
     return rec
 
 
+def _validate_text_value(
+    value: Any,
+    field: str,
+    *,
+    max_characters: int | None = None,
+    max_bytes: int | None = None,
+    allow_empty: bool = False,
+) -> str | None:
+    if not isinstance(value, str):
+        return f"field {field} must be a string"
+    if not allow_empty and not value.strip():
+        return f"field {field} must not be empty"
+    if "\x00" in value:
+        return f"field {field} contains a null character"
+    try:
+        encoded_length = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return f"field {field} contains invalid Unicode"
+    if max_characters is not None and len(value) > max_characters:
+        return f"field {field} exceeds {max_characters} characters"
+    if max_bytes is not None and encoded_length > max_bytes:
+        return f"field {field} exceeds {max_bytes} UTF-8 bytes"
+    return None
+
+
+def _validate_optional_text_value(
+    value: Any,
+    field: str,
+    *,
+    max_characters: int | None = None,
+    max_bytes: int | None = None,
+) -> str | None:
+    if value is None:
+        return None
+    return _validate_text_value(
+        value,
+        field,
+        max_characters=max_characters,
+        max_bytes=max_bytes,
+        allow_empty=True,
+    )
+
+
 def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
     rec_type = rec.get("type")
     if rec_type not in {"run_meta", "endpoint", "resource", "item", "error", "run_end"}:
@@ -956,6 +1209,11 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
         if rec.get(field) in (None, ""):
             return False, f"missing field: {field}"
 
+    for field in ("run_id",):
+        reason = _validate_text_value(rec.get(field), field, max_characters=36)
+        if reason:
+            return False, reason
+
     if rec_type == "run_meta":
         try:
             if int(rec.get("schema_version")) != 1:
@@ -963,10 +1221,63 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
         except (TypeError, ValueError):
             return False, "invalid schema_version"
 
-    if rec_type == "item" and not rec.get("name"):
-        normalized_path = str(rec.get("path", "")).replace("\\", "/")
+    if rec_type == "endpoint":
+        reason = _validate_text_value(
+            rec.get("endpoint_key"),
+            "endpoint_key",
+            max_characters=ENDPOINT_KEY_MAX_LENGTH,
+        )
+        if reason:
+            return False, reason
+        for field, max_length in (("ip", 64), ("hostname", 255), ("domain", 255)):
+            reason = _validate_optional_text_value(rec.get(field), field, max_characters=max_length)
+            if reason:
+                return False, reason
+        for container_name, field_name in (("smb", "dialect"), ("smb", "signing"), ("auth", "method")):
+            container = rec.get(container_name)
+            if container is not None and not isinstance(container, dict):
+                return False, f"field {container_name} must be an object"
+            if isinstance(container, dict):
+                reason = _validate_optional_text_value(
+                    container.get(field_name),
+                    f"{container_name}.{field_name}",
+                    max_characters=64,
+                )
+                if reason:
+                    return False, reason
+
+    if rec_type in {"resource", "item"}:
+        reason = _validate_text_value(
+            rec.get("endpoint_key"),
+            "endpoint_key",
+            max_characters=ENDPOINT_KEY_MAX_LENGTH,
+        )
+        if reason:
+            return False, reason
+
+    if rec_type == "resource":
+        reason = _validate_text_value(
+            rec.get("name"),
+            "name",
+            max_characters=RESOURCE_NAME_MAX_LENGTH,
+        )
+        if reason:
+            return False, reason
+        reason = _validate_optional_text_value(rec.get("remark"), "remark", max_bytes=INGEST_MAX_RECORD_BYTES)
+        if reason:
+            return False, reason
+
+    if rec_type == "item" and not rec.get("name") and isinstance(rec.get("path"), str):
+        normalized_path = rec["path"].replace("\\", "/")
         rec["name"] = PurePosixPath(normalized_path).name or ""
     if rec_type == "item":
+        for field, max_length in (("resource_name", RESOURCE_NAME_MAX_LENGTH), ("name", ITEM_NAME_MAX_LENGTH)):
+            reason = _validate_text_value(rec.get(field), field, max_characters=max_length)
+            if reason:
+                return False, reason
+        reason = _validate_text_value(rec.get("path"), "path", max_bytes=ITEM_PATH_MAX_BYTES)
+        if reason:
+            return False, reason
         rec["size_bytes"] = _normalize_item_size(rec.get("size_bytes"))
         rec["allocation_size_bytes"] = _normalize_item_size(rec.get("allocation_size_bytes"))
         rec["mtime"] = _normalize_item_mtime(rec.get("mtime"))
@@ -974,6 +1285,24 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
         rec["accessed_at"] = _normalize_item_mtime(rec.get("accessed_at"))
         rec["changed_at"] = _normalize_item_mtime(rec.get("changed_at"))
         rec["file_attributes"] = _normalize_file_attributes(rec.get("file_attributes"))
+
+    if rec_type == "error":
+        severity = rec.get("severity")
+        if isinstance(severity, str):
+            severity = severity.strip().lower()
+            rec["severity"] = severity
+        if severity not in ERROR_SEVERITIES:
+            return False, "field severity must be warn or error"
+        reason = _validate_text_value(
+            rec.get("code"),
+            "code",
+            max_characters=INGEST_ERROR_CODE_MAX_LENGTH,
+        )
+        if reason:
+            return False, reason
+        reason = _validate_text_value(rec.get("message"), "message", max_bytes=INGEST_MAX_RECORD_BYTES)
+        if reason:
+            return False, reason
 
     if rec_type in {"resource", "item"}:
         share_type = _normalize_share_type(rec.get("share_type"), rec.get("resource_type"))
@@ -1412,13 +1741,35 @@ def _public_ingest_error(exc: BaseException) -> str:
 def _is_retryable_ingest_error(exc: BaseException) -> bool:
     if isinstance(exc, gzip.BadGzipFile):
         return False
-    return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError, OSError, RuntimeError))
+    if isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError)):
+        return True
+    if isinstance(exc, psycopg.Error):
+        # Transaction serialization, deadlock, lock timeout, and statement
+        # timeout are safe to replay because checkpoints are committed before
+        # the offset advances durably.
+        return getattr(exc, "sqlstate", None) in {"40001", "40P01", "55P03", "57014"}
+    return isinstance(exc, OSError)
 
 
-def _retry_backoff_seconds(attempt_count: int) -> int:
+def _retry_backoff_seconds(attempt_count: int, *, jitter_key: str | None = None) -> int:
     bounded_attempt = max(1, attempt_count)
-    delay = INGEST_RETRY_BASE_SECONDS * (2 ** (bounded_attempt - 1))
-    return min(INGEST_RETRY_MAX_SECONDS, delay)
+    base_delay = max(1, INGEST_RETRY_BASE_SECONDS)
+    max_delay = max(1, INGEST_RETRY_MAX_SECONDS)
+    # Cap the exponent before exponentiation. Normal attempt counts are small,
+    # but corrupted persisted progress plus an unsafe retry configuration must
+    # not trigger pathological big-integer work merely to reach the max delay.
+    exponent_cap = (max_delay // base_delay).bit_length() if base_delay < max_delay else 0
+    exponent = min(max(0, bounded_attempt - 1), exponent_cap)
+    capped_delay = min(max_delay, base_delay * (2**exponent))
+    jitter_ratio = min(1.0, max(0.0, INGEST_RETRY_JITTER_RATIO))
+    if not jitter_key or jitter_ratio == 0:
+        return capped_delay
+    digest = hashlib.sha256(f"{jitter_key}:{bounded_attempt}".encode("utf-8")).digest()
+    unit_interval = int.from_bytes(digest[:8], "big") / ((1 << 64) - 1)
+    # Downward jitter retains the configured maximum retry budget while
+    # spreading runs that failed during the same dependency outage.
+    jittered = capped_delay * (1.0 - jitter_ratio * unit_interval)
+    return max(1, int(round(jittered)))
 
 
 def _write_worker_heartbeat(status: str, run_id: str | None = None, line_offset: int | None = None) -> None:
@@ -1445,48 +1796,69 @@ def _write_worker_heartbeat(status: str, run_id: str | None = None, line_offset:
 
 
 def connect_database():
-    return psycopg.connect(DATABASE_URL, connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS)
+    options = (
+        f"-c statement_timeout={WORKER_DATABASE_STATEMENT_TIMEOUT_MS} "
+        f"-c lock_timeout={WORKER_DATABASE_LOCK_TIMEOUT_MS}"
+    )
+    return psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS,
+        options=options,
+    )
 
 
 def discover_recoverable_runs(limit: int = 8) -> list[dict[str, str]]:
     with connect_database() as conn:
         rows = conn.execute(
             """
-            SELECT id::text, project_id::text, artifact_key
-            FROM scan_runs
-            WHERE artifact_key IS NOT NULL
-              AND (
-                  (
-                      status = 'UPLOADED'
-                      AND COALESCE(
-                          CASE
-                              WHEN pg_input_is_valid(
-                                  NULLIF(ingest_progress->>'next_retry_at', ''),
-                                  'timestamp with time zone'
-                              )
-                              THEN NULLIF(ingest_progress->>'next_retry_at', '')::timestamptz
-                          END,
-                          TO_TIMESTAMP(0)
-                      ) <= NOW()
+            WITH candidates AS (
+                SELECT id
+                FROM scan_runs
+                WHERE artifact_key IS NOT NULL
+                  AND (
+                      (
+                          status = 'UPLOADED'
+                          AND COALESCE(
+                              CASE
+                                  WHEN pg_input_is_valid(
+                                      NULLIF(ingest_progress->>'next_retry_at', ''),
+                                      'timestamp with time zone'
+                                  )
+                                  THEN NULLIF(ingest_progress->>'next_retry_at', '')::timestamptz
+                              END,
+                              TO_TIMESTAMP(0)
+                          ) <= NOW()
+                      )
+                      OR (
+                          status = 'INGESTING'
+                          AND COALESCE(
+                              CASE
+                                  WHEN pg_input_is_valid(
+                                      NULLIF(ingest_progress->>'heartbeat_at', ''),
+                                      'timestamp with time zone'
+                                  )
+                                  THEN NULLIF(ingest_progress->>'heartbeat_at', '')::timestamptz
+                              END,
+                              created_at
+                          ) <= NOW() - (%s * INTERVAL '1 second')
+                      )
                   )
-                  OR (
-                      status = 'INGESTING'
-                      AND COALESCE(
-                          CASE
-                              WHEN pg_input_is_valid(
-                                  NULLIF(ingest_progress->>'heartbeat_at', ''),
-                                  'timestamp with time zone'
-                              )
-                              THEN NULLIF(ingest_progress->>'heartbeat_at', '')::timestamptz
-                          END,
-                          created_at
-                      ) <= NOW() - (%s * INTERVAL '1 second')
-                  )
-              )
-            ORDER BY created_at ASC
-            LIMIT %s
+                ORDER BY created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            UPDATE scan_runs AS run
+            SET status = 'INGESTING',
+                ingest_progress = COALESCE(run.ingest_progress, '{}'::jsonb) || jsonb_build_object(
+                    'heartbeat_at', NOW(),
+                    'recovery_claimed_at', NOW(),
+                    'recovery_claimed_by', %s::text
+                )
+            FROM candidates
+            WHERE run.id = candidates.id
+            RETURNING run.id::text, run.project_id::text, run.artifact_key
             """,
-            (STALE_INGESTING_SECONDS, limit),
+            (STALE_INGESTING_SECONDS, max(1, limit), CONSUMER_NAME),
         ).fetchall()
     return [
         {
@@ -1592,13 +1964,52 @@ def process_job(fields: dict[str, str]) -> str:
             )
             conn.commit()
 
-            endpoint_cache: dict[str, int] = {}
-            resource_cache: dict[tuple[str, str, str], int] = {}
+            endpoint_cache: dict[str, int] = _BoundedLRUCache[str](INGEST_IDENTITY_CACHE_SIZE)
+            resource_cache: dict[tuple[str, str, str], int] = _BoundedLRUCache[tuple[str, str, str]](
+                INGEST_IDENTITY_CACHE_SIZE
+            )
             if line_offset > 0:
                 endpoint_cache, resource_cache = load_resume_caches(conn, run_id)
             item_batch: list[tuple] = []
             error_batch: list[tuple] = []
             producer_run_end_counts: dict[str, int] | None = None
+
+            def checkpoint_shutdown_if_requested() -> None:
+                nonlocal last_line_offset, last_counts
+                if not _shutdown_event.is_set():
+                    return
+                flush_item_batch(conn, item_batch)
+                flush_error_batch(conn, error_batch)
+                update_run_status(
+                    conn,
+                    run_id,
+                    "UPLOADED",
+                    line_offset,
+                    counts,
+                    extra_progress={
+                        "attempt_count": attempt_count,
+                        "paused_at": now_iso(),
+                        "paused_by": CONSUMER_NAME,
+                        "pause_reason": "worker_shutdown",
+                    },
+                )
+                write_audit(
+                    conn,
+                    project_id,
+                    "INGEST_PAUSED",
+                    "scan_run",
+                    run_id,
+                    {
+                        "worker": CONSUMER_NAME,
+                        "line_offset": line_offset,
+                        "reason": "worker_shutdown",
+                    },
+                )
+                conn.commit()
+                last_line_offset = line_offset
+                last_counts = counts.copy()
+                _write_worker_heartbeat("shutting_down", run_id=run_id, line_offset=line_offset)
+                raise _GracefulWorkerShutdown
 
             def process_record(rec: dict[str, Any]) -> None:
                 nonlocal counts, producer_run_end_counts
@@ -1743,6 +2154,7 @@ def process_job(fields: dict[str, str]) -> str:
                     current_line += 1
                     if current_line <= line_offset:
                         continue
+                    checkpoint_shutdown_if_requested()
                     line_offset = current_line
                     emit_processing_heartbeat()
                     process_record(rec)
@@ -1757,6 +2169,7 @@ def process_job(fields: dict[str, str]) -> str:
                     if current_line <= line_offset:
                         continue
 
+                    checkpoint_shutdown_if_requested()
                     line_offset = current_line
                     emit_processing_heartbeat()
                     line: str | None = None
@@ -1853,6 +2266,7 @@ def process_job(fields: dict[str, str]) -> str:
             if json_records is not None:
                 process_record_iter(json_records)
 
+            checkpoint_shutdown_if_requested()
             flush_item_batch(conn, item_batch)
             flush_error_batch(conn, error_batch)
             persisted_counts = load_persisted_summary(conn, run_id)
@@ -1879,6 +2293,9 @@ def process_job(fields: dict[str, str]) -> str:
             last_counts = counts.copy()
             _write_worker_heartbeat("idle")
             return "complete"
+        except _GracefulWorkerShutdown:
+            logger.info("ingest paused for worker shutdown run_id=%s line_offset=%s", run_id, last_line_offset)
+            return "shutdown"
         except Exception as exc:
             logger.exception("job failed run_id=%s", run_id)
             if not authoritative_row_loaded:
@@ -1896,7 +2313,8 @@ def process_job(fields: dict[str, str]) -> str:
                 logger.exception("failed to rollback aborted ingest transaction run_id=%s", run_id)
             try:
                 if retryable and attempt_count <= INGEST_MAX_RETRIES:
-                    next_retry_at = datetime.now(tz=UTC) + timedelta(seconds=_retry_backoff_seconds(attempt_count))
+                    retry_delay_seconds = _retry_backoff_seconds(attempt_count, jitter_key=run_id)
+                    next_retry_at = datetime.now(tz=UTC) + timedelta(seconds=retry_delay_seconds)
                     update_run_status(
                         conn,
                         run_id,
@@ -1908,6 +2326,8 @@ def process_job(fields: dict[str, str]) -> str:
                             "attempt_count": attempt_count,
                             "last_attempt_at": now_iso(),
                             "next_retry_at": next_retry_at.isoformat(),
+                            "retry_delay_seconds": retry_delay_seconds,
+                            "retryable": True,
                         },
                     )
                     if project_id:
@@ -1922,6 +2342,7 @@ def process_job(fields: dict[str, str]) -> str:
                                 "error": public_error,
                                 "attempt_count": attempt_count,
                                 "next_retry_at": next_retry_at.isoformat(),
+                                "retry_delay_seconds": retry_delay_seconds,
                             },
                         )
                     conn.commit()
@@ -1935,7 +2356,12 @@ def process_job(fields: dict[str, str]) -> str:
                     last_line_offset,
                     last_counts,
                     last_error=public_error,
-                    extra_progress={"attempt_count": attempt_count, "last_attempt_at": now_iso()},
+                    extra_progress={
+                        "attempt_count": attempt_count,
+                        "last_attempt_at": now_iso(),
+                        "retryable": retryable,
+                        "retry_exhausted": retryable and attempt_count > INGEST_MAX_RETRIES,
+                    },
                 )
                 if project_id:
                     write_audit(
@@ -1944,7 +2370,13 @@ def process_job(fields: dict[str, str]) -> str:
                         "INGEST_FAILED",
                         "scan_run",
                         run_id,
-                        {"worker": CONSUMER_NAME, "error": public_error, "attempt_count": attempt_count},
+                        {
+                            "worker": CONSUMER_NAME,
+                            "error": public_error,
+                            "attempt_count": attempt_count,
+                            "retryable": retryable,
+                            "retry_exhausted": retryable and attempt_count > INGEST_MAX_RETRIES,
+                        },
                     )
                 conn.commit()
                 _write_worker_heartbeat("idle")
@@ -2006,18 +2438,16 @@ def claim_stale_messages(start_id: str = "0-0") -> tuple[str, list[tuple[str, di
     return next_start_id, messages or []
 
 
-def main() -> int:
-    logger.info("worker started consumer=%s", CONSUMER_NAME)
-    _write_worker_heartbeat("idle")
-
+def _run_worker_loop() -> None:
     last_recovery_scan = 0.0
     last_redis_error_log = 0.0
     last_group_error_log = 0.0
+    last_database_recovery_error_log = 0.0
     last_idle_heartbeat = time.time()
     next_claim_start_id = "0-0"
     group_ready = False
 
-    while True:
+    while not _shutdown_event.is_set():
         messages = []
         if not group_ready:
             group_ready, last_group_error_log = try_ensure_group(last_group_error_log)
@@ -2042,6 +2472,8 @@ def main() -> int:
         if messages:
             for _, jobs in messages:
                 for message_id, fields in jobs:
+                    if _shutdown_event.is_set():
+                        break
                     try:
                         result = process_job(fields)
                         if should_ack_stream_result(result):
@@ -2052,11 +2484,15 @@ def main() -> int:
                             message_id,
                             _safe_run_id(fields),
                         )
-                        time.sleep(1)
+                        _shutdown_event.wait(1)
+                if _shutdown_event.is_set():
+                    break
 
-        if group_ready:
+        if group_ready and not _shutdown_event.is_set():
             next_claim_start_id, stale_jobs = claim_stale_messages(next_claim_start_id)
             for message_id, fields in stale_jobs:
+                if _shutdown_event.is_set():
+                    break
                 try:
                     result = process_job(fields)
                     if should_ack_stream_result(result):
@@ -2067,15 +2503,37 @@ def main() -> int:
                         message_id,
                         _safe_run_id(fields),
                     )
-                    time.sleep(1)
+                    _shutdown_event.wait(1)
 
-        if time.time() - last_recovery_scan >= RECOVERY_SCAN_SECONDS:
-            for recovered in discover_recoverable_runs(limit=RECOVERY_SCAN_LIMIT):
+        if not _shutdown_event.is_set() and time.time() - last_recovery_scan >= RECOVERY_SCAN_SECONDS:
+            recovered_count = 0
+            for _ in range(RECOVERY_SCAN_LIMIT):
+                recovered_runs: list[dict[str, str]] = []
+                try:
+                    # Claim one run immediately before processing it. Claiming
+                    # an entire serial batch would make queued work appear
+                    # INGESTING while it was only waiting behind an older run.
+                    recovered_runs = discover_recoverable_runs(limit=1)
+                except psycopg.Error as exc:
+                    now = time.time()
+                    if _should_log_redis_error(last_database_recovery_error_log, now):
+                        logger.warning("database recovery scan failed; retrying: %s", exc)
+                        last_database_recovery_error_log = now
+                    _write_worker_heartbeat("database_recovery_retry")
+                    break
+                if not recovered_runs:
+                    break
+                recovered = recovered_runs[0]
+                recovered_count += 1
                 try:
                     process_job(recovered)
                 except Exception:
                     logger.exception("failed processing recovered uploaded run run_id=%s", _safe_run_id(recovered))
-                    time.sleep(1)
+                    _shutdown_event.wait(1)
+                if _shutdown_event.is_set():
+                    break
+            if recovered_count:
+                logger.info("processed recoverable ingest runs count=%s", recovered_count)
             last_recovery_scan = time.time()
 
         now = time.time()
@@ -2083,7 +2541,21 @@ def main() -> int:
             _write_worker_heartbeat("idle")
             last_idle_heartbeat = now
         if not group_ready:
-            time.sleep(1)
+            _shutdown_event.wait(1)
+
+
+def main() -> int:
+    _shutdown_event.clear()
+    previous_handlers = _install_shutdown_signal_handlers()
+    logger.info("worker started consumer=%s", CONSUMER_NAME)
+    _write_worker_heartbeat("idle")
+    try:
+        _run_worker_loop()
+    finally:
+        _write_worker_heartbeat("stopped")
+        _restore_shutdown_signal_handlers(previous_handlers)
+    logger.info("worker stopped consumer=%s", CONSUMER_NAME)
+    return 0
 
 
 if __name__ == "__main__":

@@ -694,3 +694,45 @@ def test_process_job_propagates_connection_failure_for_stream_redelivery(monkeyp
 
     with pytest.raises(psycopg.OperationalError, match="database unavailable"):
         main.process_job({"run_id": "11111111-1111-1111-1111-111111111111"})
+
+
+def test_process_job_checkpoints_without_failure_on_worker_shutdown(monkeypatch) -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    project_id = "22222222-2222-2222-2222-222222222222"
+    run_row = (project_id, "artifact.ndjson", "UPLOADED", {}, {"line_offset": 0}, "application/x-ndjson", 64)
+    fake_conn = _FakeConn(run_row)
+    status_updates: list[tuple[str, int, dict[str, Any]]] = []
+    audit_actions: list[str] = []
+
+    def _update(_conn, _run_id, status, line_offset, _summary, **kwargs):
+        status_updates.append((status, line_offset, kwargs.get("extra_progress", {})))
+
+    def _audit(_conn, _project_id, action, *_args, **_kwargs):
+        audit_actions.append(action)
+
+    monkeypatch.setattr(main.psycopg, "connect", lambda *_args, **_kwargs: fake_conn)
+    monkeypatch.setattr(
+        main,
+        "open_artifact_stream",
+        lambda *_args: _FakeBody(
+            [f'{{"type":"endpoint","run_id":"{run_id}","endpoint_key":"host:445"}}\n']
+        ),
+    )
+    monkeypatch.setattr(main, "upsert_endpoint", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("shutdown must happen before the next record")))
+    monkeypatch.setattr(main, "update_run_status", _update)
+    monkeypatch.setattr(main, "write_audit", _audit)
+    monkeypatch.setattr(main, "_write_worker_heartbeat", lambda *_args, **_kwargs: None)
+    main._shutdown_event.set()
+    try:
+        result = main.process_job({"run_id": run_id, "project_id": project_id, "artifact_key": "artifact.ndjson"})
+    finally:
+        main._shutdown_event.clear()
+
+    assert result == "shutdown"
+    assert main.should_ack_stream_result(result) is True
+    assert [(status, offset) for status, offset, _ in status_updates] == [("INGESTING", 0), ("UPLOADED", 0)]
+    assert status_updates[-1][2]["pause_reason"] == "worker_shutdown"
+    assert audit_actions == ["INGEST_STARTED", "INGEST_PAUSED"]
+    assert fake_conn.commit_calls == 2
+    assert fake_conn.rollback_calls == 0
+    assert fake_conn._unlocked is True

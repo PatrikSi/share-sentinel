@@ -76,6 +76,30 @@ def test_count_targets_matches_streamed_deduplicated_targets(cidrs, hosts) -> No
     assert collector.count_targets(cidrs, hosts) == len(list(collector.iter_targets(cidrs, hosts)))
 
 
+def test_parse_hosts_file_streams_deduplicates_and_enforces_reviewed_limit(tmp_path) -> None:
+    collector = _load_collector_module()
+    hosts_path = tmp_path / "hosts.txt"
+    hosts_path.write_text("# scope\nSERVER-A\nserver-a\n10.0.0.1\n", encoding="utf-8")
+
+    assert collector.parse_hosts_file(str(hosts_path), max_hosts=2) == ["SERVER-A", "10.0.0.1"]
+
+    hosts_path.write_text("host-a\nhost-b\nhost-c\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="--max-targets"):
+        collector.parse_hosts_file(str(hosts_path), max_hosts=2)
+
+
+def test_parse_hosts_file_rejects_unbounded_or_ambiguous_lines(tmp_path) -> None:
+    collector = _load_collector_module()
+    hosts_path = tmp_path / "hosts.txt"
+    hosts_path.write_text("x" * (collector.HOST_INPUT_MAX_LINE_CHARACTERS + 1), encoding="utf-8")
+    with pytest.raises(ValueError, match="line 1 exceeds"):
+        collector.parse_hosts_file(str(hosts_path))
+
+    hosts_path.write_text("host-a extra-token\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="single host target"):
+        collector.parse_hosts_file(str(hosts_path))
+
+
 def test_progress_reporter_emits_line_oriented_counts_and_terminal_status() -> None:
     collector = _load_collector_module()
     stream = io.StringIO()
@@ -232,6 +256,15 @@ def test_validation_rejects_non_finite_timeouts(field, value) -> None:
     setattr(args, field, value)
 
     with pytest.raises(SystemExit, match="must be finite"):
+        collector._validate_args(args)
+
+
+def test_validation_rejects_negative_artifact_budget() -> None:
+    collector = _load_collector_module()
+    args = _base_args(None)
+    args.max_artifact_bytes = -1
+
+    with pytest.raises(SystemExit, match="--max-artifact-bytes must be zero or greater"):
         collector._validate_args(args)
 
 
@@ -772,6 +805,15 @@ def test_retry_loop_honors_bounded_retry_after(monkeypatch) -> None:
 
     assert result.status_code == 200
     assert sleeps == [30.0]
+
+
+def test_retry_after_supports_http_date_and_ignores_expired_values() -> None:
+    collector = _load_collector_module()
+    now = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
+
+    assert collector._retry_after_seconds("Mon, 24 Aug 2026 12:00:12 GMT", now=now) == 12.0
+    assert collector._retry_after_seconds("Mon, 24 Aug 2026 11:59:59 GMT", now=now) == 0.0
+    assert collector._retry_after_seconds("not-a-date", now=now) == 0.0
 
 
 @pytest.mark.parametrize("retry_after", ["nan", "inf", "-1"])

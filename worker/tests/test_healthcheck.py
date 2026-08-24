@@ -68,7 +68,10 @@ def test_check_database_uses_bounded_connect_timeout(monkeypatch) -> None:
 
     assert captured == {
         "url": "postgresql://db/share_sentinel",
-        "kwargs": {"connect_timeout": healthcheck.DATABASE_CONNECT_TIMEOUT_SECONDS},
+        "kwargs": {
+            "connect_timeout": healthcheck.WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS,
+            "options": f"-c statement_timeout={healthcheck.WORKER_DATABASE_STATEMENT_TIMEOUT_MS}",
+        },
         "query": "SELECT 1",
     }
 

@@ -24,6 +24,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
@@ -90,6 +91,9 @@ ARTIFACT_FORMAT_COMPACT_JSON = "compact_json"
 ARTIFACT_FORMAT_NDJSON = "ndjson"
 COMPACT_JSON_MAX_BUFFER_BYTES = 40 * 1024 * 1024
 COMPACT_JSON_MAX_ENDPOINT_BUFFER_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_ARTIFACT_BYTES = 10 * 1024 * 1024 * 1024
+HOST_INPUT_MAX_LINE_CHARACTERS = 1024
+HOST_TARGET_MAX_CHARACTERS = 255
 SUPPORTED_ARTIFACT_SUFFIXES = (
     ".json",
     ".json.gz",
@@ -397,8 +401,17 @@ class CompactArtifactTooLargeError(ValueError):
     """Raised before compact output assembly could exceed its memory budget."""
 
 
+class ArtifactSpoolLimitError(RuntimeError):
+    """Raised when streaming output reaches the configured local disk budget."""
+
+
 class NDJSONWriter:
-    def __init__(self, path: str | None, gzip_output: bool):
+    def __init__(
+        self,
+        path: str | None,
+        gzip_output: bool,
+        max_spool_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES,
+    ):
         self._lock = threading.Lock()
         self._path = path
         self._gzip = bool(gzip_output and path is not None)
@@ -409,7 +422,11 @@ class NDJSONWriter:
         self._run_meta: dict[str, object] | None = None
         self._run_end: dict[str, object] | None = None
         self._issues: dict[str, dict[str, object]] = {}
-        self._spool_error: OSError | None = None
+        self._spool_error: BaseException | None = None
+        self._max_spool_bytes = max(0, int(max_spool_bytes))
+        self._spool_bytes = 0
+        self._run_meta_bytes = 0
+        self._run_end_bytes = 0
         self._ndjson_spool_path: str | None = None
         self._ndjson_spool_fp = None
         if self._artifact_format == ARTIFACT_FORMAT_NDJSON:
@@ -426,16 +443,34 @@ class NDJSONWriter:
                 return
             rec_type = str(record.get("type") or "")
             if rec_type == "run_meta":
+                serialized_bytes = self._serialized_line_size(record)
+                try:
+                    self._check_spool_limit(serialized_bytes - self._run_meta_bytes)
+                except ArtifactSpoolLimitError as exc:
+                    self._spool_error = exc
+                    raise
                 self._run_meta = dict(record)
+                self._run_meta_bytes = serialized_bytes
                 return
             if rec_type == "run_end":
+                serialized_bytes = self._serialized_line_size(record)
+                try:
+                    self._check_spool_limit(serialized_bytes - self._run_end_bytes)
+                except ArtifactSpoolLimitError as exc:
+                    self._spool_error = exc
+                    raise
                 self._run_end = dict(record)
+                self._run_end_bytes = serialized_bytes
                 return
             if self._artifact_format == ARTIFACT_FORMAT_NDJSON:
                 if rec_type in {"endpoint", "resource", "item", "error"}:
                     try:
-                        self._write_json_line(self._ndjson_spool_fp, record)
-                    except OSError as exc:
+                        serialized = json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+                        serialized_bytes = len(serialized.encode("utf-8"))
+                        self._check_spool_limit(serialized_bytes)
+                        self._ndjson_spool_fp.write(serialized)
+                        self._spool_bytes += serialized_bytes
+                    except (OSError, ArtifactSpoolLimitError) as exc:
                         self._spool_error = exc
                         raise
                 return
@@ -478,6 +513,8 @@ class NDJSONWriter:
                 self._ndjson_spool_fp.close()
                 self._ndjson_spool_fp = None
             if self._spool_error is not None:
+                if isinstance(self._spool_error, ArtifactSpoolLimitError):
+                    raise self._spool_error
                 raise OSError(f"collector buffer write failed: {self._spool_error}") from self._spool_error
             if not keep_output:
                 return
@@ -541,6 +578,20 @@ class NDJSONWriter:
     @staticmethod
     def _serialized_size(value: object) -> int:
         return len(json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+
+    @classmethod
+    def _serialized_line_size(cls, value: object) -> int:
+        return cls._serialized_size(value) + 1
+
+    def _check_spool_limit(self, additional_bytes: int) -> None:
+        if self._artifact_format != ARTIFACT_FORMAT_NDJSON or self._max_spool_bytes == 0:
+            return
+        projected = self._spool_bytes + self._run_meta_bytes + self._run_end_bytes + additional_bytes
+        if projected > self._max_spool_bytes:
+            raise ArtifactSpoolLimitError(
+                "collector artifact exceeds --max-artifact-bytes "
+                f"({self._max_spool_bytes} bytes); narrow the scan or raise the reviewed limit"
+            )
 
     def _validate_compact_output_bounds(self) -> None:
         total_bytes = 0
@@ -870,6 +921,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=65536,
         help="Fail before scanning more than this many unique targets (0 disables the guard).",
     )
+    common.add_argument(
+        "--max-artifact-bytes",
+        type=int,
+        default=DEFAULT_MAX_ARTIFACT_BYTES,
+        help=(
+            "Maximum uncompressed NDJSON bytes buffered locally before aborting safely "
+            f"(default: {DEFAULT_MAX_ARTIFACT_BYTES}; 0 disables the guard)."
+        ),
+    )
     common.add_argument("--operator-label", type=str, help="Optional operator label stored in run metadata.")
     output_controls = common.add_mutually_exclusive_group()
     output_controls.add_argument(
@@ -1060,14 +1120,40 @@ def parse_targets(cidrs: list[str], hosts_file: str | None) -> list[str]:
     return list(iter_targets(cidrs, parse_hosts_file(hosts_file)))
 
 
-def parse_hosts_file(hosts_file: str | None) -> list[str]:
+def parse_hosts_file(hosts_file: str | None, max_hosts: int | None = None) -> list[str]:
     if not hosts_file:
         return []
     hosts: list[str] = []
-    for line in Path(hosts_file).read_text(encoding="utf-8-sig").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            hosts.append(line)
+    seen: set[str] = set()
+    with Path(hosts_file).open("r", encoding="utf-8-sig") as hosts_fp:
+        line_number = 0
+        while True:
+            raw_line = hosts_fp.readline(HOST_INPUT_MAX_LINE_CHARACTERS + 2)
+            if raw_line == "":
+                break
+            line_number += 1
+            if len(raw_line.rstrip("\r\n")) > HOST_INPUT_MAX_LINE_CHARACTERS:
+                raise ValueError(
+                    f"hosts file line {line_number} exceeds {HOST_INPUT_MAX_LINE_CHARACTERS} characters"
+                )
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "\x00" in line or any(character.isspace() for character in line):
+                raise ValueError(f"hosts file line {line_number} is not a valid single host target")
+            if len(line) > HOST_TARGET_MAX_CHARACTERS:
+                raise ValueError(
+                    f"hosts file line {line_number} exceeds the {HOST_TARGET_MAX_CHARACTERS}-character host limit"
+                )
+            target, key = _normalize_host_target(line)
+            if key in seen:
+                continue
+            seen.add(key)
+            hosts.append(target)
+            if max_hosts is not None and max_hosts > 0 and len(hosts) > max_hosts:
+                raise ValueError(
+                    f"hosts file contains more than the reviewed --max-targets limit ({max_hosts})"
+                )
     return hosts
 
 
@@ -1883,6 +1969,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     max_entries_per_share = int(getattr(args, "max_entries_per_share", 1))
     access_probe_limit = int(getattr(args, "access_probe_limit", 3))
     max_targets = int(getattr(args, "max_targets", 65536))
+    max_artifact_bytes = int(getattr(args, "max_artifact_bytes", DEFAULT_MAX_ARTIFACT_BYTES))
     progress_interval = float(getattr(args, "progress_interval", 5.0))
     upload_timeout = float(getattr(args, "upload_timeout", 600.0))
     upload_attempts = int(getattr(args, "upload_attempts", 3))
@@ -1995,6 +2082,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--access-probe-limit must be between 0 and 100")
     if max_targets < 0:
         raise SystemExit("--max-targets must be zero or greater")
+    if max_artifact_bytes < 0:
+        raise SystemExit("--max-artifact-bytes must be zero or greater")
     if not math.isfinite(progress_interval):
         raise SystemExit("--progress-interval must be finite")
     if progress_interval < 0:
@@ -3146,6 +3235,25 @@ def _response_detail(response: requests.Response) -> str | None:
     return str(detail) if detail is not None else None
 
 
+def _retry_after_seconds(raw_value: object, *, now: datetime | None = None) -> float:
+    raw_text = str(raw_value or "").strip()
+    if not raw_text:
+        return 0.0
+    try:
+        seconds = float(raw_text)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(raw_text)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        seconds = (retry_at.astimezone(UTC) - (now or datetime.now(tz=UTC))).total_seconds()
+    if not math.isfinite(seconds) or seconds < 0:
+        return 0.0
+    return seconds
+
+
 def _post_with_retries(
     request_fn,
     max_attempts: int = 3,
@@ -3174,10 +3282,8 @@ def _post_with_retries(
         retry_after = 0.0
         if response is not None:
             try:
-                retry_after = float(response.headers.get("Retry-After", "0"))
-            except (AttributeError, TypeError, ValueError):
-                retry_after = 0.0
-            if not math.isfinite(retry_after) or retry_after < 0:
+                retry_after = _retry_after_seconds(response.headers.get("Retry-After", "0"))
+            except AttributeError:
                 retry_after = 0.0
             close_response = getattr(response, "close", None)
             if callable(close_response):
@@ -3243,6 +3349,7 @@ def _handle_scan_result(
         )
         _record_error(stats, lock, code, message)
         if isinstance(reporter, ProgressReporter):
+            reporter.detail(f"{code}: {message}", level=1)
             reporter.target_completed(host, succeeded=False)
         return 1
 
@@ -3386,6 +3493,8 @@ def _scan_targets(
 
 
 def _scan_thread_error_code(exc: BaseException) -> str:
+    if isinstance(exc, ArtifactSpoolLimitError):
+        return "SCAN_OUTPUT_LIMIT"
     if isinstance(exc, concurrent.futures.CancelledError):
         return "SCAN_THREAD_CANCELLED"
     if isinstance(exc, (NetBIOSTimeout,)):
@@ -3467,8 +3576,9 @@ def main() -> int:
             print(f"configuration error: {message}", file=sys.stderr)
         return EXIT_FAILURE
 
+    max_targets = int(getattr(args, "max_targets", 65536))
     try:
-        host_inputs = parse_hosts_file(args.hosts)
+        host_inputs = parse_hosts_file(args.hosts, max_hosts=max_targets or None)
         target_count = count_targets(args.cidr, host_inputs)
         targets = iter_targets(args.cidr, host_inputs)
     except (OSError, ValueError) as exc:
@@ -3476,7 +3586,6 @@ def main() -> int:
         print("fix target inputs and retry (--hosts file and/or --cidr values).", file=sys.stderr)
         return EXIT_FAILURE
 
-    max_targets = int(getattr(args, "max_targets", 65536))
     if max_targets and target_count > max_targets:
         print(
             f"input error: resolved {target_count} unique targets, exceeding --max-targets {max_targets}.",
@@ -3506,7 +3615,11 @@ def main() -> int:
         output_path = temp_artifact
 
     try:
-        writer = NDJSONWriter(output_path, args.gzip)
+        writer = NDJSONWriter(
+            output_path,
+            args.gzip,
+            max_spool_bytes=int(getattr(args, "max_artifact_bytes", DEFAULT_MAX_ARTIFACT_BYTES)),
+        )
     except OSError as exc:
         if temp_artifact:
             try:
@@ -3551,6 +3664,7 @@ def main() -> int:
                 "timeout_seconds": args.timeout,
                 "max_depth": args.max_depth,
                 "max_entries_per_share": args.max_entries_per_share,
+                "max_artifact_bytes": int(getattr(args, "max_artifact_bytes", DEFAULT_MAX_ARTIFACT_BYTES)),
                 "access_probe_limit": int(getattr(args, "access_probe_limit", 3)),
                 "include_share": list(getattr(args, "include_share", []) or []),
                 "exclude_share": list(getattr(args, "exclude_share", []) or []),
@@ -3569,17 +3683,43 @@ def main() -> int:
             "method": smb_auth_method,
         },
     }
-    writer.emit(run_meta_record)
+    try:
+        writer.emit(run_meta_record)
+    except ArtifactSpoolLimitError as exc:
+        try:
+            writer.close(keep_output=False)
+        except Exception:
+            pass
+        if temp_artifact:
+            try:
+                os.unlink(temp_artifact)
+            except OSError:
+                pass
+        print(f"output error: {_error_detail(exc)}", file=sys.stderr)
+        return EXIT_FAILURE
 
     for warning in dependency_warnings:
-        _emit_error(
-            writer,
-            run_id,
-            severity="warn",
-            code="SCAN_DEPENDENCY_WARNING",
-            message=warning,
-            hint="Install the missing dependency to enable all requested share types.",
-        )
+        try:
+            _emit_error(
+                writer,
+                run_id,
+                severity="warn",
+                code="SCAN_DEPENDENCY_WARNING",
+                message=warning,
+                hint="Install the missing dependency to enable all requested share types.",
+            )
+        except ArtifactSpoolLimitError as exc:
+            try:
+                writer.close(keep_output=False)
+            except Exception:
+                pass
+            if temp_artifact:
+                try:
+                    os.unlink(temp_artifact)
+                except OSError:
+                    pass
+            print(f"output error: {_error_detail(exc)}", file=sys.stderr)
+            return EXIT_FAILURE
         _record_error(stats, lock, "SCAN_DEPENDENCY_WARNING", warning)
 
     reporter.start(workers=args.workers, share_types=selected_share_types)
@@ -3601,26 +3741,31 @@ def main() -> int:
         )
         _record_error(stats, lock, "SCAN_INTERRUPTED", interruption_message)
 
-    writer.emit(
-        {
-            "type": "run_end",
-            "run_id": run_id,
-            "finished_at": datetime.now(tz=UTC).isoformat(),
-            "stats": {
-                "targets_scanned": scan_outcome.targets_completed,
-                "targets_submitted": scan_outcome.targets_submitted,
-                "targets_cancelled": scan_outcome.targets_cancelled,
-                "targets_total": target_count,
-                "targets_remaining": max(0, target_count - scan_outcome.targets_completed),
-                "host_failures": scan_outcome.host_failures,
-                "interrupted": scan_outcome.interrupted,
-                "endpoints": stats.endpoints,
-                "resources": stats.resources,
-                "items": stats.items,
-                "errors": stats.errors,
-            },
-        }
-    )
+    try:
+        writer.emit(
+            {
+                "type": "run_end",
+                "run_id": run_id,
+                "finished_at": datetime.now(tz=UTC).isoformat(),
+                "stats": {
+                    "targets_scanned": scan_outcome.targets_completed,
+                    "targets_submitted": scan_outcome.targets_submitted,
+                    "targets_cancelled": scan_outcome.targets_cancelled,
+                    "targets_total": target_count,
+                    "targets_remaining": max(0, target_count - scan_outcome.targets_completed),
+                    "host_failures": scan_outcome.host_failures,
+                    "interrupted": scan_outcome.interrupted,
+                    "endpoints": stats.endpoints,
+                    "resources": stats.resources,
+                    "items": stats.items,
+                    "errors": stats.errors,
+                },
+            }
+        )
+    except ArtifactSpoolLimitError:
+        # The writer retains the original typed failure and reports it during
+        # the normal atomic finalization path below.
+        pass
 
     run_has_data = _is_successful_run(stats)
     keep_output = run_has_data

@@ -181,6 +181,15 @@ target count without expanding large CIDRs in memory. The default
 scope or explicitly raise the limit after review; `--max-targets 0` disables
 the guard.
 
+Host files are read line by line, deduplicated, and checked against that same
+target limit. Each non-comment line must contain one host target and is bounded
+in length, so a malformed or unexpectedly large input fails before scanning.
+
+Streaming NDJSON output has a separate `--max-artifact-bytes` guard. It defaults
+to 10 GiB of uncompressed buffered records and fails safely before the limit is
+exceeded; narrow the scan or raise the value only after reviewing local disk and
+API upload capacity. `--max-artifact-bytes 0` explicitly disables this guard.
+
 Pressing Ctrl-C stops new submissions, cancels queued targets, and asks active
 SMB/NFS tasks to stop between bounded network operations. The collector drains
 those operations before finalizing so the artifact cannot race with worker
@@ -282,7 +291,7 @@ credential or connectivity issue and rerun explicitly.
 - If upload fails after the artifact has been written, the collector tries to keep the local artifact so you can retry without rescanning.
 - If `--upload` is used without `--output`, the collector creates a temporary local artifact first and removes it only after a successful upload path.
 - An interrupted upload keeps that temporary artifact and is reported as an unknown delivery outcome rather than as success or ordinary failure.
-- API calls retry only transient connection/timeouts and HTTP 408/429/5xx responses. Backoff has jitter, honors numeric `Retry-After` up to 30 seconds, and is bounded by `--upload-attempts` (default 3).
+- API calls retry only transient connection/timeouts and HTTP 408/429/5xx responses. Backoff has jitter, honors numeric or HTTP-date `Retry-After` values up to 30 seconds, and is bounded by `--upload-attempts` (default 3).
 - `--upload-timeout` (default 600 seconds) is the response/read budget for each attempt; API connection establishment is capped at 10 seconds per attempt.
 - A timeout after an artifact POST is ambiguous because the API may already have stored and queued it. If a retry receives an ingest/state conflict, the collector reads the run and reports recovery only when its status is `UPLOADED`, `INGESTING`, or `COMPLETE` and the server artifact SHA-256 exactly matches the local file. Missing read permission, a mismatched digest, or any other state fails the upload and retains the local artifact.
 

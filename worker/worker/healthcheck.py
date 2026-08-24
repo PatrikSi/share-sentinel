@@ -21,7 +21,14 @@ def _read_timeout(name: str, default: float) -> float:
 
 REDIS_CONNECT_TIMEOUT_SECONDS = _read_timeout("REDIS_CONNECT_TIMEOUT_SECONDS", 3.0)
 REDIS_SOCKET_TIMEOUT_SECONDS = _read_timeout("REDIS_SOCKET_TIMEOUT_SECONDS", 5.0)
-DATABASE_CONNECT_TIMEOUT_SECONDS = max(1, int(_read_timeout("DATABASE_CONNECT_TIMEOUT_SECONDS", 5.0)))
+WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS = max(
+    1,
+    int(_read_timeout("WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS", 5.0)),
+)
+WORKER_DATABASE_STATEMENT_TIMEOUT_MS = max(
+    1000,
+    int(_read_timeout("WORKER_DATABASE_STATEMENT_TIMEOUT_MS", 120000.0)),
+)
 
 
 def _parse_heartbeat(path: Path) -> dict[str, object]:
@@ -39,7 +46,11 @@ def check_heartbeat(path: Path, timeout_seconds: int, now: datetime | None = Non
 
 def check_database(database_url: str) -> None:
     normalized_url = database_url.replace("postgresql+psycopg://", "postgresql://", 1)
-    with psycopg.connect(normalized_url, connect_timeout=DATABASE_CONNECT_TIMEOUT_SECONDS) as conn:
+    with psycopg.connect(
+        normalized_url,
+        connect_timeout=WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS,
+        options=f"-c statement_timeout={WORKER_DATABASE_STATEMENT_TIMEOUT_MS}",
+    ) as conn:
         conn.execute("SELECT 1").fetchone()
 
 

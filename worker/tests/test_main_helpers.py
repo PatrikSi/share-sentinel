@@ -1,6 +1,8 @@
 import gzip
 import io
 import json
+import os
+import subprocess
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -63,6 +65,23 @@ def test_read_int_env_uses_default_for_invalid_values(monkeypatch) -> None:
     assert main._read_int_env("TEST_WORKER_INT", default=9, min_value=1) == 9
 
 
+def test_read_int_env_strict_mode_rejects_invalid_or_unsafe_values(monkeypatch) -> None:
+    monkeypatch.setenv("TEST_WORKER_INT", "invalid")
+    with pytest.raises(ValueError, match="must be an integer"):
+        main._read_int_env("TEST_WORKER_INT", default=5, min_value=1, max_value=10, strict=True)
+
+    monkeypatch.setenv("TEST_WORKER_INT", "0")
+    with pytest.raises(ValueError, match="must be at least 1"):
+        main._read_int_env("TEST_WORKER_INT", default=5, min_value=1, max_value=10, strict=True)
+
+    monkeypatch.setenv("TEST_WORKER_INT", "11")
+    with pytest.raises(ValueError, match="must be at most 10"):
+        main._read_int_env("TEST_WORKER_INT", default=5, min_value=1, max_value=10, strict=True)
+
+    monkeypatch.setenv("TEST_WORKER_INT", "10")
+    assert main._read_int_env("TEST_WORKER_INT", default=5, min_value=1, max_value=10, strict=True) == 10
+
+
 def test_read_float_env_validates_and_enforces_minimum(monkeypatch) -> None:
     monkeypatch.setenv("TEST_WORKER_FLOAT", "2.5")
     assert main._read_float_env("TEST_WORKER_FLOAT", default=5.0) == 2.5
@@ -76,6 +95,54 @@ def test_read_float_env_validates_and_enforces_minimum(monkeypatch) -> None:
     for non_finite in ("nan", "inf", "-inf"):
         monkeypatch.setenv("TEST_WORKER_FLOAT", non_finite)
         assert main._read_float_env("TEST_WORKER_FLOAT", default=5.0) == 5.0
+
+
+def test_read_float_env_strict_mode_rejects_non_finite_and_out_of_range(monkeypatch) -> None:
+    for value in ("invalid", "nan", "-0.1", "1.1"):
+        monkeypatch.setenv("TEST_WORKER_FLOAT", value)
+        with pytest.raises(ValueError):
+            main._read_float_env(
+                "TEST_WORKER_FLOAT",
+                default=0.2,
+                min_value=0.0,
+                max_value=1.0,
+                strict=True,
+            )
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "expected"),
+    [
+        ("INGEST_BATCH_SIZE", str(main.MAX_INGEST_BATCH_SIZE + 1), "must be at most"),
+        ("INGEST_BATCH_SIZE", "not-an-integer", "must be an integer"),
+        ("INGEST_MAX_RECORD_BYTES", str(main.MAX_INGEST_RECORD_BYTES + 1), "must be at most"),
+        ("INGEST_JSON_COMPAT_MAX_BYTES", str(main.MAX_INGEST_JSON_COMPAT_BYTES + 1), "must be at most"),
+        ("INGEST_GZIP_MAX_BYTES", str(main.MAX_INGEST_GZIP_DECOMPRESSED_BYTES + 1), "must be at most"),
+        ("INGEST_GZIP_MAX_EXPANSION_RATIO", str(main.MAX_INGEST_GZIP_EXPANSION_RATIO + 1), "must be at most"),
+        ("INGEST_IDENTITY_CACHE_SIZE", str(main.MAX_INGEST_IDENTITY_CACHE_SIZE + 1), "must be at most"),
+        ("INGEST_MAX_RETRIES", str(main.MAX_INGEST_RETRIES + 1), "must be at most"),
+        ("INGEST_RETRY_JITTER_RATIO", "1.01", "must be at most"),
+    ],
+)
+def test_bounded_worker_settings_fail_fast_at_startup(name: str, value: str, expected: str) -> None:
+    worker_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env[name] = value
+    env["PYTHONPATH"] = str(worker_root)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "from worker import main"],
+        cwd=worker_root,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert name in result.stderr
+    assert expected in result.stderr
 
 
 def test_is_json_artifact_supports_json_and_json_gz() -> None:
@@ -189,6 +256,26 @@ def test_retry_backoff_seconds_grows_and_caps() -> None:
     assert main._retry_backoff_seconds(1) == main.INGEST_RETRY_BASE_SECONDS
     assert main._retry_backoff_seconds(2) == min(main.INGEST_RETRY_MAX_SECONDS, main.INGEST_RETRY_BASE_SECONDS * 2)
     assert main._retry_backoff_seconds(99) == main.INGEST_RETRY_MAX_SECONDS
+    assert main._retry_backoff_seconds(10**1000) == main.INGEST_RETRY_MAX_SECONDS
+
+
+def test_retry_backoff_jitter_is_stable_bounded_and_spreads_runs(monkeypatch) -> None:
+    monkeypatch.setattr(main, "INGEST_RETRY_JITTER_RATIO", 0.2)
+    base = main._retry_backoff_seconds(2)
+    first = main._retry_backoff_seconds(2, jitter_key="run-a")
+    repeated = main._retry_backoff_seconds(2, jitter_key="run-a")
+    second = main._retry_backoff_seconds(2, jitter_key="run-b")
+
+    assert first == repeated
+    assert round(base * 0.8) <= first <= base
+    assert round(base * 0.8) <= second <= base
+    assert first != second
+
+
+def test_runtime_error_is_terminal_but_dependency_errors_are_retryable() -> None:
+    assert main._is_retryable_ingest_error(RuntimeError("poison")) is False
+    assert main._is_retryable_ingest_error(main.psycopg.OperationalError("database unavailable")) is True
+    assert main._is_retryable_ingest_error(OSError("artifact unavailable")) is True
 
 
 def test_write_worker_heartbeat_persists_status_payload(tmp_path: Path, monkeypatch) -> None:
@@ -212,6 +299,60 @@ def test_ingest_error_fingerprint_is_stable_for_same_payload() -> None:
     assert row_a == row_b
     assert row_a[-1] != row_c[-1]
     assert len(row_a[-1]) == 32
+
+
+def test_ingest_error_row_bounds_untrusted_diagnostics() -> None:
+    row = main.build_ingest_error_row(
+        "run-1",
+        "unexpected",
+        "C" * 500,
+        "M" * 10000,
+        "E" * 500,
+        "R" * 500,
+        "P" * 10000,
+    )
+
+    assert row[1] == "error"
+    assert len(row[2]) == main.INGEST_ERROR_CODE_MAX_LENGTH
+    assert len(row[3]) == main.INGEST_ERROR_MESSAGE_MAX_LENGTH
+    assert len(row[4]) == main.ENDPOINT_KEY_MAX_LENGTH
+    assert len(row[5]) == main.RESOURCE_NAME_MAX_LENGTH
+    assert len(row[6]) == main.INGEST_ERROR_PATH_MAX_LENGTH
+
+
+def test_validate_record_rejects_database_poison_fields() -> None:
+    run_id = "11111111-1111-1111-1111-111111111111"
+    item = {
+        "type": "item",
+        "run_id": run_id,
+        "endpoint_key": "host:445",
+        "resource_name": "Finance",
+        "path": "\\" + ("x" * (main.ITEM_PATH_MAX_BYTES + 1)),
+        "name": "report.txt",
+    }
+    valid, reason = main.validate_record(item)
+    assert valid is False
+    assert reason == f"field path exceeds {main.ITEM_PATH_MAX_BYTES} UTF-8 bytes"
+
+    endpoint = {
+        "type": "endpoint",
+        "run_id": run_id,
+        "endpoint_key": "host:445",
+        "auth": ["not", "an", "object"],
+    }
+    valid, reason = main.validate_record(endpoint)
+    assert valid is False
+    assert reason == "field auth must be an object"
+
+
+def test_bounded_identity_cache_evicts_least_recently_used_entry() -> None:
+    cache = main._BoundedLRUCache[str](2)
+    cache["a"] = 1
+    cache["b"] = 2
+    assert cache.get("a") == 1
+    cache["c"] = 3
+
+    assert dict(cache) == {"a": 1, "c": 3}
 
 
 def test_flush_error_batch_uses_fingerprint_deduplication() -> None:
@@ -253,7 +394,8 @@ def test_load_resume_caches_preserves_existing_resource_identity() -> None:
     class _Conn:
         def execute(self, query, params):
             assert "LEFT JOIN resources" in query
-            assert params == ("run-1",)
+            assert "LIMIT %s" in query
+            assert params == ("run-1", main.INGEST_IDENTITY_CACHE_SIZE)
             return _Result()
 
     endpoints, resources = main.load_resume_caches(_Conn(), "run-1")
@@ -975,7 +1117,9 @@ def test_discover_recoverable_runs_scans_uploaded_and_stale_ingesting(monkeypatc
     assert "status = 'UPLOADED'" in captured["query"]
     assert "status = 'INGESTING'" in captured["query"]
     assert str(captured["query"]).count("pg_input_is_valid") == 2
-    assert captured["params"] == (main.STALE_INGESTING_SECONDS, 3)
+    assert "FOR UPDATE SKIP LOCKED" in captured["query"]
+    assert "recovery_claimed_by" in captured["query"]
+    assert captured["params"] == (main.STALE_INGESTING_SECONDS, 3, main.CONSUMER_NAME)
 
 
 def test_connect_database_uses_bounded_connect_timeout(monkeypatch) -> None:
@@ -992,7 +1136,13 @@ def test_connect_database_uses_bounded_connect_timeout(monkeypatch) -> None:
     assert main.connect_database() is sentinel
     assert captured == {
         "url": main.DATABASE_URL,
-        "kwargs": {"connect_timeout": main.DATABASE_CONNECT_TIMEOUT_SECONDS},
+        "kwargs": {
+            "connect_timeout": main.WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS,
+            "options": (
+                f"-c statement_timeout={main.WORKER_DATABASE_STATEMENT_TIMEOUT_MS} "
+                f"-c lock_timeout={main.WORKER_DATABASE_LOCK_TIMEOUT_MS}"
+            ),
+        },
     }
 
 
@@ -1023,4 +1173,42 @@ def test_main_runs_database_recovery_when_redis_is_unavailable_at_startup(monkey
     with pytest.raises(KeyboardInterrupt):
         main.main()
 
-    assert recovery_limits == [main.RECOVERY_SCAN_LIMIT]
+    assert recovery_limits == [1]
+
+
+def test_main_survives_transient_database_recovery_failure(monkeypatch) -> None:
+    recovery_attempts = 0
+    heartbeat_statuses: list[str] = []
+    monkeypatch.setattr(main, "RECOVERY_SCAN_SECONDS", 0)
+    monkeypatch.setattr(main, "try_ensure_group", lambda last_logged_at: (False, last_logged_at))
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        main,
+        "_write_worker_heartbeat",
+        lambda status, **_kwargs: heartbeat_statuses.append(status),
+    )
+
+    def _discover(limit: int):
+        nonlocal recovery_attempts
+        assert limit == 1
+        recovery_attempts += 1
+        if recovery_attempts == 1:
+            raise main.psycopg.OperationalError("database unavailable")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "discover_recoverable_runs", _discover)
+
+    with pytest.raises(KeyboardInterrupt):
+        main.main()
+
+    assert recovery_attempts == 2
+    assert "database_recovery_retry" in heartbeat_statuses
+
+
+def test_shutdown_signal_sets_cooperative_stop_event() -> None:
+    main._shutdown_event.clear()
+    try:
+        main._handle_shutdown_signal(main.signal.SIGTERM, None)
+        assert main._shutdown_event.is_set()
+    finally:
+        main._shutdown_event.clear()

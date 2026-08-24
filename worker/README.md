@@ -22,6 +22,7 @@ That is not just a convenience setting. The API writes uploads to local filesyst
 - Status flow is typically `PENDING_UPLOAD -> UPLOADED -> INGESTING -> COMPLETE` or `FAILED`.
 - Ingest progress is checkpointed so interrupted work can resume from a saved line offset.
 - Redis queue handoff is preferred, but the worker also scans Postgres for recoverable runs as a fallback path. If Redis is unavailable at startup, stream setup is retried without blocking that database recovery scan.
+- Recovery candidates are claimed one at a time with `FOR UPDATE SKIP LOCKED`, so multiple replicas can make progress without a serial worker pre-claiming an entire batch.
 - Postgres is authoritative for the current project and artifact key, so delayed or duplicate Redis messages cannot ingest a superseded upload.
 - Upload attempts use immutable keys; committing a new database pointer precedes best-effort cleanup of the superseded file.
 - Gzip input is protected by decompression limits before parsing.
@@ -34,6 +35,9 @@ That is not just a convenience setting. The API writes uploads to local filesyst
 - SMB signing uses the canonical `smb.signing` string (`required` or `not_required`); legacy boolean `smb.signing_required` artifacts remain accepted.
 - Unexpected poison-record failures are terminalized with a redacted operator-facing error instead of being replayed forever.
 - Duplicate stream messages honor a future `next_retry_at`; they are acknowledged while the database recovery scan owns the due retry.
+- Retry backoff includes deterministic per-run jitter to avoid synchronized retries after a shared dependency recovers.
+- Endpoint and resource identity caches are bounded LRU maps rather than inventory-sized dictionaries.
+- `SIGTERM` and `SIGINT` stop new claims and cooperatively checkpoint active work. A paused run returns to `UPLOADED`, records `INGEST_PAUSED`, and can be resumed by another worker.
 
 ## Important caveats
 
@@ -68,11 +72,19 @@ At minimum, the worker needs:
 - `WORKER_HEALTH_TIMEOUT_SECONDS`
 - `REDIS_CONNECT_TIMEOUT_SECONDS` (default `3`)
 - `REDIS_SOCKET_TIMEOUT_SECONDS` (default `5`; keep this above the worker's 3-second blocking stream read)
-- `DATABASE_CONNECT_TIMEOUT_SECONDS` (default `5`)
-- `INGEST_MAX_RECORD_BYTES` (default `8388608`)
-- `INGEST_JSON_COMPAT_MAX_BYTES` (default `52428800`; compact JSON only)
+- `WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS` (default `5`)
+- `WORKER_DATABASE_STATEMENT_TIMEOUT_MS` (default `120000`)
+- `WORKER_DATABASE_LOCK_TIMEOUT_MS` (default `15000`)
+- `INGEST_BATCH_SIZE` (default `5000`, maximum `10000`)
+- `INGEST_MAX_RECORD_BYTES` (default `8388608`, maximum `16777216`)
+- `INGEST_JSON_COMPAT_MAX_BYTES` (default `52428800`, maximum `134217728`; compact JSON only)
+- `INGEST_GZIP_MAX_BYTES` (default `10737418240`, maximum `107374182400`; decompressed bytes)
+- `INGEST_GZIP_MAX_EXPANSION_RATIO` (default `200`, maximum `1000`)
+- `INGEST_RETRY_JITTER_RATIO` (default `0.2`; range `0` through `1`)
+- `INGEST_MAX_RETRIES` (default `4`, maximum `100`)
+- `INGEST_IDENTITY_CACHE_SIZE` (default `10000`, maximum `100000` entries per identity map)
 
-In Docker, those are already wired in `docker-compose.yml`.
+The Compose file exposes the routinely tuned settings above and uses worker defaults for the others. Invalid values and values above the documented memory-safety ceilings stop worker startup with a configuration error instead of being silently clamped.
 
 ## Tests
 
