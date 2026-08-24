@@ -523,6 +523,7 @@ export function SettingsApiTokensPage() {
         ) : (
           <div className="mt-4 settings-table-wrap">
             <table className="settings-table">
+              <caption className="sr-only">API tokens matching the current filters</caption>
               <thead>
                 <tr>
                   <th>Name</th>

@@ -222,6 +222,7 @@ export function SettingsProjectsPage() {
         ) : (
           <div className="mt-4 settings-table-wrap">
             <table className="settings-table">
+              <caption className="sr-only">Projects matching the current search</caption>
               <thead>
                 <tr>
                   <th>Project</th>

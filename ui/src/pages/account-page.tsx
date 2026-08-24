@@ -1,5 +1,7 @@
 import { FormEvent, useState } from "react";
 
+import { Dialog } from "@/components/dialog";
+import { StatusBanner } from "@/components/status-banner";
 import { apiFetch } from "@/lib/api";
 
 export function AccountPage() {
@@ -10,6 +12,7 @@ export function AccountPage() {
   const [info, setInfo] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [revoking, setRevoking] = useState(false);
+  const [confirmRevokeOpen, setConfirmRevokeOpen] = useState(false);
 
   async function changePassword(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -42,6 +45,7 @@ export function AccountPage() {
   }
 
   async function revokeSessions() {
+    setConfirmRevokeOpen(false);
     setError(null);
     setInfo(null);
     setRevoking(true);
@@ -65,8 +69,8 @@ export function AccountPage() {
 
       {error || info ? (
         <div className="workspace-section space-y-2">
-          {error ? <p className="rounded-xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/30 dark:text-rose-200">{error}</p> : null}
-          {info ? <p className="rounded-xl bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200">{info}</p> : null}
+          {error ? <StatusBanner tone="error" title="Account security change failed">{error}</StatusBanner> : null}
+          {info ? <StatusBanner tone="success" title="Account security updated">{info}</StatusBanner> : null}
         </div>
       ) : null}
 
@@ -79,6 +83,7 @@ export function AccountPage() {
               Current password
               <input
                 className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
+                autoComplete="current-password"
                 type="password"
                 value={currentPassword}
                 onChange={(event) => setCurrentPassword(event.target.value)}
@@ -89,6 +94,7 @@ export function AccountPage() {
               New password
               <input
                 className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
+                autoComplete="new-password"
                 type="password"
                 value={newPassword}
                 onChange={(event) => setNewPassword(event.target.value)}
@@ -99,6 +105,7 @@ export function AccountPage() {
               Confirm new password
               <input
                 className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900"
+                autoComplete="new-password"
                 type="password"
                 value={confirmPassword}
                 onChange={(event) => setConfirmPassword(event.target.value)}
@@ -116,11 +123,38 @@ export function AccountPage() {
           <p className="text-sm text-slate-600 dark:text-slate-300">
             Revoke all refresh tokens tied to your account to force re-authentication everywhere.
           </p>
-          <button className="rounded-lg bg-ember px-3 py-1 text-sm font-semibold text-white" onClick={revokeSessions} disabled={revoking}>
-            {revoking ? "Revoking..." : "Revoke all sessions"}
+          <button
+            className="rounded-lg bg-rose-700 px-3 py-2 text-sm font-semibold text-white transition hover:bg-rose-600 disabled:opacity-60"
+            onClick={() => setConfirmRevokeOpen(true)}
+            disabled={revoking}
+            type="button"
+          >
+            {revoking ? "Revoking…" : "Revoke all sessions"}
           </button>
         </div>
       </div>
+
+      <Dialog
+        description="This invalidates every refresh session for your account across all browsers and devices. Active access may continue briefly until short-lived access tokens expire."
+        footer={
+          <>
+            <button className="settings-button" onClick={() => setConfirmRevokeOpen(false)} type="button">
+              Cancel
+            </button>
+            <button className="settings-button-danger" onClick={() => void revokeSessions()} type="button">
+              Revoke all sessions
+            </button>
+          </>
+        }
+        onClose={() => setConfirmRevokeOpen(false)}
+        open={confirmRevokeOpen}
+        size="sm"
+        title="Revoke every active session?"
+      >
+        <p className="text-sm text-slate-600 dark:text-slate-300">
+          You may need to sign in again on this device. Passwords and API tokens are not changed by this action.
+        </p>
+      </Dialog>
     </section>
   );
 }

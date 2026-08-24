@@ -1,8 +1,9 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useOutletContext, useParams } from "react-router-dom";
 
 import { Dialog } from "@/components/dialog";
 import { StatePanel } from "@/components/state-panel";
+import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
 import { Membership, PROJECT_ROLES, Project, UserRow } from "@/lib/iam";
 import type { SettingsOutletContext } from "@/pages/settings-layout";
@@ -37,9 +38,15 @@ function passwordPolicySummary(settings: SecuritySettings | null): string {
   return parts.join(", ");
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 export function SettingsIamUserPage() {
   const { me } = useOutletContext<SettingsOutletContext>();
   const { userId } = useParams<{ userId: string }>();
+  const userIdRef = useRef(userId);
+  userIdRef.current = userId;
 
   const [user, setUser] = useState<UserRow | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -49,6 +56,7 @@ export function SettingsIamUserPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [membershipsLimited, setMembershipsLimited] = useState(false);
 
   const [membershipRoleDraft, setMembershipRoleDraft] = useState<Record<string, string>>({});
   const [newProjectId, setNewProjectId] = useState("");
@@ -60,54 +68,66 @@ export function SettingsIamUserPage() {
   const [membershipToRemove, setMembershipToRemove] = useState<Membership | null>(null);
   const [pendingIdentityAction, setPendingIdentityAction] = useState<IdentityAction | null>(null);
 
-  async function loadUser() {
-    if (!userId) {
-      setUser(null);
-      return;
-    }
-    const data = await apiFetch(`/users/${userId}`);
-    setUser((data || null) as UserRow | null);
+  function isCurrentUser(targetUserId: string, signal?: AbortSignal): boolean {
+    return !signal?.aborted && userIdRef.current === targetUserId;
   }
 
-  async function loadProjects() {
-    const data = await apiFetch("/settings/projects");
-    setProjects((data || []) as Project[]);
-  }
-
-  async function loadSecuritySettings() {
-    const data = await apiFetch("/auth/security-settings");
-    setSecuritySettings(data as SecuritySettings);
-  }
-
-  async function loadMemberships() {
-    if (!userId) {
-      setMemberships([]);
-      return;
-    }
-    const rows = await apiFetchAllPages<Membership>((cursor) => {
-      const query = new URLSearchParams({ limit: "250" });
-      if (cursor) query.set("cursor", cursor);
-      query.append("user_ids", userId);
-      return `/settings/rbac/project-memberships?${query.toString()}`;
-    });
-    setMemberships(rows);
-  }
-
-  async function refreshPage() {
+  async function refreshPage(targetUserId = userId, signal?: AbortSignal) {
+    if (!targetUserId || !isCurrentUser(targetUserId, signal)) return;
     setLoading(true);
     setError(null);
     try {
-      await Promise.all([loadUser(), loadProjects(), loadMemberships(), loadSecuritySettings()]);
+      const [userData, projectData, membershipResult, settingsData] = await Promise.all([
+        apiFetch(`/users/${targetUserId}`, { signal }),
+        apiFetch("/settings/projects", { signal }),
+        apiFetchAllPages<Membership>((cursor) => {
+          const query = new URLSearchParams({ limit: "250" });
+          if (cursor) query.set("cursor", cursor);
+          query.append("user_ids", targetUserId);
+          return `/settings/rbac/project-memberships?${query.toString()}`;
+        }, { signal }, { maxPages: 20, maxItems: 5_000, maxDurationMs: 15_000 }),
+        apiFetch("/auth/security-settings", { signal }),
+      ]);
+      if (!isCurrentUser(targetUserId, signal)) return;
+      setUser((userData || null) as UserRow | null);
+      setProjects((projectData || []) as Project[]);
+      setMemberships(membershipResult.items);
+      setMembershipsLimited(membershipResult.truncated);
+      setSecuritySettings(settingsData as SecuritySettings);
     } catch (err) {
+      if (!isCurrentUser(targetUserId, signal) || isAbortError(err)) return;
       setError(err instanceof Error ? err.message : "Failed to load user details");
     } finally {
-      setLoading(false);
+      if (isCurrentUser(targetUserId, signal)) setLoading(false);
     }
   }
 
+  useLayoutEffect(() => {
+    setUser(null);
+    setProjects([]);
+    setMemberships([]);
+    setSecuritySettings(null);
+    setMembershipsLimited(false);
+    setMembershipRoleDraft({});
+    setNewProjectId("");
+    setNewProjectRole("viewer");
+    setBaselineRole("viewer");
+    setBaselineOverwrite(false);
+    setPasswordDraft("");
+    setPasswordDialogOpen(false);
+    setMembershipToRemove(null);
+    setPendingIdentityAction(null);
+    setError(userId ? null : "No user identifier was provided.");
+    setInfo(null);
+    setLoading(!!userId);
+  }, [userId]);
+
   useEffect(() => {
-    refreshPage().catch(() => undefined);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (!userId) return;
+    const targetUserId = userId;
+    const controller = new AbortController();
+    refreshPage(targetUserId, controller.signal).catch(() => undefined);
+    return () => controller.abort();
   }, [userId]);
 
   const assigned = useMemo(() => {
@@ -130,19 +150,24 @@ export function SettingsIamUserPage() {
     }
   }, [availableProjects, newProjectId]);
 
-  async function patchUser(payload: Record<string, unknown>, successMessage: string) {
-    if (!userId) return;
+  async function patchUser(payload: Record<string, unknown>, successMessage: string): Promise<boolean> {
+    const targetUserId = user?.id;
+    if (!targetUserId || targetUserId !== userIdRef.current) return false;
     setError(null);
     setInfo(null);
     try {
-      await apiFetch(`/users/${userId}`, {
+      await apiFetch(`/users/${targetUserId}`, {
         method: "PATCH",
         body: JSON.stringify(payload),
       });
+      if (!isCurrentUser(targetUserId)) return false;
       setInfo(successMessage);
-      await refreshPage();
+      await refreshPage(targetUserId);
+      return isCurrentUser(targetUserId);
     } catch (err) {
+      if (!isCurrentUser(targetUserId)) return false;
       setError(err instanceof Error ? err.message : "Failed to update user");
+      return false;
     }
   }
 
@@ -152,49 +177,60 @@ export function SettingsIamUserPage() {
       setError("A temporary password is required.");
       return;
     }
-    await patchUser({ password: passwordDraft }, `Password reset for ${user.email}.`);
-    setPasswordDraft("");
-    setPasswordDialogOpen(false);
+    const updated = await patchUser({ password: passwordDraft }, `Password reset for ${user.email}.`);
+    if (updated) {
+      setPasswordDraft("");
+      setPasswordDialogOpen(false);
+    }
   }
 
   async function upsertMembership(projectId: string, role: string, successMessage: string) {
-    if (!userId) return;
+    const targetUserId = user?.id;
+    if (!targetUserId || targetUserId !== userIdRef.current) return;
     setError(null);
     setInfo(null);
     try {
       await apiFetch("/settings/rbac/project-memberships", {
         method: "POST",
-        body: JSON.stringify({ project_id: projectId, user_id: userId, role }),
+        body: JSON.stringify({ project_id: projectId, user_id: targetUserId, role }),
       });
+      if (!isCurrentUser(targetUserId)) return;
       setInfo(successMessage);
-      await refreshPage();
+      await refreshPage(targetUserId);
     } catch (err) {
+      if (!isCurrentUser(targetUserId)) return;
       setError(err instanceof Error ? err.message : "Failed to update project access");
     }
   }
 
   async function removeMembership(membership: Membership) {
+    const targetUserId = user?.id;
+    if (!targetUserId || targetUserId !== userIdRef.current || membership.user_id !== targetUserId) return;
     setError(null);
     setInfo(null);
     try {
       await apiFetch(`/settings/rbac/project-memberships/${membership.project_id}/${membership.user_id}`, { method: "DELETE" });
+      if (!isCurrentUser(targetUserId)) return;
       setInfo("Project access removed.");
       setMembershipToRemove(null);
-      await refreshPage();
+      await refreshPage(targetUserId);
     } catch (err) {
+      if (!isCurrentUser(targetUserId)) return;
       setError(err instanceof Error ? err.message : "Failed to remove project access");
     }
   }
 
   async function assignAllProjects() {
-    if (!userId || !user) return;
+    const targetUserId = user?.id;
+    if (!targetUserId || targetUserId !== userIdRef.current) return;
     setError(null);
     setInfo(null);
     try {
-      const data = await apiFetch(`/settings/rbac/users/${userId}/assign-all-projects`, {
+      const data = await apiFetch(`/settings/rbac/users/${targetUserId}/assign-all-projects`, {
         method: "POST",
         body: JSON.stringify({ role: baselineRole, overwrite_existing: baselineOverwrite }),
       });
+      if (!isCurrentUser(targetUserId)) return;
       const updated = typeof data?.assigned_projects === "number" ? data.assigned_projects : 0;
       const skipped = Array.isArray(data?.skipped_projects) ? data.skipped_projects.length : 0;
       setInfo(
@@ -203,8 +239,9 @@ export function SettingsIamUserPage() {
           : `Baseline applied: ${updated} memberships updated.`,
       );
       setPendingIdentityAction(null);
-      await refreshPage();
+      await refreshPage(targetUserId);
     } catch (err) {
+      if (!isCurrentUser(targetUserId)) return;
       setError(err instanceof Error ? err.message : "Failed to apply project baseline");
     }
   }
@@ -213,24 +250,24 @@ export function SettingsIamUserPage() {
     if (!user || !pendingIdentityAction) return;
 
     if (pendingIdentityAction === "toggle_active") {
-      await patchUser({ is_active: !user.is_active }, user.is_active ? `Disabled ${user.email}.` : `Enabled ${user.email}.`);
-      setPendingIdentityAction(null);
+      const updated = await patchUser({ is_active: !user.is_active }, user.is_active ? `Disabled ${user.email}.` : `Enabled ${user.email}.`);
+      if (updated) setPendingIdentityAction(null);
       return;
     }
     if (pendingIdentityAction === "toggle_approval") {
-      await patchUser(
+      const updated = await patchUser(
         { is_approved: !user.is_approved },
         user.is_approved ? `Removed approval for ${user.email}.` : `Approved ${user.email}.`,
       );
-      setPendingIdentityAction(null);
+      if (updated) setPendingIdentityAction(null);
       return;
     }
     if (pendingIdentityAction === "toggle_sysadmin") {
-      await patchUser(
+      const updated = await patchUser(
         { is_sysadmin: !user.is_sysadmin },
         user.is_sysadmin ? `Removed sysadmin from ${user.email}.` : `Granted sysadmin to ${user.email}.`,
       );
-      setPendingIdentityAction(null);
+      if (updated) setPendingIdentityAction(null);
       return;
     }
     await assignAllProjects();
@@ -293,7 +330,20 @@ export function SettingsIamUserPage() {
   }
 
   if (!user) {
-    return <StatePanel title="User Not Found" description="The requested user could not be loaded." tone="warning" />;
+    return error ? (
+      <StatePanel
+        actions={
+          <button className="settings-button" onClick={() => refreshPage().catch(() => undefined)} type="button">
+            Retry user details
+          </button>
+        }
+        title="User Details Unavailable"
+        description={`${error} No user changes were made.`}
+        tone="error"
+      />
+    ) : (
+      <StatePanel title="User Not Found" description="The requested user does not exist or is outside your visible scope." tone="warning" />
+    );
   }
 
   const actionCopy = pendingIdentityAction ? identityActionCopy(pendingIdentityAction) : null;
@@ -327,6 +377,13 @@ export function SettingsIamUserPage() {
         <div className="settings-panel">
           <p className="text-sm text-emerald-700 dark:text-emerald-200">{info}</p>
         </div>
+      ) : null}
+      {membershipsLimited ? (
+        <StatusBanner tone="warning" title="Project access list is partial">
+          <p>
+            The loaded assignments remain usable, but this identity exceeded the client page, item, or time limit. Assignment totals are minimums, and adding from the incomplete “available projects” catalog is disabled.
+          </p>
+        </StatusBanner>
       ) : null}
 
       <div className="settings-grid-2">
@@ -403,7 +460,7 @@ export function SettingsIamUserPage() {
             </label>
 
             <div className="settings-note-list">
-              <p>Current project assignments: {assigned.length}</p>
+              <p>Current project assignments: {membershipsLimited ? `at least ${assigned.length}` : assigned.length}</p>
               <p>Last-project-admin guardrails remain enforced by the API.</p>
             </div>
 
@@ -429,14 +486,15 @@ export function SettingsIamUserPage() {
             className="grid gap-4"
             onSubmit={(event) => {
               event.preventDefault();
-              if (!newProjectId) return;
+              if (membershipsLimited || !newProjectId) return;
               upsertMembership(newProjectId, newProjectRole, "Project access updated.").catch(() => undefined);
             }}
           >
             <label className="settings-field">
               <span className="settings-label">Add project</span>
-              <select className="settings-select" value={newProjectId} onChange={(event) => setNewProjectId(event.target.value)} disabled={availableProjects.length === 0}>
-                {availableProjects.length === 0 ? <option value="">No remaining projects</option> : null}
+              <select className="settings-select" value={newProjectId} onChange={(event) => setNewProjectId(event.target.value)} disabled={membershipsLimited || availableProjects.length === 0}>
+                {membershipsLimited ? <option value="">Unavailable while access is partial</option> : null}
+                {!membershipsLimited && availableProjects.length === 0 ? <option value="">No remaining projects</option> : null}
                 {availableProjects.map((project) => (
                   <option key={project.id} value={project.id}>
                     {project.name}
@@ -457,7 +515,7 @@ export function SettingsIamUserPage() {
             </label>
 
             <div>
-              <button className="settings-button-primary" type="submit" disabled={!newProjectId}>
+              <button className="settings-button-primary" type="submit" disabled={membershipsLimited || !newProjectId}>
                 Add Project Access
               </button>
             </div>
@@ -470,10 +528,13 @@ export function SettingsIamUserPage() {
         </div>
 
         {assigned.length === 0 ? (
-          <div className="mt-4 settings-empty">This user does not currently belong to any projects.</div>
+          <div className="mt-4 settings-empty">
+            {membershipsLimited ? "No project assignments were returned before the bounded load stopped." : "This user does not currently belong to any projects."}
+          </div>
         ) : (
           <div className="mt-4 settings-table-wrap">
             <table className="settings-table">
+              <caption className="sr-only">Project access assigned to this user</caption>
               <thead>
                 <tr>
                   <th>Project</th>

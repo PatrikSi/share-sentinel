@@ -1,8 +1,9 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { Dialog } from "@/components/dialog";
 import { StatePanel } from "@/components/state-panel";
+import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
 import { Membership } from "@/lib/iam";
 
@@ -80,15 +81,23 @@ function metadataPreview(metadata: Record<string, unknown>): string {
     .join(" | ");
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 export function SettingsProjectDetailPage() {
   const navigate = useNavigate();
   const { projectId = "" } = useParams();
+  const projectIdRef = useRef(projectId);
+  projectIdRef.current = projectId;
 
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [members, setMembers] = useState<Membership[]>([]);
   const [tokens, setTokens] = useState<TokenRow[]>([]);
   const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [membersLimited, setMembersLimited] = useState(false);
+  const [tokensLimited, setTokensLimited] = useState(false);
 
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameDraft, setRenameDraft] = useState("");
@@ -101,91 +110,117 @@ export function SettingsProjectDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
-  async function refreshPage() {
-    if (!projectId) {
-      setProject(null);
-      setMembers([]);
-      setTokens([]);
-      setActivity([]);
-      setLoading(false);
-      setError("No project identifier was provided.");
-      return;
-    }
+  function isCurrentProject(targetProjectId: string, signal?: AbortSignal): boolean {
+    return !signal?.aborted && projectIdRef.current === targetProjectId;
+  }
 
+  async function refreshPage(targetProjectId = projectId, signal?: AbortSignal) {
+    if (!targetProjectId || !isCurrentProject(targetProjectId, signal)) return;
     setLoading(true);
     setError(null);
     try {
-      const [detail, membershipRows, tokenRows, activityRows] = await Promise.all([
-        apiFetch(`/settings/projects/${projectId}`),
+      const [detail, membershipResult, tokenResult, activityRows] = await Promise.all([
+        apiFetch(`/settings/projects/${targetProjectId}`, { signal }),
         apiFetchAllPages<Membership>((cursor) => {
-          const query = new URLSearchParams({ project_id: projectId, limit: "250" });
+          const query = new URLSearchParams({ project_id: targetProjectId, limit: "250" });
           if (cursor) query.set("cursor", cursor);
           return `/settings/rbac/project-memberships?${query.toString()}`;
-        }),
+        }, { signal }, { maxPages: 20, maxItems: 5_000, maxDurationMs: 15_000 }),
         apiFetchAllPages<TokenRow>((cursor) => {
-          const query = new URLSearchParams({ project_id: projectId, limit: "200" });
+          const query = new URLSearchParams({ project_id: targetProjectId, limit: "200" });
           if (cursor) query.set("cursor", cursor);
           return `/settings/api-tokens?${query.toString()}`;
-        }),
-        apiFetch(`/settings/audit?project_id=${projectId}&limit=100`),
+        }, { signal }, { maxPages: 20, maxItems: 4_000, maxDurationMs: 15_000 }),
+        apiFetch(`/settings/audit?project_id=${targetProjectId}&limit=100`, { signal }),
       ]);
 
+      if (!isCurrentProject(targetProjectId, signal)) return;
       setProject(detail as ProjectDetail);
-      setMembers(membershipRows);
-      setTokens(tokenRows);
+      setMembers(membershipResult.items);
+      setTokens(tokenResult.items);
+      setMembersLimited(membershipResult.truncated);
+      setTokensLimited(tokenResult.truncated);
       setActivity(((activityRows as { items?: ActivityRow[] })?.items || []) as ActivityRow[]);
       setRenameDraft((detail as ProjectDetail).name);
     } catch (err) {
+      if (!isCurrentProject(targetProjectId, signal) || isAbortError(err)) return;
       setProject(null);
       setMembers([]);
       setTokens([]);
       setActivity([]);
       setError(err instanceof Error ? err.message : "Failed to load project");
     } finally {
-      setLoading(false);
+      if (isCurrentProject(targetProjectId, signal)) setLoading(false);
     }
   }
 
+  useLayoutEffect(() => {
+    setProject(null);
+    setMembers([]);
+    setTokens([]);
+    setActivity([]);
+    setMembersLimited(false);
+    setTokensLimited(false);
+    setRenameOpen(false);
+    setRenameDraft("");
+    setRenameSubmitting(false);
+    setDeleteOpen(false);
+    setDeleteConfirmation("");
+    setDeleteSubmitting(false);
+    setError(projectId ? null : "No project identifier was provided.");
+    setInfo(null);
+    setLoading(!!projectId);
+  }, [projectId]);
+
   useEffect(() => {
-    refreshPage().catch(() => undefined);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (!projectId) return;
+    const targetProjectId = projectId;
+    const controller = new AbortController();
+    refreshPage(targetProjectId, controller.signal).catch(() => undefined);
+    return () => controller.abort();
   }, [projectId]);
 
   async function submitRename(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!projectId || !project || renameSubmitting) return;
+    const targetProjectId = project?.id;
+    if (!targetProjectId || targetProjectId !== projectIdRef.current || renameSubmitting) return;
     setRenameSubmitting(true);
     setError(null);
     setInfo(null);
     try {
-      const updated = (await apiFetch(`/settings/projects/${projectId}`, {
+      const updated = (await apiFetch(`/settings/projects/${targetProjectId}`, {
         method: "PATCH",
         body: JSON.stringify({ name: renameDraft.trim() }),
       })) as { name: string };
+      if (!isCurrentProject(targetProjectId)) return;
       setProject({ ...project, name: updated.name });
       setInfo("Project renamed.");
       setRenameOpen(false);
     } catch (err) {
+      if (!isCurrentProject(targetProjectId)) return;
       setError(err instanceof Error ? err.message : "Failed to rename project");
     } finally {
-      setRenameSubmitting(false);
+      if (isCurrentProject(targetProjectId)) setRenameSubmitting(false);
     }
   }
 
   async function confirmDelete() {
-    if (!projectId || !project || deleteSubmitting) return;
+    const targetProjectId = project?.id;
+    if (!targetProjectId || targetProjectId !== projectIdRef.current || deleteSubmitting) return;
     setDeleteSubmitting(true);
     setError(null);
     try {
-      await apiFetch(`/settings/projects/${projectId}`, {
+      await apiFetch(`/settings/projects/${targetProjectId}`, {
         method: "DELETE",
         body: JSON.stringify({ confirm_name: deleteConfirmation }),
       });
+      if (!isCurrentProject(targetProjectId)) return;
       navigate("/settings/projects", { replace: true });
     } catch (err) {
+      if (!isCurrentProject(targetProjectId)) return;
       setError(err instanceof Error ? err.message : "Failed to delete project");
     } finally {
-      setDeleteSubmitting(false);
+      if (isCurrentProject(targetProjectId)) setDeleteSubmitting(false);
     }
   }
 
@@ -194,7 +229,18 @@ export function SettingsProjectDetailPage() {
   }
 
   if (!project) {
-    return <StatePanel title="Project Unavailable" description={error || "The requested project could not be loaded."} tone="error" />;
+    return (
+      <StatePanel
+        actions={
+          <button className="settings-button" onClick={() => refreshPage().catch(() => undefined)} type="button">
+            Retry project details
+          </button>
+        }
+        title="Project Unavailable"
+        description={`${error || "The requested project could not be loaded."} No project changes were made.`}
+        tone="error"
+      />
+    );
   }
 
   return (
@@ -229,6 +275,17 @@ export function SettingsProjectDetailPage() {
         <div className="settings-panel">
           <p className="text-sm text-emerald-700 dark:text-emerald-200">{info}</p>
         </div>
+      ) : null}
+      {membersLimited || tokensLimited ? (
+        <StatusBanner tone="warning" title="Project administration lists are partial">
+          <p>
+            {membersLimited && tokensLimited
+              ? "Member and token lists"
+              : membersLimited
+                ? "The member list"
+                : "The token list"} reached the client page, item, or time limit. Summary counts remain project-wide; loaded rows remain usable.
+          </p>
+        </StatusBanner>
       ) : null}
 
       <section className="settings-panel">
@@ -270,6 +327,7 @@ export function SettingsProjectDetailPage() {
             </p>
             <div className="settings-table-wrap">
               <table className="settings-table">
+                <caption className="sr-only">Runs currently blocking project deletion</caption>
                 <thead>
                   <tr>
                     <th>Run</th>
@@ -296,15 +354,20 @@ export function SettingsProjectDetailPage() {
         <div className="settings-panel-header">
           <div>
             <h3 className="settings-panel-title">Members</h3>
-            <p className="settings-panel-copy">Current project access by user.</p>
+            <p className="settings-panel-copy">
+              Current project access by user. Showing {members.length.toLocaleString()} of {project.member_count.toLocaleString()} recorded members.
+            </p>
           </div>
         </div>
 
         {members.length === 0 ? (
-          <div className="mt-4 settings-empty">No project members were returned.</div>
+          <div className="mt-4 settings-empty">
+            {membersLimited ? "No project members were returned before the bounded load stopped." : "No project members were returned."}
+          </div>
         ) : (
           <div className="mt-4 settings-table-wrap">
             <table className="settings-table">
+              <caption className="sr-only">Members assigned to this project</caption>
               <thead>
                 <tr>
                   <th>User</th>
@@ -337,15 +400,20 @@ export function SettingsProjectDetailPage() {
         <div className="settings-panel-header">
           <div>
             <h3 className="settings-panel-title">Project Tokens</h3>
-            <p className="settings-panel-copy">Project-scoped machine credentials and ownership.</p>
+            <p className="settings-panel-copy">
+              Project-scoped machine credentials and ownership. Showing {tokens.length.toLocaleString()} of {project.token_count.toLocaleString()} recorded tokens.
+            </p>
           </div>
         </div>
 
         {tokens.length === 0 ? (
-          <div className="mt-4 settings-empty">No project-scoped tokens were returned.</div>
+          <div className="mt-4 settings-empty">
+            {tokensLimited ? "No project-scoped tokens were returned before the bounded load stopped." : "No project-scoped tokens were returned."}
+          </div>
         ) : (
           <div className="mt-4 settings-table-wrap">
             <table className="settings-table">
+              <caption className="sr-only">API tokens scoped to this project</caption>
               <thead>
                 <tr>
                   <th>Token</th>
@@ -396,6 +464,7 @@ export function SettingsProjectDetailPage() {
         ) : (
           <div className="mt-4 settings-table-wrap">
             <table className="settings-table">
+              <caption className="sr-only">Recent activity in this project</caption>
               <thead>
                 <tr>
                   <th>Time</th>

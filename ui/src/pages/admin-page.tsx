@@ -38,6 +38,7 @@ export function AdminPage() {
   const [audit, setAudit] = useState<AuditEvent[]>([]);
   const [tokens, setTokens] = useState<TokenMeta[]>([]);
   const [users, setUsers] = useState<UserRow[]>([]);
+  const [usersLimited, setUsersLimited] = useState(false);
 
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
@@ -82,7 +83,7 @@ export function AdminPage() {
   }
 
   async function loadUsers(search: string) {
-    const rows = await apiFetchAllPages<UserRow>((cursor) => {
+    const result = await apiFetchAllPages<UserRow>((cursor) => {
       const query = new URLSearchParams({ limit: "200" });
       if (search.trim()) {
         query.set("search", search.trim());
@@ -91,8 +92,9 @@ export function AdminPage() {
         query.set("cursor", cursor);
       }
       return `/users?${query.toString()}`;
-    });
-    setUsers(rows);
+    }, {}, { maxPages: 20, maxItems: 4_000, maxDurationMs: 15_000 });
+    setUsers(result.items);
+    setUsersLimited(result.truncated);
   }
 
   useEffect(() => {
@@ -469,6 +471,11 @@ export function AdminPage() {
                 onChange={(event) => setUserSearch(event.target.value)}
               />
             </div>
+            {usersLimited ? (
+              <p className="rounded-lg border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800" role="status">
+                This directory is partial because the client safety limit was reached. Loaded users remain usable; narrow the email search to find additional identities.
+              </p>
+            ) : null}
             <ul className="max-h-[320px] space-y-2 overflow-auto text-sm">
               {users.map((user) => (
                 <li className="rounded-lg border border-slate-300 p-2 dark:border-slate-700" key={user.id}>

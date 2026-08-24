@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { Navigate, Route, Routes, useLocation, useParams } from "react-router-dom";
 
 import { StatePanel } from "@/components/state-panel";
@@ -71,9 +71,20 @@ function ProjectImportRoute() {
   return <ProjectImportPage key={projectId || ""} />;
 }
 
+function SettingsIamUserRoute() {
+  const { userId } = useParams<{ userId: string }>();
+  return <SettingsIamUserPage key={userId || ""} />;
+}
+
+function SettingsProjectDetailRoute() {
+  const { projectId } = useParams<{ projectId: string }>();
+  return <SettingsProjectDetailPage key={projectId || ""} />;
+}
+
 export function App() {
   const location = useLocation();
   const session = useSession();
+  const mainRef = useRef<HTMLElement | null>(null);
   const showNav = location.pathname !== "/" && session.status === "authenticated";
 
   useEffect(() => {
@@ -93,10 +104,36 @@ export function App() {
     }
   }, []);
 
+  useEffect(() => {
+    const section = location.pathname.startsWith("/settings")
+      ? "Settings"
+      : location.pathname.includes("/inventory")
+        ? "Inventory"
+        : location.pathname.includes("/import")
+          ? "Import scan"
+          : location.pathname.includes("/runs/")
+            ? "Run details"
+            : location.pathname.startsWith("/projects")
+              ? "Projects"
+              : location.pathname.startsWith("/account")
+                ? "Account"
+                : "Sign in";
+    document.title = `${section} · Share Sentinel`;
+    mainRef.current?.focus({ preventScroll: true });
+  }, [location.pathname]);
+
   const appShell = (
     <div className={showNav ? "app-shell" : ""}>
+      <a className="skip-link" href="#main-content">
+        Skip to main content
+      </a>
       {showNav ? <TopNav /> : null}
-      <main className={showNav ? "app-main" : "app-login-main"}>
+      <main
+        className={showNav ? "app-main" : "app-login-main"}
+        id="main-content"
+        ref={mainRef}
+        tabIndex={-1}
+      >
         <section className={showNav ? "app-content" : ""}>
           <Routes>
             <Route path="/" element={<LoginPage />} />
@@ -151,14 +188,14 @@ export function App() {
               <Route index element={<Navigate to="/settings/users" replace />} />
               <Route path="general" element={<SettingsOverviewPage />} />
               <Route path="users" element={<SettingsIamPage />} />
-              <Route path="users/:userId" element={<SettingsIamUserPage />} />
+              <Route path="users/:userId" element={<SettingsIamUserRoute />} />
               <Route path="projects" element={<SettingsProjectsPage />} />
-              <Route path="projects/:projectId" element={<SettingsProjectDetailPage />} />
+              <Route path="projects/:projectId" element={<SettingsProjectDetailRoute />} />
               <Route path="tokens" element={<SettingsApiTokensPage />} />
               <Route path="audit" element={<SettingsAuditLogsPage />} />
               <Route path="overview" element={<Navigate to="/settings/general" replace />} />
               <Route path="iam" element={<Navigate to="/settings/users" replace />} />
-              <Route path="iam/users/:userId" element={<SettingsIamUserPage />} />
+              <Route path="iam/users/:userId" element={<SettingsIamUserRoute />} />
               <Route path="rbac" element={<Navigate to="/settings/users" replace />} />
               <Route path="api-tokens" element={<Navigate to="/settings/tokens" replace />} />
               <Route path="audit-logs" element={<Navigate to="/settings/audit" replace />} />

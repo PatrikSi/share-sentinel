@@ -1,10 +1,10 @@
-import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 
 import { AccessCapabilityCell, type AccessCapabilities } from "@/components/access-capability-cell";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
-import { apiFetch, apiFetchAllPages } from "@/lib/api";
+import { apiFetch } from "@/lib/api";
 import { useSession } from "@/lib/auth";
 import { copyText } from "@/lib/clipboard";
 
@@ -81,6 +81,15 @@ type RunDiffResult = {
   new_shares: RunDiffShare[];
   disappeared_shares: RunDiffShare[];
   item_churn: RunDiffChurn[];
+  truncation?: {
+    detail_limit: number;
+    truncated: boolean;
+    sections: {
+      new_shares: boolean;
+      disappeared_shares: boolean;
+      item_churn: boolean;
+    };
+  };
 };
 type RunIssueSeverity = "all" | "error" | "warn";
 type RunIssue = {
@@ -103,6 +112,7 @@ type RunActivityEvent = {
 };
 type RunDetailTab = "overview" | "issues" | "diff" | "explore" | "search";
 const RUN_DETAIL_TABS: RunDetailTab[] = ["overview", "issues", "diff", "explore", "search"];
+const MAX_SAVED_QUERIES = 25;
 
 const RUN_STATUS_COLORS: Record<string, string> = {
   PENDING_UPLOAD: "bg-slate-200 text-slate-900 dark:bg-slate-800 dark:text-slate-200",
@@ -134,6 +144,76 @@ const RUN_DETAIL_TAB_COPY: Record<RunDetailTab, { label: string; description: st
     description: "Run-scoped item search with reusable saved queries.",
   },
 };
+
+function readInitialRunDetailTab(): RunDetailTab {
+  if (typeof window === "undefined") return "overview";
+  const candidate = new URLSearchParams(window.location.search).get("view");
+  return RUN_DETAIL_TABS.includes(candidate as RunDetailTab) ? (candidate as RunDetailTab) : "overview";
+}
+
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebounced(value), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [delayMs, value]);
+  return debounced;
+}
+
+function parseSavedQueries(raw: string | null): SavedQuery[] {
+  if (!raw) return [];
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) throw new Error("Saved search data is not a list.");
+
+  return parsed
+    .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === "object")
+    .filter(
+      (entry) =>
+        typeof entry.id === "string" &&
+        typeof entry.label === "string" &&
+        entry.label.trim().length > 0 &&
+        typeof entry.q === "string" &&
+        typeof entry.ext === "string",
+    )
+    .slice(-MAX_SAVED_QUERIES)
+    .map((entry) => ({ id: entry.id as string, label: (entry.label as string).trim(), q: entry.q as string, ext: entry.ext as string }));
+}
+
+type CursorPagerProps = {
+  label: string;
+  page: number;
+  canPrevious: boolean;
+  canNext: boolean;
+  busy: boolean;
+  onPrevious: () => void;
+  onNext: () => void;
+};
+
+function CursorPager({ label, page, canPrevious, canNext, busy, onPrevious, onNext }: CursorPagerProps) {
+  return (
+    <nav aria-label={`${label} pagination`} className="mb-3 flex items-center gap-2">
+      <span aria-live="polite" className="mr-auto text-xs text-slate-500">
+        Page {page}
+      </span>
+      <button
+        className="rounded-md border border-slate-300 px-3 py-2 text-xs font-semibold disabled:opacity-50 dark:border-slate-700"
+        disabled={!canPrevious || busy}
+        onClick={onPrevious}
+        type="button"
+      >
+        Previous
+      </button>
+      <button
+        className="rounded-md border border-slate-300 px-3 py-2 text-xs font-semibold disabled:opacity-50 dark:border-slate-700"
+        disabled={!canNext || busy}
+        onClick={onNext}
+        type="button"
+      >
+        Next
+      </button>
+    </nav>
+  );
+}
 
 function parseLineOffset(progress: RunProgress | null | undefined): number {
   const raw = progress?.line_offset;
@@ -172,6 +252,8 @@ function activityTitle(action: string): string {
       return "Ingest queued via fallback";
     case "INGEST_STARTED":
       return "Worker started ingest";
+    case "INGEST_PAUSED":
+      return "Worker paused ingest safely";
     case "INGEST_RETRY_SCHEDULED":
       return "Ingest retry scheduled";
     case "INGEST_COMPLETED":
@@ -200,6 +282,12 @@ function activityDetail(event: RunActivityEvent): string {
     const counts = (event.metadata.counts || {}) as Record<string, unknown>;
     const lineOffset = Number(event.metadata.line_offset || 0);
     return `Finished at line ${lineOffset.toLocaleString()} with ${Number(counts.endpoints || 0).toLocaleString()} endpoints, ${Number(counts.resources || 0).toLocaleString()} shares, ${Number(counts.items || 0).toLocaleString()} items, and ${Number(counts.errors || 0).toLocaleString()} issues.`;
+  }
+
+  if (event.action === "INGEST_PAUSED") {
+    const lineOffset = Number(event.metadata.line_offset || 0);
+    const worker = typeof event.metadata.worker === "string" ? event.metadata.worker : "worker";
+    return `${worker} checkpointed at line ${lineOffset.toLocaleString()} during shutdown. Another worker can resume the run.`;
   }
 
   if (event.action === "INGEST_FAILED") {
@@ -342,16 +430,23 @@ function describeRunStatus(run: RunInfo | null) {
 
 export function RunDetailPage() {
   const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
+  const [, setSearchParams] = useSearchParams();
   const session = useSession();
+  const lastEndpointRequestKey = useRef<string | null>(null);
+  const lastResourceRequestKey = useRef<string | null>(null);
+  const lastItemRequestKey = useRef<string | null>(null);
+  const lastGlobalSearchRequestKey = useRef<string | null>(null);
 
   const [run, setRun] = useState<RunInfo | null>(null);
   const [projectRuns, setProjectRuns] = useState<RunCompareOption[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [refreshWarning, setRefreshWarning] = useState<string | null>(null);
+  const [baselineOptionsError, setBaselineOptionsError] = useState<string | null>(null);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [selectedBaselineRunId, setSelectedBaselineRunId] = useState("");
   const [runDiff, setRunDiff] = useState<RunDiffResult | null>(null);
-  const [activeTab, setActiveTab] = useState<RunDetailTab>("overview");
+  const [activeTab, setActiveTab] = useState<RunDetailTab>(readInitialRunDetailTab);
 
   const [endpointSearch, setEndpointSearch] = useState("");
   const [itemSearch, setItemSearch] = useState("");
@@ -363,6 +458,14 @@ export function RunDetailPage() {
   const [resources, setResources] = useState<Resource[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [globalItems, setGlobalItems] = useState<Item[]>([]);
+  const [endpointsLoading, setEndpointsLoading] = useState(false);
+  const [resourcesLoading, setResourcesLoading] = useState(false);
+  const [itemsLoading, setItemsLoading] = useState(false);
+  const [globalItemsLoading, setGlobalItemsLoading] = useState(false);
+  const [endpointsError, setEndpointsError] = useState<string | null>(null);
+  const [resourcesError, setResourcesError] = useState<string | null>(null);
+  const [itemsError, setItemsError] = useState<string | null>(null);
+  const [globalItemsError, setGlobalItemsError] = useState<string | null>(null);
 
   const [selectedEndpoint, setSelectedEndpoint] = useState<number | null>(null);
   const [selectedResource, setSelectedResource] = useState<number | null>(null);
@@ -370,6 +473,10 @@ export function RunDetailPage() {
   const [endpointCursor, setEndpointCursor] = useState<string | null>(null);
   const [endpointHistory, setEndpointHistory] = useState<Array<string | null>>([]);
   const [endpointNext, setEndpointNext] = useState<string | null>(null);
+
+  const [resourceCursor, setResourceCursor] = useState<string | null>(null);
+  const [resourceHistory, setResourceHistory] = useState<Array<string | null>>([]);
+  const [resourceNext, setResourceNext] = useState<string | null>(null);
 
   const [itemCursor, setItemCursor] = useState<string | null>(null);
   const [itemHistory, setItemHistory] = useState<Array<string | null>>([]);
@@ -400,25 +507,48 @@ export function RunDetailPage() {
   }, [projectId, runId, session.user?.id]);
   const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
   const [savedQueryLabel, setSavedQueryLabel] = useState("");
+  const [savedQueryError, setSavedQueryError] = useState<string | null>(null);
+  const debouncedEndpointSearch = useDebouncedValue(endpointSearch, 300);
+  const debouncedItemSearch = useDebouncedValue(itemSearch, 300);
+  const debouncedPathPrefix = useDebouncedValue(pathPrefix, 300);
+  const debouncedGlobalQuery = useDebouncedValue(globalQuery, 300);
+  const debouncedGlobalExt = useDebouncedValue(globalExt, 300);
+  const debouncedIssueSearch = useDebouncedValue(issueSearch, 300);
 
   useEffect(() => {
     if (!runId) return;
-    const raw = localStorage.getItem(savedQueriesKey);
-    if (!raw) {
-      setSavedQueries([]);
-      return;
-    }
     try {
-      setSavedQueries(JSON.parse(raw) as SavedQuery[]);
-    } catch {
+      setSavedQueries(parseSavedQueries(localStorage.getItem(savedQueriesKey)));
+      setSavedQueryError(null);
+    } catch (err) {
       setSavedQueries([]);
+      setSavedQueryError(
+        `${err instanceof Error ? err.message : "Saved search data could not be read."} Browser-local presets were ignored; you can create new ones.`,
+      );
     }
   }, [runId, savedQueriesKey]);
 
-  function persistSavedQueries(next: SavedQuery[]) {
-    setSavedQueries(next);
-    localStorage.setItem(savedQueriesKey, JSON.stringify(next));
+  function persistSavedQueries(next: SavedQuery[]): boolean {
+    const bounded = next.slice(-MAX_SAVED_QUERIES);
+    try {
+      localStorage.setItem(savedQueriesKey, JSON.stringify(bounded));
+      setSavedQueries(bounded);
+      setSavedQueryError(null);
+      return true;
+    } catch (err) {
+      setSavedQueryError(
+        `${err instanceof Error ? err.message : "Browser storage is unavailable."} The preset was not saved; keep this tab open or copy the query before leaving.`,
+      );
+      return false;
+    }
   }
+
+  useEffect(() => {
+    const next = new URLSearchParams(window.location.search);
+    if (activeTab === "overview") next.delete("view");
+    else next.set("view", activeTab);
+    setSearchParams(next, { replace: true });
+  }, [activeTab, setSearchParams]);
 
   useEffect(() => {
     if (!projectId || !runId) return;
@@ -439,16 +569,17 @@ export function RunDetailPage() {
     if (!projectId) return;
     const controller = new AbortController();
     setProjectRuns([]);
-    apiFetchAllPages<RunCompareOption>((cursor) => {
-      const query = new URLSearchParams({ limit: "200" });
-      if (cursor) query.set("cursor", cursor);
-      return `/projects/${projectId}/runs?${query.toString()}`;
-    }, { signal: controller.signal })
+    setBaselineOptionsError(null);
+    apiFetch(`/projects/${projectId}/runs?limit=200`, { signal: controller.signal })
       .then((data) => {
-        if (!controller.signal.aborted) setProjectRuns(data);
+        if (!controller.signal.aborted) setProjectRuns((data?.items || []) as RunCompareOption[]);
       })
       .catch((err) => {
-        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+        if (!controller.signal.aborted && !isAbortError(err)) {
+          setBaselineOptionsError(
+            err instanceof Error ? err.message : "Recent baseline run choices could not be loaded.",
+          );
+        }
       });
     return () => controller.abort();
   }, [projectId, reloadNonce]);
@@ -492,17 +623,38 @@ export function RunDetailPage() {
     setEndpointCursor(null);
     setEndpointHistory([]);
     setEndpointNext(null);
+    setResourceCursor(null);
+    setResourceHistory([]);
+    setResourceNext(null);
     setItemCursor(null);
     setItemHistory([]);
     setItemNext(null);
     setGlobalCursor(null);
     setGlobalHistory([]);
     setGlobalNext(null);
-    setActiveTab("overview");
+    setEndpointsLoading(false);
+    setResourcesLoading(false);
+    setItemsLoading(false);
+    setGlobalItemsLoading(false);
+    setEndpointsError(null);
+    setResourcesError(null);
+    setItemsError(null);
+    setGlobalItemsError(null);
+    lastEndpointRequestKey.current = null;
+    lastResourceRequestKey.current = null;
+    lastItemRequestKey.current = null;
+    lastGlobalSearchRequestKey.current = null;
+    setActiveTab(readInitialRunDetailTab());
   }, [projectId, runId]);
 
   useEffect(() => {
-    if (!projectId || !runId) return;
+    if (!projectId || !runId || !run) return;
+    if (run.status !== "COMPLETE") {
+      setDiffLoading(false);
+      setDiffError(null);
+      setRunDiff(null);
+      return;
+    }
     const controller = new AbortController();
     setDiffLoading(true);
     setDiffError(null);
@@ -527,7 +679,7 @@ export function RunDetailPage() {
         if (!controller.signal.aborted) setDiffLoading(false);
       });
     return () => controller.abort();
-  }, [projectId, reloadNonce, runId, selectedBaselineRunId]);
+  }, [projectId, reloadNonce, run?.status, runId, selectedBaselineRunId]);
 
   const shouldPollRun = run?.status === "UPLOADED" || run?.status === "INGESTING";
 
@@ -542,10 +694,15 @@ export function RunDetailPage() {
       refreshController = tickController;
       try {
         const data = await apiFetch(`/projects/${projectId}/runs/${runId}`, { signal: tickController.signal });
-        if (!stopped && !tickController.signal.aborted) setRun(data as RunInfo);
+        if (!stopped && !tickController.signal.aborted) {
+          setRun(data as RunInfo);
+          setRefreshWarning(null);
+        }
       } catch (err) {
         if (!stopped && !tickController.signal.aborted && !isAbortError(err)) {
-          setError(`Live run refresh is delayed; showing the last confirmed state. ${err instanceof Error ? err.message : "Retry when the API is available."}`);
+          setRefreshWarning(
+            `Live run refresh is delayed; showing the last confirmed state. ${err instanceof Error ? err.message : "Retry when the API is available."}`,
+          );
         }
       }
       if (stopped || tickController.signal.aborted) return;
@@ -567,7 +724,7 @@ export function RunDetailPage() {
   useEffect(() => {
     setIssueCursor(null);
     setIssueHistory([]);
-  }, [issueSearch, issueSeverity, projectId, runId]);
+  }, [debouncedIssueSearch, issueSeverity, projectId, runId]);
 
   useEffect(() => {
     if (!projectId || !runId) return;
@@ -580,7 +737,7 @@ export function RunDetailPage() {
     }
 
     const query = new URLSearchParams({ limit: "50" });
-    if (issueSearch.trim()) query.set("search", issueSearch.trim());
+    if (debouncedIssueSearch.trim()) query.set("search", debouncedIssueSearch.trim());
     if (issueSeverity !== "all") query.set("severity", issueSeverity);
     if (issueCursor) query.set("cursor", issueCursor);
 
@@ -609,7 +766,7 @@ export function RunDetailPage() {
         if (!controller.signal.aborted) setIssuesLoading(false);
       });
     return () => controller.abort();
-  }, [projectId, reloadNonce, runId, issueSearch, issueSeverity, issueCursor, activeTab, run?.summary?.errors, run?.status]);
+  }, [projectId, reloadNonce, runId, debouncedIssueSearch, issueSeverity, issueCursor, activeTab, run?.summary?.errors, run?.status]);
 
   useEffect(() => {
     if (!projectId || !runId) return;
@@ -633,50 +790,77 @@ export function RunDetailPage() {
   useEffect(() => {
     setEndpointCursor(null);
     setEndpointHistory([]);
-  }, [endpointSearch, projectId, runId]);
+  }, [debouncedEndpointSearch, projectId, runId]);
 
   useEffect(() => {
-    if (!projectId || !runId) return;
-    const query = new URLSearchParams({ limit: "100", search: endpointSearch });
+    if (!projectId || !runId || activeTab !== "explore") {
+      setEndpointsLoading(false);
+      return;
+    }
+    const requestKey = JSON.stringify([projectId, runId, debouncedEndpointSearch, endpointCursor, reloadNonce]);
+    if (lastEndpointRequestKey.current === requestKey) return;
+    const query = new URLSearchParams({ limit: "100", search: debouncedEndpointSearch });
     if (endpointCursor) query.set("cursor", endpointCursor);
 
     const controller = new AbortController();
+    setEndpointsLoading(true);
+    setEndpointsError(null);
     setEndpoints([]);
     setSelectedEndpoint(null);
+    setResourceCursor(null);
+    setResourceHistory([]);
+    setResourceNext(null);
     apiFetch(`/projects/${projectId}/runs/${runId}/endpoints?${query.toString()}`, { signal: controller.signal })
       .then((data) => {
         if (controller.signal.aborted) return;
         const rows = (data?.items || []) as Endpoint[];
+        lastEndpointRequestKey.current = requestKey;
         setEndpoints(rows);
         setEndpointNext((data?.next_cursor as string | null) || null);
-        setSelectedEndpoint((current) => {
-          if (current && rows.some((endpoint) => endpoint.id === current)) {
-            return current;
-          }
-          return rows[0]?.id || null;
-        });
+        setSelectedEndpoint(rows[0]?.id || null);
       })
       .catch((err) => {
-        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+        if (!controller.signal.aborted && !isAbortError(err)) {
+          setEndpointsError(err instanceof Error ? err.message : "Endpoint inventory could not be loaded.");
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setEndpointsLoading(false);
       });
     return () => controller.abort();
-  }, [projectId, reloadNonce, runId, endpointSearch, endpointCursor]);
+  }, [activeTab, projectId, reloadNonce, runId, debouncedEndpointSearch, endpointCursor]);
 
   useEffect(() => {
-    if (!projectId || !runId || !selectedEndpoint) {
+    if (!projectId || !runId || !selectedEndpoint || activeTab !== "explore") {
+      if (activeTab !== "explore" && selectedEndpoint) {
+        setResourcesLoading(false);
+        return;
+      }
       setResources([]);
       setSelectedResource(null);
+      setResourceNext(null);
+      setResourcesLoading(false);
+      setResourcesError(null);
       return;
     }
 
     const controller = new AbortController();
+    const query = new URLSearchParams({ limit: "200" });
+    if (resourceCursor) query.set("cursor", resourceCursor);
+    const requestKey = JSON.stringify([projectId, runId, selectedEndpoint, resourceCursor, reloadNonce]);
+    if (lastResourceRequestKey.current === requestKey) return;
+    setResourcesLoading(true);
+    setResourcesError(null);
     setResources([]);
     setSelectedResource(null);
-    apiFetch(`/projects/${projectId}/runs/${runId}/endpoints/${selectedEndpoint}/resources`, { signal: controller.signal })
+    setResourceNext(null);
+    apiFetch(`/projects/${projectId}/runs/${runId}/endpoints/${selectedEndpoint}/resources?${query.toString()}`, { signal: controller.signal })
       .then((data) => {
         if (controller.signal.aborted) return;
         const rows = (data?.items || []) as Resource[];
+        lastResourceRequestKey.current = requestKey;
         setResources(rows);
+        setResourceNext((data?.next_cursor as string | null) || null);
         setSelectedResource((current) => {
           if (current && rows.some((resource) => resource.id === current)) {
             return current;
@@ -685,67 +869,109 @@ export function RunDetailPage() {
         });
       })
       .catch((err) => {
-        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+        if (!controller.signal.aborted && !isAbortError(err)) {
+          setResourcesError(err instanceof Error ? err.message : "Share inventory could not be loaded.");
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setResourcesLoading(false);
       });
     return () => controller.abort();
-  }, [projectId, reloadNonce, runId, selectedEndpoint]);
+  }, [activeTab, projectId, reloadNonce, resourceCursor, runId, selectedEndpoint]);
 
   useEffect(() => {
     setItemCursor(null);
     setItemHistory([]);
-  }, [selectedResource, itemSearch, pathPrefix, projectId, runId]);
+  }, [selectedResource, debouncedItemSearch, debouncedPathPrefix, projectId, runId]);
 
   useEffect(() => {
-    if (!projectId || !runId || !selectedResource) {
+    if (!projectId || !runId || !selectedResource || activeTab !== "explore") {
+      if (activeTab !== "explore" && selectedResource) {
+        setItemsLoading(false);
+        return;
+      }
       setItems([]);
       setItemNext(null);
+      setItemsLoading(false);
+      setItemsError(null);
       return;
     }
 
-    const query = new URLSearchParams({ limit: "200", search: itemSearch });
-    if (pathPrefix.trim()) query.set("path_prefix", pathPrefix.trim());
+    const query = new URLSearchParams({ limit: "200", search: debouncedItemSearch });
+    if (debouncedPathPrefix.trim()) query.set("path_prefix", debouncedPathPrefix.trim());
     if (itemCursor) query.set("cursor", itemCursor);
+    const requestKey = JSON.stringify([
+      projectId,
+      runId,
+      selectedResource,
+      debouncedItemSearch,
+      debouncedPathPrefix,
+      itemCursor,
+      reloadNonce,
+    ]);
+    if (lastItemRequestKey.current === requestKey) return;
 
     const controller = new AbortController();
+    setItemsLoading(true);
+    setItemsError(null);
     setItems([]);
     setItemNext(null);
     apiFetch(`/projects/${projectId}/runs/${runId}/resources/${selectedResource}/items?${query.toString()}`, { signal: controller.signal })
       .then((data) => {
         if (controller.signal.aborted) return;
+        lastItemRequestKey.current = requestKey;
         setItems((data?.items || []) as Item[]);
         setItemNext((data?.next_cursor as string | null) || null);
       })
       .catch((err) => {
-        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+        if (!controller.signal.aborted && !isAbortError(err)) {
+          setItemsError(err instanceof Error ? err.message : "Items could not be loaded for this share.");
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setItemsLoading(false);
       });
     return () => controller.abort();
-  }, [projectId, reloadNonce, runId, selectedResource, itemSearch, pathPrefix, itemCursor]);
+  }, [activeTab, projectId, reloadNonce, runId, selectedResource, debouncedItemSearch, debouncedPathPrefix, itemCursor]);
 
   useEffect(() => {
     setGlobalCursor(null);
     setGlobalHistory([]);
-  }, [globalQuery, globalExt, projectId, runId]);
+  }, [debouncedGlobalQuery, debouncedGlobalExt, projectId, runId]);
 
   useEffect(() => {
-    if (!projectId || !runId) return;
-    const query = new URLSearchParams({ limit: "200", q: globalQuery });
-    if (globalExt) query.set("ext", globalExt);
+    if (!projectId || !runId || activeTab !== "search") {
+      setGlobalItemsLoading(false);
+      return;
+    }
+    const query = new URLSearchParams({ limit: "200", q: debouncedGlobalQuery });
+    if (debouncedGlobalExt) query.set("ext", debouncedGlobalExt);
     if (globalCursor) query.set("cursor", globalCursor);
+    const requestKey = JSON.stringify([projectId, runId, debouncedGlobalQuery, debouncedGlobalExt, globalCursor, reloadNonce]);
+    if (lastGlobalSearchRequestKey.current === requestKey) return;
 
     const controller = new AbortController();
+    setGlobalItemsLoading(true);
+    setGlobalItemsError(null);
     setGlobalItems([]);
     setGlobalNext(null);
     apiFetch(`/projects/${projectId}/runs/${runId}/search/items?${query.toString()}`, { signal: controller.signal })
       .then((data) => {
         if (controller.signal.aborted) return;
+        lastGlobalSearchRequestKey.current = requestKey;
         setGlobalItems((data?.items || []) as Item[]);
         setGlobalNext((data?.next_cursor as string | null) || null);
       })
       .catch((err) => {
-        if (!controller.signal.aborted && !isAbortError(err)) setError(err.message);
+        if (!controller.signal.aborted && !isAbortError(err)) {
+          setGlobalItemsError(err instanceof Error ? err.message : "Run-scoped item search could not be loaded.");
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setGlobalItemsLoading(false);
       });
     return () => controller.abort();
-  }, [projectId, reloadNonce, runId, globalQuery, globalExt, globalCursor]);
+  }, [activeTab, projectId, reloadNonce, runId, debouncedGlobalQuery, debouncedGlobalExt, globalCursor]);
 
   function moveCursor(
     next: string | null,
@@ -771,19 +997,36 @@ export function RunDetailPage() {
     });
   }
 
+  function selectEndpoint(endpointId: number) {
+    if (selectedEndpoint === endpointId) return;
+    setSelectedEndpoint(endpointId);
+    setResourceCursor(null);
+    setResourceHistory([]);
+    setResourceNext(null);
+  }
+
   function saveCurrentQuery() {
-    if (!savedQueryLabel.trim()) return;
+    const label = savedQueryLabel.trim();
+    if (!label) {
+      setSavedQueryError("Enter a preset name before saving this search.");
+      return;
+    }
+    if (!globalQuery.trim() && !globalExt.trim()) {
+      setSavedQueryError("Enter a query or extension before saving a preset.");
+      return;
+    }
     const next: SavedQuery[] = [
-      ...savedQueries,
+      ...savedQueries.filter((query) => query.label.toLocaleLowerCase() !== label.toLocaleLowerCase()),
       {
         id: crypto.randomUUID(),
-        label: savedQueryLabel.trim(),
+        label,
         q: globalQuery,
         ext: globalExt,
       },
     ];
-    persistSavedQueries(next);
-    setSavedQueryLabel("");
+    if (persistSavedQueries(next)) {
+      setSavedQueryLabel("");
+    }
   }
 
   function removeSavedQuery(id: string) {
@@ -813,9 +1056,15 @@ export function RunDetailPage() {
 
   function retryRunData() {
     setError(null);
+    setRefreshWarning(null);
+    setBaselineOptionsError(null);
     setDiffError(null);
     setIssuesError(null);
     setActivityError(null);
+    setEndpointsError(null);
+    setResourcesError(null);
+    setItemsError(null);
+    setGlobalItemsError(null);
     setReloadNonce((current) => current + 1);
   }
 
@@ -857,6 +1106,12 @@ export function RunDetailPage() {
     },
   ];
   const activeDiffSummary = runDiff?.baseline_run ? runDiff.summary : null;
+  const issuesBusy = issuesLoading || issueSearch !== debouncedIssueSearch;
+  const endpointsBusy = endpointsLoading || endpointSearch !== debouncedEndpointSearch;
+  const itemsBusy =
+    itemsLoading || itemSearch !== debouncedItemSearch || pathPrefix !== debouncedPathPrefix;
+  const globalItemsBusy =
+    globalItemsLoading || globalQuery !== debouncedGlobalQuery || globalExt !== debouncedGlobalExt;
 
   return (
     <section className="workspace">
@@ -985,6 +1240,14 @@ export function RunDetailPage() {
             <span>{error}</span>
             <button className="rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">Retry run data</button>
           </div>
+        ) : null}
+        {refreshWarning ? (
+          <StatusBanner tone="warning" title="Live run state may be stale">
+            <p>{refreshWarning}</p>
+            <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">
+              Retry live state
+            </button>
+          </StatusBanner>
         ) : null}
       </div>
 
@@ -1193,7 +1456,7 @@ export function RunDetailPage() {
 
       {activeTab === "issues" ? (
         <div aria-labelledby="run-tab-issues" className="workspace-section grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]" id="run-panel-issues" role="tabpanel" tabIndex={0}>
-          <div className="workspace-card">
+          <div aria-busy={issuesBusy} className="workspace-card">
             <div>
               <h2 className="text-lg font-semibold">Issue Log</h2>
               <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
@@ -1225,23 +1488,16 @@ export function RunDetailPage() {
               </label>
             </div>
 
-            <div className="mt-4 flex items-center gap-2">
-              <button
-                className="rounded-2xl border border-slate-300 px-3 py-2 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
-                onClick={() => moveBack(setIssueCursor, setIssueHistory)}
-                disabled={issueHistory.length === 0}
-                type="button"
-              >
-                Prev
-              </button>
-              <button
-                className="rounded-2xl border border-slate-300 px-3 py-2 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
-                onClick={() => moveCursor(issueNext, issueCursor, setIssueCursor, setIssueHistory)}
-                disabled={!issueNext}
-                type="button"
-              >
-                Next
-              </button>
+            <div className="mt-4">
+              <CursorPager
+                busy={issuesBusy}
+                canNext={!!issueNext}
+                canPrevious={issueHistory.length > 0}
+                label="Issue log"
+                onNext={() => moveCursor(issueNext, issueCursor, setIssueCursor, setIssueHistory)}
+                onPrevious={() => moveBack(setIssueCursor, setIssueHistory)}
+                page={issueHistory.length + 1}
+              />
             </div>
 
             {issuesError ? (
@@ -1253,8 +1509,8 @@ export function RunDetailPage() {
               </div>
             ) : null}
 
-            {issuesLoading ? <p className="mt-4 text-sm text-slate-500">Loading recorded issues.</p> : null}
-            {!issuesLoading && issues.length === 0 ? (
+            {issuesBusy ? <p className="mt-4 text-sm text-slate-500" role="status">Updating recorded issues…</p> : null}
+            {!issuesBusy && !issuesError && issues.length === 0 ? (
               <div className="mt-4">
                 <StatePanel
                   title="No Issues In View"
@@ -1394,7 +1650,9 @@ export function RunDetailPage() {
               <label className="block min-w-[280px] text-xs font-semibold uppercase tracking-wide text-slate-500">
                 Baseline run
                 <select
+                  aria-describedby={baselineOptionsError ? "baseline-options-error" : "baseline-options-help"}
                   className="mt-1 w-full rounded-2xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  disabled={run?.status !== "COMPLETE"}
                   value={selectedBaselineRunId}
                   onChange={(event) => setSelectedBaselineRunId(event.target.value)}
                 >
@@ -1405,11 +1663,60 @@ export function RunDetailPage() {
                     </option>
                   ))}
                 </select>
+                <span className="mt-1 block text-[11px] font-normal normal-case tracking-normal text-slate-500" id="baseline-options-help">
+                  Bounded to the 200 most recent runs. Automatic comparison still chooses the nearest prior complete run.
+                </span>
               </label>
             </div>
 
+            {baselineOptionsError ? (
+              <div className="mt-3" id="baseline-options-error">
+                <StatusBanner tone="warning" title="Recent baseline choices unavailable">
+                  <p>{baselineOptionsError}</p>
+                  <p className="mt-1">Automatic nearest-baseline comparison remains available. Retry to restore the manual selector.</p>
+                  <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">
+                    Retry baseline choices
+                  </button>
+                </StatusBanner>
+              </div>
+            ) : null}
+
+            {run && run.status !== "COMPLETE" ? (
+              <div className="mt-3">
+                {run.status === "UPLOADED" || run.status === "INGESTING" ? (
+                  <StatusBanner tone="warning" title="Comparison waits for active ingest">
+                    <p>
+                      This run is {run.status.toLowerCase().replaceAll("_", " ")}. Diff totals would be incomplete, so this page will keep checking and load the comparison after ingestion completes.
+                    </p>
+                  </StatusBanner>
+                ) : run.status === "PENDING_UPLOAD" ? (
+                  <StatusBanner tone="info" title="Upload required before comparison">
+                    <p>This run has no accepted artifact yet. Upload an artifact and complete ingestion before a run-to-run comparison is available.</p>
+                  </StatusBanner>
+                ) : run.status === "FAILED" ? (
+                  <StatusBanner tone="error" title="Comparison unavailable for failed run">
+                    <p>Ingestion did not complete, so no trustworthy diff can be generated. Review the recorded issue and submit a corrected artifact as a new run.</p>
+                  </StatusBanner>
+                ) : (
+                  <StatusBanner tone="info" title="Comparison is not available">
+                    <p>This run is {run.status.toLowerCase().replaceAll("_", " ")}. A comparison is available only after the run reaches complete.</p>
+                  </StatusBanner>
+                )}
+              </div>
+            ) : null}
+
             {diffLoading ? <p className="mt-3 text-sm text-slate-500">Loading run diff.</p> : null}
-            {diffError ? <p className="mt-3 rounded-2xl bg-rose-100 p-3 text-sm text-rose-700 dark:bg-rose-900/20 dark:text-rose-200">{diffError}</p> : null}
+            {diffError ? (
+              <div className="mt-3">
+                <StatusBanner tone="error" title="Run comparison unavailable">
+                  <p>{diffError}</p>
+                  <p className="mt-1">No comparison result is being shown. Retrying this read is safe.</p>
+                  <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">
+                    Retry comparison
+                  </button>
+                </StatusBanner>
+              </div>
+            ) : null}
 
             {runDiff && !diffLoading ? (
               runDiff.baseline_run ? (
@@ -1455,6 +1762,13 @@ export function RunDetailPage() {
                       <p className="mt-1 text-2xl font-semibold">{runDiff.summary.removed_items}</p>
                     </div>
                   </div>
+                  {runDiff.truncation?.truncated ? (
+                    <StatusBanner tone="warning" title="Detail lists are truncated">
+                      <p>
+                        Summary totals are exact. Each affected detail section shows at most {runDiff.truncation.detail_limit.toLocaleString()} records to keep this comparison responsive.
+                      </p>
+                    </StatusBanner>
+                  ) : null}
                 </div>
               ) : (
                 <p className="mt-3 text-sm text-slate-500">No earlier complete run is available for comparison yet.</p>
@@ -1544,40 +1858,48 @@ export function RunDetailPage() {
       ) : null}
 
       {activeTab === "explore" ? (
-        <div aria-labelledby="run-tab-explore" className="workspace-section grid gap-4 md:grid-cols-3" id="run-panel-explore" role="tabpanel" tabIndex={0}>
-          <div className="workspace-card">
+        <div
+          aria-labelledby="run-tab-explore"
+          className="workspace-section grid gap-4 xl:grid-cols-[minmax(250px,0.8fr)_minmax(280px,1fr)_minmax(340px,1.3fr)]"
+          id="run-panel-explore"
+          role="tabpanel"
+          tabIndex={0}
+        >
+          <div aria-busy={endpointsBusy} className="workspace-card">
             <div className="mb-3 flex items-center justify-between gap-2">
               <div>
                 <h2 className="text-lg font-semibold">Endpoints</h2>
                 <p className="mt-1 text-xs text-slate-500">Choose a host to load its shares.</p>
               </div>
               <input
+                aria-label="Search endpoints in this run"
                 className="w-44 rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
                 placeholder="Search endpoint"
                 value={endpointSearch}
                 onChange={(event) => setEndpointSearch(event.target.value)}
               />
             </div>
-            <div className="mb-3 flex items-center gap-2">
-              <button
-                className="rounded-2xl border border-slate-300 px-3 py-2 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
-                onClick={() => moveBack(setEndpointCursor, setEndpointHistory)}
-                disabled={endpointHistory.length === 0}
-                type="button"
-              >
-                Prev
-              </button>
-              <button
-                className="rounded-2xl border border-slate-300 px-3 py-2 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
-                onClick={() => moveCursor(endpointNext, endpointCursor, setEndpointCursor, setEndpointHistory)}
-                disabled={!endpointNext}
-                type="button"
-              >
-                Next
-              </button>
-            </div>
-            {endpoints.length === 0 ? <p className="text-sm text-slate-500">No endpoints match this run search.</p> : null}
-            <ul className="space-y-2">
+            <CursorPager
+              busy={endpointsBusy}
+              canNext={!!endpointNext}
+              canPrevious={endpointHistory.length > 0}
+              label="Endpoint inventory"
+              onNext={() => moveCursor(endpointNext, endpointCursor, setEndpointCursor, setEndpointHistory)}
+              onPrevious={() => moveBack(setEndpointCursor, setEndpointHistory)}
+              page={endpointHistory.length + 1}
+            />
+            {endpointsError ? (
+              <StatusBanner tone="error" title="Endpoints unavailable">
+                <p>{endpointsError}</p>
+                <p className="mt-1">No endpoint result is being shown. Retrying is safe.</p>
+                <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">
+                  Retry endpoints
+                </button>
+              </StatusBanner>
+            ) : null}
+            {endpointsBusy ? <p className="text-sm text-slate-500" role="status">Updating endpoint inventory…</p> : null}
+            {!endpointsBusy && !endpointsError && endpoints.length === 0 ? <p className="text-sm text-slate-500">No endpoints match this run search.</p> : null}
+            <ul className="max-h-[520px] space-y-2 overflow-auto">
               {endpoints.map((endpoint) => (
                 <li key={endpoint.id}>
                   <button
@@ -1586,7 +1908,7 @@ export function RunDetailPage() {
                         ? "border-emerald-600 bg-emerald-50 dark:bg-emerald-900/20"
                         : "border-slate-300 hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
                     }`}
-                    onClick={() => setSelectedEndpoint(endpoint.id)}
+                    onClick={() => selectEndpoint(endpoint.id)}
                     type="button"
                   >
                     <div className="font-semibold">{endpoint.endpoint_key}</div>
@@ -1599,13 +1921,33 @@ export function RunDetailPage() {
             </ul>
           </div>
 
-          <div className="workspace-card">
+          <div aria-busy={resourcesLoading} className="workspace-card">
             <div className="mb-3">
               <h2 className="text-lg font-semibold">Shares</h2>
               <p className="mt-1 text-xs text-slate-500">Select a share to inspect items in that branch.</p>
             </div>
-            {resources.length === 0 ? <p className="text-sm text-slate-500">No shares are available for the selected endpoint.</p> : null}
-            <ul className="space-y-2">
+            <CursorPager
+              busy={resourcesLoading}
+              canNext={!!resourceNext}
+              canPrevious={resourceHistory.length > 0}
+              label="Share inventory"
+              onNext={() => moveCursor(resourceNext, resourceCursor, setResourceCursor, setResourceHistory)}
+              onPrevious={() => moveBack(setResourceCursor, setResourceHistory)}
+              page={resourceHistory.length + 1}
+            />
+            {resourcesError ? (
+              <StatusBanner tone="error" title="Shares unavailable">
+                <p>{resourcesError}</p>
+                <p className="mt-1">No share result is being shown. Retrying is safe.</p>
+                <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">
+                  Retry shares
+                </button>
+              </StatusBanner>
+            ) : null}
+            {resourcesLoading ? <p className="text-sm text-slate-500" role="status">Loading shares for the selected endpoint…</p> : null}
+            {!selectedEndpoint && !endpointsBusy && !endpointsError ? <p className="text-sm text-slate-500">Select an endpoint to inspect its shares.</p> : null}
+            {selectedEndpoint && !resourcesLoading && !resourcesError && resources.length === 0 ? <p className="text-sm text-slate-500">No shares were returned for the selected endpoint.</p> : null}
+            <ul className="max-h-[520px] space-y-2 overflow-auto">
               {resources.map((resource) => (
                 <li
                   className={`overflow-hidden rounded-2xl border text-xs ${
@@ -1636,44 +1978,48 @@ export function RunDetailPage() {
             </ul>
           </div>
 
-          <div className="workspace-card">
+          <div aria-busy={itemsBusy} className="workspace-card">
             <div className="mb-3 grid gap-2">
               <div>
                 <h2 className="text-lg font-semibold">Items</h2>
                 <p className="mt-1 text-xs text-slate-500">Filter the selected share by name or path prefix.</p>
               </div>
               <input
+                aria-label="Search item names in the selected share"
                 className="rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
                 placeholder="Search name"
                 value={itemSearch}
                 onChange={(event) => setItemSearch(event.target.value)}
               />
               <input
+                aria-label="Filter selected share by path prefix"
                 className="rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
                 placeholder="Path prefix (e.g. \\HR\\)"
                 value={pathPrefix}
                 onChange={(event) => setPathPrefix(event.target.value)}
               />
             </div>
-            <div className="mb-3 flex items-center gap-2">
-              <button
-                className="rounded-2xl border border-slate-300 px-3 py-2 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
-                onClick={() => moveBack(setItemCursor, setItemHistory)}
-                disabled={itemHistory.length === 0}
-                type="button"
-              >
-                Prev
-              </button>
-              <button
-                className="rounded-2xl border border-slate-300 px-3 py-2 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
-                onClick={() => moveCursor(itemNext, itemCursor, setItemCursor, setItemHistory)}
-                disabled={!itemNext}
-                type="button"
-              >
-                Next
-              </button>
-            </div>
-            {items.length === 0 ? <p className="text-sm text-slate-500">No items match the current share filters.</p> : null}
+            <CursorPager
+              busy={itemsBusy}
+              canNext={!!itemNext}
+              canPrevious={itemHistory.length > 0}
+              label="Share items"
+              onNext={() => moveCursor(itemNext, itemCursor, setItemCursor, setItemHistory)}
+              onPrevious={() => moveBack(setItemCursor, setItemHistory)}
+              page={itemHistory.length + 1}
+            />
+            {itemsError ? (
+              <StatusBanner tone="error" title="Items unavailable">
+                <p>{itemsError}</p>
+                <p className="mt-1">No item result is being shown. Retrying is safe.</p>
+                <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">
+                  Retry items
+                </button>
+              </StatusBanner>
+            ) : null}
+            {itemsBusy ? <p className="text-sm text-slate-500" role="status">Updating items in the selected share…</p> : null}
+            {!selectedResource && !endpointsBusy && !endpointsError && !resourcesLoading && !resourcesError ? <p className="text-sm text-slate-500">Select a share to inspect its files and folders.</p> : null}
+            {selectedResource && !itemsBusy && !itemsError && items.length === 0 ? <p className="text-sm text-slate-500">No items match the current share filters.</p> : null}
             <ul className="max-h-[420px] space-y-2 overflow-auto">
               {items.map((item) => (
                 <li key={item.id} className="rounded-2xl border border-slate-300 px-3 py-3 text-xs dark:border-slate-700">
@@ -1692,7 +2038,7 @@ export function RunDetailPage() {
 
       {activeTab === "search" ? (
         <div aria-labelledby="run-tab-search" className="workspace-section space-y-4" id="run-panel-search" role="tabpanel" tabIndex={0}>
-          <div className="workspace-card">
+          <div aria-busy={globalItemsBusy} className="workspace-card">
             <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
               <div>
                 <h2 className="text-lg font-semibold">Run-Scoped Search</h2>
@@ -1703,6 +2049,7 @@ export function RunDetailPage() {
               <div className="flex flex-wrap items-end gap-2">
                 <div>
                   <input
+                    aria-label="Search items across this run"
                     className="rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
                     placeholder="Query"
                     value={globalQuery}
@@ -1711,6 +2058,7 @@ export function RunDetailPage() {
                 </div>
                 <div>
                   <input
+                    aria-label="Filter run search by file extension"
                     className="w-24 rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
                     placeholder=".ext"
                     value={globalExt}
@@ -1719,25 +2067,40 @@ export function RunDetailPage() {
                 </div>
                 <div className="flex items-center gap-2">
                   <input
+                    aria-describedby={savedQueryError ? "saved-query-error" : undefined}
+                    aria-label="Name this browser-local search preset"
                     className="w-36 rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
                     placeholder="Save local preset..."
                     value={savedQueryLabel}
-                    onChange={(event) => setSavedQueryLabel(event.target.value)}
+                    onChange={(event) => {
+                      setSavedQueryLabel(event.target.value);
+                      setSavedQueryError(null);
+                    }}
                   />
                   <button
                     className="rounded-2xl bg-slate-900 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white"
                     onClick={saveCurrentQuery}
                     type="button"
                   >
-                    Save Local
+                    Save preset
                   </button>
                 </div>
               </div>
             </div>
 
+            {savedQueryError ? (
+              <div className="mb-4">
+                <StatusBanner tone="error" title="Preset not available">
+                  <p id="saved-query-error">{savedQueryError}</p>
+                </StatusBanner>
+              </div>
+            ) : null}
+
             {savedQueries.length > 0 ? (
               <div className="mb-4">
-                <p className="mb-2 text-xs text-slate-500 dark:text-slate-400">Stored in this browser for this run only.</p>
+                <p className="mb-2 text-xs text-slate-500 dark:text-slate-400">
+                  Stored in this browser for this run only. Up to {MAX_SAVED_QUERIES} presets are retained.
+                </p>
                 <div className="flex flex-wrap gap-2">
                   {savedQueries.map((saved) => (
                     <div key={saved.id} className="flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-xs dark:bg-slate-800">
@@ -1746,12 +2109,18 @@ export function RunDetailPage() {
                         onClick={() => {
                           setGlobalQuery(saved.q);
                           setGlobalExt(saved.ext);
+                          setSavedQueryError(null);
                         }}
                         type="button"
                       >
                         {saved.label}
                       </button>
-                      <button className="text-slate-500" onClick={() => removeSavedQuery(saved.id)} type="button">
+                      <button
+                        aria-label={`Remove saved preset ${saved.label}`}
+                        className="text-slate-500"
+                        onClick={() => removeSavedQuery(saved.id)}
+                        type="button"
+                      >
                         Remove
                       </button>
                     </div>
@@ -1760,26 +2129,27 @@ export function RunDetailPage() {
               </div>
             ) : null}
 
-            <div className="mb-3 flex items-center gap-2">
-              <button
-                className="rounded-2xl border border-slate-300 px-3 py-2 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
-                onClick={() => moveBack(setGlobalCursor, setGlobalHistory)}
-                disabled={globalHistory.length === 0}
-                type="button"
-              >
-                Prev
-              </button>
-              <button
-                className="rounded-2xl border border-slate-300 px-3 py-2 text-[10px] uppercase disabled:opacity-50 dark:border-slate-700"
-                onClick={() => moveCursor(globalNext, globalCursor, setGlobalCursor, setGlobalHistory)}
-                disabled={!globalNext}
-                type="button"
-              >
-                Next
-              </button>
-            </div>
+            <CursorPager
+              busy={globalItemsBusy}
+              canNext={!!globalNext}
+              canPrevious={globalHistory.length > 0}
+              label="Run search"
+              onNext={() => moveCursor(globalNext, globalCursor, setGlobalCursor, setGlobalHistory)}
+              onPrevious={() => moveBack(setGlobalCursor, setGlobalHistory)}
+              page={globalHistory.length + 1}
+            />
 
-            {globalItems.length === 0 ? <p className="text-sm text-slate-500">No run-scoped search results match the current query.</p> : null}
+            {globalItemsError ? (
+              <StatusBanner tone="error" title="Run search unavailable">
+                <p>{globalItemsError}</p>
+                <p className="mt-1">No search result is being shown. Retrying is safe.</p>
+                <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">
+                  Retry search
+                </button>
+              </StatusBanner>
+            ) : null}
+            {globalItemsBusy ? <p className="text-sm text-slate-500" role="status">Updating run search…</p> : null}
+            {!globalItemsBusy && !globalItemsError && globalItems.length === 0 ? <p className="text-sm text-slate-500">No run-scoped search results match the current query.</p> : null}
             <ul className="max-h-[360px] space-y-2 overflow-auto">
               {globalItems.map((item) => (
                 <li key={item.id} className="rounded-2xl border border-slate-300 px-3 py-3 text-xs dark:border-slate-700">

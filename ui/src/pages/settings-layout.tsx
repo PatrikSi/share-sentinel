@@ -19,13 +19,26 @@ export function SettingsLayout() {
   const [me, setMe] = useState<UserMe | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [retryNonce, setRetryNonce] = useState(0);
 
   useEffect(() => {
-    apiFetch("/auth/me")
-      .then((data) => setMe(data as UserMe))
-      .catch((err) => setError(err instanceof Error ? err.message : "Failed to load user context"))
-      .finally(() => setLoading(false));
-  }, []);
+    const controller = new AbortController();
+    setLoading(true);
+    setError(null);
+    apiFetch("/auth/me", { signal: controller.signal })
+      .then((data) => {
+        if (!controller.signal.aborted) setMe(data as UserMe);
+      })
+      .catch((err) => {
+        if (!controller.signal.aborted && !(err instanceof DOMException && err.name === "AbortError")) {
+          setError(err instanceof Error ? err.message : "Failed to load user context");
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [retryNonce]);
 
   if (loading) {
     return (
@@ -50,7 +63,16 @@ export function SettingsLayout() {
             <p className="settings-page-copy">Administration is currently unavailable.</p>
           </div>
         </div>
-        <StatePanel title="Settings Unavailable" description={error} tone="error" />
+        <StatePanel
+          actions={
+            <button className="settings-button" onClick={() => setRetryNonce((current) => current + 1)} type="button">
+              Retry settings access
+            </button>
+          }
+          title="Settings Unavailable"
+          description={`${error} No settings were changed; retrying this read is safe.`}
+          tone="error"
+        />
       </section>
     );
   }
@@ -88,7 +110,7 @@ export function SettingsLayout() {
             <p className="settings-sidebar-title">Administration</p>
             <p className="settings-sidebar-copy">{me.email}</p>
           </div>
-          <nav className="settings-nav">
+          <nav aria-label="Settings sections" className="settings-nav">
             {SETTINGS_SECTIONS.map((section) => (
               <NavLink
                 key={section.to}
@@ -102,9 +124,9 @@ export function SettingsLayout() {
           </nav>
         </aside>
 
-        <main className="settings-page">
+        <div className="settings-page">
           <Outlet context={{ me } satisfies SettingsOutletContext} />
-        </main>
+        </div>
       </div>
     </section>
   );

@@ -17,8 +17,26 @@ export function errorMessageFromBody(body: string, status: number, requestId: st
     return appendRequestId("API returned HTML instead of JSON. Check API routing and service health.", requestId);
   }
   try {
-    const parsed = JSON.parse(body);
-    if (typeof parsed?.detail === "string") return appendRequestId(parsed.detail, requestId);
+    const parsed: unknown = JSON.parse(body);
+    if (parsed && typeof parsed === "object") {
+      const payload = parsed as {
+        detail?: unknown;
+        request_id?: unknown;
+        error?: { message?: unknown; request_id?: unknown };
+      };
+      const bodyRequestId =
+        typeof payload.error?.request_id === "string"
+          ? payload.error.request_id
+          : typeof payload.request_id === "string"
+            ? payload.request_id
+            : null;
+      const resolvedRequestId = requestId || bodyRequestId;
+      if (typeof payload.detail === "string") return appendRequestId(payload.detail, resolvedRequestId);
+      if (typeof payload.error?.message === "string") {
+        return appendRequestId(payload.error.message, resolvedRequestId);
+      }
+      return appendRequestId(`Request failed (${status}).`, resolvedRequestId);
+    }
   } catch {
     // Fall through to the server-provided plain-text response.
   }

@@ -57,6 +57,8 @@ export function ProjectImportPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [projectRole, setProjectRole] = useState<string | null>(null);
   const [projectRoleStatus, setProjectRoleStatus] = useState<ProjectRoleStatus>(projectId ? "loading" : "error");
+  const [projectRoleError, setProjectRoleError] = useState<string | null>(null);
+  const [projectContextNonce, setProjectContextNonce] = useState(0);
 
   const [runName, setRunName] = useState("");
   const [runDescription, setRunDescription] = useState("");
@@ -94,10 +96,21 @@ export function ProjectImportPage() {
   }, [projectId]);
 
   useEffect(() => {
+    if (!importing) return;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [importing]);
+
+  useEffect(() => {
     if (!projectId) return;
     const controller = new AbortController();
     setProject(null);
     setProjectRole(null);
+    setProjectRoleError(null);
     setError(null);
     apiFetch(`/projects/${projectId}`, { signal: controller.signal })
       .then((data) => {
@@ -112,14 +125,16 @@ export function ProjectImportPage() {
         if (controller.signal.aborted) return;
         setProjectRole((data?.role as string) || null);
         setProjectRoleStatus("ready");
+        setProjectRoleError(null);
       })
       .catch((err) => {
         if (controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
         setProjectRole(null);
         setProjectRoleStatus("error");
+        setProjectRoleError(err instanceof Error ? err.message : "Project access could not be confirmed.");
       });
     return () => controller.abort();
-  }, [projectId]);
+  }, [projectContextNonce, projectId]);
 
   const canImport = projectRole === "operator" || projectRole === "admin";
   const fileValidationError = useMemo(() => validateArtifactFile(artifactFile), [artifactFile]);
@@ -127,6 +142,11 @@ export function ProjectImportPage() {
   const artifactDetectedType = artifactSuffix(artifactFile);
   const uploadProgressPercent =
     uploadStage === "uploading" && uploadTotalBytes > 0 ? Math.min(100, Math.round((uploadTransferredBytes / uploadTotalBytes) * 100)) : 0;
+  const dropZoneClass = importing
+    ? "cursor-not-allowed border-slate-300 bg-slate-100 opacity-70 dark:border-slate-700 dark:bg-slate-900/60"
+    : dragActive
+      ? "cursor-pointer border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20"
+      : "cursor-pointer border-slate-300 bg-slate-50/70 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900/40 dark:hover:bg-slate-900/70";
 
   function accessLabel(): string {
     if (projectRoleStatus === "loading") return "Checking access";
@@ -142,6 +162,7 @@ export function ProjectImportPage() {
   }
 
   function handleFileSelection(file: File | null) {
+    if (importing) return;
     setArtifactFile(file);
     setError(null);
     setUploadTransferredBytes(0);
@@ -151,6 +172,7 @@ export function ProjectImportPage() {
   function onDrop(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault();
     setDragActive(false);
+    if (importing) return;
     handleFileSelection(event.dataTransfer.files?.[0] || null);
   }
 
@@ -284,7 +306,14 @@ export function ProjectImportPage() {
             <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Upload status</p>
             <h2 className="mt-2 text-xl font-semibold">{importing ? "In progress" : "Preflight"}</h2>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{stageLabel()}</p>
-            <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+            <div
+              aria-label="Import progress"
+              aria-valuemax={100}
+              aria-valuemin={0}
+              aria-valuenow={uploadStage === "queueing" ? 100 : uploadStage === "uploading" ? uploadProgressPercent : uploadStage === "creating-run" ? 12 : 0}
+              className="mt-4 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"
+              role="progressbar"
+            >
               <div
                 className={`h-full rounded-full transition-all ${
                   uploadStage === "uploading"
@@ -373,7 +402,7 @@ export function ProjectImportPage() {
         </div>
 
         {error ? (
-          <StatusBanner tone="error" title="Import Failed">
+          <StatusBanner tone="error" title={currentRunId ? "Import failed" : "Import unavailable"}>
             <p>{error}</p>
             {currentRunId && projectId ? (
               <Link className="mt-2 inline-flex rounded border border-current px-2 py-1 text-xs font-semibold" to={`/projects/${projectId}/runs/${currentRunId}`}>
@@ -416,6 +445,7 @@ export function ProjectImportPage() {
                 Run name
                 <input
                   className="mt-2 w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  disabled={importing}
                   value={runName}
                   onChange={(event) => setRunName(event.target.value)}
                   placeholder="2026-03-10 Corp east sweep"
@@ -433,6 +463,7 @@ export function ProjectImportPage() {
                 Description
                 <textarea
                   className="mt-2 min-h-[120px] w-full rounded-2xl border border-slate-300 bg-white/90 px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  disabled={importing}
                   value={runDescription}
                   onChange={(event) => setRunDescription(event.target.value)}
                   placeholder="Scope, credential set, collection notes, or known coverage gaps"
@@ -445,14 +476,11 @@ export function ProjectImportPage() {
               </div>
 
               <label
-                className={`md:col-span-2 flex min-h-[150px] cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed px-6 py-6 text-center transition ${
-                  dragActive
-                    ? "border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20"
-                    : "border-slate-300 bg-slate-50/70 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900/40 dark:hover:bg-slate-900/70"
-                }`}
+                aria-disabled={importing}
+                className={`md:col-span-2 flex min-h-[150px] flex-col items-center justify-center rounded-lg border-2 border-dashed px-6 py-6 text-center transition ${dropZoneClass}`}
                 onDragEnter={(event) => {
                   event.preventDefault();
-                  setDragActive(true);
+                  if (!importing) setDragActive(true);
                 }}
                 onDragLeave={(event) => {
                   event.preventDefault();
@@ -465,6 +493,7 @@ export function ProjectImportPage() {
               >
                 <input
                   className="sr-only"
+                  disabled={importing}
                   type="file"
                   accept=".json,.json.gz,.ndjson,.jsonl,.ndjson.gz,.jsonl.gz"
                   onChange={(event) => handleFileSelection(event.target.files?.[0] || null)}
@@ -529,7 +558,18 @@ export function ProjectImportPage() {
                   <p className="text-sm text-slate-500 dark:text-slate-400">Checking project access before enabling upload.</p>
                 ) : null}
                 {projectRoleStatus === "error" ? (
-                  <p className="text-sm text-amber-700 dark:text-amber-300">Project access could not be confirmed. Refresh or return to the dashboard.</p>
+                  <div className="flex flex-wrap items-center gap-2 text-sm text-amber-700 dark:text-amber-300" role="alert">
+                    <span>
+                      Project access could not be confirmed. {projectRoleError || "The role service did not return a usable response."} Upload remains disabled.
+                    </span>
+                    <button
+                      className="rounded-md border border-current px-3 py-2 text-xs font-semibold"
+                      onClick={() => setProjectContextNonce((current) => current + 1)}
+                      type="button"
+                    >
+                      Retry access check
+                    </button>
+                  </div>
                 ) : null}
                 {projectRoleStatus === "ready" && !canImport ? (
                   <p className="text-sm text-amber-700 dark:text-amber-300">Operator or admin access is required for ingestion.</p>

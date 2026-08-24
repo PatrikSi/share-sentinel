@@ -135,37 +135,123 @@ export async function apiFetchBlob(
   };
 }
 
-export async function apiFetchAllPages<T>(buildPath: (cursor: string | null) => string, init: RequestInit = {}): Promise<T[]> {
-  const items: T[] = [];
-  const seenCursors = new Set<string>();
-  let cursor: string | null = null;
+export type PaginatedFetchLimitReason = "page_limit" | "item_limit" | "time_limit";
 
-  const throwIfAborted = () => {
-    if (!init.signal?.aborted) return;
-    throw init.signal.reason instanceof Error
-      ? init.signal.reason
-      : new DOMException("Request cancelled.", "AbortError");
-  };
+export type PaginatedFetchLimits = {
+  maxPages: number;
+  maxItems: number;
+  maxDurationMs: number;
+};
 
-  while (true) {
-    throwIfAborted();
-    if (cursor) {
-      if (seenCursors.has(cursor)) {
-        throw new Error("Pagination cursor repeated unexpectedly.");
-      }
-      seenCursors.add(cursor);
-    }
+export type PaginatedFetchResult<T> = {
+  items: T[];
+  truncated: boolean;
+  limitReason: PaginatedFetchLimitReason | null;
+  pagesFetched: number;
+};
 
-    const data = await apiFetch(buildPath(cursor), init);
-    throwIfAborted();
-    items.push(...(((data?.items as T[]) || []) as T[]));
-    cursor = (data?.next_cursor as string | null) || null;
-    if (!cursor) {
-      break;
+const DEFAULT_PAGINATED_FETCH_LIMITS: PaginatedFetchLimits = {
+  maxPages: 20,
+  maxItems: 5_000,
+  maxDurationMs: 15_000,
+};
+
+function validatePaginationLimits(limits: PaginatedFetchLimits): void {
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`Pagination ${name} must be a positive integer.`);
     }
   }
+}
 
-  return items;
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("Request cancelled.", "AbortError");
+}
+
+export async function apiFetchAllPages<T>(
+  buildPath: (cursor: string | null) => string,
+  init: RequestInit = {},
+  requestedLimits: Partial<PaginatedFetchLimits> = {},
+): Promise<PaginatedFetchResult<T>> {
+  const limits = { ...DEFAULT_PAGINATED_FETCH_LIMITS, ...requestedLimits };
+  validatePaginationLimits(limits);
+
+  const items: T[] = [];
+  const seenCursors = new Set<string>();
+  const callerSignal = init.signal;
+  const controller = new AbortController();
+  let pagesFetched = 0;
+  let cursor: string | null = null;
+  let deadlineReached = false;
+
+  const result = (
+    truncated: boolean,
+    limitReason: PaginatedFetchLimitReason | null,
+  ): PaginatedFetchResult<T> => ({ items, truncated, limitReason, pagesFetched });
+
+  const abortFromCaller = () => controller.abort(callerSignal?.reason);
+  if (callerSignal?.aborted) {
+    throw abortReason(callerSignal);
+  }
+  callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
+  const deadline = globalThis.setTimeout(() => {
+    deadlineReached = true;
+    controller.abort(new DOMException("Pagination time limit reached.", "TimeoutError"));
+  }, limits.maxDurationMs);
+
+  try {
+    while (true) {
+      if (callerSignal?.aborted) {
+        throw abortReason(callerSignal);
+      }
+      if (deadlineReached) {
+        return result(true, "time_limit");
+      }
+      if (cursor) {
+        if (seenCursors.has(cursor)) {
+          throw new Error("Pagination cursor repeated unexpectedly.");
+        }
+        seenCursors.add(cursor);
+      }
+
+      let data;
+      try {
+        data = await apiFetch(buildPath(cursor), { ...init, signal: controller.signal });
+      } catch (error) {
+        if (callerSignal?.aborted) {
+          throw abortReason(callerSignal);
+        }
+        if (deadlineReached) {
+          return result(true, "time_limit");
+        }
+        throw error;
+      }
+
+      pagesFetched += 1;
+      const pageItems = (((data?.items as T[]) || []) as T[]);
+      const remainingCapacity = limits.maxItems - items.length;
+      if (pageItems.length > remainingCapacity) {
+        items.push(...pageItems.slice(0, remainingCapacity));
+        return result(true, "item_limit");
+      }
+      items.push(...pageItems);
+      cursor = (data?.next_cursor as string | null) || null;
+      if (!cursor) {
+        return result(false, null);
+      }
+      if (items.length >= limits.maxItems) {
+        return result(true, "item_limit");
+      }
+      if (pagesFetched >= limits.maxPages) {
+        return result(true, "page_limit");
+      }
+    }
+  } finally {
+    globalThis.clearTimeout(deadline);
+    callerSignal?.removeEventListener("abort", abortFromCaller);
+  }
 }
 
 export async function apiUploadArtifact(

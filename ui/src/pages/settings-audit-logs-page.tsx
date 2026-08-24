@@ -214,6 +214,7 @@ export function SettingsAuditLogsPage() {
         ) : (
           <div className="mt-4 settings-table-wrap">
             <table className="settings-table">
+              <caption className="sr-only">Audit events matching the current filters</caption>
               <thead>
                 <tr>
                   <th>Time</th>

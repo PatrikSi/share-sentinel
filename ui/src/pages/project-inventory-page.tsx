@@ -6,7 +6,7 @@ import { ColumnPicker } from "@/components/column-picker";
 import { Dialog } from "@/components/dialog";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
-import { apiFetch, apiFetchAllPages } from "@/lib/api";
+import { apiFetch } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import { parseInventoryQuery, type InventoryQueryClause, type InventoryQueryField, type InventoryQueryGroup } from "@/lib/inventory-query";
 
@@ -170,6 +170,7 @@ const ENDPOINT_COLUMN_OPTIONS: Array<{ key: EndpointColumnKey; label: string }> 
   { key: "run_id", label: "Run ID" },
 ];
 const QUERYABLE_FIELDS: InventoryQueryField[] = ["search", "endpoint", "share", "path", "ext", "access"];
+const MAX_EXPLICIT_RUN_SELECTIONS = 100;
 const ACCESS_QUERY_ALIASES: Record<string, string> = {
   no_access: "no_access",
   none: "no_access",
@@ -298,11 +299,24 @@ function readInitialTab(): Tab {
   return isTab(value) ? value : "items";
 }
 
-function readInitialRuns(): string[] {
-  return readInitialSearchParam("runs")
+function normalizeRunSelection(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].slice(0, MAX_EXPLICIT_RUN_SELECTIONS);
+}
+
+function readInitialRunSelection(): { ids: string[]; truncated: boolean } {
+  const rawIds = readInitialSearchParam("runs")
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
+  const uniqueIds = [...new Set(rawIds)];
+  return {
+    ids: uniqueIds.slice(0, MAX_EXPLICIT_RUN_SELECTIONS),
+    truncated: uniqueIds.length > MAX_EXPLICIT_RUN_SELECTIONS,
+  };
+}
+
+function readInitialRuns(): string[] {
+  return readInitialRunSelection().ids;
 }
 
 function readStoredColumns<T extends string>(storageKey: string, options: Array<{ key: T }>, fallback: T[]): T[] {
@@ -315,6 +329,25 @@ function readStoredColumns<T extends string>(storageKey: string, options: Array<
     return selected.length > 0 ? [...new Set(selected)] : fallback;
   } catch {
     return fallback;
+  }
+}
+
+function readStoredDensity(): Density {
+  if (typeof window === "undefined") return "compact";
+  try {
+    return localStorage.getItem("share_sentinel_inventory_density") === "comfortable" ? "comfortable" : "compact";
+  } catch {
+    return "compact";
+  }
+}
+
+function persistInventoryPreference(storageKey: string, value: string): string | null {
+  try {
+    localStorage.setItem(storageKey, value);
+    return null;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "Browser storage is unavailable.";
+    return `${reason} This display preference will last only until the page is closed.`;
   }
 }
 
@@ -446,7 +479,13 @@ export function ProjectInventoryPage() {
   const [projectRoleStatus, setProjectRoleStatus] = useState<ProjectRoleStatus>(projectId ? "loading" : "error");
   const [runs, setRuns] = useState<RunOption[]>([]);
   const [runsLoaded, setRunsLoaded] = useState(false);
+  const [runCatalogLimited, setRunCatalogLimited] = useState(false);
   const [selectedRunIds, setSelectedRunIds] = useState<string[]>(readInitialRuns);
+  const [runScopeWarning, setRunScopeWarning] = useState<string | null>(() =>
+    readInitialRunSelection().truncated
+      ? `The URL selected more than ${MAX_EXPLICIT_RUN_SELECTIONS} runs. Only the first ${MAX_EXPLICIT_RUN_SELECTIONS} were applied.`
+      : null,
+  );
 
   const [activeTab, setActiveTab] = useState<Tab>(readInitialTab);
   const [query, setQuery] = useState(() => readInitialSearchParam("q"));
@@ -481,6 +520,7 @@ export function ProjectInventoryPage() {
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [lastLoadedAt, setLastLoadedAt] = useState<Date | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
+  const [projectContextNonce, setProjectContextNonce] = useState(0);
   const [queryError, setQueryError] = useState<string | null>(null);
   const [savedInvestigations, setSavedInvestigations] = useState<SavedInvestigation[]>([]);
   const [selectedInvestigationId, setSelectedInvestigationId] = useState<string | null>(null);
@@ -502,9 +542,8 @@ export function ProjectInventoryPage() {
     [readInitialSearchParam("endpoint"), readInitialSearchParam("share"), readInitialSearchParam("path"), readInitialSearchParam("ext"), readInitialSearchParam("access")].some(Boolean),
   );
   const [showViewsDialog, setShowViewsDialog] = useState(false);
-  const [density, setDensity] = useState<Density>(() =>
-    typeof window !== "undefined" && localStorage.getItem("share_sentinel_inventory_density") === "comfortable" ? "comfortable" : "compact",
-  );
+  const [density, setDensity] = useState<Density>(readStoredDensity);
+  const [preferenceWarning, setPreferenceWarning] = useState<string | null>(null);
   const [copiedNotice, setCopiedNotice] = useState<string | null>(null);
 
   const runIdsParam = useMemo(() => selectedRunIds.join(","), [selectedRunIds]);
@@ -530,6 +569,11 @@ export function ProjectInventoryPage() {
   const hasGuidedFilters = [query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess].some((value) => value.trim());
   const hasActiveFilters = queryModeActive || hasGuidedFilters || selectedRunIds.length > 0;
   const eligibleRuns = useMemo(() => runs.filter((run) => run.status === "COMPLETE" || run.status === "INGESTING"), [runs]);
+  const selectedRunsOutsideCatalog = useMemo(() => {
+    if (!runsLoaded) return [];
+    const catalogIds = new Set(runs.map((run) => run.id));
+    return selectedRunIds.filter((id) => !catalogIds.has(id));
+  }, [runs, runsLoaded, selectedRunIds]);
   const partialRunCount =
     selectedRunIds.length > 0
       ? eligibleRuns.filter((run) => selectedRunIds.includes(run.id) && run.status === "INGESTING").length
@@ -724,12 +768,19 @@ export function ProjectInventoryPage() {
       typeof definition.draft_query === "string" && definition.draft_query.trim().length > 0
         ? definition.draft_query
         : appliedQuery;
-    const selectedRuns = Array.isArray(definition.selected_run_ids)
+    const rawSelectedRuns = Array.isArray(definition.selected_run_ids)
       ? definition.selected_run_ids.filter((value): value is string => typeof value === "string")
       : [];
+    const uniqueSelectedRuns = [...new Set(rawSelectedRuns.map((value) => value.trim()).filter(Boolean))];
+    const selectedRuns = normalizeRunSelection(uniqueSelectedRuns);
 
     setActiveTab(targetTab);
     setSelectedRunIds(selectedRuns);
+    setRunScopeWarning(
+      uniqueSelectedRuns.length > MAX_EXPLICIT_RUN_SELECTIONS
+        ? `This saved view referenced more than ${MAX_EXPLICIT_RUN_SELECTIONS} runs. Only the first ${MAX_EXPLICIT_RUN_SELECTIONS} were applied; save the view again to update it.`
+        : null,
+    );
     setQuery(typeof filters.query === "string" ? filters.query : "");
     setEndpointFilter(typeof filters.endpoint_filter === "string" ? filters.endpoint_filter : "");
     setShareFilter(typeof filters.share_filter === "string" ? filters.share_filter : "");
@@ -875,19 +926,23 @@ export function ProjectInventoryPage() {
   }, [activeTab, appliedInventoryQuery, endpointFilter, extFilter, pathPrefix, query, queryModeActive, resourceAccess, selectedRunIds, setSearchParams, shareFilter]);
 
   useEffect(() => {
-    localStorage.setItem("share_sentinel_inventory_item_columns", JSON.stringify(itemColumns));
+    const persistenceError = persistInventoryPreference("share_sentinel_inventory_item_columns", JSON.stringify(itemColumns));
+    if (persistenceError) setPreferenceWarning(persistenceError);
   }, [itemColumns]);
 
   useEffect(() => {
-    localStorage.setItem("share_sentinel_inventory_resource_columns", JSON.stringify(resourceColumns));
+    const persistenceError = persistInventoryPreference("share_sentinel_inventory_resource_columns", JSON.stringify(resourceColumns));
+    if (persistenceError) setPreferenceWarning(persistenceError);
   }, [resourceColumns]);
 
   useEffect(() => {
-    localStorage.setItem("share_sentinel_inventory_endpoint_columns", JSON.stringify(endpointColumns));
+    const persistenceError = persistInventoryPreference("share_sentinel_inventory_endpoint_columns", JSON.stringify(endpointColumns));
+    if (persistenceError) setPreferenceWarning(persistenceError);
   }, [endpointColumns]);
 
   useEffect(() => {
-    localStorage.setItem("share_sentinel_inventory_density", density);
+    const persistenceError = persistInventoryPreference("share_sentinel_inventory_density", density);
+    if (persistenceError) setPreferenceWarning(persistenceError);
   }, [density]);
 
   useEffect(() => {
@@ -934,7 +989,14 @@ export function ProjectInventoryPage() {
     setProject(null);
     setRuns([]);
     setRunsLoaded(false);
-    setSelectedRunIds(readInitialRuns());
+    setRunCatalogLimited(false);
+    const initialRunSelection = readInitialRunSelection();
+    setSelectedRunIds(initialRunSelection.ids);
+    setRunScopeWarning(
+      initialRunSelection.truncated
+        ? `The URL selected more than ${MAX_EXPLICIT_RUN_SELECTIONS} runs. Only the first ${MAX_EXPLICIT_RUN_SELECTIONS} were applied.`
+        : null,
+    );
     setExtensions([]);
     setInventoryStats(null);
     setSavedInvestigations([]);
@@ -960,10 +1022,15 @@ export function ProjectInventoryPage() {
         setProjectRole((data?.role as string) || null);
         setProjectRoleStatus("ready");
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled) return;
         setProjectRole(null);
         setProjectRoleStatus("error");
+        if (!isAbortError(err)) {
+          setError(
+            `Project access could not be confirmed; import actions remain disabled. ${err instanceof Error ? err.message : "Retry when the API is available."}`,
+          );
+        }
       });
 
     apiFetch(`/projects/${projectId}`, { signal: controller.signal })
@@ -974,14 +1041,11 @@ export function ProjectInventoryPage() {
         if (!cancelled) setError(err.message);
       });
 
-    apiFetchAllPages<RunOption>((cursor) => {
-      const query = new URLSearchParams({ limit: "200" });
-      if (cursor) query.set("cursor", cursor);
-      return `/projects/${projectId}/runs?${query.toString()}`;
-    }, { signal: controller.signal })
+    apiFetch(`/projects/${projectId}/runs?limit=200`, { signal: controller.signal })
       .then((data) => {
         if (!cancelled) {
-          setRuns(data);
+          setRuns((data?.items || []) as RunOption[]);
+          setRunCatalogLimited(!!data?.next_cursor);
           setRunsLoaded(true);
         }
       })
@@ -1004,13 +1068,20 @@ export function ProjectInventoryPage() {
       cancelled = true;
       controller.abort();
     };
-  }, [projectId]);
+  }, [projectContextNonce, projectId]);
 
   useEffect(() => {
     if (!runsLoaded) return;
-    const eligibleIds = new Set(eligibleRuns.map((run) => run.id));
-    setSelectedRunIds((current) => current.filter((id) => eligibleIds.has(id)));
-  }, [eligibleRuns, runsLoaded]);
+    const knownIneligibleIds = new Set(
+      runs.filter((run) => run.status !== "COMPLETE" && run.status !== "INGESTING").map((run) => run.id),
+    );
+    const selectedKnownIneligible = selectedRunIds.filter((id) => knownIneligibleIds.has(id));
+    if (selectedKnownIneligible.length === 0) return;
+    setSelectedRunIds((current) => current.filter((id) => !knownIneligibleIds.has(id)));
+    setRunScopeWarning(
+      `${selectedKnownIneligible.length} selected run${selectedKnownIneligible.length === 1 ? " was" : "s were"} removed because pending, uploaded, or failed runs do not have queryable inventory.`,
+    );
+  }, [runs, runsLoaded, selectedRunIds]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -1271,6 +1342,17 @@ export function ProjectInventoryPage() {
       {error ? (
         <StatusBanner tone="error" title="Some project context could not be loaded">
           <p>{error}</p>
+          <p className="mt-1">The result table may still be usable, but project scope, run choices, saved views, or permissions may be incomplete.</p>
+          <button
+            className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold"
+            onClick={() => {
+              setError(null);
+              setProjectContextNonce((current) => current + 1);
+            }}
+            type="button"
+          >
+            Retry project context
+          </button>
         </StatusBanner>
       ) : null}
       {partialRunCount > 0 ? (
@@ -1278,6 +1360,23 @@ export function ProjectInventoryPage() {
           <p>
             {partialRunCount} run{partialRunCount === 1 ? " is" : "s are"} still ingesting. Results include committed records and may be incomplete until ingestion finishes.
           </p>
+        </StatusBanner>
+      ) : null}
+      {runScopeWarning ? (
+        <StatusBanner tone="warning" title="Run scope was limited">
+          <p>{runScopeWarning}</p>
+        </StatusBanner>
+      ) : null}
+      {runCatalogLimited ? (
+        <StatusBanner tone="info" title="Run selector shows recent history">
+          <p>
+            The selector is bounded to the 200 most recent runs. Leave every run unchecked to query all eligible runs, including older history.
+          </p>
+        </StatusBanner>
+      ) : null}
+      {preferenceWarning ? (
+        <StatusBanner tone="warning" title="Display preferences are not persistent">
+          <p>{preferenceWarning}</p>
         </StatusBanner>
       ) : null}
 
@@ -1341,23 +1440,59 @@ export function ProjectInventoryPage() {
               <div className="inventory-popover-heading">
                 <div>
                   <p className="inventory-popover-title">Run scope</p>
-                  <p className="inventory-popover-copy">No selection includes every eligible run.</p>
+                  <p className="inventory-popover-copy">
+                    The selector shows up to 200 recent runs. No selection queries every eligible run, including older history. Explicit scopes support up to {MAX_EXPLICIT_RUN_SELECTIONS} runs ({activeRunCount} selected).
+                  </p>
                 </div>
                 <button className="inventory-text-button" disabled={activeRunCount === 0} onClick={() => setSelectedRunIds([])} type="button">
                   Clear
                 </button>
               </div>
               <div className="inventory-run-list">
-                {eligibleRuns.length === 0 ? <p className="inventory-empty-copy">No completed or ingesting runs are available.</p> : null}
+                {eligibleRuns.length === 0 ? <p className="inventory-empty-copy">No completed or ingesting runs are present in the recent catalog.</p> : null}
                 {unavailableRunCount > 0 ? <p className="inventory-run-note">{unavailableRunCount} pending, uploaded, or failed run{unavailableRunCount === 1 ? " is" : "s are"} excluded because they have no queryable inventory.</p> : null}
+                {selectedRunsOutsideCatalog.length > 0 ? (
+                  <p className="inventory-run-note">
+                    {selectedRunsOutsideCatalog.length} selected run{selectedRunsOutsideCatalog.length === 1 ? " is" : "s are"} outside the recent catalog. The explicit ID scope is preserved; uncheck below to remove it.
+                  </p>
+                ) : null}
+                {selectedRunsOutsideCatalog.map((selectedRunId) => (
+                  <label className="inventory-run-option" key={`older:${selectedRunId}`}>
+                    <input
+                      checked
+                      onChange={() => {
+                        setSelectedRunIds((current) => current.filter((id) => id !== selectedRunId));
+                        setRunScopeWarning(null);
+                      }}
+                      type="checkbox"
+                    />
+                    <span>
+                      <strong>Selected run outside recent history</strong>
+                      <small>{selectedRunId}</small>
+                    </span>
+                  </label>
+                ))}
                 {eligibleRuns.map((run) => (
                   <label className="inventory-run-option" key={run.id}>
                     <input
                       checked={selectedRunIds.includes(run.id)}
+                      disabled={!selectedRunIds.includes(run.id) && activeRunCount >= MAX_EXPLICIT_RUN_SELECTIONS}
                       onChange={(event) =>
-                        setSelectedRunIds((current) =>
-                          event.target.checked ? [...current, run.id] : current.filter((id) => id !== run.id),
-                        )
+                        setSelectedRunIds((current) => {
+                          if (!event.target.checked) {
+                            setRunScopeWarning(null);
+                            return current.filter((id) => id !== run.id);
+                          }
+                          if (current.includes(run.id)) return current;
+                          if (current.length >= MAX_EXPLICIT_RUN_SELECTIONS) {
+                            setRunScopeWarning(
+                              `Explicit run scope is limited to ${MAX_EXPLICIT_RUN_SELECTIONS} runs. Clear the selection to query every eligible run, or remove one before adding another.`,
+                            );
+                            return current;
+                          }
+                          setRunScopeWarning(null);
+                          return [...current, run.id];
+                        })
                       }
                       type="checkbox"
                     />

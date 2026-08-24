@@ -36,6 +36,18 @@ body {
   outline-offset: 2px;
 }
 
+.skip-link {
+  @apply fixed left-3 top-3 z-[100] -translate-y-20 rounded-md bg-slate-950 px-3 py-2 text-sm font-semibold text-white shadow-xl transition-transform dark:bg-white dark:text-slate-950;
+}
+
+.skip-link:focus {
+  @apply translate-y-0;
+}
+
+#main-content:focus {
+  outline: none;
+}
+
 .panel {
   @apply rounded-xl p-4;
   background: var(--app-panel);

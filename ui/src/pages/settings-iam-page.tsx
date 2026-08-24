@@ -1,7 +1,8 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { StatePanel } from "@/components/state-panel";
+import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
 import { Membership, PROJECT_ROLES, Project, UserRow } from "@/lib/iam";
 
@@ -37,6 +38,34 @@ const DEFAULT_FILTERS: FilterState = {
   is_sysadmin: "all",
   project_id: "all",
 };
+
+type DirectoryRequest = {
+  id: number;
+  filterKey: string;
+  userIdsKey: string | null;
+  controller: AbortController;
+};
+
+type DirectoryPage = {
+  rows: UserRow[];
+  nextCursor: string | null;
+};
+
+type MembershipPreview = {
+  rows: Membership[];
+  limited: boolean;
+};
+
+function userDirectoryPath(activeFilters: FilterState, activeCursor: string | null): string {
+  const query = new URLSearchParams({ limit: "30" });
+  if (activeFilters.search.trim()) query.set("search", activeFilters.search.trim());
+  if (activeFilters.is_active !== "all") query.set("is_active", activeFilters.is_active);
+  if (activeFilters.is_approved !== "all") query.set("is_approved", activeFilters.is_approved);
+  if (activeFilters.is_sysadmin !== "all") query.set("is_sysadmin", activeFilters.is_sysadmin);
+  if (activeFilters.project_id !== "all") query.set("project_id", activeFilters.project_id);
+  if (activeCursor) query.set("cursor", activeCursor);
+  return `/users?${query.toString()}`;
+}
 
 function formatDate(value: string): string {
   const parsed = new Date(value);
@@ -80,7 +109,13 @@ export function SettingsIamPage() {
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [directoryError, setDirectoryError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [membershipPreviewLimited, setMembershipPreviewLimited] = useState(false);
+  const [membershipPreviewError, setMembershipPreviewError] = useState<string | null>(null);
+
+  const directoryRequestSequence = useRef(0);
+  const directoryRequest = useRef<DirectoryRequest | null>(null);
 
   const [cursor, setCursor] = useState<string | null>(null);
   const [history, setHistory] = useState<Array<string | null>>([]);
@@ -112,48 +147,84 @@ export function SettingsIamPage() {
     setSecuritySettings(data as SecuritySettings);
   }
 
-  async function loadUsersPage(activeFilters: FilterState, activeCursor: string | null) {
-    const query = new URLSearchParams({ limit: "30" });
-    if (activeFilters.search.trim()) query.set("search", activeFilters.search.trim());
-    if (activeFilters.is_active !== "all") query.set("is_active", activeFilters.is_active);
-    if (activeFilters.is_approved !== "all") query.set("is_approved", activeFilters.is_approved);
-    if (activeFilters.is_sysadmin !== "all") query.set("is_sysadmin", activeFilters.is_sysadmin);
-    if (activeFilters.project_id !== "all") query.set("project_id", activeFilters.project_id);
-    if (activeCursor) query.set("cursor", activeCursor);
-
-    const data = await apiFetch(`/users?${query.toString()}`);
-    const rows = ((data?.items || []) as UserRow[]) || [];
-    setUsers(rows);
-    setNextCursor((data?.next_cursor as string | null) || null);
-    return rows;
+  async function loadUsersPage(path: string, signal: AbortSignal): Promise<DirectoryPage> {
+    const data = await apiFetch(path, { signal });
+    return {
+      rows: ((data?.items || []) as UserRow[]) || [],
+      nextCursor: (data?.next_cursor as string | null) || null,
+    };
   }
 
-  async function loadMembershipsForUsers(userIds: string[]) {
+  async function loadMembershipsForUsers(userIds: string[], signal: AbortSignal): Promise<MembershipPreview> {
     if (userIds.length === 0) {
-      setMemberships([]);
-      return;
+      return { rows: [], limited: false };
     }
-    const rows = await apiFetchAllPages<Membership>((pageCursor) => {
+    const result = await apiFetchAllPages<Membership>((pageCursor) => {
       const query = new URLSearchParams({ limit: "250" });
       if (pageCursor) query.set("cursor", pageCursor);
       for (const userId of userIds) {
         query.append("user_ids", userId);
       }
       return `/settings/rbac/project-memberships?${query.toString()}`;
-    });
-    setMemberships(rows);
+    }, { signal }, { maxPages: 10, maxItems: 2_500, maxDurationMs: 10_000 });
+    return { rows: result.items, limited: result.truncated };
+  }
+
+  function isCurrentDirectoryRequest(requestId: number, filterKey: string, userIdsKey?: string): boolean {
+    const current = directoryRequest.current;
+    if (!current || current.id !== requestId || current.filterKey !== filterKey || current.controller.signal.aborted) {
+      return false;
+    }
+    return userIdsKey === undefined || current.userIdsKey === userIdsKey;
   }
 
   async function refreshDirectory(activeFilters = filters, activeCursor = cursor) {
+    const filterKey = userDirectoryPath(activeFilters, activeCursor);
+    const requestId = ++directoryRequestSequence.current;
+    const controller = new AbortController();
+    directoryRequest.current?.controller.abort();
+    directoryRequest.current = { id: requestId, filterKey, userIdsKey: null, controller };
+
     setLoading(true);
     setError(null);
+    setDirectoryError(null);
+    setUsers([]);
+    setMemberships([]);
+    setMembershipPreviewLimited(false);
+    setMembershipPreviewError(null);
+    setNextCursor(null);
     try {
-      const rows = await loadUsersPage(activeFilters, activeCursor);
-      await loadMembershipsForUsers(rows.map((user) => user.id));
+      const page = await loadUsersPage(filterKey, controller.signal);
+      if (!isCurrentDirectoryRequest(requestId, filterKey)) return;
+
+      setUsers(page.rows);
+      setNextCursor(page.nextCursor);
+
+      const userIds = page.rows.map((user) => user.id);
+      const userIdsKey = JSON.stringify(userIds);
+      const current = directoryRequest.current;
+      if (!current || current.id !== requestId || current.filterKey !== filterKey) return;
+      current.userIdsKey = userIdsKey;
+
+      try {
+        const membershipPreview = await loadMembershipsForUsers(userIds, controller.signal);
+        if (!isCurrentDirectoryRequest(requestId, filterKey, userIdsKey)) return;
+        setMemberships(membershipPreview.rows);
+        setMembershipPreviewLimited(membershipPreview.limited);
+      } catch (err) {
+        if (!isCurrentDirectoryRequest(requestId, filterKey, userIdsKey)) return;
+        setMemberships([]);
+        setMembershipPreviewLimited(false);
+        setMembershipPreviewError(err instanceof Error ? err.message : "Failed to load project access previews");
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load users");
+      if (!isCurrentDirectoryRequest(requestId, filterKey)) return;
+      setDirectoryError(err instanceof Error ? err.message : "Failed to load users");
     } finally {
-      setLoading(false);
+      if (isCurrentDirectoryRequest(requestId, filterKey)) {
+        directoryRequest.current = null;
+        setLoading(false);
+      }
     }
   }
 
@@ -165,6 +236,14 @@ export function SettingsIamPage() {
 
   useEffect(() => {
     refreshDirectory(filters, cursor).catch(() => undefined);
+    const filterKey = userDirectoryPath(filters, cursor);
+    return () => {
+      const current = directoryRequest.current;
+      if (current?.filterKey === filterKey) {
+        directoryRequest.current = null;
+        current.controller.abort();
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters, cursor]);
 
@@ -501,15 +580,47 @@ export function SettingsIamPage() {
           </div>
         </form>
 
+        {membershipPreviewError ? (
+          <div className="mt-4">
+            <StatusBanner tone="warning" title="Project access preview is unavailable">
+              <p>
+                {membershipPreviewError} User rows are current, but project access counts were not applied. Retry the directory or open a user to load that identity's access details.
+              </p>
+            </StatusBanner>
+          </div>
+        ) : membershipPreviewLimited ? (
+          <div className="mt-4">
+            <StatusBanner tone="warning" title="Project access preview is partial">
+              <p>
+                The directory rows are usable, but project membership previews reached the client safety limit. Open a user to review that identity's bounded access list, or narrow the directory filters.
+              </p>
+            </StatusBanner>
+          </div>
+        ) : null}
+
         {loading ? (
           <div className="mt-4">
             <StatePanel title="Loading Users" description="Fetching the current directory view." />
+          </div>
+        ) : directoryError ? (
+          <div className="mt-4">
+            <StatePanel
+              actions={
+                <button className="settings-button" onClick={() => refreshDirectory(filters, cursor).catch(() => undefined)} type="button">
+                  Retry directory
+                </button>
+              }
+              title="User Directory Unavailable"
+              description={`${directoryError} No directory rows were applied. Retry this request or adjust the filters.`}
+              tone="error"
+            />
           </div>
         ) : users.length === 0 ? (
           <div className="mt-4 settings-empty">No users matched the current filters.</div>
         ) : (
           <div className="mt-4 settings-table-wrap">
             <table className="settings-table">
+              <caption className="sr-only">Users matching the current directory filters</caption>
               <thead>
                 <tr>
                   <th>User</th>
@@ -539,8 +650,17 @@ export function SettingsIamPage() {
                         </div>
                       </td>
                       <td>
-                        <div>{assigned.length} project{assigned.length === 1 ? "" : "s"}</div>
-                        {preview ? <div className="settings-meta">{preview}{assigned.length > 2 ? ", ..." : ""}</div> : null}
+                        {membershipPreviewError ? (
+                          <>
+                            <div>Preview unavailable</div>
+                            <div className="settings-meta">Open user for access details.</div>
+                          </>
+                        ) : (
+                          <>
+                            <div>{assigned.length} project{assigned.length === 1 ? "" : "s"}</div>
+                            {preview ? <div className="settings-meta">{preview}{assigned.length > 2 ? ", ..." : ""}</div> : null}
+                          </>
+                        )}
                       </td>
                       <td>{formatDate(user.created_at)}</td>
                       <td className="text-right">
@@ -557,10 +677,10 @@ export function SettingsIamPage() {
         )}
 
         <div className="mt-4 settings-toolbar">
-          <button className="settings-button" disabled={history.length === 0} onClick={previousPage} type="button">
+          <button className="settings-button" disabled={loading || history.length === 0} onClick={previousPage} type="button">
             Previous
           </button>
-          <button className="settings-button" disabled={!nextCursor} onClick={nextPage} type="button">
+          <button className="settings-button" disabled={loading || !nextCursor} onClick={nextPage} type="button">
             Next
           </button>
         </div>

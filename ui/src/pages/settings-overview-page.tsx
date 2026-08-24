@@ -71,6 +71,7 @@ export function SettingsOverviewPage() {
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -98,14 +99,25 @@ export function SettingsOverviewPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [reloadNonce]);
 
   if (loading) {
     return <StatePanel title="Loading Administration Summary" description="Collecting current user, token, and policy state." />;
   }
 
   if (error) {
-    return <StatePanel title="Administration Summary Unavailable" description={error} tone="error" />;
+    return (
+      <StatePanel
+        actions={
+          <button className="settings-button" onClick={() => setReloadNonce((current) => current + 1)} type="button">
+            Retry administration summary
+          </button>
+        }
+        title="Administration Summary Unavailable"
+        description={`${error} No administration state is being summarized; retrying this read is safe.`}
+        tone="error"
+      />
+    );
   }
 
   if (!overview) {
@@ -302,6 +314,7 @@ export function SettingsOverviewPage() {
         ) : (
           <div className="mt-4 settings-table-wrap">
             <table className="settings-table">
+              <caption className="sr-only">Recent system administration audit events</caption>
               <thead>
                 <tr>
                   <th>Time</th>

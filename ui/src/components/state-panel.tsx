@@ -16,8 +16,17 @@ type StatePanelProps = {
 };
 
 export function StatePanel({ title, description, tone = "neutral", actions }: StatePanelProps) {
+  const liveProps =
+    tone === "error"
+      ? { role: "alert", "aria-live": "assertive" as const }
+      : { role: "status", "aria-live": "polite" as const };
+
   return (
-    <div className={`rounded-lg border border-dashed px-6 py-8 text-center ${PANEL_CLASSES[tone]}`}>
+    <div
+      aria-atomic="true"
+      className={`rounded-lg border border-dashed px-6 py-8 text-center ${PANEL_CLASSES[tone]}`}
+      {...liveProps}
+    >
       <p className="text-sm font-semibold">{title}</p>
       <p className="mt-2 text-sm">{description}</p>
       {actions ? <div className="mt-4 flex justify-center">{actions}</div> : null}
