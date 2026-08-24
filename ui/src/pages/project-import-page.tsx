@@ -425,7 +425,7 @@ export function ProjectImportPage() {
               </div>
               <div className="rounded-2xl border border-white/70 bg-white/70 p-4 dark:border-slate-800 dark:bg-slate-950/40">
                 <p className="font-semibold text-slate-900 dark:text-slate-100">2. Validate the artifact</p>
-                <p className="mt-1">Drop a collector file here and confirm the file type, size, and notes before upload.</p>
+                <p className="mt-1">Drop an SMB, NFS, or SharePoint collector artifact here and confirm the file type, size, and notes before upload.</p>
               </div>
               <div className="rounded-2xl border border-white/70 bg-white/70 p-4 dark:border-slate-800 dark:bg-slate-950/40">
                 <p className="font-semibold text-slate-900 dark:text-slate-100">3. Monitor ingest</p>
@@ -459,6 +459,15 @@ export function ProjectImportPage() {
                 <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">Use the collector's `.ndjson` / `.ndjson.gz` default for large scans. Compact `.json` is a compatibility format limited to 50 MiB.</p>
               </div>
 
+              <div className="md:col-span-2">
+                <StatusBanner tone="info" title="Collection credentials stay on the collector host">
+                  <p>
+                    SharePoint authentication runs in the local collector, not in this browser. Uploaded artifacts retain non-secret provider, identity, scope, and completeness context so analysts can distinguish application inventory from a delegated user's view.
+                  </p>
+                  <p className="mt-1">SharePoint collection inventories filenames, folders, paths, identifiers, and metadata. It does not download document content.</p>
+                </StatusBanner>
+              </div>
+
               <label className="md:col-span-2 text-sm font-medium text-slate-700 dark:text-slate-300">
                 Description
                 <textarea
@@ -466,7 +475,7 @@ export function ProjectImportPage() {
                   disabled={importing}
                   value={runDescription}
                   onChange={(event) => setRunDescription(event.target.value)}
-                  placeholder="Scope, credential set, collection notes, or known coverage gaps"
+                  placeholder="Scope, collector identity label, collection notes, or known coverage gaps (never paste secrets)"
                 />
               </label>
 

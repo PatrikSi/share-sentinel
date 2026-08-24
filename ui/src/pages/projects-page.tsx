@@ -2,8 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { Dialog } from "@/components/dialog";
+import { CollectionContextPanel } from "@/components/provider-context";
 import { apiFetch } from "@/lib/api";
 import { useDashboardWorkspace } from "@/lib/dashboard-workspace";
+import { collectionContextProvider, type CollectionContext } from "@/lib/provider-context";
 
 type RunProgress = {
   line_offset?: number;
@@ -22,6 +24,7 @@ type Run = {
   artifact_size: number | null;
   ingest_progress: RunProgress;
   summary: { endpoints?: number; resources?: number; items?: number; errors?: number };
+  collection_context?: CollectionContext | null;
 };
 
 type ProjectStats = {
@@ -551,12 +554,12 @@ export function ProjectsPage() {
               detail={`Scope: ${formatCount(scopedProjectStats?.scope_runs)} • Complete: ${formatCount(scopedProjectStats?.runs_complete)}`}
             />
             <StatTile
-              label="Endpoints"
+              label="Sites & endpoints"
               value={formatCount(scopedProjectStats?.endpoints)}
-              detail={`Unique hosts: ${formatCount(scopedProjectStats?.unique_hosts)} • Ingesting: ${formatCount(scopedProjectStats?.runs_ingesting)}`}
+              detail={`Distinct hostnames: ${formatCount(scopedProjectStats?.unique_hosts)} • Ingesting: ${formatCount(scopedProjectStats?.runs_ingesting)}`}
             />
             <StatTile
-              label="Shares"
+              label="Resources"
               value={formatCount(scopedProjectStats?.shares)}
               detail={`Files: ${formatCount(scopedProjectStats?.files)} • Directories: ${formatCount(scopedProjectStats?.directories)}`}
             />
@@ -659,6 +662,7 @@ export function ProjectsPage() {
                   const isLatest = latestRun?.id === run.id;
                   const runStatusNote = describeRunCardStatus(run);
                   const issueCount = run.summary?.errors || 0;
+                  const sharePointRun = collectionContextProvider(run.collection_context) === "sharepoint";
                   return (
                     <article
                       key={run.id}
@@ -679,6 +683,7 @@ export function ProjectsPage() {
                           <h3 className="mt-3 text-xl font-semibold tracking-tight">{run.name}</h3>
                           <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">{run.description || "No description provided."}</p>
                           <p className="mt-3 font-mono text-[11px] text-slate-500">{run.id}</p>
+                          <CollectionContextPanel compact context={run.collection_context} />
                         </div>
 
                         <div className="flex flex-wrap gap-2">
@@ -742,8 +747,8 @@ export function ProjectsPage() {
                       ) : null}
 
                       <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
-                        <RunMetric label="Endpoints" value={run.summary?.endpoints} />
-                        <RunMetric label="Shares" value={run.summary?.resources} />
+                        <RunMetric label={sharePointRun ? "Sites" : "Endpoints"} value={run.summary?.endpoints} />
+                        <RunMetric label={sharePointRun ? "Libraries" : "Resources"} value={run.summary?.resources} />
                         <RunMetric label="Items" value={run.summary?.items} />
                         <RunMetric label="Errors" value={run.summary?.errors} />
                         <div className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-800 dark:bg-slate-900/80">

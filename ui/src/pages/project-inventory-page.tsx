@@ -4,14 +4,30 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 import { AccessCapabilityCell, type AccessCapabilities } from "@/components/access-capability-cell";
 import { ColumnPicker } from "@/components/column-picker";
 import { Dialog } from "@/components/dialog";
+import { ExposureBadge, ProviderBadge } from "@/components/provider-context";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import { parseInventoryQuery, type InventoryQueryClause, type InventoryQueryField, type InventoryQueryGroup } from "@/lib/inventory-query";
+import {
+  assessedIdentity,
+  collectionContextProvider,
+  collectionIsPartial,
+  collectionLimitationLabel,
+  collectionModeLabel,
+  exposureLabel,
+  metadataString,
+  normalizedProvider,
+  providerLabel,
+  resourceTypeLabel,
+  safeExternalUrl,
+  type CollectionContext,
+  type ProviderMetadata,
+} from "@/lib/provider-context";
 
 type Project = { id: string; name: string };
-type RunOption = { id: string; name: string; status: string; created_at: string };
+type RunOption = { id: string; name: string; status: string; created_at: string; collection_context?: CollectionContext | null };
 type ExtensionFacet = { ext: string; count: number };
 type InventoryStats = { runs_ingesting?: number };
 type ProjectRoleStatus = "loading" | "ready" | "error";
@@ -23,10 +39,13 @@ type InventoryItem = {
   endpoint_key: string;
   hostname: string | null;
   ip: string | null;
+  endpoint_metadata?: ProviderMetadata | null;
   resource_name: string;
   access_level: string;
   access_capabilities: AccessCapabilities | null;
   share_type: string;
+  resource_type?: string | null;
+  provider?: string | null;
   path: string;
   name: string;
   is_dir: boolean;
@@ -37,6 +56,14 @@ type InventoryItem = {
   accessed_at?: string | null;
   changed_at?: string | null;
   file_attributes?: string[] | null;
+  provider_item_id?: string | null;
+  provider_parent_id?: string | null;
+  web_url?: string | null;
+  mime_type?: string | null;
+  deleted?: boolean;
+  metadata?: ProviderMetadata | null;
+  exposure?: string | null;
+  exposure_evidence?: ProviderMetadata | null;
 };
 
 type InventoryResource = {
@@ -45,11 +72,19 @@ type InventoryResource = {
   run_name: string;
   endpoint_key: string;
   hostname: string | null;
+  endpoint_metadata?: ProviderMetadata | null;
   name: string;
   remark: string | null;
   access_level: string;
   access_capabilities: AccessCapabilities | null;
   share_type: string;
+  resource_type?: string | null;
+  provider?: string | null;
+  provider_resource_id?: string | null;
+  web_url?: string | null;
+  metadata?: ProviderMetadata | null;
+  exposure?: string | null;
+  exposure_evidence?: ProviderMetadata | null;
   item_count: number;
 };
 
@@ -62,6 +97,8 @@ type InventoryEndpoint = {
   hostname: string | null;
   domain: string | null;
   smb_signing: string | null;
+  provider?: string | null;
+  metadata?: ProviderMetadata | null;
   resource_count: number;
   item_count: number;
 };
@@ -77,6 +114,10 @@ type SavedInvestigationDefinition = {
     path_prefix?: string;
     ext_filter?: string;
     resource_access?: string;
+    provider_filter?: string;
+    resource_type_filter?: string;
+    exposure_filter?: string;
+    include_deleted?: boolean;
   };
   applied_query?: string;
   draft_query?: string;
@@ -97,6 +138,10 @@ type ItemColumnKey =
   | "path"
   | "name"
   | "resource_name"
+  | "provider"
+  | "assessment_scope"
+  | "resource_type"
+  | "exposure"
   | "share_type"
   | "access_level"
   | "endpoint_key"
@@ -111,9 +156,46 @@ type ItemColumnKey =
   | "created_at"
   | "accessed_at"
   | "changed_at"
-  | "file_attributes";
-type ResourceColumnKey = "name" | "share_type" | "access_level" | "endpoint_key" | "hostname" | "item_count" | "run_name" | "run_id" | "remark";
-type EndpointColumnKey = "endpoint_key" | "hostname" | "ip" | "domain" | "smb_signing" | "resource_count" | "item_count" | "run_name" | "run_id";
+  | "file_attributes"
+  | "web_url"
+  | "mime_type"
+  | "provider_item_id"
+  | "provider_parent_id"
+  | "site_id"
+  | "drive_id"
+  | "deleted";
+type ResourceColumnKey =
+  | "name"
+  | "provider"
+  | "assessment_scope"
+  | "resource_type"
+  | "exposure"
+  | "access_level"
+  | "endpoint_key"
+  | "hostname"
+  | "item_count"
+  | "run_name"
+  | "run_id"
+  | "remark"
+  | "web_url"
+  | "provider_resource_id"
+  | "site_id";
+type EndpointColumnKey =
+  | "endpoint_key"
+  | "provider"
+  | "assessment_scope"
+  | "site_name"
+  | "web_url"
+  | "site_id"
+  | "tenant_id"
+  | "hostname"
+  | "ip"
+  | "domain"
+  | "smb_signing"
+  | "resource_count"
+  | "item_count"
+  | "run_name"
+  | "run_id";
 type QueryFilterReflection = {
   value: string;
   modeLabel: string | null;
@@ -123,18 +205,22 @@ type QueryFilterReflection = {
 type Density = "compact" | "comfortable";
 type CellFilterField = InventoryQueryField | null;
 
-const DEFAULT_ITEM_COLUMNS: ItemColumnKey[] = ["path", "name", "resource_name", "access_level", "hostname", "size_bytes", "run_name"];
-const DEFAULT_RESOURCE_COLUMNS: ResourceColumnKey[] = ["name", "share_type", "access_level", "hostname", "item_count", "run_name", "remark"];
-const DEFAULT_ENDPOINT_COLUMNS: EndpointColumnKey[] = ["endpoint_key", "hostname", "ip", "domain", "resource_count", "item_count", "run_name"];
+const DEFAULT_ITEM_COLUMNS: ItemColumnKey[] = ["path", "name", "provider", "resource_name", "access_level", "exposure", "size_bytes", "mtime", "run_name"];
+const DEFAULT_RESOURCE_COLUMNS: ResourceColumnKey[] = ["name", "provider", "resource_type", "exposure", "access_level", "hostname", "item_count", "run_name"];
+const DEFAULT_ENDPOINT_COLUMNS: EndpointColumnKey[] = ["endpoint_key", "provider", "site_name", "hostname", "resource_count", "item_count", "run_name"];
 
 const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
   { key: "path", label: "Path" },
   { key: "name", label: "Name" },
-  { key: "resource_name", label: "Share" },
-  { key: "share_type", label: "Share Type" },
+  { key: "resource_name", label: "Share / Library" },
+  { key: "provider", label: "Source" },
+  { key: "assessment_scope", label: "Assessment Scope" },
+  { key: "resource_type", label: "Resource Type" },
+  { key: "exposure", label: "Exposure" },
+  { key: "share_type", label: "Legacy Share Type" },
   { key: "access_level", label: "Observed Access" },
   { key: "endpoint_key", label: "Endpoint Key" },
-  { key: "hostname", label: "Hostname" },
+  { key: "hostname", label: "Site / Host" },
   { key: "ip", label: "IP" },
   { key: "run_name", label: "Run Name" },
   { key: "run_id", label: "Run ID" },
@@ -146,30 +232,49 @@ const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
   { key: "accessed_at", label: "Last Accessed" },
   { key: "changed_at", label: "Metadata Changed" },
   { key: "file_attributes", label: "Attributes" },
+  { key: "web_url", label: "Canonical URL" },
+  { key: "mime_type", label: "MIME Type" },
+  { key: "provider_item_id", label: "Provider Item ID" },
+  { key: "provider_parent_id", label: "Provider Parent ID" },
+  { key: "site_id", label: "SharePoint Site ID" },
+  { key: "drive_id", label: "SharePoint Drive ID" },
+  { key: "deleted", label: "Deleted" },
 ];
 const RESOURCE_COLUMN_OPTIONS: Array<{ key: ResourceColumnKey; label: string }> = [
-  { key: "name", label: "Share" },
-  { key: "share_type", label: "Share Type" },
+  { key: "name", label: "Share / Library" },
+  { key: "provider", label: "Source" },
+  { key: "assessment_scope", label: "Assessment Scope" },
+  { key: "resource_type", label: "Resource Type" },
+  { key: "exposure", label: "Exposure" },
   { key: "access_level", label: "Observed Access" },
   { key: "endpoint_key", label: "Endpoint Key" },
-  { key: "hostname", label: "Hostname" },
+  { key: "hostname", label: "Site / Host" },
   { key: "item_count", label: "Items" },
   { key: "run_name", label: "Run Name" },
   { key: "run_id", label: "Run ID" },
   { key: "remark", label: "Remark" },
+  { key: "web_url", label: "Canonical URL" },
+  { key: "provider_resource_id", label: "Provider Resource ID" },
+  { key: "site_id", label: "SharePoint Site ID" },
 ];
 const ENDPOINT_COLUMN_OPTIONS: Array<{ key: EndpointColumnKey; label: string }> = [
-  { key: "endpoint_key", label: "Endpoint Key" },
-  { key: "hostname", label: "Hostname" },
+  { key: "endpoint_key", label: "Source Key" },
+  { key: "provider", label: "Source" },
+  { key: "assessment_scope", label: "Assessment Scope" },
+  { key: "site_name", label: "Site / Host" },
+  { key: "web_url", label: "Canonical URL" },
+  { key: "site_id", label: "SharePoint Site ID" },
+  { key: "tenant_id", label: "Tenant ID" },
+  { key: "hostname", label: "Hostname / Domain" },
   { key: "ip", label: "IP" },
   { key: "domain", label: "Domain" },
   { key: "smb_signing", label: "Signing" },
-  { key: "resource_count", label: "Shares" },
+  { key: "resource_count", label: "Resources" },
   { key: "item_count", label: "Items" },
   { key: "run_name", label: "Run Name" },
   { key: "run_id", label: "Run ID" },
 ];
-const QUERYABLE_FIELDS: InventoryQueryField[] = ["search", "endpoint", "share", "path", "ext", "access"];
+const QUERYABLE_FIELDS: InventoryQueryField[] = ["search", "endpoint", "share", "path", "ext", "access", "provider", "source", "resource_type", "exposure"];
 const MAX_EXPLICIT_RUN_SELECTIONS = 100;
 const ACCESS_QUERY_ALIASES: Record<string, string> = {
   no_access: "no_access",
@@ -190,6 +295,17 @@ const ACCESS_QUERY_ALIASES: Record<string, string> = {
   inconclusive: "unknown",
   not_tested: "unknown",
 };
+const EXPOSURE_QUERY_ALIASES: Record<string, string> = {
+  user_visible: "USER_VISIBLE",
+  uservisible: "USER_VISIBLE",
+  broad_internal: "BROAD_INTERNAL",
+  broadinternal: "BROAD_INTERNAL",
+  external: "EXTERNAL",
+  anonymous: "ANONYMOUS",
+  anyone: "ANONYMOUS",
+  restricted: "RESTRICTED",
+  unknown: "UNKNOWN",
+};
 
 function normalizeReflectionValue(field: InventoryQueryField, value: string): string {
   const trimmed = value.trim();
@@ -199,6 +315,11 @@ function normalizeReflectionValue(field: InventoryQueryField, value: string): st
   }
   if (field === "access") {
     return ACCESS_QUERY_ALIASES[trimmed.toLowerCase().replaceAll(" ", "_")] || trimmed.toLowerCase();
+  }
+  if (field === "provider" || field === "source" || field === "resource_type") return trimmed.toLowerCase().replaceAll(" ", "_");
+  if (field === "exposure") {
+    const normalized = trimmed.toLowerCase().replaceAll(" ", "_");
+    return EXPOSURE_QUERY_ALIASES[normalized] || trimmed.toUpperCase();
   }
   return trimmed;
 }
@@ -246,6 +367,10 @@ function blankQueryFilterReflections(): Record<InventoryQueryField, QueryFilterR
     path: { value: "", modeLabel: null, summary: null, selectValue: "" },
     ext: { value: "", modeLabel: null, summary: null, selectValue: "" },
     access: { value: "", modeLabel: null, summary: null, selectValue: "" },
+    provider: { value: "", modeLabel: null, summary: null, selectValue: "" },
+    source: { value: "", modeLabel: null, summary: null, selectValue: "" },
+    resource_type: { value: "", modeLabel: null, summary: null, selectValue: "" },
+    exposure: { value: "", modeLabel: null, summary: null, selectValue: "" },
   };
 }
 
@@ -261,15 +386,15 @@ const INVENTORY_TAB_COPY: Record<Tab, { label: string; description: string; empt
     emptyBody: "Broaden the guided filters, clear the run scope, or switch to the advanced query builder.",
   },
   resources: {
-    label: "Shares",
-    description: "Review exposed shares, access levels, and remarks before drilling into paths.",
-    emptyTitle: "No shares match these filters.",
+    label: "Resources",
+    description: "Compare SMB shares, NFS exports, and SharePoint libraries with access and evidence-based exposure context.",
+    emptyTitle: "No resources match these filters.",
     emptyBody: "Try a broader endpoint or access filter, or compare a different run scope.",
   },
   endpoints: {
-    label: "Endpoints",
-    description: "Scan hosts in scope first, then pivot into the shares and items behind each endpoint.",
-    emptyTitle: "No endpoints match these filters.",
+    label: "Sites & Endpoints",
+    description: "Review source scope as hosts or SharePoint sites, then pivot into the resources and items behind each source.",
+    emptyTitle: "No sites or endpoints match these filters.",
     emptyBody: "Adjust the search terms or clear the run scope to widen the endpoint set.",
   },
 };
@@ -281,6 +406,10 @@ const QUERY_FIELD_LABELS: Record<InventoryQueryField, string> = {
   path: "Path",
   ext: "Extension",
   access: "Observed Access",
+  provider: "Source",
+  source: "Run Source",
+  resource_type: "Resource Type",
+  exposure: "Exposure",
 };
 
 const FILTER_LABEL_CLASS = "text-xs font-semibold uppercase tracking-wider text-slate-500";
@@ -413,6 +542,7 @@ function formatFileAttributes(value: string[] | null | undefined): string {
 type InventoryCellProps = {
   text: string;
   label: string;
+  content?: ReactNode;
   filterField?: CellFilterField;
   filterScopeLabel?: string;
   filterValue?: string;
@@ -422,18 +552,20 @@ type InventoryCellProps = {
   onCopy: (value: string, label: string) => void;
 };
 
-function InventoryCell({ text, label, filterField = null, filterScopeLabel, filterValue, mono = false, badge, onFilter, onCopy }: InventoryCellProps) {
+function InventoryCell({ text, label, content, filterField = null, filterScopeLabel, filterValue, mono = false, badge, onFilter, onCopy }: InventoryCellProps) {
   const exactValue = filterValue ?? text;
   const actionable = exactValue !== "" && exactValue !== "—";
   const filterTarget = filterScopeLabel || label;
   return (
     <div className="inventory-cell">
-      <span
-        className={`inventory-cell-text ${mono ? "is-mono" : ""} ${badge ? `inventory-value-badge is-${badge}` : ""}`}
-        title={text === "—" ? undefined : text}
-      >
-        {text}
-      </span>
+      {content || (
+        <span
+          className={`inventory-cell-text ${mono ? "is-mono" : ""} ${badge ? `inventory-value-badge is-${badge}` : ""}`}
+          title={text === "—" ? undefined : text}
+        >
+          {text}
+        </span>
+      )}
       {actionable ? (
         <span className="inventory-cell-actions">
           {filterField ? (
@@ -494,6 +626,10 @@ export function ProjectInventoryPage() {
   const [pathPrefix, setPathPrefix] = useState(() => readInitialSearchParam("path"));
   const [extFilter, setExtFilter] = useState(() => readInitialSearchParam("ext"));
   const [resourceAccess, setResourceAccess] = useState(() => readInitialSearchParam("access"));
+  const [providerFilter, setProviderFilter] = useState(() => readInitialSearchParam("provider"));
+  const [resourceTypeFilter, setResourceTypeFilter] = useState(() => readInitialSearchParam("resourceType"));
+  const [exposureFilter, setExposureFilter] = useState(() => readInitialSearchParam("exposure"));
+  const [includeDeleted, setIncludeDeleted] = useState(() => readInitialSearchParam("includeDeleted") === "1");
   const [inventoryQueryInput, setInventoryQueryInput] = useState(initialDsl.current);
   const [appliedInventoryQuery, setAppliedInventoryQuery] = useState(initialDsl.current);
   const [appliedInventoryQueryGroups, setAppliedInventoryQueryGroups] = useState<InventoryQueryGroup[]>(() => {
@@ -539,7 +675,16 @@ export function ProjectInventoryPage() {
   );
   const [showAdvancedQuery, setShowAdvancedQuery] = useState(false);
   const [showGuidedFilters, setShowGuidedFilters] = useState(() =>
-    [readInitialSearchParam("endpoint"), readInitialSearchParam("share"), readInitialSearchParam("path"), readInitialSearchParam("ext"), readInitialSearchParam("access")].some(Boolean),
+    [
+      readInitialSearchParam("endpoint"),
+      readInitialSearchParam("share"),
+      readInitialSearchParam("path"),
+      readInitialSearchParam("ext"),
+      readInitialSearchParam("access"),
+      readInitialSearchParam("provider"),
+      readInitialSearchParam("resourceType"),
+      readInitialSearchParam("exposure"),
+    ].some(Boolean),
   );
   const [showViewsDialog, setShowViewsDialog] = useState(false);
   const [density, setDensity] = useState<Density>(readStoredDensity);
@@ -553,6 +698,9 @@ export function ProjectInventoryPage() {
   const debouncedPathPrefix = useDebouncedValue(pathPrefix, 300);
   const debouncedExtFilter = useDebouncedValue(extFilter, 300);
   const debouncedResourceAccess = useDebouncedValue(resourceAccess, 150);
+  const debouncedProviderFilter = useDebouncedValue(providerFilter, 150);
+  const debouncedResourceTypeFilter = useDebouncedValue(resourceTypeFilter, 150);
+  const debouncedExposureFilter = useDebouncedValue(exposureFilter, 150);
   const queryModeActive = appliedInventoryQuery.trim().length > 0;
   const canImport = projectRole === "operator" || projectRole === "admin";
   const queryFilterReflections = useMemo(() => {
@@ -566,7 +714,10 @@ export function ProjectInventoryPage() {
   const activeResultCount = activeTab === "items" ? items.length : activeTab === "resources" ? resources.length : endpoints.length;
   const activeColumnCount = activeTab === "items" ? itemColumns.length : activeTab === "resources" ? resourceColumns.length : endpointColumns.length;
   const activeRunCount = selectedRunIds.length;
-  const hasGuidedFilters = [query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess].some((value) => value.trim());
+  const includeDeletedApplies = activeTab === "items" && includeDeleted;
+  const hasGuidedFilters =
+    [query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess, providerFilter, resourceTypeFilter, exposureFilter].some((value) => value.trim()) ||
+    includeDeletedApplies;
   const hasActiveFilters = queryModeActive || hasGuidedFilters || selectedRunIds.length > 0;
   const eligibleRuns = useMemo(() => runs.filter((run) => run.status === "COMPLETE" || run.status === "INGESTING"), [runs]);
   const selectedRunsOutsideCatalog = useMemo(() => {
@@ -579,6 +730,23 @@ export function ProjectInventoryPage() {
       ? eligibleRuns.filter((run) => selectedRunIds.includes(run.id) && run.status === "INGESTING").length
       : inventoryStats?.runs_ingesting || 0;
   const unavailableRunCount = runs.length - eligibleRuns.length;
+  const contextScopedRuns = selectedRunIds.length > 0 ? eligibleRuns.filter((run) => selectedRunIds.includes(run.id)) : eligibleRuns;
+  const scopedSharePointRuns = contextScopedRuns.filter((run) => collectionContextProvider(run.collection_context) === "sharepoint");
+  const scopedCollectionModes = new Set(
+    scopedSharePointRuns
+      .map((run) => run.collection_context?.collection_mode)
+      .filter((mode): mode is string => typeof mode === "string" && mode.length > 0),
+  );
+  const mixedSharePointPerspectives = scopedCollectionModes.has("tenant_inventory") && scopedCollectionModes.has("delegated_user_view");
+  const incompleteCollectionRunCount = contextScopedRuns.filter((run) => collectionIsPartial(run.collection_context)).length;
+  const delegatedIdentities = [
+    ...new Set(
+      scopedSharePointRuns
+        .filter((run) => run.collection_context?.collection_mode === "delegated_user_view")
+        .map((run) => assessedIdentity(run.collection_context))
+        .filter((identity): identity is string => !!identity),
+    ),
+  ];
 
   function clearAppliedInventoryQuery() {
     setAppliedInventoryQuery("");
@@ -600,6 +768,9 @@ export function ProjectInventoryPage() {
     setPathPrefix(reflections.path.value);
     setExtFilter(reflections.ext.selectValue);
     setResourceAccess(reflections.access.selectValue);
+    setProviderFilter(reflections.provider.selectValue);
+    setResourceTypeFilter(reflections.resource_type.selectValue);
+    setExposureFilter(reflections.exposure.selectValue);
     setQueryError(null);
   }
 
@@ -633,6 +804,10 @@ export function ProjectInventoryPage() {
     setPathPrefix("");
     setExtFilter("");
     setResourceAccess("");
+    setProviderFilter("");
+    setResourceTypeFilter("");
+    setExposureFilter("");
+    setIncludeDeleted(false);
   }
 
   function clearFieldFilters() {
@@ -654,6 +829,9 @@ export function ProjectInventoryPage() {
     if (pathPrefix.trim()) group.push({ field: "path", operator: "startswith", value: pathPrefix.trim(), negated: false });
     if (extFilter.trim()) group.push({ field: "ext", operator: "equals", value: extFilter.trim(), negated: false });
     if (resourceAccess.trim()) group.push({ field: "access", operator: "equals", value: resourceAccess.trim(), negated: false });
+    if (providerFilter.trim()) group.push({ field: "provider", operator: "equals", value: providerFilter.trim(), negated: false });
+    if (resourceTypeFilter.trim()) group.push({ field: "resource_type", operator: "equals", value: resourceTypeFilter.trim(), negated: false });
+    if (exposureFilter.trim()) group.push({ field: "exposure", operator: "equals", value: exposureFilter.trim(), negated: false });
     return group.length > 0 ? [group] : [];
   }
 
@@ -694,6 +872,9 @@ export function ProjectInventoryPage() {
     if (field === "path") setPathPrefix("");
     if (field === "ext") setExtFilter("");
     if (field === "access") setResourceAccess("");
+    if (field === "provider") setProviderFilter("");
+    if (field === "resource_type") setResourceTypeFilter("");
+    if (field === "exposure") setExposureFilter("");
   }
 
   async function copyExactValue(value: string, label: string) {
@@ -716,6 +897,10 @@ export function ProjectInventoryPage() {
       pathPrefix.trim() ? `path:${pathPrefix.trim()}` : null,
       extFilter.trim() ? `ext:${extFilter.trim()}` : null,
       resourceAccess.trim() ? `access:${resourceAccess.trim()}` : null,
+      providerFilter.trim() ? `provider:${providerFilter.trim()}` : null,
+      resourceTypeFilter.trim() ? `resource_type:${resourceTypeFilter.trim()}` : null,
+      exposureFilter.trim() ? `exposure:${exposureFilter.trim()}` : null,
+      includeDeleted ? "include:deleted" : null,
     ]
       .filter(Boolean)
       .join(" ");
@@ -732,6 +917,10 @@ export function ProjectInventoryPage() {
         path_prefix: pathPrefix,
         ext_filter: extFilter,
         resource_access: resourceAccess,
+        provider_filter: providerFilter,
+        resource_type_filter: resourceTypeFilter,
+        exposure_filter: exposureFilter,
+        include_deleted: includeDeleted,
       },
       applied_query: appliedInventoryQuery.trim(),
       draft_query: inventoryQueryInput.trim(),
@@ -787,6 +976,10 @@ export function ProjectInventoryPage() {
     setPathPrefix(typeof filters.path_prefix === "string" ? filters.path_prefix : "");
     setExtFilter(typeof filters.ext_filter === "string" ? filters.ext_filter : "");
     setResourceAccess(typeof filters.resource_access === "string" ? filters.resource_access : "");
+    setProviderFilter(typeof filters.provider_filter === "string" ? filters.provider_filter : "");
+    setResourceTypeFilter(typeof filters.resource_type_filter === "string" ? filters.resource_type_filter : "");
+    setExposureFilter(typeof filters.exposure_filter === "string" ? filters.exposure_filter : "");
+    setIncludeDeleted(filters.include_deleted === true);
     setInventoryQueryInput(draftQuery);
     setSelectedInvestigationId(investigation.id);
     setInvestigationName(investigation.name);
@@ -921,9 +1114,13 @@ export function ProjectInventoryPage() {
       if (pathPrefix.trim()) next.set("path", pathPrefix.trim());
       if (extFilter.trim()) next.set("ext", extFilter.trim());
       if (resourceAccess.trim()) next.set("access", resourceAccess.trim());
+      if (providerFilter.trim()) next.set("provider", providerFilter.trim());
+      if (resourceTypeFilter.trim()) next.set("resourceType", resourceTypeFilter.trim());
+      if (exposureFilter.trim()) next.set("exposure", exposureFilter.trim());
     }
+    if (includeDeleted) next.set("includeDeleted", "1");
     setSearchParams(next, { replace: true });
-  }, [activeTab, appliedInventoryQuery, endpointFilter, extFilter, pathPrefix, query, queryModeActive, resourceAccess, selectedRunIds, setSearchParams, shareFilter]);
+  }, [activeTab, appliedInventoryQuery, endpointFilter, exposureFilter, extFilter, includeDeleted, pathPrefix, providerFilter, query, queryModeActive, resourceAccess, resourceTypeFilter, selectedRunIds, setSearchParams, shareFilter]);
 
   useEffect(() => {
     const persistenceError = persistInventoryPreference("share_sentinel_inventory_item_columns", JSON.stringify(itemColumns));
@@ -1102,7 +1299,7 @@ export function ProjectInventoryPage() {
   useEffect(() => {
     setCursor(null);
     setCursorHistory([]);
-  }, [activeTab, appliedInventoryQuery, projectId, runIdsParam, debouncedQuery, debouncedEndpointFilter, debouncedShareFilter, debouncedPathPrefix, debouncedExtFilter, debouncedResourceAccess]);
+  }, [activeTab, appliedInventoryQuery, projectId, runIdsParam, debouncedQuery, debouncedEndpointFilter, debouncedShareFilter, debouncedPathPrefix, debouncedExtFilter, debouncedResourceAccess, debouncedProviderFilter, debouncedResourceTypeFilter, debouncedExposureFilter, includeDeleted]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -1110,6 +1307,7 @@ export function ProjectInventoryPage() {
     const queryParams = new URLSearchParams({ limit: "200" });
     if (cursor) queryParams.set("cursor", cursor);
     if (runIdsParam) queryParams.set("run_ids", runIdsParam);
+    if (activeTab === "items" && includeDeleted) queryParams.set("include_deleted", "true");
     if (queryModeActive) queryParams.set("query_dsl", appliedInventoryQuery.trim());
     if (!queryModeActive) {
       const guidedGroup: InventoryQueryGroup = [];
@@ -1119,6 +1317,9 @@ export function ProjectInventoryPage() {
       if (debouncedPathPrefix.trim()) guidedGroup.push({ field: "path", operator: "startswith", value: debouncedPathPrefix.trim(), negated: false });
       if (debouncedExtFilter.trim()) guidedGroup.push({ field: "ext", operator: "equals", value: debouncedExtFilter.trim(), negated: false });
       if (debouncedResourceAccess.trim()) guidedGroup.push({ field: "access", operator: "equals", value: debouncedResourceAccess.trim(), negated: false });
+      if (debouncedProviderFilter.trim()) guidedGroup.push({ field: "provider", operator: "equals", value: debouncedProviderFilter.trim(), negated: false });
+      if (debouncedResourceTypeFilter.trim()) guidedGroup.push({ field: "resource_type", operator: "equals", value: debouncedResourceTypeFilter.trim(), negated: false });
+      if (debouncedExposureFilter.trim()) guidedGroup.push({ field: "exposure", operator: "equals", value: debouncedExposureFilter.trim(), negated: false });
       const serialized = serializeInventoryGroups(guidedGroup.length > 0 ? [guidedGroup] : []);
       if (serialized) queryParams.set("query_dsl", serialized);
     }
@@ -1164,9 +1365,13 @@ export function ProjectInventoryPage() {
     debouncedEndpointFilter,
     debouncedExtFilter,
     debouncedPathPrefix,
+    debouncedProviderFilter,
     debouncedQuery,
     debouncedResourceAccess,
+    debouncedResourceTypeFilter,
     debouncedShareFilter,
+    debouncedExposureFilter,
+    includeDeleted,
     projectId,
     queryModeActive,
     refreshNonce,
@@ -1240,18 +1445,88 @@ export function ProjectInventoryPage() {
     });
   }
 
+  function assessmentScopeCell(runId: string, label: string): ReactNode {
+    const context = runs.find((run) => run.id === runId)?.collection_context;
+    if (!context || Object.keys(context).length === 0) {
+      return <InventoryCell text="Context not recorded" label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    }
+    const mode = collectionModeLabel(context.collection_mode);
+    const identity = assessedIdentity(context);
+    const limitation = collectionLimitationLabel(context);
+    const text = `${mode}${identity ? ` · ${identity}` : ""}${limitation ? ` · ${limitation}` : ""}`;
+    return (
+      <InventoryCell
+        content={(
+          <span className="inventory-assessment-scope" title={text}>
+            <strong>{mode}</strong>
+            {identity ? <small>{identity}</small> : null}
+            {limitation ? <small className="is-partial">{limitation}</small> : null}
+          </span>
+        )}
+        label={label}
+        onCopy={copyExactValue}
+        onFilter={applyCellFilter}
+        text={text}
+      />
+    );
+  }
+
   function itemCell(row: InventoryItem, column: ItemColumnKey): ReactNode {
     const label = ITEM_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column;
+    const provider = normalizedProvider(row.provider, row.share_type, row.resource_type);
+    const resourceType = row.resource_type || (provider === "sharepoint" ? "sharepoint_library" : `${provider}_share`);
+    const exposure = row.exposure || (provider === "sharepoint" ? "UNKNOWN" : null);
+    const siteId = metadataString(row.metadata, "site_id", "siteId");
+    const siteName = metadataString(row.endpoint_metadata, "display_name", "displayName", "site_name", "siteName", "name");
+    const driveId = metadataString(row.metadata, "drive_id", "driveId");
+    const webUrl = safeExternalUrl(row.web_url);
     if (column === "path") return <InventoryCell text={row.path} label={label} filterField="path" mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
-    if (column === "name") return <InventoryCell text={row.name} label={label} filterField="search" filterScopeLabel="any searchable item field" onFilter={applyCellFilter} onCopy={copyExactValue} />;
-    if (column === "resource_name") return <InventoryCell text={row.resource_name} label={label} filterField="share" onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "name") {
+      return (
+        <InventoryCell
+          content={(
+            <span className="flex min-w-0 items-center gap-1.5">
+              <span className="inventory-cell-text" title={row.name}>{row.name}</span>
+              {row.deleted ? <span className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700 dark:bg-slate-700 dark:text-slate-200">Deleted</span> : null}
+            </span>
+          )}
+          filterField="search"
+          filterScopeLabel="any searchable item field"
+          label={label}
+          onCopy={copyExactValue}
+          onFilter={applyCellFilter}
+          text={row.name}
+        />
+      );
+    }
+    if (column === "resource_name") {
+      return (
+        <InventoryCell
+          content={provider === "sharepoint" && siteName ? (
+            <span className="inventory-assessment-scope" title={`${row.resource_name} · ${siteName}`}>
+              <strong>{row.resource_name}</strong>
+              <small>Site: {siteName}</small>
+            </span>
+          ) : undefined}
+          filterField="share"
+          label={label}
+          onCopy={copyExactValue}
+          onFilter={applyCellFilter}
+          text={row.resource_name}
+        />
+      );
+    }
+    if (column === "provider") return <InventoryCell content={<ProviderBadge provider={provider} />} text={providerLabel(provider)} filterField="provider" filterValue={provider} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "assessment_scope") return assessmentScopeCell(row.run_id, label);
+    if (column === "resource_type") return <InventoryCell text={resourceTypeLabel(resourceType)} filterField="resource_type" filterValue={resourceType} label={label} badge="neutral" onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "exposure") return exposure ? <InventoryCell content={<ExposureBadge evidence={row.exposure_evidence} exposure={exposure} />} text={exposureLabel(exposure)} filterField="exposure" filterValue={exposure} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} /> : <InventoryCell text="—" label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "share_type") return <InventoryCell text={row.share_type.toUpperCase()} label={label} badge="neutral" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "access_level") {
       return (
         <AccessCapabilityCell
           accessLevel={row.access_level}
           capabilities={row.access_capabilities}
-          evidenceScope="Share sample"
+          evidenceScope={provider === "sharepoint" ? "Library scope" : "Share sample"}
           label={label}
           onCopy={copyExactValue}
           onFilter={(value, negated) => applyCellFilter("access", value, negated)}
@@ -1259,7 +1534,7 @@ export function ProjectInventoryPage() {
       );
     }
     if (column === "endpoint_key") return <InventoryCell text={row.endpoint_key} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
-    if (column === "hostname") return <InventoryCell text={row.hostname || "—"} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "hostname") return <InventoryCell text={siteName || row.hostname || "—"} label={label} filterField="endpoint" filterScopeLabel="site or host" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "ip") return <InventoryCell text={row.ip || "—"} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "run_name") return <InventoryCell text={row.run_name} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "run_id") return <InventoryCell text={row.run_id} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
@@ -1270,13 +1545,29 @@ export function ProjectInventoryPage() {
     if (column === "accessed_at") return <InventoryCell text={formatTimestamp(row.accessed_at)} filterValue={row.accessed_at || ""} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "changed_at") return <InventoryCell text={formatTimestamp(row.changed_at)} filterValue={row.changed_at || ""} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "file_attributes") return <InventoryCell text={formatFileAttributes(row.file_attributes)} filterValue={row.file_attributes?.join(",") || ""} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "web_url") return webUrl ? <InventoryCell content={<a className="inventory-external-link" href={webUrl} rel="noreferrer" target="_blank">Open item <span aria-hidden="true">↗</span></a>} text={webUrl} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} /> : <InventoryCell text={row.web_url ? "Unsafe URL blocked" : "—"} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "mime_type") return <InventoryCell text={row.mime_type || "—"} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "provider_item_id") return <InventoryCell text={row.provider_item_id || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "provider_parent_id") return <InventoryCell text={row.provider_parent_id || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "site_id") return <InventoryCell text={siteId || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "drive_id") return <InventoryCell text={driveId || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "deleted") return <InventoryCell text={row.deleted ? "Deleted" : "Current"} label={label} badge={row.deleted ? "warning" : "positive"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     return <InventoryCell text={row.is_dir ? "Directory" : "File"} label={label} badge="neutral" onFilter={applyCellFilter} onCopy={copyExactValue} />;
   }
 
   function resourceCell(row: InventoryResource, column: ResourceColumnKey): ReactNode {
     const label = RESOURCE_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column;
+    const provider = normalizedProvider(row.provider, row.share_type, row.resource_type);
+    const resourceType = row.resource_type || (provider === "sharepoint" ? "sharepoint_library" : `${provider}_share`);
+    const exposure = row.exposure || (provider === "sharepoint" ? "UNKNOWN" : null);
+    const siteId = metadataString(row.metadata, "site_id", "siteId");
+    const siteName = metadataString(row.endpoint_metadata, "display_name", "displayName", "site_name", "siteName", "name");
+    const webUrl = safeExternalUrl(row.web_url);
     if (column === "name") return <InventoryCell text={row.name} label={label} filterField="share" onFilter={applyCellFilter} onCopy={copyExactValue} />;
-    if (column === "share_type") return <InventoryCell text={row.share_type.toUpperCase()} label={label} badge="neutral" onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "provider") return <InventoryCell content={<ProviderBadge provider={provider} />} text={providerLabel(provider)} filterField="provider" filterValue={provider} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "assessment_scope") return assessmentScopeCell(row.run_id, label);
+    if (column === "resource_type") return <InventoryCell text={resourceTypeLabel(resourceType)} filterField="resource_type" filterValue={resourceType} label={label} badge="neutral" onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "exposure") return exposure ? <InventoryCell content={<ExposureBadge evidence={row.exposure_evidence} exposure={exposure} />} text={exposureLabel(exposure)} filterField="exposure" filterValue={exposure} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} /> : <InventoryCell text="—" label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "access_level") {
       return (
         <AccessCapabilityCell
@@ -1289,19 +1580,34 @@ export function ProjectInventoryPage() {
       );
     }
     if (column === "endpoint_key") return <InventoryCell text={row.endpoint_key} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
-    if (column === "hostname") return <InventoryCell text={row.hostname || "—"} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "hostname") return <InventoryCell text={siteName || row.hostname || "—"} label={label} filterField="endpoint" filterScopeLabel="site or host" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "item_count") return <InventoryCell text={row.item_count.toLocaleString()} filterValue={String(row.item_count)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "run_name") return <InventoryCell text={row.run_name} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "run_id") return <InventoryCell text={row.run_id} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
-    return <InventoryCell text={row.remark || "—"} label={label} filterField="search" filterScopeLabel="any searchable share field" onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "web_url") return webUrl ? <InventoryCell content={<a className="inventory-external-link" href={webUrl} rel="noreferrer" target="_blank">Open resource <span aria-hidden="true">↗</span></a>} text={webUrl} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} /> : <InventoryCell text={row.web_url ? "Unsafe URL blocked" : "—"} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "provider_resource_id") return <InventoryCell text={row.provider_resource_id || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "site_id") return <InventoryCell text={siteId || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    return <InventoryCell text={row.remark || "—"} label={label} filterField="search" filterScopeLabel="any searchable resource field" onFilter={applyCellFilter} onCopy={copyExactValue} />;
   }
 
   function endpointCell(row: InventoryEndpoint, column: EndpointColumnKey): ReactNode {
     const label = ENDPOINT_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column;
+    const siteName = metadataString(row.metadata, "display_name", "displayName", "site_name", "siteName", "name");
+    const rawWebUrl = metadataString(row.metadata, "web_url", "webUrl");
+    const webUrl = safeExternalUrl(rawWebUrl);
+    const siteId = metadataString(row.metadata, "site_id", "siteId");
+    const provider = normalizedProvider(row.provider, metadataString(row.metadata, "provider"), siteId ? "sharepoint" : "network");
+    const tenantId = metadataString(row.metadata, "tenant_id", "tenantId");
     if (column === "endpoint_key") return <InventoryCell text={row.endpoint_key} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "provider") return <InventoryCell content={<ProviderBadge provider={provider} />} text={providerLabel(provider)} filterField={provider === "network" ? undefined : "provider"} filterValue={provider} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "assessment_scope") return assessmentScopeCell(row.run_id, label);
+    if (column === "site_name") return <InventoryCell text={siteName || row.hostname || "—"} label={label} filterField="endpoint" filterScopeLabel="site or endpoint" onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "web_url") return webUrl ? <InventoryCell content={<a className="inventory-external-link" href={webUrl} rel="noreferrer" target="_blank">Open site <span aria-hidden="true">↗</span></a>} text={webUrl} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} /> : <InventoryCell text={rawWebUrl ? "Unsafe URL blocked" : "—"} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "site_id") return <InventoryCell text={siteId || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "tenant_id") return <InventoryCell text={tenantId || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "hostname") return <InventoryCell text={row.hostname || "—"} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "ip") return <InventoryCell text={row.ip || "—"} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
-    if (column === "domain") return <InventoryCell text={row.domain || "—"} label={label} filterField="search" filterScopeLabel="any searchable endpoint field" onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "domain") return <InventoryCell text={row.domain || "—"} label={label} filterField="search" filterScopeLabel="any searchable source field" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "smb_signing") return <InventoryCell text={row.smb_signing || "—"} label={label} badge={row.smb_signing?.toLowerCase() === "required" ? "positive" : "neutral"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "resource_count") return <InventoryCell text={row.resource_count.toLocaleString()} filterValue={String(row.resource_count)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "item_count") return <InventoryCell text={row.item_count.toLocaleString()} filterValue={String(row.item_count)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
@@ -1311,8 +1617,8 @@ export function ProjectInventoryPage() {
 
   const activeTabCopy = INVENTORY_TAB_COPY[activeTab];
   const guidedFilterCount = queryModeActive
-    ? QUERYABLE_FIELDS.filter((field) => !!queryFilterReflections[field].summary).length
-    : [query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess].filter((value) => value.trim()).length;
+    ? QUERYABLE_FIELDS.filter((field) => !!queryFilterReflections[field].summary).length + (includeDeletedApplies ? 1 : 0)
+    : [query, endpointFilter, shareFilter, pathPrefix, extFilter, resourceAccess, providerFilter, resourceTypeFilter, exposureFilter].filter((value) => value.trim()).length + (includeDeletedApplies ? 1 : 0);
   const currentPage = cursorHistory.length + 1;
 
   return (
@@ -1327,7 +1633,7 @@ export function ProjectInventoryPage() {
             <span>Inventory</span>
           </nav>
           <h1>{project?.name || "Project inventory"}</h1>
-          <p>Browse collected files, shares, and endpoints without losing investigation context.</p>
+          <p>Compare files, folders, shares, libraries, sites, and hosts without losing source or assessment context.</p>
         </div>
         <div className="inventory-header-actions">
           {projectId && canImport ? (
@@ -1359,6 +1665,27 @@ export function ProjectInventoryPage() {
         <StatusBanner tone="warning" title="Inventory is still changing">
           <p>
             {partialRunCount} run{partialRunCount === 1 ? " is" : "s are"} still ingesting. Results include committed records and may be incomplete until ingestion finishes.
+          </p>
+        </StatusBanner>
+      ) : null}
+      {incompleteCollectionRunCount > 0 ? (
+        <StatusBanner tone="warning" title="Some collection coverage is incomplete">
+          <p>
+            {incompleteCollectionRunCount} run{incompleteCollectionRunCount === 1 ? " reports" : "s report"} partial, truncated, or failed source discovery. Results remain queryable, but absence from this view is not evidence that an object does not exist.
+          </p>
+        </StatusBanner>
+      ) : null}
+      {mixedSharePointPerspectives ? (
+        <StatusBanner tone="warning" title="Mixed SharePoint assessment perspectives">
+          <p>
+            This scope combines application tenant inventory with delegated user-visible results. Treat it as a union of observations, not as one authoritative visibility or exposure statement. Select individual runs to compare perspectives safely.
+          </p>
+        </StatusBanner>
+      ) : delegatedIdentities.length > 0 ? (
+        <StatusBanner tone="info" title="Delegated SharePoint visibility scope">
+          <p>
+            Results include resources visible to {delegatedIdentities.slice(0, 3).join(", ")}
+            {delegatedIdentities.length > 3 ? ` and ${delegatedIdentities.length - 3} more assessed identities` : ""}. User-visible does not mean public, broad internal, external, or anonymous.
           </p>
         </StatusBanner>
       ) : null}
@@ -1409,7 +1736,7 @@ export function ProjectInventoryPage() {
             <input
               autoComplete="off"
               onChange={(event) => handleSimpleFilterChange(setQuery, event.target.value)}
-              placeholder={activeTab === "items" ? "Search file, path, share, or endpoint" : activeTab === "resources" ? "Search share, remark, or endpoint" : "Search hostname, address, domain, or key"}
+              placeholder={activeTab === "items" ? "Search file, path, library, share, site, or host" : activeTab === "resources" ? "Search library, share, site, host, or remark" : "Search site, hostname, address, domain, or key"}
               ref={searchInputRef}
               type="search"
               value={query}
@@ -1499,6 +1826,13 @@ export function ProjectInventoryPage() {
                     <span>
                       <strong>{run.name}</strong>
                       <small>{run.status.replaceAll("_", " ")} · {new Date(run.created_at).toLocaleString()}</small>
+                      {run.collection_context && Object.keys(run.collection_context).length > 0 ? (
+                        <small>
+                          {providerLabel(collectionContextProvider(run.collection_context))} · {collectionModeLabel(run.collection_context.collection_mode)}
+                          {assessedIdentity(run.collection_context) ? ` · ${assessedIdentity(run.collection_context)}` : ""}
+                          {collectionLimitationLabel(run.collection_context) ? ` · ${collectionLimitationLabel(run.collection_context)}` : ""}
+                        </small>
+                      ) : null}
                     </span>
                   </label>
                 ))}
@@ -1563,6 +1897,9 @@ export function ProjectInventoryPage() {
                     ["path", "Path", pathPrefix],
                     ["ext", "Extension", extFilter],
                     ["access", "Access", resourceAccess],
+                    ["provider", "Source", providerFilter],
+                    ["resource_type", "Resource Type", resourceTypeFilter],
+                    ["exposure", "Exposure", exposureFilter],
                   ] as Array<[InventoryQueryField, string, string]>
                 ).map(([field, label, value]) =>
                   value.trim() ? (
@@ -1574,6 +1911,12 @@ export function ProjectInventoryPage() {
                     </span>
                   ) : null,
                 )}
+            {includeDeletedApplies ? (
+              <span className="inventory-filter-chip">
+                <strong>Items</strong> Include deleted
+                <button aria-label="Exclude deleted items" onClick={() => setIncludeDeleted(false)} type="button">×</button>
+              </span>
+            ) : null}
             {activeRunCount > 0 ? (
               <span className="inventory-filter-chip">
                 <strong>Runs</strong> {activeRunCount} selected
@@ -1609,26 +1952,62 @@ export function ProjectInventoryPage() {
 
             <div className="inventory-filter-grid">
               <label className={FILTER_LABEL_CLASS}>
-                Endpoint
-                <input className={FILTER_INPUT_CLASS} onChange={(event) => handleSimpleFilterChange(setEndpointFilter, event.target.value)} placeholder="Hostname, key, or address" value={endpointFilter} />
+                Site or endpoint
+                <input className={FILTER_INPUT_CLASS} onChange={(event) => handleSimpleFilterChange(setEndpointFilter, event.target.value)} placeholder="Site, hostname, key, or address" value={endpointFilter} />
+              </label>
+              <label className={FILTER_LABEL_CLASS}>
+                Source
+                <select className={FILTER_SELECT_CLASS} onChange={(event) => handleSimpleFilterChange(setProviderFilter, event.target.value)} value={providerFilter}>
+                  <option value="">All sources</option>
+                  <option value="sharepoint">SharePoint</option>
+                  <option value="smb">SMB</option>
+                  <option value="nfs">NFS</option>
+                </select>
               </label>
               {activeTab !== "endpoints" ? (
                 <label className={FILTER_LABEL_CLASS}>
-                  Share
-                  <input className={FILTER_INPUT_CLASS} onChange={(event) => handleSimpleFilterChange(setShareFilter, event.target.value)} placeholder="Finance" value={shareFilter} />
+                  Share or library
+                  <input className={FILTER_INPUT_CLASS} onChange={(event) => handleSimpleFilterChange(setShareFilter, event.target.value)} placeholder="Finance documents" value={shareFilter} />
                 </label>
               ) : null}
+              <label className={FILTER_LABEL_CLASS}>
+                Resource type
+                <select className={FILTER_SELECT_CLASS} onChange={(event) => handleSimpleFilterChange(setResourceTypeFilter, event.target.value)} value={resourceTypeFilter}>
+                  <option value="">All resource types</option>
+                  <option value="sharepoint_library">SharePoint library</option>
+                  <option value="smb_share">SMB share</option>
+                  <option value="nfs_share">NFS export</option>
+                </select>
+              </label>
+              <label className={FILTER_LABEL_CLASS}>
+                Exposure
+                <select className={FILTER_SELECT_CLASS} onChange={(event) => handleSimpleFilterChange(setExposureFilter, event.target.value)} value={exposureFilter}>
+                  <option value="">Any exposure state</option>
+                  <option value="ANONYMOUS">Anonymous access</option>
+                  <option value="EXTERNAL">External access</option>
+                  <option value="BROAD_INTERNAL">Broad internal</option>
+                  <option value="USER_VISIBLE">User-visible (not public)</option>
+                  <option value="RESTRICTED">Restricted</option>
+                  <option value="UNKNOWN">Unknown</option>
+                </select>
+              </label>
               {activeTab === "items" ? (
                 <>
                   <label className={FILTER_LABEL_CLASS}>
                     Path starts with
-                    <input className={FILTER_INPUT_CLASS} onChange={(event) => handleSimpleFilterChange(setPathPrefix, event.target.value)} placeholder="\\Finance\\Quarterly" value={pathPrefix} />
+                    <input className={FILTER_INPUT_CLASS} onChange={(event) => handleSimpleFilterChange(setPathPrefix, event.target.value)} placeholder="/Finance/Quarterly or \\Finance\\Quarterly" value={pathPrefix} />
                   </label>
                   <label className={FILTER_LABEL_CLASS}>
                     Extension
                     <input className={FILTER_INPUT_CLASS} list="inventory-extension-options" onChange={(event) => handleSimpleFilterChange(setExtFilter, event.target.value)} placeholder=".pst" value={extFilter} />
                   </label>
                 </>
+              ) : null}
+              {activeTab === "items" ? (
+                <label className={`${FILTER_LABEL_CLASS} flex items-center gap-2 self-end rounded-md border border-slate-300 px-3 py-2 dark:border-slate-700`}>
+                  <input checked={includeDeleted} className="accent-emerald-600" onChange={(event) => setIncludeDeleted(event.target.checked)} type="checkbox" />
+                  Include deleted records
+                </label>
               ) : null}
               {activeTab === "resources" ? (
                 <label className={FILTER_LABEL_CLASS}>
@@ -1665,14 +2044,14 @@ export function ProjectInventoryPage() {
                 aria-describedby="inventory-query-help"
                 id="inventory-query"
                 onChange={(event) => setInventoryQueryInput(event.target.value)}
-                placeholder={'endpoint ^ "fs-" AND share ~ "finance" AND !ext = ".tmp"'}
+                placeholder={'provider = "sharepoint" AND exposure = "ANONYMOUS"'}
                 value={inventoryQueryInput}
               />
-              <p id="inventory-query-help">Fields: search, endpoint, share, path, ext, access. Operators: = exact, ~ contains, ^ starts with, AND, OR, ! not.</p>
+              <p id="inventory-query-help">Fields: search, endpoint, share, path, ext, access, provider, source, resource_type, exposure. Operators: = exact, ~ contains, ^ starts with, AND, OR, ! not.</p>
             </div>
             <div className="inventory-query-actions">
               <button className="inventory-button-primary" onClick={handleInventoryQueryApply} type="button">Apply query</button>
-              <button className="inventory-button-secondary" onClick={() => setInventoryQueryInput('share ~ "finance" AND ext = ".xlsx"')} type="button">Example</button>
+              <button className="inventory-button-secondary" onClick={() => setInventoryQueryInput('provider = "sharepoint" AND exposure = "ANONYMOUS"')} type="button">Example</button>
               <button className="inventory-button-secondary" onClick={() => { setInventoryQueryInput(""); clearSimpleFilters(); clearAppliedInventoryQuery(); }} type="button">Clear</button>
             </div>
             {queryError ? <p className="inventory-query-error" role="alert">{queryError}</p> : null}
@@ -1720,19 +2099,19 @@ export function ProjectInventoryPage() {
               <table className="inventory-table">
                 <caption className="sr-only">Files and folders in the selected inventory scope</caption>
                 <thead><tr>{itemColumns.map((column) => <th key={column} scope="col"><span>{ITEM_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column}</span>{itemColumns.length > 1 ? <button aria-label={`Hide ${column} column`} onClick={() => toggleItemColumn(column)} title="Hide column" type="button">×</button> : null}</th>)}</tr></thead>
-                <tbody>{items.map((row) => <tr key={`${row.run_id}-${row.id}`}>{itemColumns.map((column) => <td key={`${row.id}-${column}`}>{itemCell(row, column)}</td>)}</tr>)}</tbody>
+                <tbody>{items.map((row) => <tr className={row.deleted ? "is-deleted" : undefined} key={`${row.run_id}-${row.id}`}>{itemColumns.map((column) => <td key={`${row.id}-${column}`}>{itemCell(row, column)}</td>)}</tr>)}</tbody>
               </table>
             ) : null}
             {activeTab === "resources" ? (
               <table className="inventory-table">
-                <caption className="sr-only">Shares in the selected inventory scope</caption>
+                <caption className="sr-only">Shares, exports, and document libraries in the selected inventory scope</caption>
                 <thead><tr>{resourceColumns.map((column) => <th key={column} scope="col"><span>{RESOURCE_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column}</span>{resourceColumns.length > 1 ? <button aria-label={`Hide ${column} column`} onClick={() => toggleResourceColumn(column)} title="Hide column" type="button">×</button> : null}</th>)}</tr></thead>
                 <tbody>{resources.map((row) => <tr key={`${row.run_id}-${row.id}`}>{resourceColumns.map((column) => <td key={`${row.id}-${column}`}>{resourceCell(row, column)}</td>)}</tr>)}</tbody>
               </table>
             ) : null}
             {activeTab === "endpoints" ? (
               <table className="inventory-table">
-                <caption className="sr-only">Endpoints in the selected inventory scope</caption>
+                <caption className="sr-only">SharePoint sites and network endpoints in the selected inventory scope</caption>
                 <thead><tr>{endpointColumns.map((column) => <th key={column} scope="col"><span>{ENDPOINT_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column}</span>{endpointColumns.length > 1 ? <button aria-label={`Hide ${column} column`} onClick={() => toggleEndpointColumn(column)} title="Hide column" type="button">×</button> : null}</th>)}</tr></thead>
                 <tbody>{endpoints.map((row) => <tr key={`${row.run_id}-${row.id}`}>{endpointColumns.map((column) => <td key={`${row.id}-${column}`}>{endpointCell(row, column)}</td>)}</tr>)}</tbody>
               </table>

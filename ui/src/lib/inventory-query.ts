@@ -1,4 +1,14 @@
-export type InventoryQueryField = "search" | "endpoint" | "share" | "path" | "ext" | "access";
+export type InventoryQueryField =
+  | "search"
+  | "endpoint"
+  | "share"
+  | "path"
+  | "ext"
+  | "access"
+  | "provider"
+  | "source"
+  | "resource_type"
+  | "exposure";
 export type InventoryQueryOperator = "equals" | "contains" | "startswith";
 export type InventoryQueryClause = {
   field: InventoryQueryField;
@@ -28,6 +38,13 @@ const FIELD_ALIASES: Record<string, InventoryQueryField> = {
   accesslevel: "access",
   share_access: "access",
   shareaccess: "access",
+  provider: "provider",
+  source: "source",
+  resource_type: "resource_type",
+  resourcetype: "resource_type",
+  type: "resource_type",
+  exposure: "exposure",
+  visibility: "exposure",
 };
 
 const WORD_OPERATORS: Record<string, InventoryQueryOperator> = {

@@ -2,11 +2,23 @@ import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useRef, u
 import { Link, useParams, useSearchParams } from "react-router-dom";
 
 import { AccessCapabilityCell, type AccessCapabilities } from "@/components/access-capability-cell";
+import { CollectionContextPanel, ExposureBadge, ProviderBadge } from "@/components/provider-context";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch } from "@/lib/api";
 import { useSession } from "@/lib/auth";
 import { copyText } from "@/lib/clipboard";
+import {
+  collectionContextProvider,
+  compareCollectionContexts,
+  exposureLabel,
+  metadataString,
+  normalizedProvider,
+  resourceTypeLabel,
+  safeExternalUrl,
+  type CollectionContext,
+  type ProviderMetadata,
+} from "@/lib/provider-context";
 
 type RunProgress = {
   line_offset?: number;
@@ -26,6 +38,7 @@ type RunInfo = {
   artifact_sha256: string | null;
   artifact_content_type: string | null;
   target_scope: Record<string, unknown>;
+  collection_context?: CollectionContext | null;
   ingest_progress: RunProgress;
   summary: { endpoints?: number; resources?: number; items?: number; errors?: number };
 };
@@ -34,6 +47,7 @@ type RunCompareOption = {
   name: string;
   status: string;
   created_at: string;
+  collection_context?: CollectionContext | null;
 };
 
 type Endpoint = {
@@ -42,6 +56,8 @@ type Endpoint = {
   ip: string | null;
   hostname: string | null;
   smb_signing: string | null;
+  provider?: string | null;
+  metadata?: ProviderMetadata | null;
 };
 type Resource = {
   id: number;
@@ -50,37 +66,79 @@ type Resource = {
   access_capabilities: AccessCapabilities | null;
   remark: string | null;
   share_type: string;
+  resource_type?: string | null;
+  provider?: string | null;
+  provider_resource_id?: string | null;
+  web_url?: string | null;
+  metadata?: ProviderMetadata | null;
+  exposure?: string | null;
+  exposure_evidence?: ProviderMetadata | null;
 };
-type Item = { id: number; path: string; is_dir: boolean; resource_id?: number; name?: string; size_bytes?: number | null; mtime?: string | null };
-type SavedQuery = { id: string; label: string; q: string; ext: string };
+type Item = {
+  id: number;
+  path: string;
+  is_dir: boolean;
+  resource_id?: number;
+  name?: string;
+  size_bytes?: number | null;
+  mtime?: string | null;
+  provider?: string | null;
+  provider_item_id?: string | null;
+  provider_parent_id?: string | null;
+  web_url?: string | null;
+  mime_type?: string | null;
+  deleted?: boolean;
+  metadata?: ProviderMetadata | null;
+  exposure?: string | null;
+  exposure_evidence?: ProviderMetadata | null;
+  resource_name?: string | null;
+  resource_type?: string | null;
+  share_type?: string | null;
+  provider_resource_id?: string | null;
+  endpoint_key?: string | null;
+  hostname?: string | null;
+  endpoint_metadata?: ProviderMetadata | null;
+};
+type SavedQuery = { id: string; label: string; q: string; ext: string; provider: string; exposure: string; includeDeleted: boolean };
 type RunDiffShare = {
   endpoint_key: string;
   hostname: string | null;
   ip: string | null;
   share_name: string;
   share_type: string;
+  provider_resource_id?: string;
   access_level: string | null;
   item_count: number;
 };
-type RunDiffChurn = RunDiffShare & {
+type RunDiffChurn = Omit<RunDiffShare, "item_count"> & {
   added_items: number;
   removed_items: number;
   added_examples: string[];
   removed_examples: string[];
+  access_level_changed?: boolean;
+  previous_access_level?: string | null;
+  moved_items?: number;
+  moved_examples?: Array<string | { from_path?: string; to_path?: string; path?: string; provider_item_id?: string }>;
 };
 type RunDiffResult = {
-  current_run: { id: string; name: string; created_at: string | null; status: string };
-  baseline_run: { id: string; name: string; created_at: string | null; status: string } | null;
+  current_run: { id: string; name: string; created_at: string | null; status: string; collection_context?: CollectionContext | null };
+  baseline_run: { id: string; name: string; created_at: string | null; status: string; collection_context?: CollectionContext | null } | null;
   summary: {
     new_shares: number;
     disappeared_shares: number;
     changed_shares: number;
     added_items: number;
     removed_items: number;
+    moved_items?: number;
   };
   new_shares: RunDiffShare[];
   disappeared_shares: RunDiffShare[];
   item_churn: RunDiffChurn[];
+  comparison_compatibility?: {
+    compatible: boolean;
+    warning: string | null;
+    mismatched_fields: string[];
+  };
   truncation?: {
     detail_limit: number;
     truncated: boolean;
@@ -129,7 +187,7 @@ const RUN_DETAIL_TAB_COPY: Record<RunDetailTab, { label: string; description: st
   },
   issues: {
     label: "Issues",
-    description: "Inspect ingest warnings and errors with host, share, and path context.",
+    description: "Inspect ingest warnings and errors with source, resource, and path context.",
   },
   diff: {
     label: "Diff",
@@ -137,7 +195,7 @@ const RUN_DETAIL_TAB_COPY: Record<RunDetailTab, { label: string; description: st
   },
   explore: {
     label: "Explore",
-    description: "Browse endpoints, shares, and items inside this run.",
+    description: "Browse sites or endpoints, their resources, and collected items inside this run.",
   },
   search: {
     label: "Search",
@@ -176,7 +234,15 @@ function parseSavedQueries(raw: string | null): SavedQuery[] {
         typeof entry.ext === "string",
     )
     .slice(-MAX_SAVED_QUERIES)
-    .map((entry) => ({ id: entry.id as string, label: (entry.label as string).trim(), q: entry.q as string, ext: entry.ext as string }));
+    .map((entry) => ({
+      id: entry.id as string,
+      label: (entry.label as string).trim(),
+      q: entry.q as string,
+      ext: entry.ext as string,
+      provider: typeof entry.provider === "string" ? entry.provider : "",
+      exposure: typeof entry.exposure === "string" ? entry.exposure : "",
+      includeDeleted: entry.includeDeleted === true,
+    }));
 }
 
 type CursorPagerProps = {
@@ -229,11 +295,54 @@ function issueSeverityTone(severity: Exclude<RunIssueSeverity, "all">): string {
 }
 
 function formatBytes(value: number | null | undefined): string {
-  if (!value || value <= 0) return "0 B";
+  if (value === null || value === undefined) return "—";
+  if (value <= 0) return "0 B";
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
   return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function ItemResultCard({ item }: { item: Item }) {
+  const provider = normalizedProvider(item.provider);
+  const exposure = item.exposure || (provider === "sharepoint" ? "UNKNOWN" : null);
+  const webUrl = safeExternalUrl(item.web_url);
+  const driveId = metadataString(item.metadata, "drive_id", "driveId");
+  const siteId = metadataString(item.metadata, "site_id", "siteId");
+  const siteName = metadataString(item.endpoint_metadata, "display_name", "displayName", "site_name", "siteName", "name");
+  const sourceLabel = siteName || item.hostname || item.endpoint_key;
+
+  return (
+    <li className={`rounded-2xl border px-3 py-3 text-xs dark:border-slate-700 ${item.deleted ? "border-slate-300 bg-slate-100/80 text-slate-500 dark:bg-slate-900/80" : "border-slate-300"}`}>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0 flex-1 break-all font-mono">{item.path}</div>
+        <div className="flex flex-wrap items-center gap-1">
+          {provider !== "unknown" ? <ProviderBadge provider={provider} /> : null}
+          {exposure ? <ExposureBadge compact evidence={item.exposure_evidence} exposure={exposure} /> : null}
+          {item.deleted ? <span className="rounded bg-slate-200 px-1.5 py-0.5 font-semibold text-slate-700 dark:bg-slate-700 dark:text-slate-200">Deleted</span> : null}
+        </div>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-slate-500 dark:text-slate-400">
+        {sourceLabel ? <span className="max-w-full truncate" title={sourceLabel}>{provider === "sharepoint" ? "Site" : "Source"}: {sourceLabel}</span> : null}
+        {item.resource_name ? <span className="max-w-full truncate" title={item.resource_name}>{provider === "sharepoint" ? "Library" : "Resource"}: {item.resource_name}</span> : null}
+        <span>{item.is_dir ? "Folder" : "File"}</span>
+        {!item.is_dir && item.size_bytes != null ? <span>{formatBytes(item.size_bytes)}</span> : null}
+        {item.mime_type ? <span>{item.mime_type}</span> : null}
+        {item.mtime ? <span>Modified {new Date(item.mtime).toLocaleString()}</span> : null}
+        {item.resource_id != null ? <span>Resource: <code>{item.resource_id}</code></span> : null}
+        {item.provider_item_id ? <span className="max-w-full truncate" title={item.provider_item_id}>Provider ID: <code>{item.provider_item_id}</code></span> : null}
+        {driveId ? <span className="max-w-full truncate" title={driveId}>Drive: <code>{driveId}</code></span> : null}
+        {siteId ? <span className="max-w-full truncate" title={siteId}>Site: <code>{siteId}</code></span> : null}
+      </div>
+      {webUrl ? (
+        <a className="mt-2 inline-flex rounded text-xs font-semibold text-sky-700 underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-sky-300" href={webUrl} rel="noreferrer" target="_blank">
+          {provider === "sharepoint" ? "Open in SharePoint" : "Open source item"} <span aria-hidden="true" className="ml-1">↗</span>
+        </a>
+      ) : item.web_url ? (
+        <p className="mt-2 text-xs font-semibold text-amber-700 dark:text-amber-300">Unsafe external URL blocked.</p>
+      ) : null}
+    </li>
+  );
 }
 
 function isAbortError(error: unknown): boolean {
@@ -281,7 +390,7 @@ function activityDetail(event: RunActivityEvent): string {
   if (event.action === "INGEST_COMPLETED") {
     const counts = (event.metadata.counts || {}) as Record<string, unknown>;
     const lineOffset = Number(event.metadata.line_offset || 0);
-    return `Finished at line ${lineOffset.toLocaleString()} with ${Number(counts.endpoints || 0).toLocaleString()} endpoints, ${Number(counts.resources || 0).toLocaleString()} shares, ${Number(counts.items || 0).toLocaleString()} items, and ${Number(counts.errors || 0).toLocaleString()} issues.`;
+    return `Finished at line ${lineOffset.toLocaleString()} with ${Number(counts.endpoints || 0).toLocaleString()} sources, ${Number(counts.resources || 0).toLocaleString()} resources, ${Number(counts.items || 0).toLocaleString()} items, and ${Number(counts.errors || 0).toLocaleString()} issues.`;
   }
 
   if (event.action === "INGEST_PAUSED") {
@@ -453,6 +562,9 @@ export function RunDetailPage() {
   const [pathPrefix, setPathPrefix] = useState("");
   const [globalQuery, setGlobalQuery] = useState("");
   const [globalExt, setGlobalExt] = useState("");
+  const [globalProvider, setGlobalProvider] = useState("");
+  const [globalExposure, setGlobalExposure] = useState("");
+  const [globalIncludeDeleted, setGlobalIncludeDeleted] = useState(false);
 
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
   const [resources, setResources] = useState<Resource[]>([]);
@@ -513,6 +625,8 @@ export function RunDetailPage() {
   const debouncedPathPrefix = useDebouncedValue(pathPrefix, 300);
   const debouncedGlobalQuery = useDebouncedValue(globalQuery, 300);
   const debouncedGlobalExt = useDebouncedValue(globalExt, 300);
+  const debouncedGlobalProvider = useDebouncedValue(globalProvider, 150);
+  const debouncedGlobalExposure = useDebouncedValue(globalExposure, 150);
   const debouncedIssueSearch = useDebouncedValue(issueSearch, 300);
 
   useEffect(() => {
@@ -614,6 +728,9 @@ export function RunDetailPage() {
     setPathPrefix("");
     setGlobalQuery("");
     setGlobalExt("");
+    setGlobalProvider("");
+    setGlobalExposure("");
+    setGlobalIncludeDeleted(false);
     setEndpoints([]);
     setResources([]);
     setItems([]);
@@ -821,7 +938,7 @@ export function RunDetailPage() {
       })
       .catch((err) => {
         if (!controller.signal.aborted && !isAbortError(err)) {
-          setEndpointsError(err instanceof Error ? err.message : "Endpoint inventory could not be loaded.");
+          setEndpointsError(err instanceof Error ? err.message : "Site and endpoint inventory could not be loaded.");
         }
       })
       .finally(() => {
@@ -870,7 +987,7 @@ export function RunDetailPage() {
       })
       .catch((err) => {
         if (!controller.signal.aborted && !isAbortError(err)) {
-          setResourcesError(err instanceof Error ? err.message : "Share inventory could not be loaded.");
+          setResourcesError(err instanceof Error ? err.message : "Resource inventory could not be loaded.");
         }
       })
       .finally(() => {
@@ -925,7 +1042,7 @@ export function RunDetailPage() {
       })
       .catch((err) => {
         if (!controller.signal.aborted && !isAbortError(err)) {
-          setItemsError(err instanceof Error ? err.message : "Items could not be loaded for this share.");
+          setItemsError(err instanceof Error ? err.message : "Items could not be loaded for this resource.");
         }
       })
       .finally(() => {
@@ -937,7 +1054,7 @@ export function RunDetailPage() {
   useEffect(() => {
     setGlobalCursor(null);
     setGlobalHistory([]);
-  }, [debouncedGlobalQuery, debouncedGlobalExt, projectId, runId]);
+  }, [debouncedGlobalQuery, debouncedGlobalExt, debouncedGlobalProvider, debouncedGlobalExposure, globalIncludeDeleted, projectId, runId]);
 
   useEffect(() => {
     if (!projectId || !runId || activeTab !== "search") {
@@ -946,8 +1063,11 @@ export function RunDetailPage() {
     }
     const query = new URLSearchParams({ limit: "200", q: debouncedGlobalQuery });
     if (debouncedGlobalExt) query.set("ext", debouncedGlobalExt);
+    if (debouncedGlobalProvider) query.set("provider", debouncedGlobalProvider);
+    if (debouncedGlobalExposure) query.set("exposure", debouncedGlobalExposure);
+    if (globalIncludeDeleted) query.set("include_deleted", "true");
     if (globalCursor) query.set("cursor", globalCursor);
-    const requestKey = JSON.stringify([projectId, runId, debouncedGlobalQuery, debouncedGlobalExt, globalCursor, reloadNonce]);
+    const requestKey = JSON.stringify([projectId, runId, debouncedGlobalQuery, debouncedGlobalExt, debouncedGlobalProvider, debouncedGlobalExposure, globalIncludeDeleted, globalCursor, reloadNonce]);
     if (lastGlobalSearchRequestKey.current === requestKey) return;
 
     const controller = new AbortController();
@@ -971,7 +1091,7 @@ export function RunDetailPage() {
         if (!controller.signal.aborted) setGlobalItemsLoading(false);
       });
     return () => controller.abort();
-  }, [activeTab, projectId, reloadNonce, runId, debouncedGlobalQuery, debouncedGlobalExt, globalCursor]);
+  }, [activeTab, projectId, reloadNonce, runId, debouncedGlobalQuery, debouncedGlobalExt, debouncedGlobalProvider, debouncedGlobalExposure, globalIncludeDeleted, globalCursor]);
 
   function moveCursor(
     next: string | null,
@@ -1011,8 +1131,8 @@ export function RunDetailPage() {
       setSavedQueryError("Enter a preset name before saving this search.");
       return;
     }
-    if (!globalQuery.trim() && !globalExt.trim()) {
-      setSavedQueryError("Enter a query or extension before saving a preset.");
+    if (!globalQuery.trim() && !globalExt.trim() && !globalProvider && !globalExposure && !globalIncludeDeleted) {
+      setSavedQueryError("Enter a query or select at least one source, exposure, or deletion filter before saving a preset.");
       return;
     }
     const next: SavedQuery[] = [
@@ -1022,6 +1142,9 @@ export function RunDetailPage() {
         label,
         q: globalQuery,
         ext: globalExt,
+        provider: globalProvider,
+        exposure: globalExposure,
+        includeDeleted: globalIncludeDeleted,
       },
     ];
     if (persistSavedQueries(next)) {
@@ -1046,6 +1169,9 @@ export function RunDetailPage() {
   function openIssueInSearch(issue: RunIssue) {
     setGlobalQuery(issue.path || issue.resource_name || issue.endpoint_key || issue.code);
     setGlobalExt("");
+    setGlobalProvider("");
+    setGlobalExposure("");
+    setGlobalIncludeDeleted(false);
     setActiveTab("search");
   }
 
@@ -1095,9 +1221,11 @@ export function RunDetailPage() {
     if (Array.isArray(value)) return value.length > 0;
     return value !== null && value !== undefined && value !== "";
   });
+  const runProvider = collectionContextProvider(run?.collection_context);
+  const sharePointRun = runProvider === "sharepoint";
   const summaryChips = [
-    { label: "Endpoints", value: run?.summary?.endpoints || 0, tone: "bg-slate-100 dark:bg-slate-800" },
-    { label: "Shares", value: run?.summary?.resources || 0, tone: "bg-slate-100 dark:bg-slate-800" },
+    { label: sharePointRun ? "Sites" : "Endpoints", value: run?.summary?.endpoints || 0, tone: "bg-slate-100 dark:bg-slate-800" },
+    { label: sharePointRun ? "Libraries" : "Resources", value: run?.summary?.resources || 0, tone: "bg-slate-100 dark:bg-slate-800" },
     { label: "Items", value: run?.summary?.items || 0, tone: "bg-slate-100 dark:bg-slate-800" },
     {
       label: "Errors",
@@ -1111,7 +1239,32 @@ export function RunDetailPage() {
   const itemsBusy =
     itemsLoading || itemSearch !== debouncedItemSearch || pathPrefix !== debouncedPathPrefix;
   const globalItemsBusy =
-    globalItemsLoading || globalQuery !== debouncedGlobalQuery || globalExt !== debouncedGlobalExt;
+    globalItemsLoading ||
+    globalQuery !== debouncedGlobalQuery ||
+    globalExt !== debouncedGlobalExt ||
+    globalProvider !== debouncedGlobalProvider ||
+    globalExposure !== debouncedGlobalExposure;
+  const selectedResourceRecord = resources.find((resource) => resource.id === selectedResource) || null;
+  const diffCurrentContext = runDiff?.current_run.collection_context || run?.collection_context;
+  const diffBaselineContext = runDiff?.baseline_run?.collection_context;
+  const diffContextCompatibility = runDiff?.baseline_run
+    ? compareCollectionContexts(diffCurrentContext, diffBaselineContext)
+    : null;
+  const apiDiffCompatibility = runDiff?.comparison_compatibility;
+  const diffComparisonWarning =
+    runDiff?.baseline_run && apiDiffCompatibility && !apiDiffCompatibility.compatible
+      ? {
+          known: diffContextCompatibility?.known ?? true,
+          reasons: [
+            apiDiffCompatibility.warning || "The API determined that these collection contexts are not semantically equivalent.",
+            ...(apiDiffCompatibility.mismatched_fields.length > 0
+              ? [`Mismatched context fields: ${apiDiffCompatibility.mismatched_fields.join(", ")}.`]
+              : []),
+          ],
+        }
+      : runDiff?.baseline_run && !apiDiffCompatibility && diffContextCompatibility && !diffContextCompatibility.compatible
+        ? diffContextCompatibility
+        : null;
 
   return (
     <section className="workspace">
@@ -1193,11 +1346,11 @@ export function RunDetailPage() {
                   {activeDiffSummary ? (
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div>
-                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">New Shares</p>
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">New {sharePointRun ? "Libraries" : "Resources"}</p>
                         <p className="mt-1 text-sm font-semibold">{activeDiffSummary.new_shares.toLocaleString()}</p>
                       </div>
                       <div>
-                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Changed Shares</p>
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Changed {sharePointRun ? "Libraries" : "Resources"}</p>
                         <p className="mt-1 text-sm font-semibold">{activeDiffSummary.changed_shares.toLocaleString()}</p>
                       </div>
                     </div>
@@ -1209,6 +1362,8 @@ export function RunDetailPage() {
             )}
           </div>
         </div>
+
+        {run ? <CollectionContextPanel context={run.collection_context} /> : null}
 
         <div aria-label="Run explorer sections" className="run-detail-tabs" role="tablist">
           {RUN_DETAIL_TABS.map((tab) => (
@@ -1309,8 +1464,8 @@ export function RunDetailPage() {
                             </div>
                             <p className="mt-2 text-sm font-semibold text-slate-900 dark:text-slate-100">{issue.message}</p>
                             <div className="mt-2 space-y-1 text-xs text-slate-600 dark:text-slate-300">
-                              {issue.endpoint_key ? <p>Host: {issue.endpoint_key}</p> : null}
-                              {issue.resource_name ? <p>Share: {issue.resource_name}</p> : null}
+                              {issue.endpoint_key ? <p>{sharePointRun ? "Site" : "Host"}: {issue.endpoint_key}</p> : null}
+                              {issue.resource_name ? <p>{sharePointRun ? "Library" : "Resource"}: {issue.resource_name}</p> : null}
                               {issue.path ? <p className="font-mono break-all">{issue.path}</p> : null}
                             </div>
                           </button>
@@ -1412,7 +1567,7 @@ export function RunDetailPage() {
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">New Shares</p>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">New {sharePointRun ? "Libraries" : "Resources"}</p>
                       <p className="mt-1 text-xl font-semibold">{runDiff.summary.new_shares.toLocaleString()}</p>
                     </div>
                     <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
@@ -1460,7 +1615,7 @@ export function RunDetailPage() {
             <div>
               <h2 className="text-lg font-semibold">Issue Log</h2>
               <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-                Filter ingest warnings and errors, then open an entry to inspect the exact host, share, and path context.
+                Filter ingest warnings and errors, then open an entry to inspect the exact source, resource, and path context.
               </p>
             </div>
 
@@ -1469,7 +1624,7 @@ export function RunDetailPage() {
                 Search issue text
                 <input
                   className="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900"
-                  placeholder="Code, message, endpoint, share, or path"
+                  placeholder="Code, message, source, resource, or path"
                   value={issueSearch}
                   onChange={(event) => setIssueSearch(event.target.value)}
                 />
@@ -1545,9 +1700,9 @@ export function RunDetailPage() {
                     </div>
                     <p className="mt-2 text-sm font-semibold">{issue.message}</p>
                     <div className="mt-2 space-y-1 text-xs text-slate-500">
-                      {issue.endpoint_key ? <p>Host: {issue.endpoint_key}</p> : null}
-                      {issue.resource_name ? <p>Share: {issue.resource_name}</p> : null}
-                      {issue.path ? <p className="font-mono">{issue.path}</p> : null}
+                      {issue.endpoint_key ? <p>{sharePointRun ? "Site" : "Host"}: {issue.endpoint_key}</p> : null}
+                      {issue.resource_name ? <p>{sharePointRun ? "Library" : "Resource"}: {issue.resource_name}</p> : null}
+                      {issue.path ? <p className="break-all font-mono">{issue.path}</p> : null}
                     </div>
                   </button>
                 </li>
@@ -1575,11 +1730,11 @@ export function RunDetailPage() {
 
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Host</p>
-                    <p className="mt-1 text-sm font-semibold">{selectedIssue.endpoint_key || "Unavailable"}</p>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{sharePointRun ? "Site" : "Host"}</p>
+                    <p className="mt-1 break-all text-sm font-semibold">{selectedIssue.endpoint_key || "Unavailable"}</p>
                   </div>
                   <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Share</p>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{sharePointRun ? "Library" : "Resource"}</p>
                     <p className="mt-1 text-sm font-semibold">{selectedIssue.resource_name || "Unavailable"}</p>
                   </div>
                   <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
@@ -1604,7 +1759,7 @@ export function RunDetailPage() {
                       onClick={() => focusIssueEndpoint(selectedIssue)}
                       type="button"
                     >
-                      Focus Host
+                      Focus {sharePointRun ? "Site" : "Host"}
                     </button>
                   ) : null}
                   <button
@@ -1628,7 +1783,7 @@ export function RunDetailPage() {
                 title="Select An Issue"
                 description={
                   (run?.summary?.errors || 0) > 0
-                    ? "Choose an issue from the list to inspect the recorded message and pivot into host or item review."
+                    ? `Choose an issue from the list to inspect the recorded message and pivot into ${sharePointRun ? "site" : "host"} or item review.`
                     : "No ingest warnings or errors are currently available for this run."
                 }
               />
@@ -1644,7 +1799,7 @@ export function RunDetailPage() {
               <div>
                 <h2 className="text-lg font-semibold">Run-to-Run Diff</h2>
                 <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-                  Compare this run against a prior complete run to see new shares, disappeared shares, and item churn.
+                  Compare this run against a prior complete run to see new or disappeared resources, moves, renames, and item churn.
                 </p>
               </div>
               <label className="block min-w-[280px] text-xs font-semibold uppercase tracking-wide text-slate-500">
@@ -1718,6 +1873,22 @@ export function RunDetailPage() {
               </div>
             ) : null}
 
+            {diffComparisonWarning ? (
+              <div className="mt-3">
+                <StatusBanner
+                  tone="warning"
+                  title={diffComparisonWarning.known ? "Collection perspectives are not directly comparable" : "Comparison context could not be verified"}
+                >
+                  <p>
+                    Structural changes are still shown, but do not interpret them as confirmed access gain or loss without accounting for collection scope.
+                  </p>
+                  <ul className="mt-2 list-disc space-y-1 pl-5">
+                    {diffComparisonWarning.reasons.map((reason) => <li key={reason}>{reason}</li>)}
+                  </ul>
+                </StatusBanner>
+              </div>
+            ) : null}
+
             {runDiff && !diffLoading ? (
               runDiff.baseline_run ? (
                 <div className="mt-4 space-y-4">
@@ -1740,17 +1911,17 @@ export function RunDetailPage() {
                     </div>
                   </div>
 
-                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
                     <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">New Shares</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">New {sharePointRun ? "Libraries" : "Resources"}</p>
                       <p className="mt-1 text-2xl font-semibold">{runDiff.summary.new_shares}</p>
                     </div>
                     <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Disappeared Shares</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Disappeared {sharePointRun ? "Libraries" : "Resources"}</p>
                       <p className="mt-1 text-2xl font-semibold">{runDiff.summary.disappeared_shares}</p>
                     </div>
                     <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Changed Shares</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Changed {sharePointRun ? "Libraries" : "Resources"}</p>
                       <p className="mt-1 text-2xl font-semibold">{runDiff.summary.changed_shares}</p>
                     </div>
                     <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
@@ -1760,6 +1931,10 @@ export function RunDetailPage() {
                     <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
                       <p className="text-[11px] uppercase tracking-wide text-slate-500">Removed Items</p>
                       <p className="mt-1 text-2xl font-semibold">{runDiff.summary.removed_items}</p>
+                    </div>
+                    <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Moved / Renamed</p>
+                      <p className="mt-1 text-2xl font-semibold">{runDiff.summary.moved_items || 0}</p>
                     </div>
                   </div>
                   {runDiff.truncation?.truncated ? (
@@ -1779,16 +1954,16 @@ export function RunDetailPage() {
           {runDiff?.baseline_run ? (
             <div className="grid gap-4 xl:grid-cols-3">
               <div className="workspace-card">
-                <h3 className="text-base font-semibold">New Shares</h3>
-                <p className="mt-1 text-xs text-slate-500">Shares present now but absent in the baseline run.</p>
+                <h3 className="text-base font-semibold">New {sharePointRun ? "Libraries" : "Resources"}</h3>
+                <p className="mt-1 text-xs text-slate-500">Resources present now but absent in the baseline run.</p>
                 <ul className="mt-3 max-h-[320px] space-y-2 overflow-auto">
-                  {runDiff.new_shares.length === 0 ? <li className="text-sm text-slate-500">No newly discovered shares.</li> : null}
+                  {runDiff.new_shares.length === 0 ? <li className="text-sm text-slate-500">No newly discovered resources.</li> : null}
                   {runDiff.new_shares.map((share) => (
-                    <li className="rounded-2xl border border-slate-300 p-3 text-xs dark:border-slate-700" key={`${share.endpoint_key}:${share.share_name}`}>
+                    <li className="rounded-2xl border border-slate-300 p-3 text-xs dark:border-slate-700" key={`${share.endpoint_key}:${share.provider_resource_id || share.share_name}`}>
                       <div className="font-semibold">{share.share_name}</div>
                       <div className="mt-1 text-slate-500">{share.endpoint_key}</div>
-                      <div className="mt-1 text-slate-500">
-                        {share.share_type.toUpperCase()} • {share.access_level || "unknown"} • {share.item_count} item(s)
+                      <div className="mt-1 flex flex-wrap items-center gap-2 text-slate-500">
+                        <ProviderBadge provider={share.share_type} /> <span>{share.access_level || "unknown access"} • {share.item_count} item(s)</span>
                       </div>
                     </li>
                   ))}
@@ -1796,16 +1971,16 @@ export function RunDetailPage() {
               </div>
 
               <div className="workspace-card">
-                <h3 className="text-base font-semibold">Disappeared Shares</h3>
-                <p className="mt-1 text-xs text-slate-500">Shares that existed in the baseline run but are gone now.</p>
+                <h3 className="text-base font-semibold">Disappeared {sharePointRun ? "Libraries" : "Resources"}</h3>
+                <p className="mt-1 text-xs text-slate-500">Resources that existed in the baseline run but are gone now.</p>
                 <ul className="mt-3 max-h-[320px] space-y-2 overflow-auto">
-                  {runDiff.disappeared_shares.length === 0 ? <li className="text-sm text-slate-500">No disappeared shares.</li> : null}
+                  {runDiff.disappeared_shares.length === 0 ? <li className="text-sm text-slate-500">No disappeared resources.</li> : null}
                   {runDiff.disappeared_shares.map((share) => (
-                    <li className="rounded-2xl border border-slate-300 p-3 text-xs dark:border-slate-700" key={`${share.endpoint_key}:${share.share_name}`}>
+                    <li className="rounded-2xl border border-slate-300 p-3 text-xs dark:border-slate-700" key={`${share.endpoint_key}:${share.provider_resource_id || share.share_name}`}>
                       <div className="font-semibold">{share.share_name}</div>
                       <div className="mt-1 text-slate-500">{share.endpoint_key}</div>
-                      <div className="mt-1 text-slate-500">
-                        {share.share_type.toUpperCase()} • {share.access_level || "unknown"} • {share.item_count} item(s)
+                      <div className="mt-1 flex flex-wrap items-center gap-2 text-slate-500">
+                        <ProviderBadge provider={share.share_type} /> <span>{share.access_level || "unknown access"} • {share.item_count} item(s)</span>
                       </div>
                     </li>
                   ))}
@@ -1813,23 +1988,28 @@ export function RunDetailPage() {
               </div>
 
               <div className="workspace-card">
-                <h3 className="text-base font-semibold">Item Churn</h3>
-                <p className="mt-1 text-xs text-slate-500">Shares that remained in scope but changed contents between runs.</p>
+                <h3 className="text-base font-semibold">Resource Changes</h3>
+                <p className="mt-1 text-xs text-slate-500">Resources that remained in scope but changed contents or observed access between runs.</p>
                 <ul className="mt-3 max-h-[320px] space-y-2 overflow-auto">
-                  {runDiff.item_churn.length === 0 ? <li className="text-sm text-slate-500">No item churn detected.</li> : null}
+                  {runDiff.item_churn.length === 0 ? <li className="text-sm text-slate-500">No resource changes detected.</li> : null}
                   {runDiff.item_churn.map((share) => (
                     <li className="rounded-2xl border border-slate-300 p-3 text-xs dark:border-slate-700" key={`${share.endpoint_key}:${share.share_name}`}>
                       <div className="font-semibold">{share.share_name}</div>
                       <div className="mt-1 text-slate-500">{share.endpoint_key}</div>
                       <div className="mt-1 text-slate-500">
-                        +{share.added_items} / -{share.removed_items} item(s)
+                        +{share.added_items} / -{share.removed_items} / ↔{share.moved_items || 0} item(s)
                       </div>
+                      {share.access_level_changed ? (
+                        <div className="mt-2 rounded-xl bg-amber-50 px-2.5 py-2 text-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+                          Observed access changed from {(share.previous_access_level || "unknown").replaceAll("_", " ")} to {(share.access_level || "unknown").replaceAll("_", " ")}.
+                        </div>
+                      ) : null}
                       {share.added_examples.length > 0 ? (
                         <div className="mt-2">
                           <p className="font-semibold text-emerald-700 dark:text-emerald-300">Added</p>
                           <ul className="mt-1 space-y-1 text-slate-500">
                             {share.added_examples.map((path) => (
-                              <li className="font-mono" key={`add:${share.endpoint_key}:${share.share_name}:${path}`}>
+                              <li className="break-all font-mono" key={`add:${share.endpoint_key}:${share.share_name}:${path}`}>
                                 {path}
                               </li>
                             ))}
@@ -1841,10 +2021,26 @@ export function RunDetailPage() {
                           <p className="font-semibold text-rose-700 dark:text-rose-300">Removed</p>
                           <ul className="mt-1 space-y-1 text-slate-500">
                             {share.removed_examples.map((path) => (
-                              <li className="font-mono" key={`remove:${share.endpoint_key}:${share.share_name}:${path}`}>
+                              <li className="break-all font-mono" key={`remove:${share.endpoint_key}:${share.share_name}:${path}`}>
                                 {path}
                               </li>
                             ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                      {(share.moved_examples?.length || 0) > 0 ? (
+                        <div className="mt-2">
+                          <p className="font-semibold text-sky-700 dark:text-sky-300">Moved or renamed</p>
+                          <ul className="mt-1 space-y-1 text-slate-500">
+                            {share.moved_examples?.map((example, index) => {
+                              const text =
+                                typeof example === "string"
+                                  ? example
+                                  : example.from_path && example.to_path
+                                    ? `${example.from_path} → ${example.to_path}`
+                                    : example.path || example.provider_item_id || "Move recorded";
+                              return <li className="break-all font-mono" key={`move:${share.endpoint_key}:${share.share_name}:${index}`}>{text}</li>;
+                            })}
                           </ul>
                         </div>
                       ) : null}
@@ -1868,13 +2064,13 @@ export function RunDetailPage() {
           <div aria-busy={endpointsBusy} className="workspace-card">
             <div className="mb-3 flex items-center justify-between gap-2">
               <div>
-                <h2 className="text-lg font-semibold">Endpoints</h2>
-                <p className="mt-1 text-xs text-slate-500">Choose a host to load its shares.</p>
+                <h2 className="text-lg font-semibold">Sites & Endpoints</h2>
+                <p className="mt-1 text-xs text-slate-500">Choose a SharePoint site or network host to load its resources.</p>
               </div>
               <input
-                aria-label="Search endpoints in this run"
+                aria-label="Search sites and endpoints in this run"
                 className="w-44 rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
-                placeholder="Search endpoint"
+                placeholder="Search site or endpoint"
                 value={endpointSearch}
                 onChange={(event) => setEndpointSearch(event.target.value)}
               />
@@ -1883,72 +2079,84 @@ export function RunDetailPage() {
               busy={endpointsBusy}
               canNext={!!endpointNext}
               canPrevious={endpointHistory.length > 0}
-              label="Endpoint inventory"
+              label="Site and endpoint inventory"
               onNext={() => moveCursor(endpointNext, endpointCursor, setEndpointCursor, setEndpointHistory)}
               onPrevious={() => moveBack(setEndpointCursor, setEndpointHistory)}
               page={endpointHistory.length + 1}
             />
             {endpointsError ? (
-              <StatusBanner tone="error" title="Endpoints unavailable">
+              <StatusBanner tone="error" title="Sites and endpoints unavailable">
                 <p>{endpointsError}</p>
-                <p className="mt-1">No endpoint result is being shown. Retrying is safe.</p>
+                <p className="mt-1">No source result is being shown. Retrying is safe.</p>
                 <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">
-                  Retry endpoints
+                  Retry sources
                 </button>
               </StatusBanner>
             ) : null}
-            {endpointsBusy ? <p className="text-sm text-slate-500" role="status">Updating endpoint inventory…</p> : null}
-            {!endpointsBusy && !endpointsError && endpoints.length === 0 ? <p className="text-sm text-slate-500">No endpoints match this run search.</p> : null}
+            {endpointsBusy ? <p className="text-sm text-slate-500" role="status">Updating source inventory…</p> : null}
+            {!endpointsBusy && !endpointsError && endpoints.length === 0 ? <p className="text-sm text-slate-500">No sites or endpoints match this run search.</p> : null}
             <ul className="max-h-[520px] space-y-2 overflow-auto">
-              {endpoints.map((endpoint) => (
-                <li key={endpoint.id}>
-                  <button
-                    className={`w-full rounded-2xl border px-3 py-3 text-left text-xs ${
-                      selectedEndpoint === endpoint.id
-                        ? "border-emerald-600 bg-emerald-50 dark:bg-emerald-900/20"
-                        : "border-slate-300 hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                    }`}
-                    onClick={() => selectEndpoint(endpoint.id)}
-                    type="button"
-                  >
-                    <div className="font-semibold">{endpoint.endpoint_key}</div>
-                    <div className="mt-1 text-slate-500">
-                      {(endpoint.hostname || endpoint.ip || "-") + (endpoint.smb_signing ? ` • signing:${endpoint.smb_signing}` : "")}
-                    </div>
-                  </button>
-                </li>
-              ))}
+              {endpoints.map((endpoint) => {
+                const siteName = metadataString(endpoint.metadata, "display_name", "displayName", "site_name", "siteName", "name");
+                const rawWebUrl = metadataString(endpoint.metadata, "web_url", "webUrl");
+                const webUrl = safeExternalUrl(rawWebUrl);
+                const siteId = metadataString(endpoint.metadata, "site_id", "siteId");
+                const provider = normalizedProvider(endpoint.provider, metadataString(endpoint.metadata, "provider"), siteId ? "sharepoint" : "network");
+                return (
+                  <li className={`overflow-hidden rounded-2xl border ${selectedEndpoint === endpoint.id ? "border-emerald-600 bg-emerald-50 dark:bg-emerald-900/20" : "border-slate-300 dark:border-slate-700"}`} key={endpoint.id}>
+                    <button className="w-full px-3 py-3 text-left text-xs hover:bg-slate-100 dark:hover:bg-slate-800" onClick={() => selectEndpoint(endpoint.id)} type="button">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-semibold">{siteName || endpoint.hostname || endpoint.endpoint_key}</span>
+                        <ProviderBadge provider={provider} />
+                      </div>
+                      <div className="mt-1 break-all font-mono text-[11px] text-slate-500">{endpoint.endpoint_key}</div>
+                      <div className="mt-1 text-slate-500">
+                        {(endpoint.hostname || endpoint.ip || "No network address") + (endpoint.smb_signing ? ` • signing:${endpoint.smb_signing}` : "")}
+                      </div>
+                      {siteId ? <div className="mt-1 truncate text-slate-500" title={siteId}>Site ID: {siteId}</div> : null}
+                    </button>
+                    {webUrl ? (
+                      <a className="block border-t border-slate-200 px-3 py-2 text-xs font-semibold text-sky-700 hover:bg-sky-50 dark:border-slate-700 dark:text-sky-300 dark:hover:bg-sky-900/20" href={webUrl} rel="noreferrer" target="_blank">{provider === "sharepoint" ? "Open SharePoint site" : "Open source"} <span aria-hidden="true">↗</span></a>
+                    ) : rawWebUrl ? <p className="border-t border-slate-200 px-3 py-2 text-xs font-semibold text-amber-700 dark:border-slate-700 dark:text-amber-300">Unsafe external URL blocked.</p> : null}
+                  </li>
+                );
+              })}
             </ul>
           </div>
 
           <div aria-busy={resourcesLoading} className="workspace-card">
             <div className="mb-3">
-              <h2 className="text-lg font-semibold">Shares</h2>
-              <p className="mt-1 text-xs text-slate-500">Select a share to inspect items in that branch.</p>
+              <h2 className="text-lg font-semibold">Resources</h2>
+              <p className="mt-1 text-xs text-slate-500">Select a share, export, or document library to inspect its items.</p>
             </div>
             <CursorPager
               busy={resourcesLoading}
               canNext={!!resourceNext}
               canPrevious={resourceHistory.length > 0}
-              label="Share inventory"
+              label="Resource inventory"
               onNext={() => moveCursor(resourceNext, resourceCursor, setResourceCursor, setResourceHistory)}
               onPrevious={() => moveBack(setResourceCursor, setResourceHistory)}
               page={resourceHistory.length + 1}
             />
             {resourcesError ? (
-              <StatusBanner tone="error" title="Shares unavailable">
+              <StatusBanner tone="error" title="Resources unavailable">
                 <p>{resourcesError}</p>
-                <p className="mt-1">No share result is being shown. Retrying is safe.</p>
+                <p className="mt-1">No resource result is being shown. Retrying is safe.</p>
                 <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">
-                  Retry shares
+                  Retry resources
                 </button>
               </StatusBanner>
             ) : null}
-            {resourcesLoading ? <p className="text-sm text-slate-500" role="status">Loading shares for the selected endpoint…</p> : null}
-            {!selectedEndpoint && !endpointsBusy && !endpointsError ? <p className="text-sm text-slate-500">Select an endpoint to inspect its shares.</p> : null}
-            {selectedEndpoint && !resourcesLoading && !resourcesError && resources.length === 0 ? <p className="text-sm text-slate-500">No shares were returned for the selected endpoint.</p> : null}
+            {resourcesLoading ? <p className="text-sm text-slate-500" role="status">Loading resources for the selected site or endpoint…</p> : null}
+            {!selectedEndpoint && !endpointsBusy && !endpointsError ? <p className="text-sm text-slate-500">Select a site or endpoint to inspect its resources.</p> : null}
+            {selectedEndpoint && !resourcesLoading && !resourcesError && resources.length === 0 ? <p className="text-sm text-slate-500">No resources were returned for the selected source.</p> : null}
             <ul className="max-h-[520px] space-y-2 overflow-auto">
-              {resources.map((resource) => (
+              {resources.map((resource) => {
+                const provider = normalizedProvider(resource.provider, resource.share_type, resource.resource_type);
+                const resourceType = resource.resource_type || (provider === "sharepoint" ? "sharepoint_library" : `${provider}_share`);
+                const exposure = resource.exposure || (provider === "sharepoint" ? "UNKNOWN" : null);
+                const webUrl = safeExternalUrl(resource.web_url);
+                return (
                 <li
                   className={`overflow-hidden rounded-2xl border text-xs ${
                     selectedResource === resource.id
@@ -1962,19 +2170,23 @@ export function RunDetailPage() {
                     onClick={() => setSelectedResource(resource.id)}
                     type="button"
                   >
-                    <span className="block font-semibold">{resource.name}</span>
-                    <span className="mt-1 block text-slate-500">{resource.share_type.toUpperCase()}</span>
+                    <span className="flex flex-wrap items-center justify-between gap-2"><strong>{resource.name}</strong><ProviderBadge provider={provider} /></span>
+                    <span className="mt-1 block text-slate-500">{resourceTypeLabel(resourceType)}</span>
+                    {resource.provider_resource_id ? <span className="mt-1 block truncate font-mono text-[11px] text-slate-500" title={resource.provider_resource_id}>ID: {resource.provider_resource_id}</span> : null}
                     {resource.remark ? <span className="mt-1 block text-slate-500">{resource.remark}</span> : null}
                   </button>
-                  <div className="border-t border-slate-200 bg-white/70 px-3 py-2 dark:border-slate-700 dark:bg-slate-950/30">
+                  <div className="space-y-2 border-t border-slate-200 bg-white/70 px-3 py-2 dark:border-slate-700 dark:bg-slate-950/30">
+                    {exposure ? <div className="flex flex-wrap items-center gap-2"><ExposureBadge evidence={resource.exposure_evidence} exposure={exposure} /><span className="text-[11px] text-slate-500">{exposureLabel(exposure)}</span></div> : null}
                     <AccessCapabilityCell
                       accessLevel={resource.access_level}
                       capabilities={resource.access_capabilities}
-                      label="Share access"
+                      label={provider === "sharepoint" ? "Observed library access" : "Share access"}
                     />
+                    {webUrl ? <a className="inline-flex text-xs font-semibold text-sky-700 underline underline-offset-2 dark:text-sky-300" href={webUrl} rel="noreferrer" target="_blank">Open resource <span aria-hidden="true" className="ml-1">↗</span></a> : resource.web_url ? <p className="text-xs font-semibold text-amber-700 dark:text-amber-300">Unsafe external URL blocked.</p> : null}
                   </div>
                 </li>
-              ))}
+                );
+              })}
             </ul>
           </div>
 
@@ -1982,19 +2194,21 @@ export function RunDetailPage() {
             <div className="mb-3 grid gap-2">
               <div>
                 <h2 className="text-lg font-semibold">Items</h2>
-                <p className="mt-1 text-xs text-slate-500">Filter the selected share by name or path prefix.</p>
+                <p className="mt-1 text-xs text-slate-500">
+                  Filter {selectedResourceRecord?.name ? `${selectedResourceRecord.name} ` : "the selected resource "}by name or canonical path prefix.
+                </p>
               </div>
               <input
-                aria-label="Search item names in the selected share"
+                aria-label="Search item names in the selected resource"
                 className="rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
                 placeholder="Search name"
                 value={itemSearch}
                 onChange={(event) => setItemSearch(event.target.value)}
               />
               <input
-                aria-label="Filter selected share by path prefix"
+                aria-label="Filter selected resource by path prefix"
                 className="rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
-                placeholder="Path prefix (e.g. \\HR\\)"
+                placeholder="Path prefix (e.g. /HR/ or \\HR\\)"
                 value={pathPrefix}
                 onChange={(event) => setPathPrefix(event.target.value)}
               />
@@ -2003,7 +2217,7 @@ export function RunDetailPage() {
               busy={itemsBusy}
               canNext={!!itemNext}
               canPrevious={itemHistory.length > 0}
-              label="Share items"
+              label="Resource items"
               onNext={() => moveCursor(itemNext, itemCursor, setItemCursor, setItemHistory)}
               onPrevious={() => moveBack(setItemCursor, setItemHistory)}
               page={itemHistory.length + 1}
@@ -2017,20 +2231,11 @@ export function RunDetailPage() {
                 </button>
               </StatusBanner>
             ) : null}
-            {itemsBusy ? <p className="text-sm text-slate-500" role="status">Updating items in the selected share…</p> : null}
-            {!selectedResource && !endpointsBusy && !endpointsError && !resourcesLoading && !resourcesError ? <p className="text-sm text-slate-500">Select a share to inspect its files and folders.</p> : null}
-            {selectedResource && !itemsBusy && !itemsError && items.length === 0 ? <p className="text-sm text-slate-500">No items match the current share filters.</p> : null}
+            {itemsBusy ? <p className="text-sm text-slate-500" role="status">Updating items in the selected resource…</p> : null}
+            {!selectedResource && !endpointsBusy && !endpointsError && !resourcesLoading && !resourcesError ? <p className="text-sm text-slate-500">Select a resource to inspect its files and folders.</p> : null}
+            {selectedResource && !itemsBusy && !itemsError && items.length === 0 ? <p className="text-sm text-slate-500">No items match the current resource filters.</p> : null}
             <ul className="max-h-[420px] space-y-2 overflow-auto">
-              {items.map((item) => (
-                <li key={item.id} className="rounded-2xl border border-slate-300 px-3 py-3 text-xs dark:border-slate-700">
-                  <div className="font-mono">{item.path}</div>
-                  <div className="mt-1 flex flex-wrap gap-x-3 text-slate-500">
-                    <span>{item.is_dir ? "directory" : "file"}</span>
-                    {!item.is_dir && item.size_bytes != null ? <span>{formatBytes(item.size_bytes)}</span> : null}
-                    {item.mtime ? <span>Modified {new Date(item.mtime).toLocaleString()}</span> : null}
-                  </div>
-                </li>
-              ))}
+              {items.map((item) => <ItemResultCard item={item} key={item.id} />)}
             </ul>
           </div>
         </div>
@@ -2043,7 +2248,7 @@ export function RunDetailPage() {
               <div>
                 <h2 className="text-lg font-semibold">Run-Scoped Search</h2>
                 <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-                  Search items across the full run and keep browser-local query/ext combinations for quick recall.
+                  Search items across the full run and keep browser-local query, source, exposure, deletion, and extension filters for quick recall.
                 </p>
               </div>
               <div className="flex flex-wrap items-end gap-2">
@@ -2056,6 +2261,31 @@ export function RunDetailPage() {
                     onChange={(event) => setGlobalQuery(event.target.value)}
                   />
                 </div>
+                <label className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                  Source
+                  <select className="mt-1 rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs normal-case tracking-normal text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" onChange={(event) => setGlobalProvider(event.target.value)} value={globalProvider}>
+                    <option value="">All</option>
+                    <option value="sharepoint">SharePoint</option>
+                    <option value="smb">SMB</option>
+                    <option value="nfs">NFS</option>
+                  </select>
+                </label>
+                <label className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                  Exposure
+                  <select className="mt-1 rounded-2xl border border-slate-300 bg-white px-3 py-2 text-xs normal-case tracking-normal text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" onChange={(event) => setGlobalExposure(event.target.value)} value={globalExposure}>
+                    <option value="">Any</option>
+                    <option value="ANONYMOUS">Anonymous</option>
+                    <option value="EXTERNAL">External</option>
+                    <option value="BROAD_INTERNAL">Broad internal</option>
+                    <option value="USER_VISIBLE">User-visible (not public)</option>
+                    <option value="RESTRICTED">Restricted</option>
+                    <option value="UNKNOWN">Unknown</option>
+                  </select>
+                </label>
+                <label className="flex items-center gap-2 rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
+                  <input checked={globalIncludeDeleted} className="accent-emerald-600" onChange={(event) => setGlobalIncludeDeleted(event.target.checked)} type="checkbox" />
+                  Include deleted
+                </label>
                 <div>
                   <input
                     aria-label="Filter run search by file extension"
@@ -2109,8 +2339,12 @@ export function RunDetailPage() {
                         onClick={() => {
                           setGlobalQuery(saved.q);
                           setGlobalExt(saved.ext);
+                          setGlobalProvider(saved.provider);
+                          setGlobalExposure(saved.exposure);
+                          setGlobalIncludeDeleted(saved.includeDeleted);
                           setSavedQueryError(null);
                         }}
+                        title={[saved.q, saved.ext, saved.provider, saved.exposure, saved.includeDeleted ? "include deleted" : ""].filter(Boolean).join(" · ") || "Saved run search"}
                         type="button"
                       >
                         {saved.label}
@@ -2151,16 +2385,7 @@ export function RunDetailPage() {
             {globalItemsBusy ? <p className="text-sm text-slate-500" role="status">Updating run search…</p> : null}
             {!globalItemsBusy && !globalItemsError && globalItems.length === 0 ? <p className="text-sm text-slate-500">No run-scoped search results match the current query.</p> : null}
             <ul className="max-h-[360px] space-y-2 overflow-auto">
-              {globalItems.map((item) => (
-                <li key={item.id} className="rounded-2xl border border-slate-300 px-3 py-3 text-xs dark:border-slate-700">
-                  <div className="font-mono">{item.path}</div>
-                  <div className="mt-1 flex flex-wrap gap-x-3 text-slate-500">
-                    <span>resource_id: {item.resource_id ?? "-"}</span>
-                    {!item.is_dir && item.size_bytes != null ? <span>{formatBytes(item.size_bytes)}</span> : null}
-                    {item.mtime ? <span>Modified {new Date(item.mtime).toLocaleString()}</span> : null}
-                  </div>
-                </li>
-              ))}
+              {globalItems.map((item) => <ItemResultCard item={item} key={item.id} />)}
             </ul>
           </div>
         </div>

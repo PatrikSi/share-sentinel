@@ -263,7 +263,7 @@ export function AccessCapabilityCell({ accessLevel, capabilities, evidenceScope,
             {summary.label}
           </span>
           {evidenceScope ? (
-            <span className="inventory-access-scope" title="Capability evidence applies to the sampled share, not necessarily this exact item">
+            <span className="inventory-access-scope" title="Capability evidence is resource-level and may not apply to this exact item">
               {evidenceScope}
             </span>
           ) : null}
