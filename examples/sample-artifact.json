@@ -3,7 +3,7 @@
   "format": "share_sentinel_compact_json",
   "meta": {
     "tool": "share-sentinel-collector",
-    "tool_version": "0.2.0",
+    "tool_version": "1.0.0",
     "run_id": "00000000-0000-4000-8000-000000000001",
     "started_at": "2026-01-15T10:00:00+00:00",
     "finished_at": "2026-01-15T10:00:10+00:00",

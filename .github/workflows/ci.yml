@@ -45,6 +45,9 @@ jobs:
         run: |
           bash -n bootstrap.sh scripts/*.sh
           ./scripts/doctor.sh --help >/dev/null
+      - name: Validate release metadata
+        if: matrix.component == 'api'
+        run: python scripts/check-release.py
       - name: Run tests
         working-directory: ${{ matrix.component }}
         run: pytest -q -p no:cacheprovider
@@ -132,7 +135,7 @@ jobs:
       - name: Validate generated environment modes
         run: |
           ./bootstrap.sh --development --output "${RUNNER_TEMP}/share-sentinel-dev.env" >/dev/null
-          ./bootstrap.sh --production sentinel.example.com --image-tag v0.2.0 --output "${RUNNER_TEMP}/share-sentinel-prod.env" >/dev/null
+          ./bootstrap.sh --production sentinel.example.com --image-tag v1.0.0 --output "${RUNNER_TEMP}/share-sentinel-prod.env" >/dev/null
           test "$(stat -c '%a' "${RUNNER_TEMP}/share-sentinel-dev.env")" = "600"
           test "$(stat -c '%a' "${RUNNER_TEMP}/share-sentinel-prod.env")" = "600"
           docker compose --env-file "${RUNNER_TEMP}/share-sentinel-dev.env" config --quiet

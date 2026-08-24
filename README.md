@@ -4,7 +4,7 @@
 
 Share Sentinel is a self-hostable workspace for ingesting SMB and NFS collection artifacts, tracking project-scoped inventory, and reviewing run-to-run changes without losing analyst context.
 
-Version 0.2.0 is an initial publication candidate: the core local workflow is tested end to end, while HA operation, MFA, SSO, and turnkey internet-facing deployment are intentionally outside the current support boundary.
+Version 1.0.0 is the initial open-source release: the core local workflow is tested end to end, while HA operation, MFA, SSO, and turnkey internet-facing deployment are intentionally outside the current support boundary.
 
 It is built around one loop:
 

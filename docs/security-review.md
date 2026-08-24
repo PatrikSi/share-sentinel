@@ -1,7 +1,7 @@
 # Security review
 
-Review date: 2026-08-11
-Target: Share Sentinel 0.2.0 publication candidate
+Review date: 2026-08-24
+Target: Share Sentinel 1.0.0 initial open-source release
 Scope: API, worker, collector, UI, dependency manifests, containers, and reference Compose topology
 
 ## Outcome

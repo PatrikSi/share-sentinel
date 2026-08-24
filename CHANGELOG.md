@@ -10,6 +10,8 @@ The project follows a simple release-first workflow:
 
 ## Unreleased
 
+## [1.0.0] - 2026-08-24
+
 ### Added
 
 - GHCR publication for API, worker, UI, and collector images after full CI or release verification, including exact commit/release tags, vulnerability scans, provenance, and SBOM attestations.
