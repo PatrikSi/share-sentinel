@@ -10,12 +10,22 @@ The project follows a simple release-first workflow:
 
 ## Unreleased
 
+No user-visible changes yet.
+
+## [1.1.0] - 2026-08-24
+
 ### Added
 
 - Metadata-only SharePoint Online collection through Microsoft Graph, with unattended application inventory and delegated user quick-check perspectives, bounded paging/retries, and optional direct upload.
 - Durable per-library delta checkpoints and local SQLite metadata snapshots that materialize a complete artifact on every successful run while preserving stable site, library, and drive-item identities across moves and renames.
 - First-class SharePoint provider metadata, collection context, resource types, exposure evidence, inventory filters, and run-explorer presentation. Delegated `USER_VISIBLE` evidence is explicitly distinct from public, external, or anonymous exposure.
 - Collector-shaped full/delta SharePoint fixtures, an end-to-end stable-ID diff smoke test, and Windows unit/contract coverage for SharePoint collector authentication paths.
+- A small application-version footer so operators can identify the running web build during support and incident triage.
+
+### Fixed
+
+- Project deletion now serializes run creation and artifact-pointer commits, preventing a concurrent upload from leaving sensitive scan artifacts outside the deletion snapshot.
+- Release publication can be rerun safely and replaces generated source assets on an existing GitHub release.
 
 ### Operator notes
 

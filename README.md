@@ -4,7 +4,7 @@
 
 Share Sentinel is a self-hostable workspace for ingesting SMB, NFS, and SharePoint Online collection artifacts, tracking project-scoped inventory, and reviewing run-to-run changes without losing analyst context.
 
-Version 1.0.0 is the initial open-source release: the core local workflow is tested end to end, while HA operation, MFA, SSO, and turnkey internet-facing deployment are intentionally outside the current support boundary.
+Version 1.1.0 adds first-class SharePoint Online monitoring to the tested local workflow. HA operation, application MFA/SSO, and turnkey internet-facing deployment remain intentionally outside the current support boundary.
 
 It is built around one loop:
 

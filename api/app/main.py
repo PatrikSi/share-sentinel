@@ -20,7 +20,7 @@ logging.basicConfig(
 
 app = FastAPI(
     title="Share Sentinel API",
-    version="1.0.0",
+    version="1.1.0",
     root_path=app_settings.api_root_path,
     docs_url="/docs" if docs_enabled else None,
     redoc_url="/redoc" if docs_enabled else None,

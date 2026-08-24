@@ -18,16 +18,24 @@ def _match_version(path: Path, pattern: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify release versions and changelog state.")
-    parser.add_argument("--tag", help="Optional release tag, for example v1.0.0.")
+    parser.add_argument("--tag", help="Optional release tag, for example v1.1.0.")
     args = parser.parse_args()
 
     expected = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    ui_package = json.loads((ROOT / "ui" / "package.json").read_text(encoding="utf-8"))
+    ui_lock = json.loads((ROOT / "ui" / "package-lock.json").read_text(encoding="utf-8"))
     versions = {
         "api/app/main.py": _match_version(ROOT / "api" / "app" / "main.py", r'version="([^"]+)"'),
         "collector/share_sentinel_collector.py": _match_version(
             ROOT / "collector" / "share_sentinel_collector.py", r'^TOOL_VERSION = "([^"]+)"'
         ),
-        "ui/package.json": json.loads((ROOT / "ui" / "package.json").read_text(encoding="utf-8"))["version"],
+        "collector/sharepoint/graph.py": _match_version(
+            ROOT / "collector" / "sharepoint" / "graph.py",
+            r'"User-Agent": "share-sentinel-sharepoint/([^"]+)"',
+        ),
+        "ui/package.json": ui_package["version"],
+        "ui/package-lock.json": ui_lock["version"],
+        'ui/package-lock.json packages[""]': ui_lock["packages"][""]["version"],
     }
     mismatches = {path: version for path, version in versions.items() if version != expected}
     if mismatches:

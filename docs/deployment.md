@@ -45,7 +45,7 @@ COMPOSE_FILE=docker-compose.yml
 APP_ENV=production
 APP_HOST=sentinel.example.com
 SHARE_SENTINEL_STACK=production
-SHARE_SENTINEL_IMAGE_TAG=v1.0.0
+SHARE_SENTINEL_IMAGE_TAG=v1.1.0
 GATEWAY_BIND_ADDRESS=127.0.0.1
 GATEWAY_HTTP_PORT=8080
 AUTH_COOKIE_SECURE=true
@@ -65,7 +65,7 @@ The bootstrap script can create this contract without placing secrets in shell h
 ./bootstrap.sh \
   --production sentinel.example.com \
   --admin-email admin@example.com \
-  --image-tag v1.0.0
+  --image-tag v1.1.0
 ```
 
 It defaults to `latest` when `--image-tag` is omitted. Use an exact `vX.Y.Z` or `sha-<full-commit>` tag for a repeatable production rollout. If the GHCR packages are private, authenticate the deployment host with a read-only package token before pulling:

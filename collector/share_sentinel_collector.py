@@ -78,7 +78,7 @@ except ImportError:
         """Fallback error type used when impacket is unavailable."""
 
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.1.0"
 SENSITIVE_ARGUMENT_FLAGS = {"--password", "--hashes", "--api-token"}
 SMB_PASSWORD_ENV = "SHARE_SENTINEL_SMB_PASSWORD"
 SMB_HASHES_ENV = "SHARE_SENTINEL_SMB_HASHES"

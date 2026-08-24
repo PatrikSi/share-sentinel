@@ -245,7 +245,7 @@ class GraphClient:
             headers = {
                 "Authorization": f"Bearer {context.access_token}",
                 "Accept": "application/json",
-                "User-Agent": "share-sentinel-sharepoint/1.0.0",
+                "User-Agent": "share-sentinel-sharepoint/1.1.0",
             }
             try:
                 response = self._get_session().request(
