@@ -168,14 +168,24 @@ def test_refresh_accepts_refresh_cookie_when_csrf_matches(monkeypatch) -> None:
         f"{settings.auth_refresh_cookie_name}=cookie-refresh; "
         f"{settings.auth_csrf_cookie_name}=csrf-token"
     )
+    auth_cookie_calls: list[tuple[str, str]] = []
+    refresh_cookie_calls: list[str] = []
 
     monkeypatch.setattr(auth_router, "_consume_refresh_token", lambda *_args, **_kwargs: consumed)
     monkeypatch.setattr(auth_router, "hash_external_token", lambda value: f"hash:{value}")
     monkeypatch.setattr(auth_router, "random_token", lambda *_args, **_kwargs: "next-refresh")
     monkeypatch.setattr(auth_router, "make_access_token", lambda *_args, **_kwargs: "next-access")
     monkeypatch.setattr(auth_router, "generate_csrf_token", lambda: "next-csrf")
-    monkeypatch.setattr(auth_router, "set_auth_cookies", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(auth_router, "set_refresh_cookie", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        auth_router,
+        "set_auth_cookies",
+        lambda _response, access, csrf: auth_cookie_calls.append((access, csrf)),
+    )
+    monkeypatch.setattr(
+        auth_router,
+        "set_refresh_cookie",
+        lambda _response, refresh: refresh_cookie_calls.append(refresh),
+    )
     monkeypatch.setattr(auth_router, "write_audit_event", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(auth_router.rate_limiter, "check", lambda *_args, **_kwargs: None)
 
@@ -187,6 +197,8 @@ def test_refresh_accepts_refresh_cookie_when_csrf_matches(monkeypatch) -> None:
     )
 
     assert result.ok is True
+    assert auth_cookie_calls == [("next-access", "next-csrf")]
+    assert refresh_cookie_calls == ["next-refresh"]
 
 
 def test_refresh_requires_csrf_when_using_refresh_cookie() -> None:

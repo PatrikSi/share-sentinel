@@ -91,19 +91,23 @@ def set_auth_cookies(response: Response, access_token: str, csrf_token: str) -> 
     cookie_common = {
         "domain": settings.auth_cookie_domain,
         "path": settings.auth_cookie_path,
-        "max_age": settings.access_token_minutes * 60,
         "secure": settings.auth_cookie_secure,
         "samesite": settings.auth_cookie_samesite,
     }
     response.set_cookie(
         key=settings.auth_cookie_name,
         value=access_token,
+        max_age=settings.access_token_minutes * 60,
         httponly=True,
         **cookie_common,
     )
     response.set_cookie(
         key=settings.auth_csrf_cookie_name,
         value=csrf_token,
+        # Cookie-based refresh uses double-submit CSRF protection after the
+        # short-lived access cookie has expired, so both refresh credentials
+        # must remain available for the same lifetime.
+        max_age=settings.refresh_token_days * 24 * 60 * 60,
         httponly=False,
         **cookie_common,
     )
