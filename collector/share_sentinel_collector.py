@@ -566,7 +566,9 @@ class NDJSONWriter:
             if self._gzip:
                 with gzip.open(temporary_path, "wt", encoding="utf-8") as target_fp:
                     self._write_payload(target_fp)
-                with open(temporary_path, "rb") as target_fp:
+                # Windows maps fsync to _commit, which requires a writable
+                # descriptor even though the gzip stream is already closed.
+                with open(temporary_path, "r+b") as target_fp:
                     os.fsync(target_fp.fileno())
             else:
                 with open(temporary_path, "w", encoding="utf-8") as target_fp:

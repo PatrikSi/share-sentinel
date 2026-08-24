@@ -26,6 +26,7 @@ No user-visible changes yet.
 
 - Project deletion now serializes run creation and artifact-pointer commits, preventing a concurrent upload from leaving sensitive scan artifacts outside the deletion snapshot.
 - Release publication can be rerun safely and replaces generated source assets on an existing GitHub release.
+- Gzip collector artifacts now use a Windows-compatible durability flush before their atomic rename.
 
 ### Operator notes
 
