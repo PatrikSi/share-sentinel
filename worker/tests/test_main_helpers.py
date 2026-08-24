@@ -352,7 +352,275 @@ def test_validate_record_normalizes_access_level_aliases() -> None:
     assert reason is None
     assert resource_record["access_level"] == "readable"
     assert main._normalize_access_level("list") == "list_only"
-    assert main._normalize_access_level("unknown-value") == "no_access"
+    assert main._normalize_access_level("write") == "unknown"
+    assert main._normalize_access_level("modify") == "unknown"
+    assert main._normalize_access_level("read_write") == "readable"
+    assert main._normalize_access_level("full_control") == "readable"
+    assert main._normalize_access_level("unknown") == "unknown"
+    assert main._normalize_access_level("unknown-value") == "unknown"
+
+
+def test_validate_record_bounds_access_capabilities_and_preserves_probe_metadata() -> None:
+    resource_record = {
+        "type": "resource",
+        "run_id": "run-1",
+        "endpoint_key": "host:445",
+        "name": "Finance",
+        "access_level": "unknown",
+        "access_capabilities": {
+            "read_file": {
+                "status": "allowed",
+                "attempted": "1",
+                "allowed": 1,
+                "denied": -2,
+                "inconclusive": False,
+            },
+            "_metadata": {
+                "probe_method": "non_mutating_handle_open",
+                "coverage": "bounded_sample",
+                "probe_limit": 3,
+                "partial": True,
+                "complete": True,
+                "listing_truncated": False,
+                "directory_candidates_seen": 7,
+                "file_candidates_seen": 11,
+                "ignored_nested": {"unbounded": ["data"]},
+            },
+            "bad": {"status": "not-a-status"},
+            "x" * 65: {"status": "allowed"},
+        },
+    }
+
+    ok, reason = main.validate_record(resource_record)
+
+    assert ok is True
+    assert reason is None
+    assert resource_record["access_level"] == "unknown"
+    assert resource_record["access_capabilities"] == {
+        "read_file": {
+            "status": "allowed",
+            "attempted": 1,
+            "allowed": 1,
+            "denied": 0,
+            "inconclusive": 0,
+        },
+        "_metadata": {
+            "probe_method": "non_mutating_handle_open",
+            "coverage": "bounded_sample",
+            "probe_limit": 3,
+            "directory_candidates_seen": 7,
+            "file_candidates_seen": 11,
+            "partial": True,
+            "complete": True,
+            "listing_truncated": False,
+        },
+        "bad": {
+            "status": "not_tested",
+            "attempted": 0,
+            "allowed": 0,
+            "denied": 0,
+            "inconclusive": 0,
+        },
+    }
+
+
+def test_merge_access_capabilities_is_monotonic_and_idempotent() -> None:
+    final = {
+        "read_file": {"status": "allowed", "attempted": 1, "allowed": 1, "denied": 0, "inconclusive": 0},
+        "_metadata": {
+            "probe_method": "non_mutating_handle_open",
+            "coverage": "bounded_sample",
+            "probe_limit": 3,
+            "complete": True,
+            "partial": True,
+            "file_candidates_seen": 4,
+        },
+    }
+    stale_provisional = {
+        "read_file": {"status": "not_tested", "attempted": 0, "allowed": 0, "denied": 0, "inconclusive": 0},
+        "_metadata": {"coverage": "disabled", "probe_limit": 3, "complete": False, "partial": True},
+    }
+
+    merged = main._merge_access_capabilities(final, stale_provisional)
+
+    assert merged["read_file"] == final["read_file"]
+    assert merged["_metadata"]["complete"] is True
+    assert merged["_metadata"]["coverage"] == "bounded_sample"
+    assert main._merge_access_capabilities(merged, final) == merged
+
+    mixed = main._merge_access_capabilities(
+        {"read_file": {"status": "allowed", "attempted": 1, "allowed": 1}},
+        {"read_file": {"status": "denied", "attempted": 1, "denied": 1}},
+    )
+    assert mixed["read_file"]["status"] == "mixed"
+    assert mixed["read_file"]["attempted"] == 2
+
+
+def test_completed_capability_metadata_wins_regardless_of_replay_order() -> None:
+    final = {
+        "_metadata": {
+            "probe_method": "non_mutating_handle_open",
+            "coverage": "bounded_sample",
+            "complete": True,
+            "partial": True,
+            "listing_truncated": False,
+        }
+    }
+    stale_provisional = {
+        "_metadata": {
+            "probe_method": "legacy_probe",
+            "coverage": "disabled",
+            "complete": False,
+            "partial": False,
+            "listing_truncated": True,
+        }
+    }
+
+    forward = main._merge_access_capabilities(stale_provisional, final)
+    reverse = main._merge_access_capabilities(final, stale_provisional)
+
+    assert forward == reverse
+    assert forward["_metadata"] == final["_metadata"]
+
+
+def test_capability_key_bounds_prioritize_contract_fields_during_normalize_and_merge() -> None:
+    extras = {f"extra_{index:02d}": {"status": "allowed"} for index in range(40)}
+    document = {
+        **extras,
+        "read_file": {"status": "allowed", "attempted": 1, "allowed": 1},
+        "_metadata": {"complete": True, "coverage": "bounded_sample"},
+    }
+
+    normalized = main._normalize_access_capabilities(document)
+    assert len(normalized) == main.ACCESS_CAPABILITY_MAX_KEYS
+    assert "_metadata" in normalized
+    assert "read_file" in normalized
+
+    left = {f"left_{index:02d}": {"status": "allowed"} for index in range(31)}
+    right = {f"right_{index:02d}": {"status": "denied"} for index in range(31)}
+    merged = main._merge_access_capabilities(
+        {**left, "read_file": {"status": "allowed"}},
+        {**right, "_metadata": {"complete": True}},
+    )
+    assert len(merged) == main.ACCESS_CAPABILITY_MAX_KEYS
+    assert "_metadata" in merged
+    assert "read_file" in merged
+
+
+def test_capability_counter_saturation_preserves_attempted_invariant_and_evidence_classes() -> None:
+    maximum = main.ACCESS_CAPABILITY_MAX_COUNT
+    normalized = main._normalize_access_capabilities(
+        {
+            "read_file": {
+                "attempted": maximum,
+                "allowed": maximum,
+                "denied": maximum,
+                "inconclusive": maximum,
+            }
+        }
+    )["read_file"]
+
+    outcome_total = normalized["allowed"] + normalized["denied"] + normalized["inconclusive"]
+    assert outcome_total == maximum
+    assert normalized["attempted"] >= outcome_total
+    assert normalized["allowed"] > 0
+    assert normalized["denied"] > 0
+    assert normalized["inconclusive"] > 0
+    assert normalized["status"] == "mixed"
+
+
+def test_saturated_capability_merge_is_idempotent_and_replay_order_independent() -> None:
+    maximum = main.ACCESS_CAPABILITY_MAX_COUNT
+    allowed = {"read_file": {"allowed": maximum}}
+    denied = {"read_file": {"denied": maximum}}
+    inconclusive = {"read_file": {"inconclusive": maximum}}
+
+    merged = main._merge_access_capabilities(main._merge_access_capabilities(allowed, denied), inconclusive)
+    replayed = main._merge_access_capabilities(merged, allowed)
+    permuted = main._merge_access_capabilities(
+        main._merge_access_capabilities(inconclusive, allowed),
+        denied,
+    )
+
+    assert replayed == merged
+    assert permuted == merged
+    evidence = merged["read_file"]
+    assert evidence["attempted"] >= evidence["allowed"] + evidence["denied"] + evidence["inconclusive"]
+    assert evidence["status"] == "mixed"
+
+
+def test_upsert_resource_does_not_downgrade_existing_access_or_capability_evidence() -> None:
+    captured: dict[str, object] = {}
+    existing_capabilities = {
+        "read_file": {"status": "allowed", "attempted": 1, "allowed": 1, "denied": 0, "inconclusive": 0},
+        "_metadata": {"coverage": "bounded_sample", "complete": True, "partial": True},
+    }
+
+    class _Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class _Conn:
+        def execute(self, query, params):
+            if "SELECT id, access_level::text" in query:
+                return _Result((9, "readable", existing_capabilities))
+            if "UPDATE resources" in query:
+                captured["query"] = query
+                captured["params"] = params
+                return _Result((9,))
+            raise AssertionError(f"unexpected query: {query}")
+
+    resource_id = main.upsert_resource(
+        _Conn(),
+        "run-1",
+        7,
+        {
+            "resource_type": "smb_share",
+            "name": "Finance",
+            "access_level": "unknown",
+            "access_capabilities": {
+                "read_file": {"status": "not_tested"},
+                "_metadata": {"coverage": "disabled", "complete": False, "partial": True},
+            },
+        },
+    )
+
+    assert resource_id == 9
+    assert captured["params"][1] == "readable"
+    persisted_capabilities = json.loads(captured["params"][2])
+    assert persisted_capabilities["read_file"]["status"] == "allowed"
+    assert persisted_capabilities["_metadata"]["coverage"] == "bounded_sample"
+
+
+def test_write_only_capability_evidence_corrects_stale_no_access_summary() -> None:
+    capabilities = {
+        "list": {"status": "denied", "attempted": 1, "denied": 1},
+        "create_file": {"status": "allowed", "attempted": 1, "allowed": 1},
+    }
+
+    assert main._reconcile_access_level_with_capabilities("no_access", capabilities) == "unknown"
+    assert main._reconcile_access_level_with_capabilities("list_only", capabilities) == "list_only"
+    assert main._reconcile_access_level_with_capabilities("readable", capabilities) == "readable"
+
+    connected_but_not_listable = {
+        "tree_connect": {"status": "allowed", "attempted": 1, "allowed": 1},
+        "list": {"status": "denied", "attempted": 1, "denied": 1},
+    }
+    assert main._reconcile_access_level_with_capabilities("no_access", connected_but_not_listable) == "unknown"
+
+
+def test_capability_evidence_upgrades_legacy_access_summary() -> None:
+    assert main._reconcile_access_level_with_capabilities(
+        "no_access",
+        {"read_file": {"status": "allowed"}},
+    ) == "readable"
+    assert main._reconcile_access_level_with_capabilities(
+        "unknown",
+        {"list": {"status": "mixed"}},
+    ) == "list_only"
 
 
 def test_normalize_smb_signing_accepts_canonical_and_legacy_fields() -> None:
@@ -372,7 +640,12 @@ def test_validate_record_normalizes_optional_item_metadata() -> None:
         "path": "\\report.xlsx",
         "name": "report.xlsx",
         "size_bytes": "1024",
+        "allocation_size_bytes": 4096,
         "mtime": "2026-08-23T12:34:56Z",
+        "created_at": "2026-01-01T00:00:00Z",
+        "accessed_at": "2026-08-24T12:34:56Z",
+        "changed_at": "2026-08-23T13:00:00Z",
+        "file_attributes": ["Archive", "READ-ONLY", "Archive", 123, "x" * 65],
     }
 
     ok, reason = main.validate_record(item_record)
@@ -380,7 +653,12 @@ def test_validate_record_normalizes_optional_item_metadata() -> None:
     assert ok is True
     assert reason is None
     assert item_record["size_bytes"] == 1024
+    assert item_record["allocation_size_bytes"] == 4096
     assert item_record["mtime"].isoformat() == "2026-08-23T12:34:56+00:00"
+    assert item_record["created_at"].isoformat() == "2026-01-01T00:00:00+00:00"
+    assert item_record["accessed_at"].isoformat() == "2026-08-24T12:34:56+00:00"
+    assert item_record["changed_at"].isoformat() == "2026-08-23T13:00:00+00:00"
+    assert item_record["file_attributes"] == ["archive", "read_only"]
 
     item_record.update(size_bytes=-1, mtime="not-a-date")
     main.validate_record(item_record)
@@ -422,13 +700,30 @@ def test_flush_item_batch_upserts_optional_metadata() -> None:
         def cursor(self):
             return _Cursor()
 
-    rows = [("run-1", 7, "\\report.xlsx", "report.xlsx", False, 1024, "2026-08-23T12:34:56Z")]
+    rows = [
+        (
+            "run-1",
+            7,
+            "\\report.xlsx",
+            "report.xlsx",
+            False,
+            1024,
+            4096,
+            "2026-08-23T12:34:56Z",
+            "2026-01-01T00:00:00Z",
+            "2026-08-24T12:34:56Z",
+            "2026-08-23T13:00:00Z",
+            '["archive"]',
+        )
+    ]
     main.flush_item_batch(_Conn(), rows)
 
     assert "size_bytes" in str(captured["query"])
     assert "mtime" in str(captured["query"])
     assert "DO UPDATE SET" in str(captured["query"])
-    assert len(captured["params"][0]) == 7
+    assert "allocation_size_bytes" in str(captured["query"])
+    assert "file_attributes" in str(captured["query"])
+    assert len(captured["params"][0]) == 12
     assert rows == []
 
 
@@ -479,6 +774,7 @@ def test_records_from_nested_json_preserves_share_type() -> None:
 
     assert resource["share_type"] == "nfs"
     assert resource["resource_type"] == "nfs_share"
+    assert resource["access_level"] == "unknown"
     assert item["share_type"] == "nfs"
     assert item["resource_type"] == "nfs_share"
 
@@ -493,12 +789,21 @@ def test_records_from_nested_json_preserves_item_metadata() -> None:
                     "shares": [
                         {
                             "name": "Finance",
+                            "access_level": "readable",
+                            "access_capabilities": {
+                                "read_file": {"status": "allowed", "attempted": 1, "allowed": 1},
+                            },
                             "entries": [
                                 {
                                     "name": "report.xlsx",
                                     "is_dir": False,
                                     "size_bytes": 4096,
+                                    "allocation_size_bytes": 8192,
                                     "mtime": "2026-08-23T12:34:56Z",
+                                    "created_at": "2026-01-01T00:00:00Z",
+                                    "accessed_at": "2026-08-24T12:34:56Z",
+                                    "changed_at": "2026-08-23T13:00:00Z",
+                                    "file_attributes": ["archive"],
                                 }
                             ],
                         }
@@ -509,9 +814,17 @@ def test_records_from_nested_json_preserves_item_metadata() -> None:
         run_id,
     )
 
+    resource = next(record for record in records if record.get("type") == "resource")
     item = next(record for record in records if record.get("type") == "item")
+    assert resource["access_level"] == "readable"
+    assert resource["access_capabilities"]["read_file"]["status"] == "allowed"
     assert item["size_bytes"] == 4096
+    assert item["allocation_size_bytes"] == 8192
     assert item["mtime"] == "2026-08-23T12:34:56Z"
+    assert item["created_at"] == "2026-01-01T00:00:00Z"
+    assert item["accessed_at"] == "2026-08-24T12:34:56Z"
+    assert item["changed_at"] == "2026-08-23T13:00:00Z"
+    assert item["file_attributes"] == ["archive"]
 
 
 def test_records_from_compact_json_includes_run_meta_issue_summary_and_run_end() -> None:

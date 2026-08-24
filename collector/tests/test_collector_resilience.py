@@ -484,8 +484,26 @@ def test_list_share_entries_emits_safe_file_metadata_and_normalizes_extension() 
         def get_filesize(self):
             return 1234
 
-        def get_mtime_epoch(self):
+        def get_allocsize(self):
+            return 4096
+
+        def get_wtime_epoch(self):
             return mtime_epoch
+
+        def get_ctime_epoch(self):
+            return mtime_epoch - 120
+
+        def get_atime_epoch(self):
+            return mtime_epoch + 30
+
+        def get_mtime_epoch(self):
+            return mtime_epoch + 60
+
+        def is_archive(self):
+            return True
+
+        def is_readonly(self):
+            return True
 
     class _Connection:
         def listPath(self, *_args, **_kwargs):
@@ -508,7 +526,63 @@ def test_list_share_entries_emits_safe_file_metadata_and_normalizes_extension() 
             "name": "report.pdf",
             "is_dir": False,
             "size_bytes": 1234,
+            "allocation_size_bytes": 4096,
             "mtime": datetime.fromtimestamp(mtime_epoch, tz=UTC).isoformat(),
+            "created_at": datetime.fromtimestamp(mtime_epoch - 120, tz=UTC).isoformat(),
+            "accessed_at": datetime.fromtimestamp(mtime_epoch + 30, tz=UTC).isoformat(),
+            "changed_at": datetime.fromtimestamp(mtime_epoch + 60, tz=UTC).isoformat(),
+            "file_attributes": ["archive", "read_only"],
+        }
+    ]
+
+
+def test_entry_metadata_suppresses_unset_zero_filetime_timestamps() -> None:
+    collector = _load_collector_module()
+    zero_filetime_epoch = -11_644_473_600
+
+    class _Entry:
+        def get_longname(self):
+            return "placeholder.txt"
+
+        def is_directory(self):
+            return False
+
+        def get_filesize(self):
+            return 0
+
+        def get_wtime_epoch(self):
+            return zero_filetime_epoch
+
+        def get_ctime_epoch(self):
+            return zero_filetime_epoch
+
+        def get_atime_epoch(self):
+            return zero_filetime_epoch
+
+        def get_mtime_epoch(self):
+            return zero_filetime_epoch
+
+    class _Connection:
+        def listPath(self, *_args, **_kwargs):
+            return [_Entry()]
+
+    records = list(
+        collector.list_share_entries(
+            _Connection(),
+            "Reports",
+            max_depth=1,
+            max_entries=10,
+            exclude_path_regex=None,
+            extensions=None,
+        )
+    )
+
+    assert records == [
+        {
+            "path": "\\placeholder.txt",
+            "name": "placeholder.txt",
+            "is_dir": False,
+            "size_bytes": 0,
         }
     ]
 
@@ -602,7 +676,7 @@ def test_nfs_advertised_export_does_not_overstate_access(monkeypatch) -> None:
     ) is True
 
     resource = next(record for record in records if record["type"] == "resource")
-    assert resource["access_level"] == "no_access"
+    assert resource["access_level"] == "unknown"
 
 
 @pytest.mark.parametrize(

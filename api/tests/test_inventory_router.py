@@ -1,6 +1,7 @@
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_session_user
@@ -133,6 +134,47 @@ def test_inventory_saved_investigations_create_list_and_delete(monkeypatch) -> N
     assert delete_response.status_code == 200
     assert delete_response.json() == {"ok": True}
     assert fake_db.deleted == [created]
+
+
+def test_inventory_resources_accepts_unknown_and_exposes_access_capabilities(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    capabilities = {
+        "list": {"status": "allowed", "attempted": 1, "allowed": 1, "denied": 0, "inconclusive": 0},
+        "read_file": {"status": "inconclusive", "attempted": 1, "allowed": 0, "denied": 0, "inconclusive": 1},
+    }
+    fake_db = _FakeDb(
+        execute_queue=[
+            _ExecuteResult(
+                [
+                    SimpleNamespace(
+                        id=7,
+                        run_id=run_id,
+                        run_name="Access probe",
+                        endpoint_key="host:445",
+                        hostname="host",
+                        name="Finance",
+                        remark=None,
+                        access_level="unknown",
+                        access_capabilities=capabilities,
+                        resource_type="smb_share",
+                        item_count=3,
+                    )
+                ]
+            )
+        ]
+    )
+    monkeypatch.setattr(inventory_router, "require_project_role", lambda *_args, **_kwargs: None)
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get(f"/projects/{project_id}/inventory/resources?access_level=unknown")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["access_level"] == "unknown"
+    assert response.json()["items"][0]["access_capabilities"] == capabilities
 
 
 def test_inventory_saved_investigations_update(monkeypatch) -> None:

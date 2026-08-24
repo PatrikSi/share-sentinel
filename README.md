@@ -87,7 +87,7 @@ Project inventory supports three working views:
 - shares
 - endpoints
 
-The page supports guided filters, an optional query DSL, run scoping, and project-shared saved investigations.
+The page supports guided filters, an optional query DSL, run scoping, and project-shared saved investigations. SMB results distinguish observed listing, file-read, create-file, create-directory, modify, delete, ACL-change, and ownership-change capabilities instead of treating every listable share as equally readable.
 
 ### Run explorer
 
@@ -147,6 +147,8 @@ See the [deployment guide](./docs/deployment.md) for the production configuratio
 - Ingest is asynchronous. Runs can stay in `UPLOADED` or `INGESTING` while the worker is catching up.
 - Retryable ingest failures are rescheduled with backoff, but terminal parser or data-shape failures still land the run in `FAILED`.
 - MFA, SSO, and SCIM are not implemented.
+- SMB capability checks are bounded observations made with the scan identity, not a guarantee for every object or for future writes. They request rights on existing handles without creating or modifying content; quotas, read-only storage, security products, and object-specific ACLs can still affect a later operation.
+- NFS collection currently discovers advertised exports but does not mount them, so NFS access remains `unknown` unless a richer external artifact supplies evidence.
 - The project is best treated as actively evolving rather than as a locked compatibility surface.
 
 ## Documentation

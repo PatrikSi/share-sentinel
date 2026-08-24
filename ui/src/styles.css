@@ -1081,6 +1081,132 @@ body {
   @apply bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200;
 }
 
+.inventory-access-cell {
+  @apply min-w-[260px] items-start;
+}
+
+.inventory-access-content {
+  @apply min-w-0 flex-1;
+}
+
+.inventory-access-summary {
+  @apply flex min-w-0 flex-wrap items-center gap-1;
+}
+
+.inventory-access-state {
+  @apply inline-flex flex-none items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold;
+}
+
+.inventory-access-state-icon {
+  @apply inline-flex h-3.5 min-w-3.5 items-center justify-center rounded-sm border border-current px-0.5 font-mono text-[9px] leading-none;
+}
+
+.inventory-access-scope {
+  @apply whitespace-nowrap text-[10px] font-medium text-slate-500 dark:text-slate-400;
+}
+
+.inventory-access-state.is-neutral {
+  @apply bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200;
+}
+
+.inventory-access-state.is-positive {
+  @apply bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200;
+}
+
+.inventory-access-state.is-warning {
+  @apply bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100;
+}
+
+.inventory-access-state.is-negative {
+  @apply bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-200;
+}
+
+.inventory-capability-chip,
+.inventory-capability-more {
+  @apply inline-flex flex-none items-center gap-1 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[10px] font-medium text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200;
+}
+
+.inventory-capability-chip.is-mixed {
+  @apply border-amber-400 bg-amber-50 text-amber-900 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-100;
+}
+
+.inventory-capability-more {
+  @apply font-semibold text-slate-500 dark:text-slate-400;
+}
+
+.inventory-access-evidence {
+  @apply w-fit max-w-full text-xs;
+}
+
+.inventory-access-evidence[open] {
+  @apply mt-1 basis-full;
+}
+
+.inventory-access-evidence > summary {
+  @apply inline-flex cursor-pointer list-none items-center gap-1 rounded px-1 py-0.5 text-[10px] font-semibold text-slate-500 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white;
+}
+
+.inventory-access-evidence > summary::-webkit-details-marker {
+  display: none;
+}
+
+.inventory-access-evidence > summary::before {
+  content: "▸";
+}
+
+.inventory-access-evidence[open] > summary::before {
+  content: "▾";
+}
+
+.inventory-access-evidence > ul {
+  @apply mt-1 grid min-w-[280px] max-w-[400px] gap-px overflow-hidden rounded-md border bg-slate-200 dark:bg-slate-700;
+  border-color: var(--app-border);
+}
+
+.inventory-access-evidence li {
+  @apply grid grid-cols-[16px_minmax(108px,1fr)_auto] items-center gap-x-1.5 bg-white px-2 py-1 text-[11px] dark:bg-slate-900;
+}
+
+.inventory-capability-status-icon {
+  @apply inline-flex h-3.5 w-3.5 items-center justify-center rounded-sm border border-current font-mono text-[9px] leading-none text-slate-500 dark:text-slate-400;
+}
+
+.inventory-capability-name {
+  @apply font-medium text-slate-700 dark:text-slate-200;
+}
+
+.inventory-access-evidence li > strong {
+  @apply whitespace-nowrap text-[10px] font-semibold text-slate-600 dark:text-slate-300;
+}
+
+.inventory-access-evidence li > small {
+  @apply col-start-2 col-end-4 min-w-0 break-words text-[10px] leading-4 text-slate-500 dark:text-slate-400;
+}
+
+.inventory-access-evidence li.is-allowed .inventory-capability-status-icon,
+.inventory-access-evidence li.is-allowed > strong {
+  @apply text-emerald-700 dark:text-emerald-300;
+}
+
+.inventory-access-evidence li.is-denied .inventory-capability-status-icon,
+.inventory-access-evidence li.is-denied > strong {
+  @apply text-rose-700 dark:text-rose-300;
+}
+
+.inventory-access-evidence li.is-mixed .inventory-capability-status-icon,
+.inventory-access-evidence li.is-mixed > strong {
+  @apply text-amber-700 dark:text-amber-300;
+}
+
+.inventory-access-evidence li.is-inconclusive .inventory-capability-status-icon,
+.inventory-access-evidence li.is-inconclusive > strong {
+  @apply text-violet-700 dark:text-violet-300;
+}
+
+.inventory-access-evidence li.inventory-capability-metadata {
+  @apply bg-slate-50 dark:bg-slate-950;
+}
+
 .inventory-cell-actions {
   @apply ml-auto flex flex-none items-center gap-0.5 rounded border border-slate-200 bg-white p-0.5 opacity-0 shadow-sm transition-opacity dark:border-slate-700 dark:bg-slate-900;
 }

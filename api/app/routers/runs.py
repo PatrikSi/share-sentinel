@@ -1254,6 +1254,7 @@ def endpoint_resources(
                 "name": r.name,
                 "remark": r.remark,
                 "access_level": r.access_level.value if hasattr(r.access_level, "value") else r.access_level,
+                "access_capabilities": r.access_capabilities or {},
             }
             for r in resources
         ]
@@ -1315,7 +1316,12 @@ def resource_items(
                 "name": i.name,
                 "is_dir": i.is_dir,
                 "size_bytes": i.size_bytes,
+                "allocation_size_bytes": i.allocation_size_bytes,
                 "mtime": i.mtime.isoformat() if i.mtime else None,
+                "created_at": i.created_at.isoformat() if i.created_at else None,
+                "accessed_at": i.accessed_at.isoformat() if i.accessed_at else None,
+                "changed_at": i.changed_at.isoformat() if i.changed_at else None,
+                "file_attributes": i.file_attributes or [],
             }
             for i in items
         ],
@@ -1371,7 +1377,12 @@ def search_items(
                 "name": i.name,
                 "is_dir": i.is_dir,
                 "size_bytes": i.size_bytes,
+                "allocation_size_bytes": i.allocation_size_bytes,
                 "mtime": i.mtime.isoformat() if i.mtime else None,
+                "created_at": i.created_at.isoformat() if i.created_at else None,
+                "accessed_at": i.accessed_at.isoformat() if i.accessed_at else None,
+                "changed_at": i.changed_at.isoformat() if i.changed_at else None,
+                "file_attributes": i.file_attributes or [],
             }
             for i in items
         ],

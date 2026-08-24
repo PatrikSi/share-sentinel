@@ -142,6 +142,7 @@ class Resource(Base):
     name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     remark: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     access_level: Mapped[AccessLevel] = mapped_column(value_enum(AccessLevel, name="access_level"), nullable=False)
+    access_capabilities: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
 
 
 class Item(Base):
@@ -159,7 +160,12 @@ class Item(Base):
     name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     is_dir: Mapped[bool] = mapped_column(sa.Boolean, nullable=False)
     size_bytes: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
+    allocation_size_bytes: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
     mtime: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    accessed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    changed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    file_attributes: Mapped[list[str]] = mapped_column(JSONB, nullable=False, server_default=sa.text("'[]'::jsonb"))
 
 
 class IngestError(Base):

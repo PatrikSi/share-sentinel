@@ -17,6 +17,8 @@ The project follows a simple release-first workflow:
 - `docker-compose.dev.yml` for local source builds and a root-level `bootstrap.sh` that generates and validates development or production environment files.
 - A compact enterprise inventory workspace with URL-backed filters, saved views, configurable columns and density, value include/exclude actions, keyboard shortcuts, clearer partial-ingest state, and optional file size/modified-time columns.
 - Collector progress, verbosity and quiet modes, truthful processed/remaining counters, bounded upload retries, interruption-safe partial artifacts, and streaming schema-v1 NDJSON output for large scans.
+- Bounded, non-mutating SMB access probes for tree connection, directory listing, file reads, file and directory creation rights, existing-file modification, deletion, ACL changes, and ownership changes, with explicit allowed, denied, mixed, inconclusive, and not-tested evidence.
+- Optional SMB allocation size, creation time, last-access time, metadata-change time, and file-attribute inventory fields.
 
 ### Changed
 
@@ -33,6 +35,13 @@ The project follows a simple release-first workflow:
 - Worker retries now expose scheduled activity and bounded backoff, resume without downgrading existing share access, reject oversized or invalidly encoded records, and derive final counts from persisted inventory.
 - Database passwords are passed through libpq rather than embedded in URLs, so URL-reserved characters render safely in Compose.
 - The UI runtime now runs as UID/GID `10001:10001`; Python linting is enforced in both main-branch and tag-release workflows.
+- Share access now starts as unknown and upgrades monotonically from observed evidence; inventory and run-explorer views expose compact capability summaries and expandable probe evidence, while preserving the legacy access summary for compatible filters and artifacts.
+- SMB `mtime` now uses the server's last-write timestamp instead of Impacket's metadata-change timestamp.
+
+### Operator notes
+
+- Migration `0008` adds the `unknown` access state, per-resource capability evidence, and optional item metadata columns. The bootstrap service applies it before the API and worker start.
+- Access probes use `FILE_OPEN` on existing SMB objects and never create, modify, delete, take ownership of, or rewrite ACLs. They can still generate ordinary SMB and authorization audit telemetry and may update server-side last-access accounting.
 
 ## [0.2.0] - 2026-07-16
 

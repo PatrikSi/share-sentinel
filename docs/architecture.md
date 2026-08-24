@@ -79,6 +79,8 @@ The bundled collector is an external producer. It can write a compatible artifac
 
 The collector scans SMB and NFS targets and writes schema-v1 NDJSON by default, optionally gzip-compressed based on the output suffix. NDJSON records are spooled incrementally so one endpoint tree does not need to be rebuilt in memory; after collection finishes, the finalized artifact is streamed from disk during upload. Explicit `.json` and `.json.gz` outputs remain available as bounded compact-format compatibility exports.
 
+For SMB, each resource keeps a compatibility `access_level` plus independent observed-capability evidence. Directory listing provides list evidence; bounded handle opens request narrow rights for file reading, file/directory creation, existing-file modification, deletion, ACL changes, and ownership changes. The collector always uses `FILE_OPEN` against existing objects and closes the handle without performing the requested mutation. Authorization denials, transient/inconclusive failures, and untested capabilities remain distinct. NFS export discovery does not imply mount or content access and is therefore recorded as unknown.
+
 ### 2. Upload
 
 An operator or the collector creates a run, uploads the artifact, and the API:
@@ -94,7 +96,7 @@ The worker consumes the queued job, opens the artifact, parses the records, and 
 
 - endpoints
 - resources
-- items
+- items, including optional size, allocation, timestamp, and file-attribute metadata
 - ingest errors
 
 The worker updates `scan_runs.summary` and `scan_runs.ingest_progress` as it goes.

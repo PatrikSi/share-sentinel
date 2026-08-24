@@ -89,7 +89,8 @@ Main UX patterns:
 - active filter chips with individual removal and a clear-all action
 - server-backed equals and exclude shortcuts on supported table values, plus copy-exact-value actions
 - a free-text DSL editor with examples, validation, and apply/clear actions
-- column pickers, compact/comfortable density, sticky headers, and optional Size and Modified columns
+- column pickers, compact/comfortable density, sticky headers, and optional size, allocation, timestamp, and file-attribute columns
+- compact observed-access summaries with expandable per-capability evidence; write/control observations remain visible even when a drop-box-style share denies listing
 - explicit loading, no-match, request-error, and partial-ingest states; failed requests do not relabel old rows as current results
 - complete filter, tab, query, and eligible run context in the URL for refreshes and shareable links
 
@@ -124,7 +125,7 @@ What each tab is for:
 
 Run-scoped saved search presets are browser-local and separate from project-shared inventory investigations.
 
-Run artifact provenance includes content type, size, and a copyable SHA-256 when supplied by the API. Item views format collected size and modification timestamps when present.
+Run artifact provenance includes content type, size, and a copyable SHA-256 when supplied by the API. The run explorer shows the same compact, expandable share-access evidence as project inventory. Item views format collected size and modification timestamps when present. Project inventory additionally exposes optional allocation size, creation, last-access, metadata-change, and file-attribute columns.
 
 ## Settings
 

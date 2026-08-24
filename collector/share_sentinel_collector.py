@@ -30,9 +30,42 @@ import requests
 
 try:
     from impacket.nmb import NetBIOSError, NetBIOSTimeout
+    from impacket.smb3structs import (
+        DELETE,
+        FILE_ADD_FILE,
+        FILE_ADD_SUBDIRECTORY,
+        FILE_DELETE_CHILD,
+        FILE_DIRECTORY_FILE,
+        FILE_NON_DIRECTORY_FILE,
+        FILE_OPEN,
+        FILE_READ_DATA,
+        FILE_SHARE_DELETE,
+        FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+        FILE_WRITE_DATA,
+        WRITE_DAC,
+        WRITE_OWNER,
+    )
     from impacket.smbconnection import SessionError, SMBConnection
 except ImportError:
     SMBConnection = None
+
+    # Keep tests, help, and dependency diagnostics usable without Impacket. The
+    # values come from MS-SMB2 and match Impacket's smb3structs constants.
+    FILE_READ_DATA = 0x00000001
+    FILE_WRITE_DATA = 0x00000002
+    FILE_ADD_FILE = 0x00000002
+    FILE_ADD_SUBDIRECTORY = 0x00000004
+    FILE_DELETE_CHILD = 0x00000040
+    DELETE = 0x00010000
+    WRITE_DAC = 0x00040000
+    WRITE_OWNER = 0x00080000
+    FILE_DIRECTORY_FILE = 0x00000001
+    FILE_NON_DIRECTORY_FILE = 0x00000040
+    FILE_OPEN = 0x00000001
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
 
     class SessionError(Exception):
         """Fallback error type used when impacket is unavailable."""
@@ -66,6 +99,40 @@ SUPPORTED_ARTIFACT_SUFFIXES = (
     ".jsonl.gz",
 )
 UPLOAD_RETRIABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+SMB_CAPABILITY_NAMES = (
+    "tree_connect",
+    "list",
+    "read_file",
+    "create_file",
+    "create_directory",
+    "modify_file",
+    "delete",
+    "write_acl",
+    "write_owner",
+)
+SMB_CAPABILITY_OUTCOMES = frozenset({"allowed", "denied", "inconclusive"})
+SMB1_DENIED_ERROR_PAIRS = frozenset(
+    {
+        (0x01, 0x0005),  # ERRDOS/ERRnoaccess
+        (0x02, 0x0004),  # ERRSRV/ERRaccess
+    }
+)
+SMB_DENIED_STATUS_CODES = frozenset(
+    {
+        0xC0000022,  # STATUS_ACCESS_DENIED
+        0xC00000CA,  # STATUS_NETWORK_ACCESS_DENIED
+        0xC0000061,  # STATUS_PRIVILEGE_NOT_HELD
+        0xC00000A2,  # STATUS_MEDIA_WRITE_PROTECTED
+        0xC0000121,  # STATUS_CANNOT_DELETE
+    }
+)
+SMB_DENIED_STATUS_LABELS = (
+    "STATUS_ACCESS_DENIED",
+    "STATUS_NETWORK_ACCESS_DENIED",
+    "STATUS_PRIVILEGE_NOT_HELD",
+    "STATUS_MEDIA_WRITE_PROTECTED",
+    "STATUS_CANNOT_DELETE",
+)
 
 
 @dataclass
@@ -85,6 +152,13 @@ class ScanOutcome:
     host_failures: int
     interrupted: bool = False
     targets_cancelled: int = 0
+
+
+@dataclass
+class _SMBProbeCircuit:
+    """Share-scoped circuit breaker for explicit handle probes."""
+
+    transport_failed: bool = False
 
 
 class _ScanCancelled:
@@ -564,9 +638,11 @@ class NDJSONWriter:
                             "share_type": share_type,
                             "resource_type": record.get("resource_type"),
                             "remark": record.get("remark"),
-                            "access_level": record.get("access_level", "no_access"),
+                            "access_level": record.get("access_level", "unknown"),
                             "entries": [],
                         }
+                        if isinstance(record.get("access_capabilities"), dict):
+                            share_doc["access_capabilities"] = record["access_capabilities"]
                         share_states[share_key] = {
                             "doc": share_doc,
                             "index": {},
@@ -574,7 +650,12 @@ class NDJSONWriter:
                         share_order.append(share_key)
                     else:
                         share_doc = share_states[share_key]["doc"]
-                        for field_name in ("resource_type", "remark", "access_level"):
+                        for field_name in (
+                            "resource_type",
+                            "remark",
+                            "access_level",
+                            "access_capabilities",
+                        ):
                             if record.get(field_name) is not None:
                                 share_doc[field_name] = record[field_name]
                     continue
@@ -592,7 +673,7 @@ class NDJSONWriter:
                             "share_type": share_type,
                             "resource_type": record.get("resource_type"),
                             "remark": None,
-                            "access_level": "no_access",
+                            "access_level": "unknown",
                             "entries": [],
                         }
                         share_state = {
@@ -652,10 +733,17 @@ class NDJSONWriter:
                 node["path"] = parent_path
                 node["name"] = leaf_name
                 node["is_dir"] = bool(record.get("is_dir", False))
-                if record.get("size_bytes") is not None:
-                    node["size_bytes"] = record["size_bytes"]
-                if record.get("mtime") is not None:
-                    node["mtime"] = record["mtime"]
+                for metadata_field in (
+                    "size_bytes",
+                    "allocation_size_bytes",
+                    "mtime",
+                    "created_at",
+                    "accessed_at",
+                    "changed_at",
+                    "file_attributes",
+                ):
+                    if record.get(metadata_field) is not None:
+                        node[metadata_field] = record[metadata_field]
                 if node["is_dir"]:
                     node.setdefault("children", [])
                 else:
@@ -838,6 +926,15 @@ def _build_parser() -> argparse.ArgumentParser:
     tuning.add_argument("--max-depth", type=int, default=1, help="Max directory traversal depth per share.")
     tuning.add_argument("--max-entries-per-share", type=int, default=5000, help="Cap listed entries per share/export.")
     tuning.add_argument(
+        "--access-probe-limit",
+        type=int,
+        default=3,
+        help=(
+            "Maximum discovered directories and files sampled per SMB share for non-mutating access probes "
+            "(0 disables explicit handle probes; directory listing evidence is still recorded)."
+        ),
+    )
+    tuning.add_argument(
         "--include-share",
         action="append",
         default=[],
@@ -1009,25 +1106,471 @@ def normalize_path(base: str, child: str) -> str:
     return joined if joined.startswith("\\") else f"\\{joined}"
 
 
+def _new_access_capabilities() -> dict[str, dict[str, object]]:
+    return {
+        capability: {
+            "status": "not_tested",
+            "attempted": 0,
+            "allowed": 0,
+            "denied": 0,
+            "inconclusive": 0,
+        }
+        for capability in SMB_CAPABILITY_NAMES
+    }
+
+
+def _capability_status(evidence: dict[str, object]) -> str:
+    allowed = int(evidence.get("allowed", 0))
+    denied = int(evidence.get("denied", 0))
+    inconclusive = int(evidence.get("inconclusive", 0))
+    if allowed and denied:
+        return "mixed"
+    if allowed:
+        return "allowed"
+    if denied:
+        return "denied"
+    if inconclusive:
+        return "inconclusive"
+    return "not_tested"
+
+
+def _record_capability(
+    capabilities: dict[str, dict[str, object]],
+    capability: str,
+    outcome: str,
+) -> None:
+    if capability not in capabilities or outcome not in SMB_CAPABILITY_OUTCOMES:
+        return
+    evidence = capabilities[capability]
+    evidence["attempted"] = int(evidence.get("attempted", 0)) + 1
+    evidence[outcome] = int(evidence.get(outcome, 0)) + 1
+    evidence["status"] = _capability_status(evidence)
+
+
+def _access_capability_snapshot(
+    capabilities: dict[str, dict[str, object]],
+    *,
+    probe_limit: int = 0,
+    partial: bool = True,
+    complete: bool = False,
+    directory_samples: int = 0,
+    file_samples: int = 0,
+    directory_candidates_seen: int = 0,
+    file_candidates_seen: int = 0,
+    listing_truncated: bool = False,
+) -> dict[str, dict[str, object]]:
+    snapshot = {
+        capability: {
+            "status": str(evidence.get("status") or "not_tested"),
+            "attempted": int(evidence.get("attempted", 0)),
+            "allowed": int(evidence.get("allowed", 0)),
+            "denied": int(evidence.get("denied", 0)),
+            "inconclusive": int(evidence.get("inconclusive", 0)),
+        }
+        for capability, evidence in capabilities.items()
+    }
+    snapshot["_metadata"] = {
+        "probe_method": "non_mutating_handle_open",
+        "coverage": "bounded_sample" if probe_limit > 0 else "disabled",
+        "probe_limit": max(0, probe_limit),
+        "partial": bool(partial),
+        "complete": bool(complete),
+        "directory_samples": max(0, directory_samples),
+        "file_samples": max(0, file_samples),
+        "directory_candidates_seen": max(0, directory_candidates_seen),
+        "file_candidates_seen": max(0, file_candidates_seen),
+        "listing_truncated": bool(listing_truncated),
+    }
+    return snapshot
+
+
+def _legacy_access_level(capabilities: dict[str, dict[str, object]]) -> str:
+    if int(capabilities["read_file"].get("allowed", 0)) > 0:
+        return "readable"
+    if int(capabilities["list"].get("allowed", 0)) > 0:
+        return "list_only"
+
+    any_allowed = any(
+        int(capabilities[name].get("allowed", 0)) > 0
+        for name in SMB_CAPABILITY_NAMES
+    )
+    tree_connect_denied = int(capabilities["tree_connect"].get("denied", 0)) > 0
+    if tree_connect_denied and not any_allowed:
+        return "no_access"
+    return "unknown"
+
+
+def _smb_probe_outcome(exc: BaseException) -> str:
+    status_code = None
+    get_error_code = getattr(exc, "getErrorCode", None)
+    if callable(get_error_code):
+        try:
+            status_code = int(get_error_code())
+        except Exception:
+            status_code = None
+    legacy_error_pair: tuple[int, int] | None = None
+    get_error_packet = getattr(exc, "getErrorPacket", None)
+    if callable(get_error_packet):
+        try:
+            error_packet = get_error_packet()
+        except Exception:
+            error_packet = None
+        if error_packet is not None:
+            try:
+                # Impacket's SMB1 NewSMBPacket is a Structure with mapping
+                # fields, not the accessor methods exposed by SessionError.
+                legacy_error_pair = (
+                    int(error_packet["ErrorClass"]),  # type: ignore[index]
+                    int(error_packet["ErrorCode"]),  # type: ignore[index]
+                )
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+                get_error_class = getattr(error_packet, "get_error_class", None)
+                get_legacy_error_code = getattr(error_packet, "get_error_code", None)
+                if callable(get_error_class) and callable(get_legacy_error_code):
+                    try:
+                        legacy_error_pair = (
+                            int(get_error_class()),
+                            int(get_legacy_error_code()),
+                        )
+                    except Exception:
+                        legacy_error_pair = None
+                else:
+                    legacy_error_pair = None
+
+    if legacy_error_pair in SMB1_DENIED_ERROR_PAIRS or status_code in SMB_DENIED_STATUS_CODES:
+        return "denied"
+
+    detail = _error_detail(exc).upper()
+    if any(label in detail for label in SMB_DENIED_STATUS_LABELS):
+        return "denied"
+    return "inconclusive"
+
+
+def _is_smb_transport_failure(exc: BaseException) -> bool:
+    # Impacket reports server-side SMB status errors as SessionError. Its other
+    # network exceptions mean the session itself is no longer reliable enough
+    # to multiply the timeout across every remaining access-mask probe.
+    if isinstance(exc, SessionError):
+        return False
+    return isinstance(
+        exc,
+        (NetBIOSError, NetBIOSTimeout, socket.timeout, TimeoutError, OSError),
+    )
+
+
+def _smb_handle_path(path: str) -> str:
+    return str(path or "").replace("/", "\\").strip("\\")
+
+
+def _probe_smb_handle_access(
+    conn: SMBConnection,
+    tree_id: object,
+    path: str,
+    *,
+    is_directory: bool,
+    desired_access: int,
+    capability: str,
+    capabilities: dict[str, dict[str, object]],
+    cancel_event: threading.Event | None,
+    probe_circuit: _SMBProbeCircuit | None = None,
+) -> None:
+    if (
+        (cancel_event is not None and cancel_event.is_set())
+        or (probe_circuit is not None and probe_circuit.transport_failed)
+    ):
+        return
+    open_file = getattr(conn, "openFile", None)
+    if not callable(open_file):
+        return
+
+    file_id = None
+    try:
+        file_id = open_file(
+            tree_id,
+            _smb_handle_path(path),
+            desiredAccess=desired_access,
+            shareMode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            creationOption=FILE_DIRECTORY_FILE if is_directory else FILE_NON_DIRECTORY_FILE,
+            creationDisposition=FILE_OPEN,
+        )
+    except (SessionError, NetBIOSError, NetBIOSTimeout, socket.timeout, TimeoutError, OSError) as exc:
+        _record_capability(capabilities, capability, _smb_probe_outcome(exc))
+        if probe_circuit is not None and _is_smb_transport_failure(exc):
+            probe_circuit.transport_failed = True
+        return
+
+    _record_capability(capabilities, capability, "allowed")
+    close_file = getattr(conn, "closeFile", None)
+    if callable(close_file) and file_id is not None:
+        try:
+            close_file(tree_id, file_id)
+        except Exception:
+            # The requested access was conclusively granted. Session cleanup and
+            # the final logoff still provide bounded recovery if handle close fails.
+            pass
+
+
+def _probe_smb_directory_access(
+    conn: SMBConnection,
+    tree_id: object,
+    path: str,
+    capabilities: dict[str, dict[str, object]],
+    cancel_event: threading.Event | None,
+    probe_circuit: _SMBProbeCircuit | None = None,
+) -> None:
+    for capability, desired_access in (
+        ("create_file", FILE_ADD_FILE),
+        ("create_directory", FILE_ADD_SUBDIRECTORY),
+        ("delete", FILE_DELETE_CHILD),
+        ("write_acl", WRITE_DAC),
+        ("write_owner", WRITE_OWNER),
+    ):
+        _probe_smb_handle_access(
+            conn,
+            tree_id,
+            path,
+            is_directory=True,
+            desired_access=desired_access,
+            capability=capability,
+            capabilities=capabilities,
+            cancel_event=cancel_event,
+            probe_circuit=probe_circuit,
+        )
+        if probe_circuit is not None and probe_circuit.transport_failed:
+            break
+
+
+def _probe_smb_file_access(
+    conn: SMBConnection,
+    tree_id: object,
+    path: str,
+    capabilities: dict[str, dict[str, object]],
+    cancel_event: threading.Event | None,
+    probe_circuit: _SMBProbeCircuit | None = None,
+) -> None:
+    for capability, desired_access in (
+        ("read_file", FILE_READ_DATA),
+        ("modify_file", FILE_WRITE_DATA),
+        ("delete", DELETE),
+    ):
+        _probe_smb_handle_access(
+            conn,
+            tree_id,
+            path,
+            is_directory=False,
+            desired_access=desired_access,
+            capability=capability,
+            capabilities=capabilities,
+            cancel_event=cancel_event,
+            probe_circuit=probe_circuit,
+        )
+        if probe_circuit is not None and probe_circuit.transport_failed:
+            break
+
+
+def _entry_timestamp(entry: object, method_name: str) -> str | None:
+    method = getattr(entry, method_name, None)
+    if not callable(method):
+        return None
+    try:
+        epoch = float(method())
+        # A zero Windows FILETIME converts to 1601-01-01. Directory listings
+        # commonly use it to mean "unset", so do not publish it as real data.
+        if epoch <= -11_644_473_600:
+            return None
+        value = datetime.fromtimestamp(epoch, tz=UTC)
+    except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+        return None
+    return value.isoformat()
+
+
 def _entry_metadata(entry: object, *, is_dir: bool) -> dict[str, object]:
     metadata: dict[str, object] = {}
     if not is_dir:
         try:
             size_bytes = int(entry.get_filesize())  # type: ignore[attr-defined]
-        except (AttributeError, OverflowError, TypeError, ValueError):
+        except (AttributeError, OSError, OverflowError, TypeError, ValueError):
             pass
         else:
             if size_bytes >= 0:
                 metadata["size_bytes"] = size_bytes
+        try:
+            allocation_size = int(entry.get_allocsize())  # type: ignore[attr-defined]
+        except (AttributeError, OverflowError, TypeError, ValueError):
+            pass
+        else:
+            if allocation_size >= 0:
+                metadata["allocation_size_bytes"] = allocation_size
 
-    try:
-        mtime_epoch = float(entry.get_mtime_epoch())  # type: ignore[attr-defined]
-        mtime = datetime.fromtimestamp(mtime_epoch, tz=UTC)
-    except (AttributeError, OSError, OverflowError, TypeError, ValueError):
-        pass
-    else:
-        metadata["mtime"] = mtime.isoformat()
+    timestamp_methods = (
+        ("mtime", "get_wtime_epoch"),
+        ("created_at", "get_ctime_epoch"),
+        ("accessed_at", "get_atime_epoch"),
+        ("changed_at", "get_mtime_epoch"),
+    )
+    for field_name, method_name in timestamp_methods:
+        value = _entry_timestamp(entry, method_name)
+        if value is not None:
+            metadata[field_name] = value
+
+    attribute_methods = (
+        ("archive", "is_archive"),
+        ("compressed", "is_compressed"),
+        ("hidden", "is_hidden"),
+        ("read_only", "is_readonly"),
+        ("system", "is_system"),
+        ("temporary", "is_temporary"),
+    )
+    attributes: list[str] = []
+    for label, method_name in attribute_methods:
+        method = getattr(entry, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            if bool(method()):
+                attributes.append(label)
+        except (AttributeError, OSError, TypeError, ValueError):
+            continue
+    if attributes:
+        metadata["file_attributes"] = attributes
     return metadata
+
+
+def _discover_smb_probe_candidates(
+    conn: SMBConnection,
+    share_name: str,
+    *,
+    directory_seeds: list[str],
+    directory_samples: list[str],
+    file_samples: list[str],
+    probe_limit: int,
+    max_entries: int,
+    exclude_path_regex: re.Pattern[str] | None,
+    already_listed_paths: set[str],
+    on_list_error=None,
+    on_list_success=None,
+    cancel_event: threading.Event | None = None,
+    probe_circuit: _SMBProbeCircuit | None = None,
+) -> tuple[int, int, bool, int]:
+    """Find bounded file samples below directories excluded by inventory depth.
+
+    The helper never emits inventory records and never opens or mutates an
+    object. Both directory listing attempts and inspected entries are capped so
+    sparse or cyclic-looking namespaces cannot turn capability sampling into an
+    unbounded traversal.
+    """
+
+    if probe_limit <= 0 or max_entries <= 0 or len(file_samples) >= probe_limit:
+        return 0, 0, False, 0
+
+    queue: collections.deque[str] = collections.deque()
+    queued_paths: set[str] = set()
+    for raw_path in directory_seeds:
+        path = normalize_path("", _smb_handle_path(raw_path))
+        path_key = _smb_handle_path(path).casefold()
+        if (
+            not path_key
+            or path_key in already_listed_paths
+            or path_key in queued_paths
+            or (exclude_path_regex is not None and exclude_path_regex.search(path))
+        ):
+            continue
+        queue.append(path)
+        queued_paths.add(path_key)
+
+    directory_sample_keys = {
+        _smb_handle_path(path).casefold() for path in directory_samples
+    }
+    file_sample_keys = {_smb_handle_path(path).casefold() for path in file_samples}
+    directory_candidates_seen = 0
+    file_candidates_seen = 0
+    directory_attempts = 0
+    inspected = 0
+    limit_reached = False
+
+    while (
+        queue
+        and directory_attempts < probe_limit
+        and inspected < max_entries
+        and len(file_samples) < probe_limit
+    ):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+
+        directory_path = queue.popleft()
+        directory_key = _smb_handle_path(directory_path).casefold()
+        if directory_key in already_listed_paths:
+            continue
+        directory_attempts += 1
+        wildcard = f"{_smb_handle_path(directory_path)}\\*"
+
+        try:
+            entries = conn.listPath(share_name, wildcard)
+        except (SessionError, NetBIOSError, NetBIOSTimeout, socket.timeout, TimeoutError, OSError) as exc:
+            if on_list_error is not None:
+                try:
+                    on_list_error(directory_path, exc)
+                except Exception:
+                    pass
+            if _is_smb_transport_failure(exc):
+                if probe_circuit is not None:
+                    probe_circuit.transport_failed = True
+                break
+            continue
+
+        already_listed_paths.add(directory_key)
+        if on_list_success is not None:
+            try:
+                on_list_success(directory_path)
+            except Exception:
+                pass
+
+        for entry in entries:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            name = entry.get_longname()
+            if name in {".", ".."}:
+                continue
+            if inspected >= max_entries:
+                limit_reached = True
+                break
+            inspected += 1
+
+            full_path = normalize_path(directory_path, name)
+            if exclude_path_regex is not None and exclude_path_regex.search(full_path):
+                continue
+
+            is_directory = bool(entry.is_directory())
+            path_key = _smb_handle_path(full_path).casefold()
+            if is_directory:
+                directory_candidates_seen += 1
+                if len(directory_samples) < probe_limit and path_key not in directory_sample_keys:
+                    directory_samples.append(full_path)
+                    directory_sample_keys.add(path_key)
+                if (
+                    path_key not in already_listed_paths
+                    and path_key not in queued_paths
+                    and directory_attempts + len(queue) < probe_limit
+                ):
+                    queue.append(full_path)
+                    queued_paths.add(path_key)
+                continue
+
+            file_candidates_seen += 1
+            if path_key not in file_sample_keys:
+                file_samples.append(full_path)
+                file_sample_keys.add(path_key)
+            if len(file_samples) >= probe_limit:
+                break
+
+    if (
+        not limit_reached
+        and inspected >= max_entries
+        and queue
+        and len(file_samples) < probe_limit
+    ):
+        limit_reached = True
+    return directory_candidates_seen, file_candidates_seen, limit_reached, inspected
 
 
 def list_share_entries(
@@ -1040,6 +1583,8 @@ def list_share_entries(
     on_list_error=None,
     on_limit_reached=None,
     on_list_success=None,
+    on_probe_candidate=None,
+    on_probe_directory_seed=None,
     cancel_event: threading.Event | None = None,
 ):
     queue = collections.deque([("", 0)])
@@ -1061,6 +1606,8 @@ def list_share_entries(
                     on_list_error(rel_path or "\\", exc)
                 except Exception:
                     pass
+            if _is_smb_transport_failure(exc):
+                break
             continue
 
         if on_list_success is not None:
@@ -1108,6 +1655,11 @@ def list_share_entries(
                 continue
 
             is_dir = bool(entry.is_directory())
+            if on_probe_candidate is not None:
+                try:
+                    on_probe_candidate(full_path, is_dir)
+                except Exception:
+                    pass
             if extensions and not is_dir:
                 suffix = os.path.splitext(name)[1].lower()
                 if suffix not in extensions:
@@ -1123,8 +1675,14 @@ def list_share_entries(
                 **_entry_metadata(entry, is_dir=is_dir),
             }
 
-            if is_dir and depth + 1 < max_depth:
-                queue.append((full_path.strip("\\"), depth + 1))
+            if is_dir:
+                if depth + 1 < max_depth:
+                    queue.append((full_path.strip("\\"), depth + 1))
+                elif on_probe_directory_seed is not None:
+                    try:
+                        on_probe_directory_seed(full_path)
+                    except Exception:
+                        pass
             if _finish_at_cap():
                 break
 
@@ -1323,6 +1881,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     timeout = float(getattr(args, "timeout", 1.0))
     max_depth = int(getattr(args, "max_depth", 1))
     max_entries_per_share = int(getattr(args, "max_entries_per_share", 1))
+    access_probe_limit = int(getattr(args, "access_probe_limit", 3))
     max_targets = int(getattr(args, "max_targets", 65536))
     progress_interval = float(getattr(args, "progress_interval", 5.0))
     upload_timeout = float(getattr(args, "upload_timeout", 600.0))
@@ -1432,6 +1991,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--max-depth must be greater than zero")
     if max_entries_per_share <= 0:
         raise SystemExit("--max-entries-per-share must be greater than zero")
+    if access_probe_limit < 0 or access_probe_limit > 100:
+        raise SystemExit("--access-probe-limit must be between 0 and 100")
     if max_targets < 0:
         raise SystemExit("--max-targets must be zero or greater")
     if not math.isfinite(progress_interval):
@@ -1791,9 +2352,15 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
         if not eligible_shares:
             return True
 
-        def _handle_list_error(share_name: str, denied_path: str, exc: BaseException) -> None:
+        def _handle_list_error(
+            share_name: str,
+            denied_path: str,
+            exc: BaseException,
+            capabilities: dict[str, dict[str, object]],
+        ) -> None:
             detail = _error_detail(exc)
             message = f"SMB share listing failed for {share_name}: {detail}"
+            _record_capability(capabilities, "list", _smb_probe_outcome(exc))
             _emit_error(
                 writer,
                 run_id,
@@ -1831,6 +2398,9 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             share_name = _share_info_value(share, "shi1_netname")
             remark = _share_info_value(share, "shi1_remark")
             _report_detail(args, f"host {host}: listing SMB share {share_name}")
+            capabilities = _new_access_capabilities()
+            probe_limit = max(0, int(getattr(args, "access_probe_limit", 3)))
+            cancel_event = getattr(args, "cancel_event", None)
             resource_record = {
                 "type": "resource",
                 "run_id": run_id,
@@ -1839,19 +2409,114 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "resource_type": "smb_share",
                 "name": share_name,
                 "remark": remark,
-                "access_level": "no_access",
+                "access_level": "unknown",
+                "access_capabilities": _access_capability_snapshot(
+                    capabilities,
+                    probe_limit=probe_limit,
+                    partial=True,
+                    complete=False,
+                ),
             }
             writer.emit(resource_record)
             with lock:
                 stats.resources += 1
 
-            listed_paths = False
+            directory_samples: list[str] = []
+            file_samples: list[str] = []
+            probe_directory_seeds: list[str] = []
+            probe_directory_seed_keys: set[str] = set()
+            directory_candidates_seen = 0
+            file_candidates_seen = 0
+            listing_truncated = False
+            workflow_finished = False
+            tree_id = None
+            listed_directory_paths: set[str] = set()
+            probe_circuit = _SMBProbeCircuit()
 
-            def _handle_list_success(_listed_path: str) -> None:
-                nonlocal listed_paths
-                listed_paths = True
+            def _handle_list_success(listed_path: str) -> None:
+                listed_directory_paths.add(_smb_handle_path(listed_path).casefold())
+                _record_capability(capabilities, "list", "allowed")
+
+            def _handle_share_list_error(denied_path: str, exc: BaseException) -> None:
+                if _is_smb_transport_failure(exc):
+                    probe_circuit.transport_failed = True
+                _handle_list_error(
+                    share_name,
+                    denied_path,
+                    exc,
+                    capabilities,
+                )
+
+            def _capture_probe_candidate(path: str, is_directory: bool) -> None:
+                nonlocal directory_candidates_seen, file_candidates_seen
+                if is_directory:
+                    directory_candidates_seen += 1
+                    if len(directory_samples) < probe_limit:
+                        directory_samples.append(path)
+                    return
+                file_candidates_seen += 1
+                if len(file_samples) < probe_limit:
+                    file_samples.append(path)
+
+            def _capture_probe_directory_seed(path: str) -> None:
+                path_key = _smb_handle_path(path).casefold()
+                if (
+                    len(probe_directory_seeds) < probe_limit
+                    and path_key not in probe_directory_seed_keys
+                ):
+                    probe_directory_seeds.append(path)
+                    probe_directory_seed_keys.add(path_key)
+
+            def _handle_share_list_limit(inspected: int, emitted: int) -> None:
+                nonlocal listing_truncated
+                listing_truncated = True
+                _handle_list_limit(share_name, inspected, emitted)
 
             try:
+                connect_tree = getattr(conn, "connectTree", None)
+                if callable(connect_tree) and not (cancel_event is not None and cancel_event.is_set()):
+                    try:
+                        tree_id = connect_tree(share_name)
+                    except (
+                        SessionError,
+                        NetBIOSError,
+                        NetBIOSTimeout,
+                        socket.timeout,
+                        TimeoutError,
+                        OSError,
+                    ) as exc:
+                        outcome = _smb_probe_outcome(exc)
+                        _record_capability(capabilities, "tree_connect", outcome)
+                        message = f"SMB tree connection failed for {share_name}: {_error_detail(exc)}"
+                        code = "TREE_CONNECT_DENIED" if outcome == "denied" else "TREE_CONNECT_FAILED"
+                        _emit_error(
+                            writer,
+                            run_id,
+                            severity="warn",
+                            code=code,
+                            message=message,
+                            endpoint_key=endpoint_key,
+                            resource_name=share_name,
+                            path="\\",
+                            hint=_session_error_hint(_error_detail(exc), attempted_auth),
+                        )
+                        _record_error(stats, lock, code, message)
+                    else:
+                        _record_capability(capabilities, "tree_connect", "allowed")
+
+                # Request access masks on existing objects only. FILE_OPEN plus
+                # these narrow masks cannot create, modify, take ownership, or
+                # delete anything; it asks the server whether the right exists.
+                if tree_id is not None and probe_limit > 0:
+                    _probe_smb_directory_access(
+                        conn,
+                        tree_id,
+                        "",
+                        capabilities,
+                        cancel_event,
+                        probe_circuit,
+                    )
+
                 for entry in list_share_entries(
                     conn,
                     share_name,
@@ -1859,14 +2524,12 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                     max_entries=max(1, args.max_entries_per_share),
                     exclude_path_regex=exclude_path_regex,
                     extensions=extensions,
-                    on_list_error=lambda denied_path, exc, share_name=share_name: _handle_list_error(share_name, denied_path, exc),
-                    on_limit_reached=lambda inspected, emitted, share_name=share_name: _handle_list_limit(
-                        share_name,
-                        inspected,
-                        emitted,
-                    ),
+                    on_list_error=_handle_share_list_error,
+                    on_limit_reached=_handle_share_list_limit,
                     on_list_success=_handle_list_success,
-                    cancel_event=getattr(args, "cancel_event", None),
+                    on_probe_candidate=_capture_probe_candidate,
+                    on_probe_directory_seed=_capture_probe_directory_seed,
+                    cancel_event=cancel_event,
                 ):
                     writer.emit(
                         {
@@ -1881,23 +2544,66 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                     )
                     with lock:
                         stats.items += 1
+                if (
+                    tree_id is not None
+                    and probe_limit > 0
+                    and len(file_samples) < probe_limit
+                    and not probe_circuit.transport_failed
+                    and not (cancel_event is not None and cancel_event.is_set())
+                ):
+                    (
+                        nested_directory_candidates,
+                        nested_file_candidates,
+                        nested_listing_truncated,
+                        nested_inspected,
+                    ) = _discover_smb_probe_candidates(
+                        conn,
+                        share_name,
+                        directory_seeds=list(probe_directory_seeds),
+                        directory_samples=directory_samples,
+                        file_samples=file_samples,
+                        probe_limit=probe_limit,
+                        max_entries=max(1, args.max_entries_per_share),
+                        exclude_path_regex=exclude_path_regex,
+                        already_listed_paths=listed_directory_paths,
+                        on_list_error=_handle_share_list_error,
+                        on_list_success=_handle_list_success,
+                        cancel_event=cancel_event,
+                        probe_circuit=probe_circuit,
+                    )
+                    directory_candidates_seen += nested_directory_candidates
+                    file_candidates_seen += nested_file_candidates
+                    if nested_listing_truncated and not listing_truncated:
+                        _handle_share_list_limit(nested_inspected, 0)
+                if tree_id is not None and probe_limit > 0:
+                    for directory_path in directory_samples:
+                        if probe_circuit.transport_failed:
+                            break
+                        _probe_smb_directory_access(
+                            conn,
+                            tree_id,
+                            directory_path,
+                            capabilities,
+                            cancel_event,
+                            probe_circuit,
+                        )
+                    for file_path in file_samples:
+                        if probe_circuit.transport_failed:
+                            break
+                        _probe_smb_file_access(
+                            conn,
+                            tree_id,
+                            file_path,
+                            capabilities,
+                            cancel_event,
+                            probe_circuit,
+                        )
+                workflow_finished = not (cancel_event is not None and cancel_event.is_set())
             except SessionError as exc:
-                detail = _error_detail(exc)
-                message = f"SMB share listing failed for {share_name}: {detail}"
-                _emit_error(
-                    writer,
-                    run_id,
-                    severity="warn",
-                    code="LIST_SESSION_ERROR",
-                    message=message,
-                    endpoint_key=endpoint_key,
-                    resource_name=share_name,
-                    path="\\",
-                    hint=_session_error_hint(detail, attempted_auth),
-                )
-                _record_error(stats, lock, "LIST_SESSION_ERROR", message)
+                _handle_list_error(share_name, "\\", exc, capabilities)
             except (socket.timeout, TimeoutError):
                 message = f"SMB share listing timed out for {share_name}."
+                _record_capability(capabilities, "list", "inconclusive")
                 _emit_error(
                     writer,
                     run_id,
@@ -1913,6 +2619,7 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
             except OSError as exc:
                 detail = _error_detail(exc)
                 message = f"SMB share listing IO failure for {share_name}: {detail}"
+                _record_capability(capabilities, "list", "inconclusive")
                 _emit_error(
                     writer,
                     run_id,
@@ -1926,13 +2633,41 @@ def scan_host_smb(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 )
                 _record_error(stats, lock, "LIST_IO_ERROR", message)
             except (NetBIOSError, NetBIOSTimeout) as exc:
-                _handle_list_error(share_name, "\\", exc)
-            if listed_paths:
-                writer.emit({**resource_record, "access_level": "list_only"})
+                _handle_list_error(share_name, "\\", exc, capabilities)
+            finally:
+                if tree_id is not None:
+                    disconnect_tree = getattr(conn, "disconnectTree", None)
+                    if callable(disconnect_tree):
+                        try:
+                            disconnect_tree(tree_id)
+                        except Exception:
+                            pass
+
+            final_access_level = _legacy_access_level(capabilities)
+            # These are observations from a bounded sample, never a complete
+            # effective-permissions calculation for every object in the share.
+            capability_partial = True
+            writer.emit(
+                {
+                    **resource_record,
+                    "access_level": final_access_level,
+                    "access_capabilities": _access_capability_snapshot(
+                        capabilities,
+                        probe_limit=probe_limit,
+                        partial=capability_partial,
+                        complete=workflow_finished,
+                        directory_samples=len(directory_samples),
+                        file_samples=len(file_samples),
+                        directory_candidates_seen=directory_candidates_seen,
+                        file_candidates_seen=file_candidates_seen,
+                        listing_truncated=listing_truncated,
+                    ),
+                }
+            )
             _report_detail(
                 args,
                 f"host {host}: finished SMB share {share_name} "
-                f"({'listable' if listed_paths else 'not listable'})",
+                f"(access={final_access_level}, probes={probe_limit})",
             )
         return True
 
@@ -2127,7 +2862,7 @@ def scan_host_nfs(host: str, args: argparse.Namespace, run_id: str, writer: NDJS
                 "resource_type": "nfs_share",
                 "name": export_path,
                 "remark": "",
-                "access_level": "no_access",
+                "access_level": "unknown",
             }
         )
         with lock:
@@ -2816,6 +3551,7 @@ def main() -> int:
                 "timeout_seconds": args.timeout,
                 "max_depth": args.max_depth,
                 "max_entries_per_share": args.max_entries_per_share,
+                "access_probe_limit": int(getattr(args, "access_probe_limit", 3)),
                 "include_share": list(getattr(args, "include_share", []) or []),
                 "exclude_share": list(getattr(args, "exclude_share", []) or []),
                 "exclude_path_regex": args.exclude_path_regex or None,

@@ -61,6 +61,7 @@ python share_sentinel_collector.py \
   --workers 50 \
   --timeout 3 \
   --max-depth 1 \
+  --access-probe-limit 3 \
   --progress-interval 5 \
   --output out.ndjson.gz \
   --gzip
@@ -203,6 +204,7 @@ Treat these flags as capacity levers:
 - `--workers`
 - `--max-depth`
 - `--max-entries-per-share`
+- `--access-probe-limit`
 - `--max-targets`
 - target count and host list size
 
@@ -219,6 +221,51 @@ known to be small. The collector keeps one NDJSON spool open and writes each
 flat record once, so a large share does not require a directory tree in RAM or
 one filesystem open per item. Compact `.json` is a bounded compatibility path,
 not the large-scan format.
+
+### Observed SMB access
+
+SMB resource records retain the compatibility `access_level` and add independent
+`access_capabilities` evidence for share tree connection, directory listing,
+file reading, file creation, directory creation, existing-file modification,
+deletion, ACL changes, and ownership changes. Each capability is `allowed`,
+`denied`, `mixed`, `not_tested`, or `inconclusive` and includes bounded attempt
+counts. Unknown, transient, sharing-violation, and disappeared-object outcomes
+are not converted into authorization denials.
+
+Compatibility summaries are conservative: `readable` requires an observed
+file-read right, `list_only` requires an observed listing but no read, and
+`no_access` is reserved for an explicit share tree-connect denial with no
+stronger positive evidence. Connected-but-not-listable and write-only cases use
+`unknown` in the compatibility field while their capability evidence shows the
+useful result.
+
+The reserved `_metadata.complete` flag means the per-share probe workflow
+reached its final record without cancellation; it does not mean coverage was
+exhaustive. Read it together with `_metadata.partial`, sample counts, and
+`listing_truncated`. A completed bounded scan can correctly be partial.
+
+The default `--access-probe-limit 3` checks the share root plus up to three
+discovered directories and three discovered files. Candidate selection happens
+before `--extensions-only` output filtering, so an inventory display filter does
+not accidentally suppress access evidence. Set the limit to `0` to disable
+explicit handle probes; tree-connect and directory-listing observations are
+still recorded.
+
+Access candidate discovery is separate from inventory output depth. When the
+configured traversal sees folders but no files, the collector may inspect a
+bounded number of those folders to find probe candidates without emitting
+out-of-depth items. This prevents the default root-only inventory view from
+silently turning a common nested share into `read_file: not_tested`.
+
+These checks are non-mutating. They open existing objects with `FILE_OPEN`, ask
+the SMB server to authorize one narrow access mask, and immediately close the
+handle. They never create a probe file or directory, write bytes, mark an object
+for deletion, replace an ACL, or take ownership. A positive result proves that
+the scan identity was granted that right on a sampled object at scan time; it
+does not guarantee that a later operation will succeed under quotas, read-only
+storage, endpoint security controls, object-specific ACLs, or changed state.
+Handle opens can still produce ordinary SMB/authorization audit telemetry and
+may affect server-side last-access accounting.
 
 Only scan systems for which you have explicit authorization. The collector performs concurrent authentication, share enumeration, and directory traversal and can create meaningful target load.
 
@@ -257,9 +304,11 @@ upload.
 
 The tracked [`examples/sample-artifact.json`](../examples/sample-artifact.json) is synthetic and safe to use for a first ingest test.
 
-SMB file entries include nullable `size_bytes` and UTC ISO-8601 `mtime` values
-when the server returns valid metadata. Older entries and NFS export-only
-records remain valid without these fields.
+SMB entries include nullable UTC ISO-8601 `mtime` (last write), `created_at`,
+`accessed_at`, and `changed_at` (metadata change) values when the server returns
+valid metadata. Files can additionally include `size_bytes`,
+`allocation_size_bytes`, and common `file_attributes`. Older entries and NFS
+export-only records remain valid without these fields.
 
 SMB dialects use Impacket's negotiated protocol constants (`2.0.2`, `2.1`,
 `3.0`, `3.0.2`, or `3.1.1`). The `smb.signing` value is deliberately limited
@@ -271,7 +320,7 @@ NFS collection currently checks tcp/2049 and enumerates advertised exports via
 `showmount -e`. It does not mount exports or traverse their contents. A missing,
 timed-out, or denied `showmount` command is recorded as a partial-coverage issue
 rather than silently treated as an empty server. Discovered exports are marked
-`no_access`; an advertised export name does not prove that the scanner can mount
+`unknown`; an advertised export name does not prove that the scanner can mount
 or list it.
 
 ## Exit codes

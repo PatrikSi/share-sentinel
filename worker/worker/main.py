@@ -98,6 +98,7 @@ SHARE_TYPE_TO_RESOURCE_TYPE = {
 }
 RESOURCE_TYPE_TO_SHARE_TYPE = {value: key for key, value in SHARE_TYPE_TO_RESOURCE_TYPE.items()}
 ACCESS_LEVEL_ALIASES = {
+    "unknown": "unknown",
     "no_access": "no_access",
     "none": "no_access",
     "denied": "no_access",
@@ -110,13 +111,53 @@ ACCESS_LEVEL_ALIASES = {
     "read_only": "readable",
     "read-write": "readable",
     "read_write": "readable",
-    "write": "readable",
-    "writable": "readable",
-    "modify": "readable",
+    "write": "unknown",
+    "writable": "unknown",
+    "modify": "unknown",
     "full": "readable",
     "full_control": "readable",
     "rw": "readable",
 }
+ACCESS_LEVEL_RANK = {
+    "unknown": 0,
+    "no_access": 1,
+    "list_only": 2,
+    "readable": 3,
+}
+ACCESS_CAPABILITY_STATUSES = {"allowed", "denied", "mixed", "not_tested", "inconclusive"}
+ACCESS_CAPABILITY_NAMES = (
+    "tree_connect",
+    "list",
+    "read_file",
+    "create_file",
+    "create_directory",
+    "modify_file",
+    "delete",
+    "write_acl",
+    "write_owner",
+)
+ACCESS_CAPABILITY_MAX_KEYS = 32
+ACCESS_CAPABILITY_MAX_KEY_LENGTH = 64
+ACCESS_CAPABILITY_MAX_COUNT = 2**31 - 1
+_ACCESS_CAPABILITY_OUTCOME_BASE_LIMIT = ACCESS_CAPABILITY_MAX_COUNT // 3
+ACCESS_CAPABILITY_OUTCOME_LIMITS = (
+    _ACCESS_CAPABILITY_OUTCOME_BASE_LIMIT + (ACCESS_CAPABILITY_MAX_COUNT % 3),
+    _ACCESS_CAPABILITY_OUTCOME_BASE_LIMIT,
+    _ACCESS_CAPABILITY_OUTCOME_BASE_LIMIT,
+)
+ACCESS_CAPABILITY_EVIDENCE_FIELDS = {"method", "scope", "coverage"}
+ACCESS_CAPABILITY_MAX_EVIDENCE_LENGTH = 256
+ACCESS_CAPABILITY_METADATA_TEXT_FIELDS = {"probe_method", "coverage"}
+ACCESS_CAPABILITY_METADATA_COUNT_FIELDS = {
+    "probe_limit",
+    "directory_samples",
+    "file_samples",
+    "directory_candidates_seen",
+    "file_candidates_seen",
+}
+ACCESS_CAPABILITY_METADATA_BOOLEAN_FIELDS = {"partial", "complete", "listing_truncated"}
+FILE_ATTRIBUTE_MAX_VALUES = 32
+FILE_ATTRIBUTE_MAX_LENGTH = 64
 GZIP_DECOMPRESSED_LIMIT_ERROR = "gzip artifact exceeds decompressed size limit"
 NDJSON_RECORD_TOO_LARGE_ERROR = "NDJSON record exceeds configured size limit"
 INVALID_GZIP_ARTIFACT_ERROR = "invalid gzip artifact"
@@ -210,25 +251,64 @@ def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) 
 
 
 def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec: dict[str, Any]) -> int:
-    row = conn.execute(
+    resource_type = rec.get("resource_type", "smb_share")
+    resource_name = rec.get("name")
+    incoming_capabilities = _normalize_access_capabilities(rec.get("access_capabilities"))
+    incoming_access = _reconcile_access_level_with_capabilities(
+        _normalize_access_level(rec.get("access_level")),
+        incoming_capabilities,
+    )
+
+    existing = conn.execute(
         """
-        INSERT INTO resources (run_id, endpoint_id, resource_type, name, remark, access_level)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (run_id, endpoint_id, resource_type, name)
-        DO UPDATE SET
-            remark = COALESCE(EXCLUDED.remark, resources.remark),
-            access_level = EXCLUDED.access_level
-        RETURNING id
+        SELECT id, access_level::text, access_capabilities
+        FROM resources
+        WHERE run_id = %s
+          AND endpoint_id = %s
+          AND resource_type = %s
+          AND name = %s
+        FOR UPDATE
         """,
-        (
-            run_id,
-            endpoint_id,
-            rec.get("resource_type", "smb_share"),
-            rec.get("name"),
-            rec.get("remark"),
-            _normalize_access_level(rec.get("access_level")),
-        ),
+        (run_id, endpoint_id, resource_type, resource_name),
     ).fetchone()
+
+    if existing is None:
+        row = conn.execute(
+            """
+            INSERT INTO resources (
+                run_id, endpoint_id, resource_type, name, remark, access_level, access_capabilities
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                run_id,
+                endpoint_id,
+                resource_type,
+                resource_name,
+                rec.get("remark"),
+                incoming_access,
+                json.dumps(incoming_capabilities),
+            ),
+        ).fetchone()
+    else:
+        existing_id, existing_access, existing_capabilities = existing
+        merged_capabilities = _merge_access_capabilities(existing_capabilities, incoming_capabilities)
+        merged_access = _reconcile_access_level_with_capabilities(
+            _stronger_access_level(existing_access, incoming_access),
+            merged_capabilities,
+        )
+        row = conn.execute(
+            """
+            UPDATE resources
+            SET remark = COALESCE(%s, remark),
+                access_level = %s,
+                access_capabilities = %s
+            WHERE id = %s
+            RETURNING id
+            """,
+            (rec.get("remark"), merged_access, json.dumps(merged_capabilities), existing_id),
+        ).fetchone()
     return int(row[0])
 
 
@@ -238,14 +318,25 @@ def flush_item_batch(conn: psycopg.Connection, rows: list[tuple]) -> None:
     with conn.cursor() as cur:
         cur.executemany(
             """
-            INSERT INTO items (run_id, resource_id, path, name, is_dir, size_bytes, mtime)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO items (
+                run_id, resource_id, path, name, is_dir, size_bytes, allocation_size_bytes,
+                mtime, created_at, accessed_at, changed_at, file_attributes
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (run_id, resource_id, path)
             DO UPDATE SET
                 name = EXCLUDED.name,
                 is_dir = EXCLUDED.is_dir,
                 size_bytes = COALESCE(EXCLUDED.size_bytes, items.size_bytes),
-                mtime = COALESCE(EXCLUDED.mtime, items.mtime)
+                allocation_size_bytes = COALESCE(EXCLUDED.allocation_size_bytes, items.allocation_size_bytes),
+                mtime = COALESCE(EXCLUDED.mtime, items.mtime),
+                created_at = COALESCE(EXCLUDED.created_at, items.created_at),
+                accessed_at = COALESCE(EXCLUDED.accessed_at, items.accessed_at),
+                changed_at = COALESCE(EXCLUDED.changed_at, items.changed_at),
+                file_attributes = CASE
+                    WHEN EXCLUDED.file_attributes = '[]'::jsonb THEN items.file_attributes
+                    ELSE EXCLUDED.file_attributes
+                END
             """,
             rows,
         )
@@ -476,7 +567,322 @@ def _normalize_access_level(raw_access_level: Any) -> str:
         normalized = raw_access_level.strip().lower().replace(" ", "_")
         if normalized in ACCESS_LEVEL_ALIASES:
             return ACCESS_LEVEL_ALIASES[normalized]
-    return "no_access"
+    return "unknown"
+
+
+def _stronger_access_level(current: Any, incoming: Any) -> str:
+    current_level = _normalize_access_level(current)
+    incoming_level = _normalize_access_level(incoming)
+    if ACCESS_LEVEL_RANK[incoming_level] > ACCESS_LEVEL_RANK[current_level]:
+        return incoming_level
+    return current_level
+
+
+def _normalize_capability_count(raw_count: Any) -> int:
+    if raw_count is None or isinstance(raw_count, bool):
+        return 0
+    try:
+        count = int(raw_count)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return min(ACCESS_CAPABILITY_MAX_COUNT, max(0, count))
+
+
+def _normalize_capability_status(raw_status: Any) -> str | None:
+    if not isinstance(raw_status, str):
+        return None
+    status = raw_status.strip().lower().replace("-", "_").replace(" ", "_")
+    return status if status in ACCESS_CAPABILITY_STATUSES else None
+
+
+def _normalize_capability_outcome_counts(
+    raw_allowed: Any,
+    raw_denied: Any,
+    raw_inconclusive: Any,
+) -> tuple[int, int, int]:
+    """Use fixed class budgets so max-based replay merges remain an idempotent join."""
+
+    raw_counts = (raw_allowed, raw_denied, raw_inconclusive)
+    return tuple(
+        min(_normalize_capability_count(raw_count), limit)
+        for raw_count, limit in zip(raw_counts, ACCESS_CAPABILITY_OUTCOME_LIMITS, strict=True)
+    )
+
+
+def _normalize_capability_key(raw_key: Any) -> str:
+    return str(raw_key).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _capability_key_priority(key: str) -> tuple[int, int, str]:
+    if key == "_metadata":
+        return (0, 0, key)
+    try:
+        return (1, ACCESS_CAPABILITY_NAMES.index(key), key)
+    except ValueError:
+        return (2, 0, key)
+
+
+def _limit_access_capability_keys(capabilities: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    keys = sorted(capabilities, key=_capability_key_priority)
+    return {key: capabilities[key] for key in keys[:ACCESS_CAPABILITY_MAX_KEYS]}
+
+
+def _status_from_capability_evidence(
+    status: str | None,
+    *,
+    allowed: int,
+    denied: int,
+    inconclusive: int,
+) -> str:
+    if allowed > 0 and denied > 0:
+        return "mixed"
+    if allowed > 0:
+        return "allowed"
+    if denied > 0:
+        return "denied"
+    if inconclusive > 0:
+        return "inconclusive"
+    return status or "not_tested"
+
+
+def _normalize_capability_metadata(raw_metadata: Any) -> dict[str, bool | int | str]:
+    if not isinstance(raw_metadata, dict):
+        return {}
+    metadata: dict[str, bool | int | str] = {}
+    for field in ACCESS_CAPABILITY_METADATA_TEXT_FIELDS:
+        raw_value = raw_metadata.get(field)
+        if isinstance(raw_value, str) and raw_value.strip():
+            metadata[field] = raw_value.strip()[:ACCESS_CAPABILITY_MAX_EVIDENCE_LENGTH]
+    for field in ACCESS_CAPABILITY_METADATA_COUNT_FIELDS:
+        if field in raw_metadata:
+            metadata[field] = _normalize_capability_count(raw_metadata.get(field))
+    for field in ACCESS_CAPABILITY_METADATA_BOOLEAN_FIELDS:
+        raw_value = raw_metadata.get(field)
+        if isinstance(raw_value, bool):
+            metadata[field] = raw_value
+    return metadata
+
+
+def _normalize_access_capabilities(raw_capabilities: Any) -> dict[str, dict[str, Any]]:
+    if isinstance(raw_capabilities, str):
+        try:
+            raw_capabilities = json.loads(raw_capabilities)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(raw_capabilities, dict):
+        return {}
+
+    normalized: dict[str, dict[str, Any]] = {}
+    raw_entries = sorted(
+        raw_capabilities.items(),
+        key=lambda entry: _capability_key_priority(_normalize_capability_key(entry[0])),
+    )
+    for raw_key, raw_value in raw_entries:
+        if len(normalized) >= ACCESS_CAPABILITY_MAX_KEYS:
+            break
+        key = _normalize_capability_key(raw_key)
+        if not key or len(key) > ACCESS_CAPABILITY_MAX_KEY_LENGTH or key in normalized:
+            continue
+
+        if key == "_metadata":
+            metadata = _normalize_capability_metadata(raw_value)
+            if metadata:
+                normalized[key] = metadata
+            continue
+
+        if isinstance(raw_value, str):
+            status = _normalize_capability_status(raw_value)
+            if status is None:
+                continue
+            raw_value = {"status": status}
+        if not isinstance(raw_value, dict):
+            continue
+
+        allowed, denied, inconclusive = _normalize_capability_outcome_counts(
+            raw_value.get("allowed"),
+            raw_value.get("denied"),
+            raw_value.get("inconclusive"),
+        )
+        attempted = max(
+            _normalize_capability_count(raw_value.get("attempted")),
+            allowed + denied + inconclusive,
+        )
+        attempted = min(ACCESS_CAPABILITY_MAX_COUNT, attempted)
+        status = _status_from_capability_evidence(
+            _normalize_capability_status(raw_value.get("status")),
+            allowed=allowed,
+            denied=denied,
+            inconclusive=inconclusive,
+        )
+        capability: dict[str, int | str] = {
+            "status": status,
+            "attempted": attempted,
+            "allowed": allowed,
+            "denied": denied,
+            "inconclusive": inconclusive,
+        }
+        for evidence_field in ACCESS_CAPABILITY_EVIDENCE_FIELDS:
+            raw_evidence = raw_value.get(evidence_field)
+            if not isinstance(raw_evidence, str):
+                continue
+            evidence = raw_evidence.strip()
+            if evidence:
+                capability[evidence_field] = evidence[:ACCESS_CAPABILITY_MAX_EVIDENCE_LENGTH]
+        if "sample_limit" in raw_value:
+            capability["sample_limit"] = _normalize_capability_count(raw_value.get("sample_limit"))
+        normalized[key] = capability
+    return normalized
+
+
+def _merge_capability_status(current: str, incoming: str) -> str:
+    statuses = {current, incoming}
+    if "mixed" in statuses or statuses == {"allowed", "denied"}:
+        return "mixed"
+    if "allowed" in statuses:
+        return "allowed"
+    if "denied" in statuses:
+        return "denied"
+    if "inconclusive" in statuses:
+        return "inconclusive"
+    return "not_tested"
+
+
+def _capability_status_rank(status: str) -> int:
+    if status == "not_tested":
+        return 0
+    if status == "inconclusive":
+        return 1
+    if status in {"allowed", "denied"}:
+        return 2
+    return 3
+
+
+def _merge_capability_metadata(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    current_complete = current.get("complete") is True
+    incoming_complete = incoming.get("complete") is True
+    completed_snapshot = None
+    if current_complete != incoming_complete:
+        completed_snapshot = current if current_complete else incoming
+    metadata: dict[str, Any] = {}
+    for field in ACCESS_CAPABILITY_METADATA_TEXT_FIELDS:
+        current_value = current.get(field)
+        incoming_value = incoming.get(field)
+        if completed_snapshot is not None and completed_snapshot.get(field):
+            selected = completed_snapshot[field]
+        else:
+            values = sorted(value for value in (current_value, incoming_value) if value)
+            selected = values[0] if values else None
+        if selected:
+            metadata[field] = selected
+    for field in ACCESS_CAPABILITY_METADATA_COUNT_FIELDS:
+        if field in current or field in incoming:
+            metadata[field] = max(int(current.get(field, 0)), int(incoming.get(field, 0)))
+    for field in ACCESS_CAPABILITY_METADATA_BOOLEAN_FIELDS:
+        if field not in current and field not in incoming:
+            continue
+        if field == "complete":
+            metadata[field] = current_complete or incoming_complete
+        elif completed_snapshot is not None and field in completed_snapshot:
+            metadata[field] = bool(completed_snapshot[field])
+        else:
+            metadata[field] = bool(current.get(field, False) or incoming.get(field, False))
+    return metadata
+
+
+def _merge_access_capabilities(current: Any, incoming: Any) -> dict[str, dict[str, Any]]:
+    current_normalized = _normalize_access_capabilities(current)
+    incoming_normalized = _normalize_access_capabilities(incoming)
+    merged = dict(current_normalized)
+    for key, incoming_value in incoming_normalized.items():
+        current_value = merged.get(key)
+        if current_value is None:
+            merged[key] = incoming_value
+            continue
+        if key == "_metadata":
+            merged[key] = _merge_capability_metadata(current_value, incoming_value)
+            continue
+
+        allowed, denied, inconclusive = _normalize_capability_outcome_counts(
+            max(int(current_value["allowed"]), int(incoming_value["allowed"])),
+            max(int(current_value["denied"]), int(incoming_value["denied"])),
+            max(int(current_value["inconclusive"]), int(incoming_value["inconclusive"])),
+        )
+        attempted = min(
+            ACCESS_CAPABILITY_MAX_COUNT,
+            max(
+                int(current_value["attempted"]),
+                int(incoming_value["attempted"]),
+                allowed + denied + inconclusive,
+            ),
+        )
+        status = _status_from_capability_evidence(
+            _merge_capability_status(str(current_value["status"]), str(incoming_value["status"])),
+            allowed=allowed,
+            denied=denied,
+            inconclusive=inconclusive,
+        )
+        merged[key] = {
+            "status": status,
+            "attempted": attempted,
+            "allowed": allowed,
+            "denied": denied,
+            "inconclusive": inconclusive,
+        }
+        current_rank = _capability_status_rank(str(current_value["status"]))
+        incoming_rank = _capability_status_rank(str(incoming_value["status"]))
+        for evidence_field in ACCESS_CAPABILITY_EVIDENCE_FIELDS:
+            current_evidence = current_value.get(evidence_field)
+            incoming_evidence = incoming_value.get(evidence_field)
+            if incoming_rank > current_rank and incoming_evidence:
+                chosen_evidence = incoming_evidence
+            elif current_rank > incoming_rank and current_evidence:
+                chosen_evidence = current_evidence
+            else:
+                values = sorted(value for value in (current_evidence, incoming_evidence) if value)
+                chosen_evidence = values[0] if values else None
+            if chosen_evidence:
+                merged[key][evidence_field] = chosen_evidence
+        if "sample_limit" in current_value or "sample_limit" in incoming_value:
+            merged[key]["sample_limit"] = max(
+                int(current_value.get("sample_limit", 0)),
+                int(incoming_value.get("sample_limit", 0)),
+            )
+    return _limit_access_capability_keys(merged)
+
+
+def _reconcile_access_level_with_capabilities(access_level: str, capabilities: Any) -> str:
+    """Keep the compatibility summary consistent with stronger observed evidence."""
+
+    normalized = _normalize_access_capabilities(capabilities)
+
+    def _is_observed(capability: str) -> bool:
+        evidence = normalized.get(capability)
+        if not isinstance(evidence, dict):
+            return False
+        return evidence.get("status") in {"allowed", "mixed"} or int(evidence.get("allowed", 0)) > 0
+
+    if _is_observed("read_file"):
+        return _stronger_access_level(access_level, "readable")
+    if _is_observed("list"):
+        return _stronger_access_level(access_level, "list_only")
+
+    non_listing_access_observed = any(
+        _is_observed(capability)
+        for capability in (
+            "create_file",
+            "create_directory",
+            "modify_file",
+            "delete",
+            "write_acl",
+            "write_owner",
+        )
+    )
+    tree_connection_observed = _is_observed("tree_connect")
+    if (tree_connection_observed or non_listing_access_observed) and _normalize_access_level(access_level) == "no_access":
+        # The legacy enum has no connected-but-not-listable or write-only state.
+        # Either observation disproves the old no-access label.
+        return "unknown"
+    return _normalize_access_level(access_level)
 
 
 def _normalize_item_size(raw_size: Any) -> int | None:
@@ -506,6 +912,22 @@ def _normalize_item_mtime(raw_mtime: Any) -> datetime | None:
         return parsed.astimezone(UTC)
     except (OSError, OverflowError, TypeError, ValueError):
         return None
+
+
+def _normalize_file_attributes(raw_attributes: Any) -> list[str]:
+    if not isinstance(raw_attributes, list):
+        return []
+    normalized: list[str] = []
+    for raw_attribute in raw_attributes:
+        if len(normalized) >= FILE_ATTRIBUTE_MAX_VALUES:
+            break
+        if not isinstance(raw_attribute, str):
+            continue
+        attribute = raw_attribute.strip().lower().replace("-", "_").replace(" ", "_")
+        if not attribute or len(attribute) > FILE_ATTRIBUTE_MAX_LENGTH or attribute in normalized:
+            continue
+        normalized.append(attribute)
+    return normalized
 
 
 def _bind_record_to_ingest_run(rec: dict[str, Any], run_id: str) -> dict[str, Any]:
@@ -546,7 +968,12 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
         rec["name"] = PurePosixPath(normalized_path).name or ""
     if rec_type == "item":
         rec["size_bytes"] = _normalize_item_size(rec.get("size_bytes"))
+        rec["allocation_size_bytes"] = _normalize_item_size(rec.get("allocation_size_bytes"))
         rec["mtime"] = _normalize_item_mtime(rec.get("mtime"))
+        rec["created_at"] = _normalize_item_mtime(rec.get("created_at"))
+        rec["accessed_at"] = _normalize_item_mtime(rec.get("accessed_at"))
+        rec["changed_at"] = _normalize_item_mtime(rec.get("changed_at"))
+        rec["file_attributes"] = _normalize_file_attributes(rec.get("file_attributes"))
 
     if rec_type in {"resource", "item"}:
         share_type = _normalize_share_type(rec.get("share_type"), rec.get("resource_type"))
@@ -554,6 +981,7 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
         rec["resource_type"] = _resource_type_from_share_type(share_type)
     if rec_type == "resource":
         rec["access_level"] = _normalize_access_level(rec.get("access_level"))
+        rec["access_capabilities"] = _normalize_access_capabilities(rec.get("access_capabilities"))
     return True, None
 
 
@@ -606,7 +1034,12 @@ def _iter_items_from_entries(
             "name": name,
             "is_dir": is_dir,
             "size_bytes": raw_entry.get("size_bytes"),
+            "allocation_size_bytes": raw_entry.get("allocation_size_bytes"),
             "mtime": raw_entry.get("mtime"),
+            "created_at": raw_entry.get("created_at"),
+            "accessed_at": raw_entry.get("accessed_at"),
+            "changed_at": raw_entry.get("changed_at"),
+            "file_attributes": raw_entry.get("file_attributes"),
         }
 
         children = raw_entry.get("children")
@@ -657,7 +1090,8 @@ def _records_from_endpoint_payload(raw_endpoint: dict[str, Any], run_id: str) ->
                 "share_type": share_type,
                 "name": share_name,
                 "remark": raw_share.get("remark"),
-                "access_level": raw_share.get("access_level", "no_access"),
+                "access_level": raw_share.get("access_level", "unknown"),
+                "access_capabilities": raw_share.get("access_capabilities"),
             }
         )
 
@@ -1240,7 +1674,8 @@ def process_job(fields: dict[str, str]) -> str:
                                 "resource_type": resource_type,
                                 "name": resource_name,
                                 "remark": None,
-                                "access_level": "no_access",
+                                "access_level": "unknown",
+                                "access_capabilities": {},
                             },
                         )
                         resource_cache[key] = resource_id
@@ -1252,7 +1687,12 @@ def process_job(fields: dict[str, str]) -> str:
                             rec.get("name", ""),
                             bool(rec.get("is_dir", False)),
                             rec.get("size_bytes"),
+                            rec.get("allocation_size_bytes"),
                             rec.get("mtime"),
+                            rec.get("created_at"),
+                            rec.get("accessed_at"),
+                            rec.get("changed_at"),
+                            json.dumps(rec.get("file_attributes") or []),
                         )
                     )
                     counts["items"] += 1

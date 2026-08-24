@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 
+import { AccessCapabilityCell, type AccessCapabilities } from "@/components/access-capability-cell";
 import { ColumnPicker } from "@/components/column-picker";
 import { Dialog } from "@/components/dialog";
 import { StatePanel } from "@/components/state-panel";
@@ -24,12 +25,18 @@ type InventoryItem = {
   ip: string | null;
   resource_name: string;
   access_level: string;
+  access_capabilities: AccessCapabilities | null;
   share_type: string;
   path: string;
   name: string;
   is_dir: boolean;
   size_bytes?: number | null;
+  allocation_size_bytes?: number | null;
   mtime?: string | null;
+  created_at?: string | null;
+  accessed_at?: string | null;
+  changed_at?: string | null;
+  file_attributes?: string[] | null;
 };
 
 type InventoryResource = {
@@ -41,6 +48,7 @@ type InventoryResource = {
   name: string;
   remark: string | null;
   access_level: string;
+  access_capabilities: AccessCapabilities | null;
   share_type: string;
   item_count: number;
 };
@@ -98,7 +106,12 @@ type ItemColumnKey =
   | "run_id"
   | "is_dir"
   | "size_bytes"
-  | "mtime";
+  | "allocation_size_bytes"
+  | "mtime"
+  | "created_at"
+  | "accessed_at"
+  | "changed_at"
+  | "file_attributes";
 type ResourceColumnKey = "name" | "share_type" | "access_level" | "endpoint_key" | "hostname" | "item_count" | "run_name" | "run_id" | "remark";
 type EndpointColumnKey = "endpoint_key" | "hostname" | "ip" | "domain" | "smb_signing" | "resource_count" | "item_count" | "run_name" | "run_id";
 type QueryFilterReflection = {
@@ -119,7 +132,7 @@ const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
   { key: "name", label: "Name" },
   { key: "resource_name", label: "Share" },
   { key: "share_type", label: "Share Type" },
-  { key: "access_level", label: "Share Access" },
+  { key: "access_level", label: "Observed Access" },
   { key: "endpoint_key", label: "Endpoint Key" },
   { key: "hostname", label: "Hostname" },
   { key: "ip", label: "IP" },
@@ -127,12 +140,17 @@ const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
   { key: "run_id", label: "Run ID" },
   { key: "is_dir", label: "Type" },
   { key: "size_bytes", label: "Size" },
+  { key: "allocation_size_bytes", label: "Allocated Size" },
   { key: "mtime", label: "Modified" },
+  { key: "created_at", label: "Created" },
+  { key: "accessed_at", label: "Last Accessed" },
+  { key: "changed_at", label: "Metadata Changed" },
+  { key: "file_attributes", label: "Attributes" },
 ];
 const RESOURCE_COLUMN_OPTIONS: Array<{ key: ResourceColumnKey; label: string }> = [
   { key: "name", label: "Share" },
   { key: "share_type", label: "Share Type" },
-  { key: "access_level", label: "Access" },
+  { key: "access_level", label: "Observed Access" },
   { key: "endpoint_key", label: "Endpoint Key" },
   { key: "hostname", label: "Hostname" },
   { key: "item_count", label: "Items" },
@@ -156,16 +174,20 @@ const ACCESS_QUERY_ALIASES: Record<string, string> = {
   no_access: "no_access",
   none: "no_access",
   denied: "no_access",
+  access_denied: "no_access",
   list_only: "list_only",
   list: "list_only",
   browse: "list_only",
+  list_observed: "list_only",
   readable: "readable",
   read: "readable",
   read_only: "readable",
+  read_observed: "readable",
   read_write: "readable",
   "read-write": "readable",
-  write: "readable",
-  writable: "readable",
+  unknown: "unknown",
+  inconclusive: "unknown",
+  not_tested: "unknown",
 };
 
 function normalizeReflectionValue(field: InventoryQueryField, value: string): string {
@@ -257,7 +279,7 @@ const QUERY_FIELD_LABELS: Record<InventoryQueryField, string> = {
   share: "Share",
   path: "Path",
   ext: "Extension",
-  access: "Share Access",
+  access: "Observed Access",
 };
 
 const FILTER_LABEL_CLASS = "text-xs font-semibold uppercase tracking-wider text-slate-500";
@@ -346,6 +368,13 @@ function formatTimestamp(value: string | null | undefined): string {
   if (!value) return "—";
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+}
+
+function formatFileAttributes(value: string[] | null | undefined): string {
+  if (!value || value.length === 0) return "—";
+  return value
+    .map((attribute) => attribute.replaceAll("_", " ").replace(/\b\w/g, (character) => character.toUpperCase()))
+    .join(", ");
 }
 
 type InventoryCellProps = {
@@ -1147,7 +1176,16 @@ export function ProjectInventoryPage() {
     if (column === "resource_name") return <InventoryCell text={row.resource_name} label={label} filterField="share" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "share_type") return <InventoryCell text={row.share_type.toUpperCase()} label={label} badge="neutral" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "access_level") {
-      return <InventoryCell text={row.access_level} label={label} filterField="access" badge={row.access_level === "readable" ? "positive" : row.access_level === "list_only" ? "warning" : "neutral"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+      return (
+        <AccessCapabilityCell
+          accessLevel={row.access_level}
+          capabilities={row.access_capabilities}
+          evidenceScope="Share sample"
+          label={label}
+          onCopy={copyExactValue}
+          onFilter={(value, negated) => applyCellFilter("access", value, negated)}
+        />
+      );
     }
     if (column === "endpoint_key") return <InventoryCell text={row.endpoint_key} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "hostname") return <InventoryCell text={row.hostname || "—"} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" onFilter={applyCellFilter} onCopy={copyExactValue} />;
@@ -1155,7 +1193,12 @@ export function ProjectInventoryPage() {
     if (column === "run_name") return <InventoryCell text={row.run_name} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "run_id") return <InventoryCell text={row.run_id} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "size_bytes") return <InventoryCell text={formatBytes(row.size_bytes)} filterValue={row.size_bytes == null ? "" : String(row.size_bytes)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "allocation_size_bytes") return <InventoryCell text={formatBytes(row.allocation_size_bytes)} filterValue={row.allocation_size_bytes == null ? "" : String(row.allocation_size_bytes)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "mtime") return <InventoryCell text={formatTimestamp(row.mtime)} filterValue={row.mtime || ""} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "created_at") return <InventoryCell text={formatTimestamp(row.created_at)} filterValue={row.created_at || ""} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "accessed_at") return <InventoryCell text={formatTimestamp(row.accessed_at)} filterValue={row.accessed_at || ""} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "changed_at") return <InventoryCell text={formatTimestamp(row.changed_at)} filterValue={row.changed_at || ""} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "file_attributes") return <InventoryCell text={formatFileAttributes(row.file_attributes)} filterValue={row.file_attributes?.join(",") || ""} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     return <InventoryCell text={row.is_dir ? "Directory" : "File"} label={label} badge="neutral" onFilter={applyCellFilter} onCopy={copyExactValue} />;
   }
 
@@ -1163,7 +1206,17 @@ export function ProjectInventoryPage() {
     const label = RESOURCE_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column;
     if (column === "name") return <InventoryCell text={row.name} label={label} filterField="share" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "share_type") return <InventoryCell text={row.share_type.toUpperCase()} label={label} badge="neutral" onFilter={applyCellFilter} onCopy={copyExactValue} />;
-    if (column === "access_level") return <InventoryCell text={row.access_level} label={label} filterField="access" badge={row.access_level === "readable" ? "positive" : row.access_level === "list_only" ? "warning" : "neutral"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "access_level") {
+      return (
+        <AccessCapabilityCell
+          accessLevel={row.access_level}
+          capabilities={row.access_capabilities}
+          label={label}
+          onCopy={copyExactValue}
+          onFilter={(value, negated) => applyCellFilter("access", value, negated)}
+        />
+      );
+    }
     if (column === "endpoint_key") return <InventoryCell text={row.endpoint_key} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "hostname") return <InventoryCell text={row.hostname || "—"} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "item_count") return <InventoryCell text={row.item_count.toLocaleString()} filterValue={String(row.item_count)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
@@ -1447,9 +1500,10 @@ export function ProjectInventoryPage() {
                   Access
                   <select className={FILTER_SELECT_CLASS} onChange={(event) => handleSimpleFilterChange(setResourceAccess, event.target.value)} value={resourceAccess}>
                     <option value="">Any access</option>
-                    <option value="readable">Readable</option>
-                    <option value="list_only">List only</option>
-                    <option value="no_access">No access</option>
+                    <option value="readable">Read observed</option>
+                    <option value="list_only">List observed</option>
+                    <option value="no_access">Access denied</option>
+                    <option value="unknown">Unknown</option>
                   </select>
                 </label>
               ) : null}

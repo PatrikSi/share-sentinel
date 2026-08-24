@@ -1,6 +1,7 @@
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
+import { AccessCapabilityCell, type AccessCapabilities } from "@/components/access-capability-cell";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
@@ -42,7 +43,14 @@ type Endpoint = {
   hostname: string | null;
   smb_signing: string | null;
 };
-type Resource = { id: number; name: string; access_level: string; remark: string | null; share_type: string };
+type Resource = {
+  id: number;
+  name: string;
+  access_level: string;
+  access_capabilities: AccessCapabilities | null;
+  remark: string | null;
+  share_type: string;
+};
 type Item = { id: number; path: string; is_dir: boolean; resource_id?: number; name?: string; size_bytes?: number | null; mtime?: string | null };
 type SavedQuery = { id: string; label: string; q: string; ext: string };
 type RunDiffShare = {
@@ -1599,22 +1607,30 @@ export function RunDetailPage() {
             {resources.length === 0 ? <p className="text-sm text-slate-500">No shares are available for the selected endpoint.</p> : null}
             <ul className="space-y-2">
               {resources.map((resource) => (
-                <li key={resource.id}>
+                <li
+                  className={`overflow-hidden rounded-2xl border text-xs ${
+                    selectedResource === resource.id
+                      ? "border-emerald-600 bg-emerald-50 dark:bg-emerald-900/20"
+                      : "border-slate-300 dark:border-slate-700"
+                  }`}
+                  key={resource.id}
+                >
                   <button
-                    className={`w-full rounded-2xl border px-3 py-3 text-left text-xs ${
-                      selectedResource === resource.id
-                        ? "border-emerald-600 bg-emerald-50 dark:bg-emerald-900/20"
-                        : "border-slate-300 hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-                    }`}
+                    className="w-full px-3 py-3 text-left hover:bg-slate-100 dark:hover:bg-slate-800"
                     onClick={() => setSelectedResource(resource.id)}
                     type="button"
                   >
                     <span className="block font-semibold">{resource.name}</span>
-                    <span className="mt-1 block text-slate-500">
-                      {resource.share_type.toUpperCase()} • {resource.access_level}
-                    </span>
+                    <span className="mt-1 block text-slate-500">{resource.share_type.toUpperCase()}</span>
                     {resource.remark ? <span className="mt-1 block text-slate-500">{resource.remark}</span> : null}
                   </button>
+                  <div className="border-t border-slate-200 bg-white/70 px-3 py-2 dark:border-slate-700 dark:bg-slate-950/30">
+                    <AccessCapabilityCell
+                      accessLevel={resource.access_level}
+                      capabilities={resource.access_capabilities}
+                      label="Share access"
+                    />
+                  </div>
                 </li>
               ))}
             </ul>

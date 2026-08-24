@@ -27,6 +27,7 @@ class ResourceType(str, Enum):
 
 
 class AccessLevel(str, Enum):
+    UNKNOWN = "unknown"
     NO_ACCESS = "no_access"
     LIST_ONLY = "list_only"
     READABLE = "readable"

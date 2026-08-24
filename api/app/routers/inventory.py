@@ -87,6 +87,7 @@ def _audit_read(
 
 
 ACCESS_LEVEL_ALIASES = {
+    "unknown": "unknown",
     "no_access": "no_access",
     "none": "no_access",
     "denied": "no_access",
@@ -98,8 +99,6 @@ ACCESS_LEVEL_ALIASES = {
     "read_only": "readable",
     "read_write": "readable",
     "read-write": "readable",
-    "write": "readable",
-    "writable": "readable",
 }
 
 
@@ -581,12 +580,18 @@ def inventory_items(
             Endpoint.ip,
             Resource.name.label("resource_name"),
             Resource.access_level,
+            Resource.access_capabilities,
             Resource.resource_type,
             Item.path,
             Item.name,
             Item.is_dir,
             Item.size_bytes,
+            Item.allocation_size_bytes,
             Item.mtime,
+            Item.created_at,
+            Item.accessed_at,
+            Item.changed_at,
+            Item.file_attributes,
         )
         .select_from(Item)
         .join(Resource, (Resource.id == Item.resource_id) & (Resource.run_id == Item.run_id))
@@ -643,12 +648,18 @@ def inventory_items(
             "ip": row.ip,
             "resource_name": row.resource_name,
             "access_level": row.access_level.value if hasattr(row.access_level, "value") else row.access_level,
+            "access_capabilities": row.access_capabilities or {},
             "share_type": share_type_from_resource_type(row.resource_type),
             "path": row.path,
             "name": row.name,
             "is_dir": bool(row.is_dir),
             "size_bytes": row.size_bytes,
+            "allocation_size_bytes": row.allocation_size_bytes,
             "mtime": row.mtime.isoformat() if row.mtime else None,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "accessed_at": row.accessed_at.isoformat() if row.accessed_at else None,
+            "changed_at": row.changed_at.isoformat() if row.changed_at else None,
+            "file_attributes": row.file_attributes or [],
         }
         for row in rows
     ]
@@ -703,6 +714,7 @@ def inventory_resources(
             Resource.name,
             Resource.remark,
             Resource.access_level,
+            Resource.access_capabilities,
             Resource.resource_type,
             func.count(Item.id).label("item_count"),
         )
@@ -720,6 +732,7 @@ def inventory_resources(
             Resource.name,
             Resource.remark,
             Resource.access_level,
+            Resource.access_capabilities,
             Resource.resource_type,
         )
     )
@@ -728,7 +741,7 @@ def inventory_resources(
         stmt = stmt.where(Resource.run_id.in_(run_id_list))
     if access_level:
         normalized_access_level = access_level.strip().lower()
-        if normalized_access_level not in {"no_access", "list_only", "readable"}:
+        if normalized_access_level not in {"unknown", "no_access", "list_only", "readable"}:
             raise HTTPException(status_code=400, detail="invalid access_level")
         stmt = stmt.where(Resource.access_level == normalized_access_level)
     if endpoint:
@@ -754,6 +767,7 @@ def inventory_resources(
             "name": row.name,
             "remark": row.remark,
             "access_level": row.access_level.value if hasattr(row.access_level, "value") else row.access_level,
+            "access_capabilities": row.access_capabilities or {},
             "share_type": share_type_from_resource_type(row.resource_type),
             "item_count": int(row.item_count or 0),
         }

@@ -238,7 +238,9 @@ Item-level inventory view. Supports:
 - `limit`
 - `cursor`
 
-Item rows include nullable `size_bytes` and ISO-8601 `mtime` values when the source collector supplied usable metadata.
+Item rows include nullable `size_bytes`, `allocation_size_bytes`, ISO-8601 `mtime`, `created_at`, `accessed_at`, and `changed_at` values, plus a `file_attributes` array, when the source collector supplied usable metadata. For SMB artifacts produced by the bundled collector, `mtime` is the server's last-write time and `changed_at` is its metadata-change time.
+
+Each item also inherits its resource's `access_level` and `access_capabilities`. Capability evidence is resource-level and sampled; it must not be interpreted as proof that the individual item row was tested.
 
 Inventory pagination currently uses a stable server-defined order. Arbitrary column sorting is not part of the API contract yet; clients must not sort one fetched page and present it as a full-result sort.
 
@@ -253,6 +255,8 @@ Share-level inventory view. Supports:
 - `run_ids`
 - `limit`
 - `cursor`
+
+Resource rows include the compatibility `access_level` (`unknown`, `no_access`, `list_only`, or `readable`) and an `access_capabilities` object. Known capabilities are `tree_connect`, `list`, `read_file`, `create_file`, `create_directory`, `modify_file`, `delete`, `write_acl`, and `write_owner`. Each contains a status (`allowed`, `denied`, `mixed`, `not_tested`, or `inconclusive`) and bounded evidence counts. A reserved `_metadata` object describes the non-mutating probe method and sample coverage. Its `complete` flag means a final per-share probe record was produced without cancellation, while `partial` describes limited or degraded coverage; both can truthfully be `true`.
 
 ### `GET /projects/{project_id}/inventory/endpoints`
 
