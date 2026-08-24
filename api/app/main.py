@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.config import get_settings
+from app.error_handlers import register_error_handlers
 from app.middleware import RequestContextMiddleware
 from app.routers import audit, auth, health, inventory, projects, runs, settings, users
 
@@ -25,6 +26,7 @@ app = FastAPI(
     redoc_url="/redoc" if docs_enabled else None,
     openapi_url="/openapi.json" if docs_enabled else None,
 )
+register_error_handlers(app)
 
 origins = [item.strip() for item in app_settings.cors_origins.split(",") if item.strip()]
 app.add_middleware(

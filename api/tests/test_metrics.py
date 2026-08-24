@@ -39,6 +39,19 @@ def test_metrics_endpoint_exposes_request_and_error_counters() -> None:
     assert 'share_sentinel_http_requests_total{method="GET",path="__unmatched__",status="404"} 1' in payload
     assert 'share_sentinel_http_request_errors_total{method="GET",path="__unmatched__",error="http_4xx"} 1' in payload
     assert 'share_sentinel_http_request_duration_seconds_count{method="GET",path="/healthz"} 1' in payload
+    assert 'share_sentinel_database_pool_connections{state="size"} 10' in payload
+    assert 'share_sentinel_database_pool_connections{state="checked_out"}' in payload
+
+
+def test_metrics_expose_bounded_database_error_classes() -> None:
+    metrics.record_database_error("pool_timeout")
+    metrics.record_database_error("pool_timeout")
+    metrics.record_database_error("operational_error")
+
+    payload = metrics.render_prometheus()
+
+    assert 'share_sentinel_database_errors_total{error="pool_timeout"} 2' in payload
+    assert 'share_sentinel_database_errors_total{error="operational_error"} 1' in payload
 
 
 def test_metrics_capture_uncaught_exceptions() -> None:

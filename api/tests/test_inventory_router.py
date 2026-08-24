@@ -82,6 +82,21 @@ def _clear_overrides():
     app.dependency_overrides.clear()
 
 
+def test_parse_run_ids_deduplicates_and_bounds_query_width() -> None:
+    run_id = uuid.uuid4()
+
+    assert inventory_router._parse_run_ids(f"{run_id},{run_id}") == [run_id]
+
+    oversized = ",".join(str(uuid.uuid4()) for _ in range(inventory_router.MAX_INVENTORY_RUN_IDS + 1))
+    try:
+        inventory_router._parse_run_ids(oversized)
+    except Exception as exc:  # HTTPException is intentionally part of the router contract.
+        assert getattr(exc, "status_code", None) == 400
+        assert "too many run_ids" in str(getattr(exc, "detail", ""))
+    else:
+        raise AssertionError("oversized run_ids should be rejected")
+
+
 def test_inventory_saved_investigations_create_list_and_delete(monkeypatch) -> None:
     project_id = uuid.uuid4()
     fake_db = _FakeDb()

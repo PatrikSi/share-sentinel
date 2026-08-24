@@ -8,14 +8,20 @@ from app.db import get_db
 from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
 from app.enums import ProjectRole
 from app.models import AuditEvent
-from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_datetime_cursor_value
+from app.pagination import (
+    KeysetColumn,
+    apply_keyset_pagination,
+    paginate_rows,
+    parse_datetime_cursor_value,
+    parse_int_cursor_value,
+)
 from app.services.audit import write_audit_event
 from app.token_scopes import SCOPE_READ_AUDIT
 
 router = APIRouter(prefix="/projects/{project_id}/audit", tags=["audit"])
 PROJECT_AUDIT_CURSOR = (
     KeysetColumn("ts", AuditEvent.ts, direction="desc", parser=parse_datetime_cursor_value),
-    KeysetColumn("id", AuditEvent.id, direction="desc"),
+    KeysetColumn("id", AuditEvent.id, direction="desc", parser=parse_int_cursor_value),
 )
 
 

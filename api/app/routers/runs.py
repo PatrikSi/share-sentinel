@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import heapq
 import logging
 import time
 import uuid
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
-from app.db import escape_like, get_db
+from app.db import SessionLocal, escape_like, get_db
 from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
 from app.enums import ErrorSeverity, ProjectRole, RunStatus
 from app.models import AuditEvent, Endpoint, IngestError, Item, Resource, ScanRun
@@ -57,11 +58,12 @@ RUN_LIST_CURSOR = (
     KeysetColumn("id", ScanRun.id, direction="desc", parser=parse_uuid_cursor_value),
 )
 RUN_ENDPOINT_CURSOR = (KeysetColumn("id", Endpoint.id, parser=parse_int_cursor_value),)
+RUN_RESOURCE_CURSOR = (KeysetColumn("id", Resource.id, parser=parse_int_cursor_value),)
 RUN_ITEM_CURSOR = (KeysetColumn("id", Item.id, parser=parse_int_cursor_value),)
 RUN_ERROR_CURSOR = (KeysetColumn("id", IngestError.id, parser=parse_int_cursor_value),)
 RUN_ACTIVITY_CURSOR = (
     KeysetColumn("ts", AuditEvent.ts, direction="desc", parser=parse_datetime_cursor_value),
-    KeysetColumn("id", AuditEvent.id, direction="desc"),
+    KeysetColumn("id", AuditEvent.id, direction="desc", parser=parse_int_cursor_value),
 )
 RUN_ACTIVITY_ACTIONS = {
     "RUN_CREATED",
@@ -69,11 +71,17 @@ RUN_ACTIVITY_ACTIONS = {
     "INGEST_QUEUED",
     "INGEST_QUEUE_FALLBACK",
     "INGEST_STARTED",
+    "INGEST_PAUSED",
     "INGEST_RETRY_SCHEDULED",
     "INGEST_COMPLETED",
     "INGEST_FAILED",
 }
 EMPTY_RUN_SUMMARY = {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
+UPLOADABLE_RUN_STATUSES = frozenset({RunStatus.PENDING_UPLOAD, RunStatus.UPLOADED, RunStatus.FAILED})
+MAX_SEARCH_CHARS = 512
+MAX_PATH_PREFIX_CHARS = 4096
+MAX_RUN_DIFF_DETAIL_RECORDS = 2000
+DEFAULT_RUN_DIFF_DETAIL_RECORDS = 500
 
 
 def _run_lock_key(run_id: uuid.UUID) -> int:
@@ -90,6 +98,44 @@ def _get_run(db: Session, project_id: uuid.UUID, run_id: uuid.UUID) -> ScanRun:
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
     return run
+
+
+def _require_endpoint(
+    db: Session,
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+    endpoint_id: int,
+) -> None:
+    endpoint = db.execute(
+        select(Endpoint.id)
+        .join(ScanRun, ScanRun.id == Endpoint.run_id)
+        .where(
+            Endpoint.id == endpoint_id,
+            Endpoint.run_id == run_id,
+            ScanRun.project_id == project_id,
+        )
+    ).scalar_one_or_none()
+    if endpoint is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="endpoint not found in run")
+
+
+def _require_resource(
+    db: Session,
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+    resource_id: int,
+) -> None:
+    resource = db.execute(
+        select(Resource.id)
+        .join(ScanRun, ScanRun.id == Resource.run_id)
+        .where(
+            Resource.id == resource_id,
+            Resource.run_id == run_id,
+            ScanRun.project_id == project_id,
+        )
+    ).scalar_one_or_none()
+    if resource is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="resource not found in run")
 
 
 def _to_run_out(run: ScanRun) -> RunOut:
@@ -127,6 +173,25 @@ def _clear_run_ingest_data(db: Session, run: ScanRun) -> None:
     run.ingest_progress = {"line_offset": 0}
 
 
+def _require_uploadable_run(run: ScanRun) -> None:
+    if run.status not in UPLOADABLE_RUN_STATUSES:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run state does not accept upload")
+
+
+def _rollback_upload_session_quietly(db: Session, run_id: uuid.UUID, operation: str) -> None:
+    try:
+        db.rollback()
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to roll back %s transaction run_id=%s", operation, run_id)
+
+
+def _close_upload_session_quietly(db: Session, run_id: uuid.UUID, operation: str) -> None:
+    try:
+        db.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to close %s session run_id=%s", operation, run_id)
+
+
 def _delete_artifact_quietly(key: str | None) -> None:
     if not key:
         return
@@ -134,7 +199,7 @@ def _delete_artifact_quietly(key: str | None) -> None:
         delete_object(key)
     except FileNotFoundError:
         return
-    except (OSError, ValueError):
+    except Exception:  # noqa: BLE001 - cleanup must not mask the primary operation.
         logger.warning("failed to delete artifact key=%s", key, exc_info=True)
 
 
@@ -266,7 +331,7 @@ def _iter_run_diff_resources(db: Session, run_id: uuid.UUID):
 
     current_key: tuple[str, str, str] | None = None
     current_record: dict | None = None
-    for row in db.execute(stmt):
+    for row in db.execute(stmt.execution_options(yield_per=1000)):
         resource_type = row.resource_type.value if hasattr(row.resource_type, "value") else str(row.resource_type)
         access_level = row.access_level.value if hasattr(row.access_level, "value") else row.access_level
         key = _resource_identity(row.endpoint_key, resource_type, row.name)
@@ -308,82 +373,146 @@ def _serialize_diff_resource(resource: dict) -> dict:
     }
 
 
-def _build_run_diff_from_iters(current_iter, baseline_iter, example_limit: int = 5) -> dict:
+def _set_difference_summary(left: set[str], right: set[str], example_limit: int) -> tuple[int, list[str]]:
+    count = 0
+
+    def iter_difference():
+        nonlocal count
+        for path in left:
+            if path not in right:
+                count += 1
+                yield path
+
+    examples = heapq.nsmallest(example_limit, iter_difference())
+    return count, examples
+
+
+def _build_run_diff_from_iters(
+    current_iter,
+    baseline_iter,
+    example_limit: int = 5,
+    detail_limit: int | None = None,
+) -> dict:
     current_iter = iter(current_iter)
     baseline_iter = iter(baseline_iter)
     current_entry = _next_resource_record(current_iter)
     baseline_entry = _next_resource_record(baseline_iter)
 
-    new_shares = []
-    disappeared_shares = []
-    item_churn = []
+    new_shares: list[dict] = []
+    disappeared_shares: list[dict] = []
+    new_share_count = 0
+    disappeared_share_count = 0
+    changed_share_count = 0
+    added_item_count = 0
+    removed_item_count = 0
 
-    while current_entry is not None or baseline_entry is not None:
-        if baseline_entry is None:
-            _current_key, current_resource = current_entry
-            new_shares.append(_serialize_diff_resource(current_resource))
-            current_entry = _next_resource_record(current_iter)
-            continue
+    def append_bounded(items: list[dict], record: dict) -> None:
+        if detail_limit is None or len(items) < detail_limit:
+            items.append(record)
 
-        if current_entry is None:
-            _baseline_key, baseline_resource = baseline_entry
-            disappeared_shares.append(_serialize_diff_resource(baseline_resource))
-            baseline_entry = _next_resource_record(baseline_iter)
-            continue
+    def iter_item_churn():
+        nonlocal current_entry
+        nonlocal baseline_entry
+        nonlocal new_share_count
+        nonlocal disappeared_share_count
+        nonlocal changed_share_count
+        nonlocal added_item_count
+        nonlocal removed_item_count
 
-        current_key, current_resource = current_entry
-        baseline_key, baseline_resource = baseline_entry
-        if _normalized_resource_key(current_key) < _normalized_resource_key(baseline_key):
-            new_shares.append(_serialize_diff_resource(current_resource))
-            current_entry = _next_resource_record(current_iter)
-            continue
+        while current_entry is not None or baseline_entry is not None:
+            if baseline_entry is None:
+                _current_key, current_resource = current_entry
+                new_share_count += 1
+                append_bounded(new_shares, _serialize_diff_resource(current_resource))
+                current_entry = _next_resource_record(current_iter)
+                continue
 
-        if _normalized_resource_key(current_key) > _normalized_resource_key(baseline_key):
-            disappeared_shares.append(_serialize_diff_resource(baseline_resource))
-            baseline_entry = _next_resource_record(baseline_iter)
-            continue
+            if current_entry is None:
+                _baseline_key, baseline_resource = baseline_entry
+                disappeared_share_count += 1
+                append_bounded(disappeared_shares, _serialize_diff_resource(baseline_resource))
+                baseline_entry = _next_resource_record(baseline_iter)
+                continue
 
-        added_paths = sorted(current_resource["item_paths"] - baseline_resource["item_paths"])
-        removed_paths = sorted(baseline_resource["item_paths"] - current_resource["item_paths"])
-        if added_paths or removed_paths:
-            item_churn.append(
-                {
+            current_key, current_resource = current_entry
+            baseline_key, baseline_resource = baseline_entry
+            if _normalized_resource_key(current_key) < _normalized_resource_key(baseline_key):
+                new_share_count += 1
+                append_bounded(new_shares, _serialize_diff_resource(current_resource))
+                current_entry = _next_resource_record(current_iter)
+                continue
+
+            if _normalized_resource_key(current_key) > _normalized_resource_key(baseline_key):
+                disappeared_share_count += 1
+                append_bounded(disappeared_shares, _serialize_diff_resource(baseline_resource))
+                baseline_entry = _next_resource_record(baseline_iter)
+                continue
+
+            added_items, added_examples = _set_difference_summary(
+                current_resource["item_paths"],
+                baseline_resource["item_paths"],
+                example_limit,
+            )
+            removed_items, removed_examples = _set_difference_summary(
+                baseline_resource["item_paths"],
+                current_resource["item_paths"],
+                example_limit,
+            )
+            if added_items or removed_items:
+                changed_share_count += 1
+                added_item_count += added_items
+                removed_item_count += removed_items
+                yield {
                     "endpoint_key": current_resource["endpoint_key"],
                     "hostname": current_resource["hostname"] or baseline_resource["hostname"],
                     "ip": current_resource["ip"] or baseline_resource["ip"],
                     "share_name": current_resource["share_name"],
                     "share_type": current_resource["share_type"],
                     "access_level": current_resource["access_level"] or baseline_resource["access_level"],
-                    "added_items": len(added_paths),
-                    "removed_items": len(removed_paths),
-                    "added_examples": added_paths[:example_limit],
-                    "removed_examples": removed_paths[:example_limit],
+                    "added_items": added_items,
+                    "removed_items": removed_items,
+                    "added_examples": added_examples,
+                    "removed_examples": removed_examples,
                 }
-            )
 
-        current_entry = _next_resource_record(current_iter)
-        baseline_entry = _next_resource_record(baseline_iter)
+            current_entry = _next_resource_record(current_iter)
+            baseline_entry = _next_resource_record(baseline_iter)
 
-    item_churn.sort(
-        key=lambda item: (
-            -(item["added_items"] + item["removed_items"]),
-            item["endpoint_key"].lower(),
-            item["share_name"].lower(),
-        )
+    churn_sort_key = lambda item: (  # noqa: E731
+        -(item["added_items"] + item["removed_items"]),
+        item["endpoint_key"].lower(),
+        item["share_name"].lower(),
     )
+    churn_iter = iter_item_churn()
+    if detail_limit is None:
+        item_churn = sorted(churn_iter, key=churn_sort_key)
+    else:
+        item_churn = heapq.nsmallest(detail_limit, churn_iter, key=churn_sort_key)
 
-    return {
+    payload = {
         "summary": {
-            "new_shares": len(new_shares),
-            "disappeared_shares": len(disappeared_shares),
-            "changed_shares": len(item_churn),
-            "added_items": sum(item["added_items"] for item in item_churn),
-            "removed_items": sum(item["removed_items"] for item in item_churn),
+            "new_shares": new_share_count,
+            "disappeared_shares": disappeared_share_count,
+            "changed_shares": changed_share_count,
+            "added_items": added_item_count,
+            "removed_items": removed_item_count,
         },
         "new_shares": new_shares,
         "disappeared_shares": disappeared_shares,
         "item_churn": item_churn,
     }
+    if detail_limit is not None:
+        sections = {
+            "new_shares": new_share_count > len(new_shares),
+            "disappeared_shares": disappeared_share_count > len(disappeared_shares),
+            "item_churn": changed_share_count > len(item_churn),
+        }
+        payload["truncation"] = {
+            "detail_limit": detail_limit,
+            "truncated": any(sections.values()),
+            "sections": sections,
+        }
+    return payload
 
 
 def _build_run_diff(current_snapshot: dict[tuple[str, str, str], dict], baseline_snapshot: dict[tuple[str, str, str], dict], example_limit: int = 5) -> dict:
@@ -474,10 +603,186 @@ def _default_baseline_run(db: Session, project_id: uuid.UUID, run: ScanRun) -> S
             ScanRun.status == RunStatus.COMPLETE,
             ScanRun.created_at <= run.created_at,
         )
-        .order_by(ScanRun.created_at.desc())
+        .order_by(ScanRun.created_at.desc(), ScanRun.id.desc())
         .limit(1)
     )
     return db.execute(stmt).scalar_one_or_none()
+
+
+def _run_diff_item_count(db: Session, run: ScanRun) -> int:
+    # The summary is an ingest-time convenience value and can be stale on
+    # legacy, repaired, or partially replayed runs. This count is an OOM guard,
+    # so only authoritative persisted rows are safe to trust.
+    return int(db.execute(select(func.count(Item.id)).where(Item.run_id == run.id)).scalar() or 0)
+
+
+def _enforce_run_diff_item_limit(db: Session, current_run: ScanRun, baseline_run: ScanRun) -> int:
+    settings = get_settings()
+    total_items = _run_diff_item_count(db, current_run) + _run_diff_item_count(db, baseline_run)
+    if total_items > settings.api_run_diff_max_items:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"run diff covers {total_items} items, exceeding the synchronous limit of "
+                f"{settings.api_run_diff_max_items}; reduce scan scope or provision a larger "
+                "API_RUN_DIFF_MAX_ITEMS limit with sufficient API memory"
+            ),
+        )
+    return total_items
+
+
+def _require_complete_run_for_diff(run: ScanRun, label: str) -> None:
+    status_value = run.status.value if hasattr(run.status, "value") else str(run.status)
+    if status_value != RunStatus.COMPLETE.value:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"run diff requires a COMPLETE {label} run; "
+                f"{label} run status is {status_value}"
+            ),
+        )
+
+
+def _get_upload_auth_context(
+    auth: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_RUNS)),
+    db: Session = Depends(get_db),
+) -> AuthContext:
+    """Release the authentication transaction before streaming request bytes."""
+    db.rollback()
+    return auth
+
+
+def _preflight_artifact_upload(
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+    auth: AuthContext,
+) -> None:
+    """Validate current authorization and run state in a short-lived session."""
+    db = SessionLocal()
+    try:
+        require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
+        run = _get_run(db, project_id, run_id)
+        _require_uploadable_run(run)
+    finally:
+        _close_upload_session_quietly(db, run_id, "artifact upload preflight")
+
+
+def _commit_uploaded_artifact(
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+    auth: AuthContext,
+    key: str,
+    size: int,
+    digest: str,
+    content_type: str,
+    upload_ms: int,
+    request_metadata: dict,
+) -> uuid.UUID:
+    """Select an uploaded object under the run lock and clean up safely.
+
+    Before COMMIT starts, failures delete the unreferenced immutable object.
+    Once COMMIT is attempted its outcome is ambiguous, so the object is kept
+    for the database pointer or orphan reconciliation.
+    """
+    db = SessionLocal()
+    commit_attempted = False
+    previous_artifact_key: str | None = None
+    authoritative_run_id = run_id
+    try:
+        require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
+        run = _get_run(db, project_id, run_id)
+        if not _try_lock_run_for_mutation(db, run.id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run is currently ingesting")
+        db.refresh(run)
+        _require_uploadable_run(run)
+
+        previous_status = run.status
+        previous_artifact_key = run.artifact_key
+        authoritative_run_id = run.id
+        if previous_status == RunStatus.FAILED or previous_artifact_key is not None:
+            _clear_run_ingest_data(db, run)
+
+        run.artifact_key = key
+        run.artifact_size = size
+        run.artifact_sha256 = digest
+        run.artifact_content_type = content_type
+        run.status = RunStatus.UPLOADED
+        run.ingest_progress = {"line_offset": 0}
+        db.add(run)
+
+        write_audit_event(
+            db,
+            action="ARTIFACT_UPLOADED",
+            object_type="scan_run",
+            object_id=str(run.id),
+            actor_user_id=auth.user_id,
+            actor_token_id=auth.token_id,
+            project_id=project_id,
+            metadata={
+                **request_metadata,
+                "size": size,
+                "content_type": content_type,
+                "upload_ms": upload_ms,
+            },
+        )
+        commit_attempted = True
+        db.commit()
+    except BaseException:
+        _rollback_upload_session_quietly(db, run_id, "artifact pointer")
+        if not commit_attempted:
+            _delete_artifact_quietly(key)
+        raise
+    finally:
+        _close_upload_session_quietly(db, run_id, "artifact pointer")
+
+    _delete_superseded_artifact(previous_artifact_key, key)
+    return authoritative_run_id
+
+
+def _write_enqueue_audit(
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+    auth: AuthContext,
+    queued: bool,
+    request_metadata: dict,
+) -> None:
+    db = SessionLocal()
+    try:
+        write_audit_event(
+            db,
+            action="INGEST_QUEUED" if queued else "INGEST_QUEUE_FALLBACK",
+            object_type="scan_run",
+            object_id=str(run_id),
+            actor_user_id=auth.user_id,
+            actor_token_id=auth.token_id,
+            project_id=project_id,
+            metadata=request_metadata if queued else {**request_metadata, "reason": "redis enqueue failed"},
+        )
+        db.commit()
+    except BaseException:
+        _rollback_upload_session_quietly(db, run_id, "ingest enqueue audit")
+        raise
+    finally:
+        _close_upload_session_quietly(db, run_id, "ingest enqueue audit")
+
+
+async def _run_critical_upload_step(func, *args):
+    """Let a bounded durable step finish before propagating cancellation."""
+    task = asyncio.create_task(run_in_threadpool(func, *args))
+    cancellation_requested = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancellation_requested = True
+            continue
+
+    # A durability error takes precedence over cancellation so the API and
+    # logs retain the actual database failure. Cleanup is owned by the helper.
+    result = task.result()
+    if cancellation_requested:
+        raise asyncio.CancelledError
+    return result
 
 
 async def _enqueue_with_retries(payload: dict, retries: int) -> bool:
@@ -828,7 +1133,7 @@ def list_run_errors(
     run_id: uuid.UUID,
     request: Request,
     severity: ErrorSeverity | None = Query(default=None),
-    search: str | None = Query(default=None),
+    search: str | None = Query(default=None, max_length=MAX_SEARCH_CHARS),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -942,13 +1247,21 @@ def diff_run(
     run_id: uuid.UUID,
     request: Request,
     baseline_run_id: uuid.UUID | None = Query(default=None),
+    detail_limit: int = Query(
+        default=DEFAULT_RUN_DIFF_DETAIL_RECORDS,
+        ge=1,
+        le=MAX_RUN_DIFF_DETAIL_RECORDS,
+    ),
     db: Session = Depends(get_db),
     _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     current_run = _get_run(db, project_id, run_id)
+    _require_complete_run_for_diff(current_run, "current")
     baseline_run = _get_run(db, project_id, baseline_run_id) if baseline_run_id else _default_baseline_run(db, project_id, current_run)
+    if baseline_run is not None:
+        _require_complete_run_for_diff(baseline_run, "baseline")
 
     if baseline_run is None:
         _write_read_audit(
@@ -969,11 +1282,22 @@ def diff_run(
             "new_shares": [],
             "disappeared_shares": [],
             "item_churn": [],
+            "truncation": {
+                "detail_limit": detail_limit,
+                "truncated": False,
+                "sections": {
+                    "new_shares": False,
+                    "disappeared_shares": False,
+                    "item_churn": False,
+                },
+            },
         }
 
+    compared_items = _enforce_run_diff_item_limit(db, current_run, baseline_run)
     payload = _build_run_diff_from_iters(
         _iter_run_diff_resources(db, current_run.id),
         _iter_run_diff_resources(db, baseline_run.id),
+        detail_limit=detail_limit,
     )
     payload["current_run"] = _run_summary_payload(current_run)
     payload["baseline_run"] = _run_summary_payload(baseline_run)
@@ -986,7 +1310,13 @@ def diff_run(
         action="RUN_DIFF_VIEWED",
         object_type="scan_run",
         object_id=str(run_id),
-        metadata={**payload["summary"], "baseline_run_id": str(baseline_run.id)},
+        metadata={
+            **payload["summary"],
+            "baseline_run_id": str(baseline_run.id),
+            "compared_items": compared_items,
+            "detail_limit": detail_limit,
+            "truncated": payload["truncation"]["truncated"],
+        },
     )
     db.commit()
     return payload
@@ -1028,88 +1358,33 @@ async def upload_artifact(
     run_id: uuid.UUID,
     request: Request,
     file: UploadFile | None = File(default=None),
-    db: Session = Depends(get_db),
-    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_RUNS)),
-    auth: AuthContext = Depends(get_auth_context),
+    auth: AuthContext = Depends(_get_upload_auth_context),
 ):
-    require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
+    await run_in_threadpool(_preflight_artifact_upload, project_id, run_id, auth)
     actor_key = str(auth.token_id or auth.user_id or "anon")
     await _check_upload_rate_limit(request, actor_key)
 
     settings = get_settings()
-    run = _get_run(db, project_id, run_id)
-    if run.status not in {RunStatus.PENDING_UPLOAD, RunStatus.UPLOADED, RunStatus.FAILED}:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run state does not accept upload")
-
     content_type = _normalize_content_type(file.content_type if file else request.headers.get("content-type", "application/octet-stream"))
     filename = file.filename if file else _raw_artifact_filename(request)
     _validate_artifact_upload_headers(content_type, filename)
     suffix = _artifact_suffix(content_type, filename)
     key = _new_artifact_key(project_id, run_id, suffix)
-
-    # Authentication/project preflight opens a SQLAlchemy transaction. Release
-    # its pooled connection before a potentially long request-body transfer;
-    # immutable object keys let us re-check authoritative state afterward.
-    db.rollback()
-
+    request_metadata = request_meta(request)
     started = time.perf_counter()
     size, digest = await _upload_artifact_stream(request, file, key, content_type)
-
-    commit_attempted = False
-    previous_artifact_key: str | None = None
-    try:
-        require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
-        run = _get_run(db, project_id, run_id)
-        if not _try_lock_run_for_mutation(db, run.id):
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run is currently ingesting")
-        db.refresh(run)
-        if run.status not in {RunStatus.PENDING_UPLOAD, RunStatus.UPLOADED, RunStatus.FAILED}:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run state does not accept upload")
-        previous_status = run.status
-        previous_artifact_key = run.artifact_key
-
-        if previous_status == RunStatus.FAILED or previous_artifact_key is not None:
-            _clear_run_ingest_data(db, run)
-
-        run.artifact_key = key
-        run.artifact_size = size
-        run.artifact_sha256 = digest
-        run.artifact_content_type = content_type
-        run.status = RunStatus.UPLOADED
-        run.ingest_progress = {"line_offset": 0}
-        db.add(run)
-
-        write_audit_event(
-            db,
-            action="ARTIFACT_UPLOADED",
-            object_type="scan_run",
-            object_id=str(run.id),
-            actor_user_id=auth.user_id,
-            actor_token_id=auth.token_id,
-            project_id=project_id,
-            metadata={
-                **request_meta(request),
-                "size": size,
-                "content_type": content_type,
-                "upload_ms": int((time.perf_counter() - started) * 1000),
-            },
-        )
-        commit_attempted = True
-        db.commit()
-    except BaseException:
-        try:
-            db.rollback()
-        except Exception:  # noqa: BLE001
-            logger.exception("failed to roll back artifact pointer transaction run_id=%s", run_id)
-        # Once COMMIT has been attempted its outcome can be ambiguous. Keep the
-        # immutable object so a possibly committed DB pointer never references
-        # deleted bytes; orphan reconciliation can remove it later if needed.
-        if not commit_attempted:
-            await _run_cleanup_in_threadpool(_delete_artifact_quietly, key)
-        raise
-
-    authoritative_run_id = run.id
-    await run_in_threadpool(_delete_superseded_artifact, previous_artifact_key, key)
+    authoritative_run_id = await _run_critical_upload_step(
+        _commit_uploaded_artifact,
+        project_id,
+        run_id,
+        auth,
+        key,
+        size,
+        digest,
+        content_type,
+        int((time.perf_counter() - started) * 1000),
+        request_metadata,
+    )
 
     payload = {
         "run_id": str(authoritative_run_id),
@@ -1119,29 +1394,14 @@ async def upload_artifact(
         "uploaded_at": datetime.now(tz=UTC).isoformat(),
     }
     queued = await _enqueue_with_retries(payload, settings.redis_stream_retries)
-    if queued:
-        write_audit_event(
-            db,
-            action="INGEST_QUEUED",
-            object_type="scan_run",
-            object_id=str(authoritative_run_id),
-            actor_user_id=auth.user_id,
-            actor_token_id=auth.token_id,
-            project_id=project_id,
-            metadata=request_meta(request),
-        )
-    else:
-        write_audit_event(
-            db,
-            action="INGEST_QUEUE_FALLBACK",
-            object_type="scan_run",
-            object_id=str(authoritative_run_id),
-            actor_user_id=auth.user_id,
-            actor_token_id=auth.token_id,
-            project_id=project_id,
-            metadata={**request_meta(request), "reason": "redis enqueue failed"},
-        )
-    db.commit()
+    await _run_critical_upload_step(
+        _write_enqueue_audit,
+        project_id,
+        authoritative_run_id,
+        auth,
+        queued,
+        request_metadata,
+    )
 
     return {
         "ok": True,
@@ -1157,7 +1417,7 @@ def list_endpoints(
     project_id: uuid.UUID,
     run_id: uuid.UUID,
     request: Request,
-    search: str | None = None,
+    search: str | None = Query(default=None, max_length=MAX_SEARCH_CHARS),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -1219,19 +1479,22 @@ def endpoint_resources(
     run_id: uuid.UUID,
     endpoint_id: int,
     request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
     _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
-    _get_run(db, project_id, run_id)
+    _require_endpoint(db, project_id, run_id, endpoint_id)
 
-    stmt = (
-        select(Resource)
-        .where(Resource.run_id == run_id, Resource.endpoint_id == endpoint_id)
-        .order_by(Resource.id.asc())
+    stmt = select(Resource).where(Resource.run_id == run_id, Resource.endpoint_id == endpoint_id)
+    stmt = apply_keyset_pagination(stmt, RUN_RESOURCE_CURSOR, cursor, limit)
+    resources, next_cursor = paginate_rows(
+        db.execute(stmt).scalars().all(),
+        RUN_RESOURCE_CURSOR,
+        limit,
     )
-    resources = db.execute(stmt).scalars().all()
 
     _write_read_audit(
         db,
@@ -1241,7 +1504,12 @@ def endpoint_resources(
         action="RESOURCES_LISTED",
         object_type="endpoint",
         object_id=str(endpoint_id),
-        metadata={"run_id": str(run_id), "result_count": len(resources)},
+        metadata={
+            "run_id": str(run_id),
+            "limit": limit,
+            "cursor": cursor,
+            "result_count": len(resources),
+        },
     )
     db.commit()
 
@@ -1257,7 +1525,8 @@ def endpoint_resources(
                 "access_capabilities": r.access_capabilities or {},
             }
             for r in resources
-        ]
+        ],
+        "next_cursor": next_cursor,
     }
 
 
@@ -1267,8 +1536,8 @@ def resource_items(
     run_id: uuid.UUID,
     resource_id: int,
     request: Request,
-    search: str | None = None,
-    path_prefix: str | None = None,
+    search: str | None = Query(default=None, max_length=MAX_SEARCH_CHARS),
+    path_prefix: str | None = Query(default=None, max_length=MAX_PATH_PREFIX_CHARS),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -1276,7 +1545,7 @@ def resource_items(
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
-    _get_run(db, project_id, run_id)
+    _require_resource(db, project_id, run_id, resource_id)
 
     stmt = select(Item).where(Item.run_id == run_id, Item.resource_id == resource_id)
     if search:
@@ -1334,8 +1603,8 @@ def search_items(
     project_id: uuid.UUID,
     run_id: uuid.UUID,
     request: Request,
-    q: str | None = None,
-    ext: str | None = None,
+    q: str | None = Query(default=None, max_length=MAX_SEARCH_CHARS),
+    ext: str | None = Query(default=None, max_length=MAX_SEARCH_CHARS),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),

@@ -7,6 +7,42 @@ def test_log_level_normalized() -> None:
     assert settings.log_level == "DEBUG"
 
 
+def test_api_database_capacity_defaults_are_bounded() -> None:
+    settings = Settings()
+
+    assert settings.api_database_pool_size == 10
+    assert settings.api_database_max_overflow == 20
+    assert settings.api_database_pool_timeout_seconds == 10
+    assert settings.api_database_connect_timeout_seconds == 5
+    assert settings.api_database_statement_timeout_ms == 30_000
+    assert settings.api_database_lock_timeout_ms == 5_000
+    assert settings.api_run_diff_max_items == 250_000
+    assert settings.migration_database_connect_timeout_seconds == 10
+    assert settings.migration_database_lock_timeout_ms == 60_000
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("api_database_pool_size", 0),
+        ("api_database_pool_size", 201),
+        ("api_database_max_overflow", -1),
+        ("api_database_max_overflow", 501),
+        ("api_database_pool_timeout_seconds", 301),
+        ("api_database_connect_timeout_seconds", 301),
+        ("api_database_pool_recycle_seconds", 86_401),
+        ("api_database_statement_timeout_ms", 3_600_001),
+        ("api_database_lock_timeout_ms", 0),
+        ("api_run_diff_max_items", 5_000_001),
+        ("migration_database_connect_timeout_seconds", 301),
+        ("migration_database_lock_timeout_ms", 3_600_001),
+    ],
+)
+def test_api_database_capacity_settings_reject_unsafe_values(field: str, value: int) -> None:
+    with pytest.raises(ValueError, match=field):
+        Settings(**{field: value})
+
+
 def test_production_rejects_weak_jwt_secret() -> None:
     with pytest.raises(ValueError):
         Settings(

@@ -44,6 +44,10 @@ INVENTORY_QUERY_WORD_OPERATORS = {
 }
 
 INVENTORY_QUERY_COMPACT_OPERATORS = ("!^", "!~", "!=", "=", ":", "~", "^")
+MAX_INVENTORY_QUERY_CHARS = 4096
+MAX_INVENTORY_QUERY_TOKENS = 100
+MAX_INVENTORY_QUERY_CLAUSES = 25
+MAX_INVENTORY_QUERY_VALUE_CHARS = 1024
 
 
 @dataclass(frozen=True)
@@ -55,19 +59,38 @@ class InventoryQueryClause:
 
 
 def parse_inventory_query(raw: str | None) -> list[list[InventoryQueryClause]]:
-    tokens = _tokenize_inventory_query(raw or "")
+    query = raw or ""
+    if len(query) > MAX_INVENTORY_QUERY_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"inventory query is too long; maximum is {MAX_INVENTORY_QUERY_CHARS} characters",
+        )
+
+    tokens = _tokenize_inventory_query(query)
     if not tokens:
         return []
+    if len(tokens) > MAX_INVENTORY_QUERY_TOKENS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"inventory query is too complex; maximum is {MAX_INVENTORY_QUERY_CLAUSES} clauses",
+        )
 
     groups: list[list[InventoryQueryClause]] = []
     current_group: list[InventoryQueryClause] = []
     pending_connector = "AND"
     expecting_clause = True
     index = 0
+    clause_count = 0
 
     while index < len(tokens):
         if expecting_clause:
             clause, index = _parse_inventory_query_clause(tokens, index)
+            clause_count += 1
+            if clause_count > MAX_INVENTORY_QUERY_CLAUSES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"inventory query is too complex; maximum is {MAX_INVENTORY_QUERY_CLAUSES} clauses",
+                )
             if not current_group or pending_connector == "AND":
                 current_group.append(clause)
             else:
@@ -163,6 +186,7 @@ def _parse_inventory_query_clause(tokens: list[str], index: int) -> tuple[Invent
     value = tokens[index].strip()
     if not value:
         raise HTTPException(status_code=400, detail=f"missing value for {field}")
+    _validate_inventory_query_value(value)
 
     return InventoryQueryClause(field=field, operator=operator, value=value, negated=negated), index + 1
 
@@ -194,6 +218,7 @@ def _parse_compact_inventory_query_clause(token: str, inherited_negated: bool = 
     value = value_token.strip()
     if not value:
         raise HTTPException(status_code=400, detail=f"missing value for {field}")
+    _validate_inventory_query_value(value)
 
     operator = INVENTORY_QUERY_WORD_OPERATORS[operator_token[-1] if operator_token.startswith("!") else operator_token]
     negated = inherited_negated ^ prefix_negated ^ operator_token.startswith("!")
@@ -206,3 +231,14 @@ def _normalize_inventory_query_field(value: str) -> str:
     if field is None:
         raise HTTPException(status_code=400, detail=f"unsupported inventory query field: {value}")
     return field
+
+
+def _validate_inventory_query_value(value: str) -> None:
+    if len(value) > MAX_INVENTORY_QUERY_VALUE_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "inventory query value is too long; "
+                f"maximum is {MAX_INVENTORY_QUERY_VALUE_CHARS} characters"
+            ),
+        )

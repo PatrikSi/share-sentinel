@@ -1,7 +1,13 @@
 import pytest
 from app.models import Endpoint, Item, Resource
 from app.routers import inventory as inventory_router
-from app.services.inventory_query import InventoryQueryClause, parse_inventory_query
+from app.services.inventory_query import (
+    MAX_INVENTORY_QUERY_CHARS,
+    MAX_INVENTORY_QUERY_CLAUSES,
+    MAX_INVENTORY_QUERY_VALUE_CHARS,
+    InventoryQueryClause,
+    parse_inventory_query,
+)
 from fastapi import HTTPException
 from sqlalchemy import select
 
@@ -41,6 +47,20 @@ def test_parse_inventory_query_rejects_invalid_input(raw: str, detail: str) -> N
         parse_inventory_query(raw)
 
     assert detail in exc_info.value.detail
+
+
+def test_parse_inventory_query_rejects_unbounded_input() -> None:
+    with pytest.raises(HTTPException, match="too long") as length_error:
+        parse_inventory_query("x" * (MAX_INVENTORY_QUERY_CHARS + 1))
+    assert length_error.value.status_code == 400
+
+    with pytest.raises(HTTPException, match="too complex") as clause_error:
+        parse_inventory_query(" AND ".join("search=value" for _ in range(MAX_INVENTORY_QUERY_CLAUSES + 1)))
+    assert clause_error.value.status_code == 400
+
+    with pytest.raises(HTTPException, match="value is too long") as value_error:
+        parse_inventory_query(f"search:{'x' * (MAX_INVENTORY_QUERY_VALUE_CHARS + 1)}")
+    assert value_error.value.status_code == 400
 
 
 def test_resource_and_endpoint_query_builders_use_exists_for_child_item_filters() -> None:

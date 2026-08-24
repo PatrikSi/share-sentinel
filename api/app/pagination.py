@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import uuid
 from dataclasses import dataclass
@@ -11,6 +12,9 @@ from fastapi import HTTPException, status
 from sqlalchemy import and_, or_
 
 Direction = Literal["asc", "desc"]
+MAX_CURSOR_ENCODED_BYTES = 2048
+MAX_CURSOR_DECODED_BYTES = 1024
+MAX_BIGINT_CURSOR_VALUE = 2**63 - 1
 
 
 @dataclass(frozen=True)
@@ -26,14 +30,24 @@ class KeysetColumn:
 def parse_datetime_cursor_value(raw: Any) -> datetime:
     if not isinstance(raw, str) or not raw.strip():
         raise ValueError("expected ISO datetime string")
-    return datetime.fromisoformat(raw)
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("expected timezone-aware ISO datetime string")
+    return parsed
 
 
 def parse_int_cursor_value(raw: Any) -> int:
-    return int(raw)
+    if isinstance(raw, bool):
+        raise ValueError("expected integer")
+    parsed = int(raw)
+    if parsed < 0 or parsed > MAX_BIGINT_CURSOR_VALUE:
+        raise ValueError("integer cursor value is out of range")
+    return parsed
 
 
 def parse_uuid_cursor_value(raw: Any) -> uuid.UUID:
+    if not isinstance(raw, str):
+        raise ValueError("expected UUID string")
     return uuid.UUID(str(raw))
 
 
@@ -60,7 +74,7 @@ def parse_keyset_cursor(cursor: str | None, specs: Sequence[KeysetColumn]) -> di
 
     try:
         payload = _decode_cursor_payload(cursor)
-    except (ValueError, json.JSONDecodeError) as exc:
+    except (binascii.Error, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
         raise _invalid_cursor() from exc
 
     if not isinstance(payload, dict):
@@ -114,8 +128,12 @@ def _order_by_clauses(specs: Sequence[KeysetColumn]) -> list[Any]:
 
 
 def _decode_cursor_payload(cursor: str) -> Any:
+    if not isinstance(cursor, str) or not cursor or len(cursor.encode("utf-8")) > MAX_CURSOR_ENCODED_BYTES:
+        raise ValueError("cursor is empty or too large")
     padded = cursor + "=" * (-len(cursor) % 4)
-    raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+    raw = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+    if len(raw) > MAX_CURSOR_DECODED_BYTES:
+        raise ValueError("decoded cursor is too large")
     return json.loads(raw.decode("utf-8"))
 
 
@@ -136,4 +154,7 @@ def _row_cursor_value(row: Any, spec: KeysetColumn) -> Any:
 
 
 def _invalid_cursor() -> HTTPException:
-    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid cursor")
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="invalid cursor; restart pagination without the cursor",
+    )

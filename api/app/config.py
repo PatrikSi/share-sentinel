@@ -27,6 +27,16 @@ class Settings(BaseSettings):
     api_root_path: str = ""
 
     database_url: str = "postgresql+psycopg://share_sentinel:share_sentinel@db:5432/share_sentinel"
+    api_database_pool_size: int = 10
+    api_database_max_overflow: int = 20
+    api_database_pool_timeout_seconds: int = 10
+    api_database_pool_recycle_seconds: int = 1800
+    api_database_connect_timeout_seconds: int = 5
+    api_database_statement_timeout_ms: int = 30_000
+    api_database_lock_timeout_ms: int = 5_000
+    api_run_diff_max_items: int = 250_000
+    migration_database_connect_timeout_seconds: int = 10
+    migration_database_lock_timeout_ms: int = 60_000
     redis_url: str = "redis://redis:6379/0"
     redis_connect_timeout_seconds: float = 3.0
     redis_socket_timeout_seconds: float = 5.0
@@ -161,6 +171,75 @@ class Settings(BaseSettings):
     def _validate_positive_runtime_setting(cls, value: int, info) -> int:
         if value <= 0:
             raise ValueError(f"{info.field_name} must be greater than zero")
+        return value
+
+    @field_validator(
+        "api_database_pool_size",
+        "api_database_pool_timeout_seconds",
+        "api_database_pool_recycle_seconds",
+        "api_database_connect_timeout_seconds",
+        "api_database_statement_timeout_ms",
+        "api_database_lock_timeout_ms",
+        "api_run_diff_max_items",
+        "migration_database_connect_timeout_seconds",
+        "migration_database_lock_timeout_ms",
+    )
+    @classmethod
+    def _validate_positive_database_setting(cls, value: int, info) -> int:
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be greater than zero")
+        return value
+
+    @field_validator("api_database_pool_size")
+    @classmethod
+    def _validate_database_pool_size(cls, value: int) -> int:
+        if value > 200:
+            raise ValueError("api_database_pool_size must be 200 or less")
+        return value
+
+    @field_validator("api_database_max_overflow")
+    @classmethod
+    def _validate_database_max_overflow(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("api_database_max_overflow must be zero or greater")
+        if value > 500:
+            raise ValueError("api_database_max_overflow must be 500 or less")
+        return value
+
+    @field_validator(
+        "api_database_pool_timeout_seconds",
+        "api_database_connect_timeout_seconds",
+        "migration_database_connect_timeout_seconds",
+    )
+    @classmethod
+    def _validate_database_wait_timeout(cls, value: int, info) -> int:
+        if value > 300:
+            raise ValueError(f"{info.field_name} must be 300 seconds or less")
+        return value
+
+    @field_validator("api_database_pool_recycle_seconds")
+    @classmethod
+    def _validate_database_pool_recycle(cls, value: int) -> int:
+        if value > 86_400:
+            raise ValueError("api_database_pool_recycle_seconds must be 86400 seconds or less")
+        return value
+
+    @field_validator(
+        "api_database_statement_timeout_ms",
+        "api_database_lock_timeout_ms",
+        "migration_database_lock_timeout_ms",
+    )
+    @classmethod
+    def _validate_database_query_timeout(cls, value: int, info) -> int:
+        if value > 3_600_000:
+            raise ValueError(f"{info.field_name} must be 3600000 milliseconds or less")
+        return value
+
+    @field_validator("api_run_diff_max_items")
+    @classmethod
+    def _validate_api_run_diff_max_items(cls, value: int) -> int:
+        if value > 5_000_000:
+            raise ValueError("api_run_diff_max_items must be 5000000 or less")
         return value
 
     @field_validator("api_token_last_used_update_interval_seconds")

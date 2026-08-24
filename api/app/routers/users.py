@@ -26,6 +26,7 @@ from app.services.audit import write_audit_event
 from app.token_scopes import SCOPE_READ_USERS, SCOPE_WRITE_MEMBERS, SCOPE_WRITE_USERS, has_required_scope
 
 router = APIRouter(prefix="/users", tags=["users"])
+MAX_USER_SEARCH_CHARS = 512
 USER_LIST_CURSOR = (
     KeysetColumn("created_at", User.created_at, direction="desc", parser=parse_datetime_cursor_value),
     KeysetColumn("id", User.id, direction="desc", parser=parse_uuid_cursor_value),
@@ -96,7 +97,7 @@ def create_user(
 
 @router.get("", response_model=dict)
 def list_users(
-    search: str | None = None,
+    search: str | None = Query(default=None, max_length=MAX_USER_SEARCH_CHARS),
     include_pending_only: bool = False,
     project_id: uuid.UUID | None = Query(default=None),
     is_active: bool | None = Query(default=None),

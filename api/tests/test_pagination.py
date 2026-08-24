@@ -1,3 +1,4 @@
+import base64
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -50,6 +51,36 @@ def test_parse_keyset_cursor_rejects_invalid_tokens() -> None:
         parse_keyset_cursor("not-base64", specs)
 
     assert getattr(exc_info.value, "status_code", None) == 400
+    assert "restart pagination" in exc_info.value.detail
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        "%%%",
+        "a" * 2049,
+        base64.urlsafe_b64encode(b"x" * 1025).decode("ascii"),
+        base64.urlsafe_b64encode(b"\xff").decode("ascii"),
+    ],
+)
+def test_parse_keyset_cursor_rejects_malformed_or_oversized_tokens(cursor: str) -> None:
+    specs = (KeysetColumn("id", "id", parser=parse_int_cursor_value),)
+
+    with pytest.raises(Exception) as exc_info:
+        parse_keyset_cursor(cursor, specs)
+
+    assert getattr(exc_info.value, "status_code", None) == 400
+
+
+@pytest.mark.parametrize("value", [True, -1, 2**63, "not-an-integer"])
+def test_parse_int_cursor_value_rejects_invalid_bigint_values(value) -> None:
+    with pytest.raises(ValueError):
+        parse_int_cursor_value(value)
+
+
+def test_parse_datetime_cursor_value_requires_timezone() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        parse_datetime_cursor_value("2026-03-11T05:45:00")
 
 
 def test_build_keyset_filter_creates_lexicographic_predicate() -> None:

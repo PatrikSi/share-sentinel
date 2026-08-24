@@ -26,6 +26,11 @@ router = APIRouter(prefix="/projects/{project_id}/inventory", tags=["inventory"]
 INVENTORY_ITEM_CURSOR = (KeysetColumn("id", Item.id, direction="desc", parser=parse_int_cursor_value),)
 INVENTORY_RESOURCE_CURSOR = (KeysetColumn("id", Resource.id, direction="desc", parser=parse_int_cursor_value),)
 INVENTORY_ENDPOINT_CURSOR = (KeysetColumn("id", Endpoint.id, direction="desc", parser=parse_int_cursor_value),)
+MAX_INVENTORY_RUN_IDS = 100
+MAX_FILTER_CHARS = 512
+MAX_PATH_FILTER_CHARS = 4096
+MAX_QUERY_DSL_CHARS = 4096
+MAX_RUN_IDS_FILTER_CHARS = 4096
 
 
 def _saved_investigation_out(model: SavedInvestigation) -> SavedInvestigationOut:
@@ -47,15 +52,23 @@ def _parse_run_ids(raw: str | None) -> list[uuid.UUID]:
     if not raw:
         return []
 
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if len(parts) > MAX_INVENTORY_RUN_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"too many run_ids; maximum is {MAX_INVENTORY_RUN_IDS}",
+        )
+
     values: list[uuid.UUID] = []
-    for part in raw.split(","):
-        token = part.strip()
-        if not token:
-            continue
+    seen: set[uuid.UUID] = set()
+    for token in parts:
         try:
-            values.append(uuid.UUID(token))
+            parsed = uuid.UUID(token)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"invalid run_id: {token}") from exc
+        if parsed not in seen:
+            seen.add(parsed)
+            values.append(parsed)
     return values
 
 
@@ -421,7 +434,7 @@ def delete_saved_investigation(
 def inventory_stats(
     project_id: uuid.UUID,
     request: Request,
-    run_ids: str | None = Query(default=None, description="comma-separated run UUIDs"),
+    run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
     db: Session = Depends(get_db),
     _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
     auth: AuthContext = Depends(get_auth_context),
@@ -433,54 +446,58 @@ def inventory_stats(
     if run_id_list:
         scope_runs_stmt = scope_runs_stmt.where(ScanRun.id.in_(run_id_list))
 
-    scope_runs = scope_runs_stmt.subquery()
+    scope_runs = scope_runs_stmt.cte("scope_runs")
     scope_run_ids = select(scope_runs.c.id)
 
-    runs_total = int(db.execute(select(func.count(ScanRun.id)).where(ScanRun.project_id == project_id)).scalar() or 0)
-    runs_complete = int(
-        db.execute(select(func.count(ScanRun.id)).where(ScanRun.project_id == project_id, ScanRun.status == RunStatus.COMPLETE)).scalar() or 0
-    )
-    runs_ingesting = int(
-        db.execute(select(func.count(ScanRun.id)).where(ScanRun.project_id == project_id, ScanRun.status == RunStatus.INGESTING)).scalar() or 0
-    )
-    latest_run_at = db.execute(select(func.max(ScanRun.created_at)).where(ScanRun.project_id == project_id)).scalar()
+    run_totals = db.execute(
+        select(
+            func.count(ScanRun.id).label("runs_total"),
+            func.count(ScanRun.id).filter(ScanRun.status == RunStatus.COMPLETE).label("runs_complete"),
+            func.count(ScanRun.id).filter(ScanRun.status == RunStatus.INGESTING).label("runs_ingesting"),
+            func.max(ScanRun.created_at).label("latest_run_at"),
+        ).where(ScanRun.project_id == project_id)
+    ).one()
+    runs_total = int(run_totals.runs_total or 0)
+    runs_complete = int(run_totals.runs_complete or 0)
+    runs_ingesting = int(run_totals.runs_ingesting or 0)
+    latest_run_at = run_totals.latest_run_at
 
-    endpoint_count = int(db.execute(select(func.count(Endpoint.id)).where(Endpoint.run_id.in_(scope_run_ids))).scalar() or 0)
-    resource_count = int(db.execute(select(func.count(Resource.id)).where(Resource.run_id.in_(scope_run_ids))).scalar() or 0)
+    entity_totals = db.execute(
+        select(
+            select(func.count()).select_from(scope_runs).scalar_subquery().label("scope_runs"),
+            select(func.count(Endpoint.id))
+            .where(Endpoint.run_id.in_(scope_run_ids))
+            .scalar_subquery()
+            .label("endpoints"),
+            select(func.count(Resource.id))
+            .where(Resource.run_id.in_(scope_run_ids))
+            .scalar_subquery()
+            .label("resources"),
+            select(func.count(func.distinct(func.coalesce(Endpoint.hostname, Endpoint.ip, Endpoint.endpoint_key))))
+            .where(Endpoint.run_id.in_(scope_run_ids))
+            .scalar_subquery()
+            .label("unique_hosts"),
+        )
+    ).one()
+    project_run_count_in_scope = int(entity_totals.scope_runs or 0)
+    endpoint_count = int(entity_totals.endpoints or 0)
+    resource_count = int(entity_totals.resources or 0)
+    unique_hosts = int(entity_totals.unique_hosts or 0)
 
     item_totals = db.execute(
         select(
             func.count(Item.id),
             func.count(Item.id).filter(Item.is_dir.is_(False)),
             func.count(Item.id).filter(Item.is_dir.is_(True)),
+            func.count(func.distinct(func.lower(func.substring(Item.name, r"\.[^.]+$")))).filter(
+                Item.is_dir.is_(False),
+            ),
         ).where(Item.run_id.in_(scope_run_ids))
     ).one()
     items_total = int(item_totals[0] or 0)
     files_total = int(item_totals[1] or 0)
     directories_total = int(item_totals[2] or 0)
-
-    ext_expr = func.lower(func.substring(Item.name, r"\.[^.]+$"))
-    file_types_count = int(
-        db.execute(
-            select(func.count(func.distinct(ext_expr))).where(
-                Item.run_id.in_(scope_run_ids),
-                Item.is_dir.is_(False),
-                ext_expr.is_not(None),
-            )
-        ).scalar()
-        or 0
-    )
-
-    unique_hosts = int(
-        db.execute(
-            select(func.count(func.distinct(func.coalesce(Endpoint.hostname, Endpoint.ip, Endpoint.endpoint_key)))).where(
-                Endpoint.run_id.in_(scope_run_ids)
-            )
-        ).scalar()
-        or 0
-    )
-
-    project_run_count_in_scope = int(db.execute(select(func.count()).select_from(scope_runs)).scalar() or 0)
+    file_types_count = int(item_totals[3] or 0)
     _audit_read(
         db,
         request,
@@ -511,7 +528,7 @@ def inventory_stats(
 def inventory_extensions(
     project_id: uuid.UUID,
     request: Request,
-    run_ids: str | None = Query(default=None, description="comma-separated run UUIDs"),
+    run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
     limit: int = Query(default=50, ge=1, le=500),
     db: Session = Depends(get_db),
     _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
@@ -552,13 +569,13 @@ def inventory_extensions(
 def inventory_items(
     project_id: uuid.UUID,
     request: Request,
-    q: str | None = Query(default=None),
-    query_dsl: str | None = Query(default=None),
-    ext: str | None = Query(default=None),
-    endpoint: str | None = Query(default=None),
-    share: str | None = Query(default=None),
-    path_prefix: str | None = Query(default=None),
-    run_ids: str | None = Query(default=None, description="comma-separated run UUIDs"),
+    q: str | None = Query(default=None, max_length=MAX_FILTER_CHARS),
+    query_dsl: str | None = Query(default=None, max_length=MAX_QUERY_DSL_CHARS),
+    ext: str | None = Query(default=None, max_length=MAX_FILTER_CHARS),
+    endpoint: str | None = Query(default=None, max_length=MAX_FILTER_CHARS),
+    share: str | None = Query(default=None, max_length=MAX_FILTER_CHARS),
+    path_prefix: str | None = Query(default=None, max_length=MAX_PATH_FILTER_CHARS),
+    run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
     is_dir: bool | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
@@ -689,11 +706,11 @@ def inventory_items(
 def inventory_resources(
     project_id: uuid.UUID,
     request: Request,
-    q: str | None = Query(default=None),
-    query_dsl: str | None = Query(default=None),
-    endpoint: str | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=MAX_FILTER_CHARS),
+    query_dsl: str | None = Query(default=None, max_length=MAX_QUERY_DSL_CHARS),
+    endpoint: str | None = Query(default=None, max_length=MAX_FILTER_CHARS),
     access_level: str | None = Query(default=None),
-    run_ids: str | None = Query(default=None, description="comma-separated run UUIDs"),
+    run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -704,6 +721,12 @@ def inventory_resources(
     run_id_list = _parse_run_ids(run_ids)
     query_groups = parse_inventory_query(query_dsl)
 
+    item_count_subquery = (
+        select(func.count(Item.id))
+        .where(Item.run_id == Resource.run_id, Item.resource_id == Resource.id)
+        .correlate(Resource)
+        .scalar_subquery()
+    )
     stmt = (
         select(
             Resource.id,
@@ -716,25 +739,12 @@ def inventory_resources(
             Resource.access_level,
             Resource.access_capabilities,
             Resource.resource_type,
-            func.count(Item.id).label("item_count"),
+            item_count_subquery.label("item_count"),
         )
         .select_from(Resource)
         .join(Endpoint, (Endpoint.id == Resource.endpoint_id) & (Endpoint.run_id == Resource.run_id))
         .join(ScanRun, ScanRun.id == Resource.run_id)
-        .outerjoin(Item, (Item.resource_id == Resource.id) & (Item.run_id == Resource.run_id))
         .where(*_base_project_filters(project_id))
-        .group_by(
-            Resource.id,
-            Resource.run_id,
-            ScanRun.name,
-            Endpoint.endpoint_key,
-            Endpoint.hostname,
-            Resource.name,
-            Resource.remark,
-            Resource.access_level,
-            Resource.access_capabilities,
-            Resource.resource_type,
-        )
     )
 
     if run_id_list:
@@ -797,9 +807,9 @@ def inventory_resources(
 def inventory_endpoints(
     project_id: uuid.UUID,
     request: Request,
-    q: str | None = Query(default=None),
-    query_dsl: str | None = Query(default=None),
-    run_ids: str | None = Query(default=None, description="comma-separated run UUIDs"),
+    q: str | None = Query(default=None, max_length=MAX_FILTER_CHARS),
+    query_dsl: str | None = Query(default=None, max_length=MAX_QUERY_DSL_CHARS),
+    run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -810,6 +820,20 @@ def inventory_endpoints(
     run_id_list = _parse_run_ids(run_ids)
     query_groups = parse_inventory_query(query_dsl)
 
+    resource_count_subquery = (
+        select(func.count(Resource.id))
+        .where(Resource.run_id == Endpoint.run_id, Resource.endpoint_id == Endpoint.id)
+        .correlate(Endpoint)
+        .scalar_subquery()
+    )
+    item_count_subquery = (
+        select(func.count(Item.id))
+        .select_from(Resource)
+        .join(Item, (Item.resource_id == Resource.id) & (Item.run_id == Resource.run_id))
+        .where(Resource.run_id == Endpoint.run_id, Resource.endpoint_id == Endpoint.id)
+        .correlate(Endpoint)
+        .scalar_subquery()
+    )
     stmt = (
         select(
             Endpoint.id,
@@ -820,24 +844,12 @@ def inventory_endpoints(
             Endpoint.hostname,
             Endpoint.domain,
             Endpoint.smb_signing,
-            func.count(func.distinct(Resource.id)).label("resource_count"),
-            func.count(Item.id).label("item_count"),
+            resource_count_subquery.label("resource_count"),
+            item_count_subquery.label("item_count"),
         )
         .select_from(Endpoint)
         .join(ScanRun, ScanRun.id == Endpoint.run_id)
-        .outerjoin(Resource, (Resource.endpoint_id == Endpoint.id) & (Resource.run_id == Endpoint.run_id))
-        .outerjoin(Item, (Item.resource_id == Resource.id) & (Item.run_id == Resource.run_id))
         .where(*_base_project_filters(project_id))
-        .group_by(
-            Endpoint.id,
-            Endpoint.run_id,
-            ScanRun.name,
-            Endpoint.endpoint_key,
-            Endpoint.ip,
-            Endpoint.hostname,
-            Endpoint.domain,
-            Endpoint.smb_signing,
-        )
     )
 
     if run_id_list:

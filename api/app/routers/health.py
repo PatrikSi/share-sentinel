@@ -5,7 +5,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app import metrics as metrics_module
-from app.db import get_db
+from app.db import engine, get_db
 from app.deps import require_sysadmin
 from app.redis_client import create_redis_client
 from app.services import storage
@@ -60,6 +60,6 @@ def healthz_deep(
 @router.get("/metrics", include_in_schema=False)
 def metrics(_=Depends(require_sysadmin)):
     return PlainTextResponse(
-        metrics_module.render_prometheus(),
+        metrics_module.render_prometheus(engine.pool),
         media_type="text/plain; version=0.0.4; charset=utf-8",
     )

@@ -14,12 +14,15 @@ FastAPI service for auth, project management, run lifecycle, artifact upload, an
 - Password policy and self-service password changes
 - Optional cookie session support with CSRF protection for unsafe methods
 - Request IDs and request logging
+- Backward-compatible structured error envelopes with stable codes and request IDs
 - Redis-backed fixed-window rate limits (auth + upload)
 - Atomic rate-limit counter expiry and bounded Redis connect/read timeouts
 - Deep health endpoint for database and Redis readiness (`/healthz/deep`)
 - Async ingestion queueing via Redis Streams
 - Trusted-host enforcement and explicit production configuration validation
 - Raw streaming artifact uploads with filename-aware JSON/NDJSON/gzip classification
+- Off-event-loop, short-lived database phases around long artifact streams
+- Bounded keyset collections and matching tenant/run pagination indexes
 
 ## Local run (without Docker)
 
@@ -50,7 +53,11 @@ Redis dependency calls use `REDIS_CONNECT_TIMEOUT_SECONDS` (default `3`) and `RE
 
 Atomic rate-limit expiry uses Redis `EVAL`. The bundled Redis image supports it; a managed Redis ACL must permit `EVAL` or general API rate limits fail according to `RATE_LIMIT_FAIL_OPEN` while login protection uses its bounded process-local fallback.
 
-New Postgres connections use a five-second connect timeout. Database statement and transaction timeout policy remains a deployment-level control.
+API Postgres connections have explicit pool and query budgets. Defaults are a pool of `10`, overflow of `20`, a 10-second pool wait, five-second connect, 30-second statement timeout, and five-second lock timeout. Configure them with the `API_DATABASE_*` settings and keep the aggregate pool across all API replicas below the Postgres connection budget.
+
+Alembic bootstrap uses separate migration budgets: `MIGRATION_DATABASE_CONNECT_TIMEOUT_SECONDS` defaults to `10` and `MIGRATION_DATABASE_LOCK_TIMEOUT_MS` defaults to `60000`. Migration statements intentionally do not inherit the short API statement timeout because concurrent index builds may legitimately run for a long time after acquiring their locks.
+
+Synchronous run diff is intentionally bounded. `API_RUN_DIFF_MAX_ITEMS` defaults to `250000` total items across both runs; larger comparisons return an actionable `422` instead of risking process exhaustion. Detail arrays default to 500 records each (request maximum 2000), preserve exact aggregate counts, and return explicit truncation metadata.
 
 First-party artifact clients send the file itself as the request body to `POST /projects/{project_id}/runs/{run_id}/artifact` with:
 
@@ -59,7 +66,7 @@ First-party artifact clients send the file itself as the request body to `POST /
 - `Content-Type: application/gzip` for gzip variants
 - `X-Artifact-Filename` set to a basename ending in `.json`, `.json.gz`, `.ndjson`, `.ndjson.gz`, `.jsonl`, or `.jsonl.gz`
 
-The filename header is limited to 255 characters and cannot contain path separators, controls, or leading/trailing whitespace. Multipart file upload remains available for compatibility. The API ends its preflight database transaction before reading the body, stores each attempt under an immutable key, then reacquires the run lock and rechecks its authoritative state before selecting the artifact.
+The filename header is limited to 255 characters and cannot contain path separators, controls, or leading/trailing whitespace. Multipart file upload remains available for compatibility. The API ends its authentication transaction before reading the body, stores each attempt under an immutable key, then uses short-lived database sessions off the async event loop to recheck authorization/state, acquire the run lock, select the artifact, and record queue outcome. Cancellation waits for each bounded durable database phase to finish, so a committed pointer or required cleanup is not abandoned halfway through.
 
 `UPLOAD_MAX_BYTES`, `UPLOAD_CHUNK_BYTES`, `REDIS_STREAM_RETRIES`, `REDIS_STREAM_MAXLEN`, token lifetimes, and login-throttle counts/windows must be positive. Upload chunks must not exceed the upload limit or 128 MiB. Invalid settings fail application startup instead of silently disabling the relevant control.
 

@@ -21,6 +21,7 @@ from app.pagination import (
     apply_keyset_pagination,
     paginate_rows,
     parse_datetime_cursor_value,
+    parse_int_cursor_value,
     parse_uuid_cursor_value,
 )
 from app.routers import users as users_router
@@ -60,6 +61,7 @@ from app.token_scopes import (
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 logger = logging.getLogger("share_sentinel.settings")
+MAX_SETTINGS_SEARCH_CHARS = 512
 SETTINGS_API_TOKEN_CURSOR = (
     KeysetColumn(
         "created_at",
@@ -93,7 +95,13 @@ SETTINGS_AUDIT_CURSOR = (
         parser=parse_datetime_cursor_value,
         getter=lambda row: row.AuditEvent.ts,
     ),
-    KeysetColumn("id", AuditEvent.id, direction="desc", getter=lambda row: row.AuditEvent.id),
+    KeysetColumn(
+        "id",
+        AuditEvent.id,
+        direction="desc",
+        parser=parse_int_cursor_value,
+        getter=lambda row: row.AuditEvent.id,
+    ),
 )
 SETTINGS_PROJECT_MEMBERSHIP_CURSOR = (
     KeysetColumn("project_name", Project.name),
@@ -312,7 +320,7 @@ def list_all_projects(
 
 @router.get("/projects/catalog", response_model=dict)
 def list_project_catalog(
-    q: str | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=MAX_SETTINGS_SEARCH_CHARS),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -514,7 +522,7 @@ def settings_overview(
 @router.get("/api-tokens", response_model=dict)
 def list_all_api_tokens(
     request: Request,
-    q: str | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=MAX_SETTINGS_SEARCH_CHARS),
     project_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
@@ -829,7 +837,7 @@ def list_api_token_scope_catalog(
 @router.get("/audit", response_model=dict)
 def list_global_audit(
     request: Request,
-    q: str | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=MAX_SETTINGS_SEARCH_CHARS),
     project_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
@@ -866,7 +874,7 @@ def list_global_audit(
 @router.get("/audit/export")
 def export_global_audit(
     request: Request,
-    q: str | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=MAX_SETTINGS_SEARCH_CHARS),
     project_id: uuid.UUID | None = Query(default=None),
     format: str = Query(default="csv", pattern="^(csv|json)$"),
     max_rows: int = Query(default=5000, ge=1, le=20000),
@@ -951,7 +959,7 @@ def export_global_audit(
 
 @router.get("/rbac/project-memberships", response_model=dict)
 def list_project_memberships(
-    q: str | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=MAX_SETTINGS_SEARCH_CHARS),
     user_ids: list[uuid.UUID] | None = Query(default=None),
     project_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=500),

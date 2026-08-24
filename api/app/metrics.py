@@ -28,6 +28,7 @@ class MetricsRegistry:
         self._http_request_duration_seconds_bucket: dict[tuple[str, str, float], int] = defaultdict(int)
         self._http_request_duration_seconds_sum: dict[tuple[str, str], float] = defaultdict(float)
         self._http_request_duration_seconds_count: dict[tuple[str, str], int] = defaultdict(int)
+        self._database_errors_total: dict[str, int] = defaultdict(int)
 
     def reset(self) -> None:
         with self._lock:
@@ -36,6 +37,7 @@ class MetricsRegistry:
             self._http_request_duration_seconds_bucket.clear()
             self._http_request_duration_seconds_sum.clear()
             self._http_request_duration_seconds_count.clear()
+            self._database_errors_total.clear()
 
     def record_http_request(self, method: str, path: str, status_code: int, latency_seconds: float) -> None:
         normalized_method = _normalize_method(method)
@@ -61,6 +63,11 @@ class MetricsRegistry:
         with self._lock:
             self._http_request_errors_total[(normalized_method, normalized_path, normalized_error)] += 1
 
+    def record_database_error(self, error: str) -> None:
+        normalized_error = _normalize_error(error)
+        with self._lock:
+            self._database_errors_total[normalized_error] += 1
+
     def render_prometheus(self) -> str:
         with self._lock:
             lines = [
@@ -84,6 +91,19 @@ class MetricsRegistry:
                 lines.append(
                     "share_sentinel_http_request_errors_total"
                     + _labels({"method": method, "path": path, "error": error})
+                    + f" {count}"
+                )
+
+            lines.extend(
+                [
+                    "# HELP share_sentinel_database_errors_total Database errors by bounded failure class.",
+                    "# TYPE share_sentinel_database_errors_total counter",
+                ]
+            )
+            for error, count in sorted(self._database_errors_total.items()):
+                lines.append(
+                    "share_sentinel_database_errors_total"
+                    + _labels({"error": error})
                     + f" {count}"
                 )
 
@@ -127,8 +147,15 @@ def record_http_error(method: str, path: str, error: str) -> None:
     _registry.record_http_error(method, path, error)
 
 
-def render_prometheus() -> str:
-    return _registry.render_prometheus()
+def record_database_error(error: str) -> None:
+    _registry.record_database_error(error)
+
+
+def render_prometheus(database_pool=None) -> str:
+    payload = _registry.render_prometheus()
+    if database_pool is not None:
+        payload += _render_database_pool_metrics(database_pool)
+    return payload
 
 
 def reset_for_tests() -> None:
@@ -187,3 +214,29 @@ def _format_bucket(bucket: float) -> str:
 
 def _format_float(value: float) -> str:
     return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def _render_database_pool_metrics(pool) -> str:
+    try:
+        values = {
+            "size": max(0, int(pool.size())),
+            "checked_in": max(0, int(pool.checkedin())),
+            "checked_out": max(0, int(pool.checkedout())),
+            # QueuePool reports negative overflow before its base pool has
+            # opened; operationally that still means zero overflow pressure.
+            "overflow": max(0, int(pool.overflow())),
+        }
+    except (AttributeError, TypeError, ValueError):
+        return ""
+
+    lines = [
+        "# HELP share_sentinel_database_pool_connections Database connection pool state for this API process.",
+        "# TYPE share_sentinel_database_pool_connections gauge",
+    ]
+    for state, value in values.items():
+        lines.append(
+            "share_sentinel_database_pool_connections"
+            + _labels({"state": state})
+            + f" {value}"
+        )
+    return "\n".join(lines) + "\n"

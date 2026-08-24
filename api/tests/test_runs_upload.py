@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -232,6 +234,7 @@ def test_delete_superseded_artifact_only_removes_replaced_key(monkeypatch) -> No
 
 def test_run_activity_includes_scheduled_ingest_retries() -> None:
     assert "INGEST_RETRY_SCHEDULED" in runs_router.RUN_ACTIVITY_ACTIONS
+    assert "INGEST_PAUSED" in runs_router.RUN_ACTIVITY_ACTIONS
 
 
 def test_enqueue_retries_run_blocking_redis_calls_off_event_loop(monkeypatch) -> None:
@@ -288,6 +291,17 @@ def test_upload_rate_limit_runs_blocking_redis_call_off_event_loop(monkeypatch) 
     ]
 
 
+def test_upload_auth_dependency_releases_authentication_transaction() -> None:
+    auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
+    rollbacks: list[str] = []
+    db = SimpleNamespace(rollback=lambda: rollbacks.append("rollback"))
+
+    result = runs_router._get_upload_auth_context(auth=auth, db=db)
+
+    assert result is auth
+    assert rollbacks == ["rollback"]
+
+
 def test_try_lock_run_for_mutation_returns_boolean() -> None:
     class _Result:
         def __init__(self, value):
@@ -337,7 +351,7 @@ def test_delete_run_rejects_locked_ingesting_run(monkeypatch) -> None:
     assert exc.value.detail == "run is currently ingesting"
 
 
-def test_upload_artifact_rejects_locked_run(monkeypatch) -> None:
+def test_upload_pointer_rejects_locked_run_and_deletes_uncommitted_object(monkeypatch) -> None:
     project_id = uuid.uuid4()
     run_id = uuid.uuid4()
     auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
@@ -356,42 +370,38 @@ def test_upload_artifact_rejects_locked_run(monkeypatch) -> None:
     monkeypatch.setattr(runs_router, "_try_lock_run_for_mutation", lambda *_args, **_kwargs: False)
     events: list[str] = []
 
-    async def _upload(*_args, **_kwargs):
-        assert events == ["rollback"]
-        events.append("upload")
-        return 24, "a" * 64
-
-    monkeypatch.setattr(runs_router, "rate_limiter", SimpleNamespace(check=lambda *_args, **_kwargs: None))
-    monkeypatch.setattr(runs_router, "_new_artifact_key", lambda *_args, **_kwargs: "new-artifact.ndjson")
-    monkeypatch.setattr(runs_router, "_upload_artifact_stream", _upload)
-    monkeypatch.setattr(runs_router, "_delete_artifact_quietly", lambda key: events.append(f"delete:{key}"))
-
     class _Db:
         def rollback(self):
             events.append("rollback")
 
+        def close(self):
+            events.append("close")
+
         def refresh(self, *_args, **_kwargs):
             raise AssertionError("refresh should not happen when the run lock is unavailable")
 
+    monkeypatch.setattr(runs_router, "SessionLocal", _Db)
+    monkeypatch.setattr(runs_router, "_delete_artifact_quietly", lambda key: events.append(f"delete:{key}"))
+
     with pytest.raises(runs_router.HTTPException) as exc:
-        asyncio.run(
-            runs_router.upload_artifact(
-                project_id=project_id,
-                run_id=run_id,
-                request=SimpleNamespace(headers={"content-type": "application/x-ndjson"}),
-                file=None,
-                db=_Db(),
-                _=auth,
-                auth=auth,
-            )
+        runs_router._commit_uploaded_artifact(
+            project_id,
+            run_id,
+            auth,
+            "new-artifact.ndjson",
+            24,
+            "a" * 64,
+            "application/x-ndjson",
+            12,
+            {},
         )
 
     assert exc.value.status_code == 409
     assert exc.value.detail == "run is currently ingesting"
-    assert events == ["rollback", "upload", "rollback", "delete:new-artifact.ndjson"]
+    assert events == ["rollback", "delete:new-artifact.ndjson", "close"]
 
 
-def test_upload_artifact_rechecks_status_after_lock(monkeypatch) -> None:
+def test_upload_pointer_rechecks_status_after_lock(monkeypatch) -> None:
     project_id = uuid.uuid4()
     run_id = uuid.uuid4()
     auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
@@ -408,83 +418,129 @@ def test_upload_artifact_rechecks_status_after_lock(monkeypatch) -> None:
     monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runs_router, "_get_run", lambda *_args, **_kwargs: run)
     monkeypatch.setattr(runs_router, "_try_lock_run_for_mutation", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(runs_router, "rate_limiter", SimpleNamespace(check=lambda *_args, **_kwargs: None))
-    monkeypatch.setattr(runs_router, "get_settings", lambda: SimpleNamespace(redis_stream_retries=1))
     events: list[str] = []
-
-    async def _upload(*_args, **_kwargs):
-        assert events == ["rollback"]
-        events.append("upload")
-        return 24, "a" * 64
-
-    monkeypatch.setattr(runs_router, "_new_artifact_key", lambda *_args, **_kwargs: "new-artifact.ndjson")
-    monkeypatch.setattr(runs_router, "_upload_artifact_stream", _upload)
-    monkeypatch.setattr(runs_router, "_delete_artifact_quietly", lambda key: events.append(f"delete:{key}"))
 
     class _Db:
         def rollback(self):
             events.append("rollback")
 
+        def close(self):
+            events.append("close")
+
         def refresh(self, refreshed_run):
             events.append("refresh")
             refreshed_run.status = runs_router.RunStatus.INGESTING
 
+    monkeypatch.setattr(runs_router, "SessionLocal", _Db)
+    monkeypatch.setattr(runs_router, "_delete_artifact_quietly", lambda key: events.append(f"delete:{key}"))
+
     with pytest.raises(runs_router.HTTPException) as exc:
-        asyncio.run(
-            runs_router.upload_artifact(
-                project_id=project_id,
-                run_id=run_id,
-                request=SimpleNamespace(headers={"content-type": "application/x-ndjson"}),
-                file=None,
-                db=_Db(),
-                _=auth,
-                auth=auth,
-            )
+        runs_router._commit_uploaded_artifact(
+            project_id,
+            run_id,
+            auth,
+            "new-artifact.ndjson",
+            24,
+            "a" * 64,
+            "application/x-ndjson",
+            12,
+            {},
         )
 
     assert exc.value.status_code == 409
     assert exc.value.detail == "run state does not accept upload"
-    assert events == ["rollback", "upload", "refresh", "rollback", "delete:new-artifact.ndjson"]
+    assert events == ["refresh", "rollback", "delete:new-artifact.ndjson", "close"]
 
 
-def test_upload_artifact_cancellation_after_stream_deletes_uncommitted_object(monkeypatch) -> None:
+def test_upload_pointer_cancellation_deletes_uncommitted_object(monkeypatch) -> None:
     project_id = uuid.uuid4()
     run_id = uuid.uuid4()
     auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
     run = SimpleNamespace(id=run_id, status=runs_router.RunStatus.PENDING_UPLOAD)
     events: list[str] = []
 
-    async def _upload(*_args, **_kwargs):
-        assert events == ["rollback"]
-        events.append("upload")
-        return 24, "a" * 64
-
     class _Db:
         def rollback(self):
             events.append("rollback")
 
+        def close(self):
+            events.append("close")
+
     monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runs_router, "_get_run", lambda *_args, **_kwargs: run)
     monkeypatch.setattr(runs_router, "_try_lock_run_for_mutation", lambda *_args, **_kwargs: (_ for _ in ()).throw(asyncio.CancelledError()))
-    monkeypatch.setattr(runs_router, "_check_upload_rate_limit", lambda *_args, **_kwargs: asyncio.sleep(0))
-    monkeypatch.setattr(runs_router, "_new_artifact_key", lambda *_args, **_kwargs: "new-artifact.ndjson")
-    monkeypatch.setattr(runs_router, "_upload_artifact_stream", _upload)
+    monkeypatch.setattr(runs_router, "SessionLocal", _Db)
     monkeypatch.setattr(runs_router, "_delete_artifact_quietly", lambda key: events.append(f"delete:{key}"))
 
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(
-            runs_router.upload_artifact(
-                project_id=project_id,
-                run_id=run_id,
-                request=SimpleNamespace(headers={"content-type": "application/x-ndjson"}),
-                file=None,
-                db=_Db(),
-                _=auth,
-                auth=auth,
-            )
+        runs_router._commit_uploaded_artifact(
+            project_id,
+            run_id,
+            auth,
+            "new-artifact.ndjson",
+            24,
+            "a" * 64,
+            "application/x-ndjson",
+            12,
+            {},
         )
 
-    assert events == ["rollback", "upload", "rollback", "delete:new-artifact.ndjson"]
+    assert events == ["rollback", "delete:new-artifact.ndjson", "close"]
+
+
+def test_upload_pointer_keeps_object_after_ambiguous_commit_failure(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
+    run = SimpleNamespace(
+        id=run_id,
+        status=runs_router.RunStatus.PENDING_UPLOAD,
+        artifact_key=None,
+        artifact_size=None,
+        artifact_sha256=None,
+        artifact_content_type=None,
+        ingest_progress={"line_offset": 0},
+    )
+    events: list[str] = []
+
+    class _Db:
+        def refresh(self, _run):
+            events.append("refresh")
+
+        def add(self, _run):
+            events.append("add")
+
+        def commit(self):
+            events.append("commit")
+            raise RuntimeError("commit outcome unknown")
+
+        def rollback(self):
+            events.append("rollback")
+
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(runs_router, "SessionLocal", _Db)
+    monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runs_router, "_get_run", lambda *_args, **_kwargs: run)
+    monkeypatch.setattr(runs_router, "_try_lock_run_for_mutation", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runs_router, "write_audit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runs_router, "_delete_artifact_quietly", lambda key: events.append(f"delete:{key}"))
+
+    with pytest.raises(RuntimeError, match="commit outcome unknown"):
+        runs_router._commit_uploaded_artifact(
+            project_id,
+            run_id,
+            auth,
+            "new-artifact.ndjson",
+            24,
+            "a" * 64,
+            "application/x-ndjson",
+            12,
+            {},
+        )
+
+    assert events == ["refresh", "add", "commit", "rollback", "close"]
 
 
 @pytest.mark.parametrize(
@@ -527,26 +583,65 @@ def test_replacement_upload_clears_partial_inventory_before_selecting_new_artifa
         def rollback(self):
             events.append("rollback")
 
-    async def _upload(*_args, **_kwargs):
-        return 24, "a" * 64
+        def close(self):
+            events.append("close")
 
-    async def _queued(*_args, **_kwargs):
-        return True
+    monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runs_router, "_get_run", lambda *_args, **_kwargs: run)
+    monkeypatch.setattr(runs_router, "_try_lock_run_for_mutation", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runs_router, "SessionLocal", _Db)
+    monkeypatch.setattr(runs_router, "_clear_run_ingest_data", lambda *_args, **_kwargs: events.append("clear"))
+    monkeypatch.setattr(runs_router, "_delete_superseded_artifact", lambda *_args: events.append("delete-old"))
+    monkeypatch.setattr(runs_router, "write_audit_event", lambda *_args, **_kwargs: None)
+
+    result = runs_router._commit_uploaded_artifact(
+        project_id,
+        run_id,
+        auth,
+        "new-artifact.ndjson",
+        24,
+        "a" * 64,
+        "application/x-ndjson",
+        12,
+        {},
+    )
+
+    assert result == run_id
+    assert run.artifact_key == "new-artifact.ndjson"
+    assert events.index("clear") < events.index("commit") < events.index("close") < events.index("delete-old")
+
+
+def test_upload_preflight_closes_its_session_before_streaming(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
+    run = SimpleNamespace(id=run_id, status=runs_router.RunStatus.PENDING_UPLOAD)
+    events: list[str] = []
+
+    class _Db:
+        def close(self):
+            events.append("preflight-close")
+
+    async def _upload(*_args, **_kwargs):
+        assert events == ["preflight-close"]
+        events.append("stream")
+        return 24, "a" * 64
 
     async def _rate_limit(*_args, **_kwargs):
         return None
 
+    async def _enqueue(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(runs_router, "SessionLocal", _Db)
     monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(runs_router, "_check_upload_rate_limit", _rate_limit)
     monkeypatch.setattr(runs_router, "_get_run", lambda *_args, **_kwargs: run)
-    monkeypatch.setattr(runs_router, "_try_lock_run_for_mutation", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(runs_router, "_new_artifact_key", lambda *_args, **_kwargs: "new-artifact.ndjson")
+    monkeypatch.setattr(runs_router, "_check_upload_rate_limit", _rate_limit)
     monkeypatch.setattr(runs_router, "_upload_artifact_stream", _upload)
-    monkeypatch.setattr(runs_router, "_clear_run_ingest_data", lambda *_args, **_kwargs: events.append("clear"))
-    monkeypatch.setattr(runs_router, "_delete_superseded_artifact", lambda *_args: events.append("delete-old"))
-    monkeypatch.setattr(runs_router, "write_audit_event", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(runs_router, "request_meta", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(runs_router, "_enqueue_with_retries", _queued)
+    monkeypatch.setattr(runs_router, "_commit_uploaded_artifact", lambda *_args: run_id)
+    monkeypatch.setattr(runs_router, "_write_enqueue_audit", lambda *_args: None)
+    monkeypatch.setattr(runs_router, "_enqueue_with_retries", _enqueue)
+    monkeypatch.setattr(runs_router, "request_meta", lambda *_args: {})
     monkeypatch.setattr(runs_router, "get_settings", lambda: SimpleNamespace(redis_stream_retries=1))
 
     result = asyncio.run(
@@ -555,13 +650,190 @@ def test_replacement_upload_clears_partial_inventory_before_selecting_new_artifa
             run_id=run_id,
             request=SimpleNamespace(headers={"content-type": "application/x-ndjson"}),
             file=None,
-            db=_Db(),
-            _=auth,
             auth=auth,
         )
     )
 
-    assert result["artifact_key"] == "new-artifact.ndjson"
-    assert run.artifact_key == "new-artifact.ndjson"
-    assert events[0] == "rollback"
-    assert events.index("clear") < events.index("commit") < events.index("delete-old")
+    assert result["ok"] is True
+    assert events == ["preflight-close", "stream"]
+
+
+@pytest.mark.parametrize("queued", [True, False])
+def test_enqueue_outcome_audit_uses_independent_session(monkeypatch, queued: bool) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
+    events: list[str] = []
+    audit_events: list[dict] = []
+
+    class _Db:
+        def commit(self):
+            events.append("commit")
+
+        def rollback(self):
+            events.append("rollback")
+
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(runs_router, "SessionLocal", _Db)
+    monkeypatch.setattr(
+        runs_router,
+        "write_audit_event",
+        lambda _db, **kwargs: audit_events.append(kwargs),
+    )
+
+    runs_router._write_enqueue_audit(
+        project_id,
+        run_id,
+        auth,
+        queued,
+        {"request_id": "request-1"},
+    )
+
+    assert events == ["commit", "close"]
+    assert audit_events[0]["action"] == ("INGEST_QUEUED" if queued else "INGEST_QUEUE_FALLBACK")
+    expected_metadata = {"request_id": "request-1"}
+    if not queued:
+        expected_metadata["reason"] = "redis enqueue failed"
+    assert audit_events[0]["metadata"] == expected_metadata
+
+
+@pytest.mark.parametrize(
+    "blocking_helper",
+    ["_preflight_artifact_upload", "_commit_uploaded_artifact", "_write_enqueue_audit"],
+)
+def test_upload_database_helpers_do_not_block_event_loop(monkeypatch, blocking_helper: str) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking(*args):
+        started.set()
+        release.wait(timeout=2)
+        if blocking_helper == "_commit_uploaded_artifact":
+            return args[1]
+        return None
+
+    async def _upload(*_args, **_kwargs):
+        return 24, "a" * 64
+
+    async def _rate_limit(*_args, **_kwargs):
+        return None
+
+    async def _enqueue(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(runs_router, "_preflight_artifact_upload", lambda *_args: None)
+    monkeypatch.setattr(runs_router, "_commit_uploaded_artifact", lambda *_args: run_id)
+    monkeypatch.setattr(runs_router, "_write_enqueue_audit", lambda *_args: None)
+    monkeypatch.setattr(runs_router, blocking_helper, _blocking)
+    monkeypatch.setattr(runs_router, "_check_upload_rate_limit", _rate_limit)
+    monkeypatch.setattr(runs_router, "_upload_artifact_stream", _upload)
+    monkeypatch.setattr(runs_router, "_enqueue_with_retries", _enqueue)
+    monkeypatch.setattr(runs_router, "request_meta", lambda *_args: {})
+    monkeypatch.setattr(runs_router, "get_settings", lambda: SimpleNamespace(redis_stream_retries=1))
+
+    async def _exercise() -> dict:
+        before = time.perf_counter()
+        task = asyncio.create_task(
+            runs_router.upload_artifact(
+                project_id=project_id,
+                run_id=run_id,
+                request=SimpleNamespace(headers={"content-type": "application/x-ndjson"}),
+                file=None,
+                auth=auth,
+            )
+        )
+        await asyncio.sleep(0.05)
+        elapsed = time.perf_counter() - before
+        assert started.is_set()
+        assert elapsed < 0.5
+        release.set()
+        return await task
+
+    assert asyncio.run(_exercise())["ok"] is True
+
+
+def test_upload_preflights_can_run_concurrently(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    auth = SimpleNamespace(user_id=uuid.uuid4(), token_id=None)
+    release = threading.Event()
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+
+    def _blocking_preflight(*_args) -> None:
+        nonlocal active
+        nonlocal max_active
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+        release.wait(timeout=1)
+        with active_lock:
+            active -= 1
+
+    async def _upload(*_args, **_kwargs):
+        return 24, "a" * 64
+
+    async def _rate_limit(*_args, **_kwargs):
+        return None
+
+    async def _enqueue(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(runs_router, "_preflight_artifact_upload", _blocking_preflight)
+    monkeypatch.setattr(runs_router, "_commit_uploaded_artifact", lambda _project_id, run_id, *_args: run_id)
+    monkeypatch.setattr(runs_router, "_write_enqueue_audit", lambda *_args: None)
+    monkeypatch.setattr(runs_router, "_check_upload_rate_limit", _rate_limit)
+    monkeypatch.setattr(runs_router, "_upload_artifact_stream", _upload)
+    monkeypatch.setattr(runs_router, "_enqueue_with_retries", _enqueue)
+    monkeypatch.setattr(runs_router, "request_meta", lambda *_args: {})
+    monkeypatch.setattr(runs_router, "get_settings", lambda: SimpleNamespace(redis_stream_retries=1))
+
+    async def _exercise() -> None:
+        tasks = [
+            asyncio.create_task(
+                runs_router.upload_artifact(
+                    project_id=project_id,
+                    run_id=uuid.uuid4(),
+                    request=SimpleNamespace(headers={"content-type": "application/x-ndjson"}),
+                    file=None,
+                    auth=auth,
+                )
+            )
+            for _ in range(2)
+        ]
+        await asyncio.sleep(0.05)
+        release.set()
+        await asyncio.gather(*tasks)
+
+    asyncio.run(_exercise())
+    assert max_active == 2
+
+
+def test_critical_upload_step_finishes_cleanup_before_propagating_cancellation() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def _durable_step() -> None:
+        started.set()
+        release.wait(timeout=2)
+        completed.set()
+
+    async def _exercise() -> None:
+        task = asyncio.create_task(runs_router._run_critical_upload_step(_durable_step))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_exercise())
+    assert completed.is_set()

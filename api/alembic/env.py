@@ -42,6 +42,16 @@ def run_migrations_online() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={
+            "connect_timeout": settings.migration_database_connect_timeout_seconds,
+            # Concurrent index builds can legitimately run for hours. Bound
+            # lock acquisition, but do not inherit the API request statement
+            # timeout for migration work that has already acquired its locks.
+            "options": (
+                f"-c lock_timeout={settings.migration_database_lock_timeout_ms} "
+                "-c statement_timeout=0"
+            ),
+        },
     )
 
     with connectable.connect() as connection:

@@ -159,3 +159,62 @@ def test_list_run_activity_returns_timeline_rows(monkeypatch) -> None:
         }
     ]
     assert fake_db.commit_count == 1
+
+
+def test_endpoint_resources_uses_bounded_keyset_pagination(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    fake_run = SimpleNamespace(id=run_id, project_id=project_id)
+    resources = [
+        SimpleNamespace(
+            id=10,
+            resource_type="smb_share",
+            name="Finance",
+            remark=None,
+            access_level="readable",
+            access_capabilities={},
+        ),
+        SimpleNamespace(
+            id=11,
+            resource_type="smb_share",
+            name="Engineering",
+            remark=None,
+            access_level="list_only",
+            access_capabilities={},
+        ),
+    ]
+    fake_db = _FakeDb(execute_queue=[_ExecuteResult([fake_run]), _ExecuteResult(resources)])
+    monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runs_router, "write_audit_event", lambda *_args, **_kwargs: None)
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get(
+            f"/projects/{project_id}/runs/{run_id}/endpoints/7/resources?limit=1"
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["id"] for item in payload["items"]] == [10]
+    assert payload["next_cursor"]
+    assert fake_db.commit_count == 1
+
+
+def test_endpoint_resources_rejects_endpoint_outside_project_run(monkeypatch) -> None:
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    fake_db = _FakeDb(execute_queue=[_ExecuteResult([])])
+    monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get(
+            f"/projects/{project_id}/runs/{run_id}/endpoints/999/resources"
+        )
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "endpoint not found in run"

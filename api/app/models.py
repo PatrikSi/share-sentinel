@@ -115,6 +115,7 @@ class Endpoint(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "endpoint_key", name="uq_endpoints_run_key"),
         Index("ix_endpoints_run_ip", "run_id", "ip"),
+        Index("ix_endpoints_run_id", "run_id", "id"),
     )
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
@@ -132,7 +133,8 @@ class Resource(Base):
     __tablename__ = "resources"
     __table_args__ = (
         UniqueConstraint("run_id", "endpoint_id", "resource_type", "name", name="uq_resources_run_endpoint_type_name"),
-        Index("ix_resources_run_endpoint", "run_id", "endpoint_id"),
+        Index("ix_resources_run_id", "run_id", "id"),
+        Index("ix_resources_run_endpoint_id", "run_id", "endpoint_id", "id"),
     )
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
@@ -149,8 +151,9 @@ class Item(Base):
     __tablename__ = "items"
     __table_args__ = (
         UniqueConstraint("run_id", "resource_id", "path", name="uq_items_run_resource_path"),
-        Index("ix_items_run_resource_path", "run_id", "resource_id", "path"),
         Index("ix_items_run_name", "run_id", "name"),
+        Index("ix_items_run_id", "run_id", "id"),
+        Index("ix_items_run_resource_id", "run_id", "resource_id", "id"),
     )
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
@@ -170,7 +173,11 @@ class Item(Base):
 
 class IngestError(Base):
     __tablename__ = "ingest_errors"
-    __table_args__ = (UniqueConstraint("run_id", "fingerprint", name="uq_ingest_errors_run_fingerprint"),)
+    __table_args__ = (
+        UniqueConstraint("run_id", "fingerprint", name="uq_ingest_errors_run_fingerprint"),
+        Index("ix_ingest_errors_run_id", "run_id", "id"),
+        Index("ix_ingest_errors_run_severity_id", "run_id", "severity", "id"),
+    )
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
     run_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, ForeignKey("scan_runs.id", ondelete="CASCADE"), nullable=False)
@@ -186,7 +193,17 @@ class IngestError(Base):
 
 class AuditEvent(Base):
     __tablename__ = "audit_events"
-    __table_args__ = (Index("ix_audit_events_project_ts", "project_id", "ts"),)
+    __table_args__ = (
+        Index("ix_audit_events_project_ts_id", "project_id", "ts", "id"),
+        Index(
+            "ix_audit_events_project_object_ts_id",
+            "project_id",
+            "object_type",
+            "object_id",
+            "ts",
+            "id",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
     ts: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
@@ -219,8 +236,18 @@ class SavedInvestigation(Base):
     )
 
 
-Index("ix_scan_runs_project_created", ScanRun.project_id, ScanRun.created_at)
+Index("ix_scan_runs_project_created_id", ScanRun.project_id, ScanRun.created_at, ScanRun.id)
+Index(
+    "ix_scan_runs_project_status_created_id",
+    ScanRun.project_id,
+    ScanRun.status,
+    ScanRun.created_at,
+    ScanRun.id,
+)
 Index("ix_scan_runs_status_created", ScanRun.status, ScanRun.created_at)
 Index("ix_refresh_tokens_user_revoked", RefreshToken.user_id, RefreshToken.revoked_at)
 Index("ix_users_approval_status", User.is_approved, User.created_at)
+Index("ix_users_created_id", User.created_at.desc(), User.id.desc())
+Index("ix_api_tokens_created_id", ApiToken.created_at.desc(), ApiToken.id.desc())
+Index("ix_audit_events_ts_id", AuditEvent.ts.desc(), AuditEvent.id.desc())
 Index("ix_saved_investigations_project_updated", SavedInvestigation.project_id, SavedInvestigation.updated_at)
