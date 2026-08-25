@@ -426,6 +426,12 @@ does not retry failed logons because retries across many hosts can amplify an
 incorrect credential into an Active Directory account lockout. Correct the
 credential or connectivity issue and rerun explicitly.
 
+If an authenticated session explicitly denies share enumeration, the endpoint
+and denial are retained as useful partial evidence; known shares can still be
+assessed with `--include-share`. Session loss, transport status responses, and
+other protocol failures during enumeration are reported as failed host
+assessments rather than being mislabeled as permission denial.
+
 ### Output and retry behavior
 
 - File artifacts are assembled into a private (`0600`) sibling temporary file, flushed, and atomically replaced. A failed final write does not truncate a previously good artifact at the destination.

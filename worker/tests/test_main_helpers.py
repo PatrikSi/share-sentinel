@@ -815,6 +815,7 @@ def test_validate_record_bounds_access_capabilities_and_preserves_probe_metadata
                 "coverage": "bounded_sample",
                 "assessment_summary": "read_observed",
                 "assessment_reason": "bounded_observation",
+                "probe_abort_reason": "tree_session_invalid",
                 "share_presence": "confirmed",
                 "probe_limit": 3,
                 "partial": True,
@@ -822,6 +823,7 @@ def test_validate_record_bounds_access_capabilities_and_preserves_probe_metadata
                 "finalized": True,
                 "degraded": False,
                 "transport_failed": False,
+                "probes_aborted": True,
                 "listing_truncated": False,
                 "directory_candidates_seen": 7,
                 "file_candidates_seen": 11,
@@ -854,6 +856,7 @@ def test_validate_record_bounds_access_capabilities_and_preserves_probe_metadata
             "coverage": "bounded_sample",
             "assessment_summary": "read_observed",
             "assessment_reason": "bounded_observation",
+            "probe_abort_reason": "tree_session_invalid",
             "share_presence": "confirmed",
             "probe_limit": 3,
             "directory_candidates_seen": 7,
@@ -864,6 +867,7 @@ def test_validate_record_bounds_access_capabilities_and_preserves_probe_metadata
             "finalized": True,
             "degraded": False,
             "transport_failed": False,
+            "probes_aborted": True,
         },
         "bad": {
             "status": "not_tested",
@@ -984,6 +988,8 @@ def test_finalized_degraded_metadata_and_reason_fields_survive_stale_replay() ->
             "finalized": True,
             "degraded": True,
             "transport_failed": True,
+            "probes_aborted": True,
+            "probe_abort_reason": "tree_session_invalid",
         },
     }
     stale_provisional = {
@@ -997,6 +1003,7 @@ def test_finalized_degraded_metadata_and_reason_fields_survive_stale_replay() ->
             "finalized": False,
             "degraded": False,
             "transport_failed": False,
+            "probes_aborted": False,
         },
     }
 

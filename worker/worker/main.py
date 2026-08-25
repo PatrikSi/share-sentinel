@@ -271,6 +271,7 @@ ACCESS_CAPABILITY_METADATA_TEXT_FIELDS = {
     "coverage",
     "assessment_summary",
     "assessment_reason",
+    "probe_abort_reason",
     "share_presence",
 }
 ACCESS_CAPABILITY_METADATA_COUNT_FIELDS = {
@@ -287,6 +288,7 @@ ACCESS_CAPABILITY_METADATA_BOOLEAN_FIELDS = {
     "finalized",
     "degraded",
     "transport_failed",
+    "probes_aborted",
 }
 FILE_ATTRIBUTE_MAX_VALUES = 32
 FILE_ATTRIBUTE_MAX_LENGTH = 64

@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import requests
 
 
@@ -331,6 +332,49 @@ def test_main_discards_output_when_orchestration_error_record_cannot_be_written(
     assert rc == collector.EXIT_FAILURE
     assert not output_path.exists()
     assert "output error: disk quota exceeded" in stderr_capture.getvalue().lower()
+
+
+@pytest.mark.parametrize(
+    ("cleanup_interrupt", "expected_type"),
+    [(KeyboardInterrupt(), KeyboardInterrupt), (SystemExit(17), SystemExit)],
+)
+def test_abort_collection_output_preserves_cleanup_interrupt_after_bounded_retry(
+    monkeypatch, tmp_path, cleanup_interrupt, expected_type
+) -> None:
+    collector = _load_collector_module()
+    temp_artifact = tmp_path / "incomplete.ndjson"
+    temp_artifact.write_text("partial", encoding="utf-8")
+    stderr_capture = io.StringIO()
+    writer = collector.NDJSONWriter(str(temp_artifact), gzip_output=False)
+    writer._spool_error = OSError("disk quota exceeded")
+    buffer_dir = Path(writer._buffer_dir)
+    original_close = writer.close
+    close_calls = 0
+
+    def _interrupt_once(*, keep_output):
+        nonlocal close_calls
+        assert keep_output is False
+        close_calls += 1
+        if close_calls == 1:
+            raise cleanup_interrupt
+        return original_close(keep_output=keep_output)
+
+    monkeypatch.setattr(writer, "close", _interrupt_once)
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    with pytest.raises(expected_type) as raised:
+        collector._abort_collection_output(
+            writer,
+            temp_artifact=str(temp_artifact),
+            error=OSError("disk quota exceeded"),
+        )
+
+    assert close_calls == 2
+    assert not buffer_dir.exists()
+    assert not temp_artifact.exists()
+    assert "output error: disk quota exceeded" in stderr_capture.getvalue().lower()
+    if isinstance(cleanup_interrupt, SystemExit):
+        assert raised.value.code == 17
 
 
 def test_main_reports_upload_errors_without_traceback_returns_partial(monkeypatch, tmp_path) -> None:

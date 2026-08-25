@@ -100,18 +100,30 @@ def test_smb1_ambiguous_or_non_denial_codes_remain_inconclusive(
 
 
 @pytest.mark.parametrize(
-    ("error_class", "error_code", "reason_code", "transport_fatal", "abort_remaining_probes"),
+    (
+        "error_class",
+        "error_code",
+        "reason_code",
+        "transport_fatal",
+        "abort_remaining_probes",
+        "root_path_fallback",
+    ),
     [
-        (1, 2, "object_not_found", False, False),
-        (1, 3, "object_not_found", False, False),
-        (1, 67, "share_unavailable", False, False),
-        (2, 5, "tree_session_invalid", False, True),
-        (2, 6, "share_unavailable", False, False),
-        (2, 67, "invalid_request", False, False),
+        (1, 2, "object_not_found", False, False, True),
+        (1, 3, "object_not_found", False, False, True),
+        (1, 67, "share_unavailable", False, False, False),
+        (2, 5, "tree_session_invalid", False, True, False),
+        (2, 6, "share_unavailable", False, False, False),
+        (2, 67, "invalid_request", False, False, True),
     ],
 )
 def test_smb1_failures_retain_class_code_and_specific_reason(
-    error_class, error_code, reason_code, transport_fatal, abort_remaining_probes
+    error_class,
+    error_code,
+    reason_code,
+    transport_fatal,
+    abort_remaining_probes,
+    root_path_fallback,
 ) -> None:
     collector = _load_collector_module()
 
@@ -133,6 +145,7 @@ def test_smb1_failures_retain_class_code_and_specific_reason(
     assert classification.protocol_status == f"SMB1:{error_class:02X}:{error_code:04X}"
     assert classification.transport_fatal is transport_fatal
     assert classification.abort_remaining_probes is abort_remaining_probes
+    assert classification.root_path_fallback is root_path_fallback
 
 
 def test_smb1_ntstatus_packet_is_not_reported_as_a_legacy_error_pair() -> None:
@@ -280,6 +293,60 @@ def test_root_handle_probe_retries_explicit_root_only_for_compatible_path_failur
     assert capabilities["create_file"]["status"] == "allowed"
     assert capabilities["create_file"]["reason_code"] == "granted"
     assert capabilities["create_directory"]["status"] == "allowed"
+
+
+@pytest.mark.parametrize(("error_class", "error_code"), [(1, 2), (1, 3), (2, 67)])
+def test_smb1_root_handle_probe_retries_explicit_root_for_legacy_path_failures(
+    monkeypatch, error_class, error_code
+) -> None:
+    collector = _load_collector_module()
+
+    class _LegacyPacket:
+        def __getitem__(self, field_name):
+            return {"ErrorClass": error_class, "ErrorCode": error_code}[field_name]
+
+    class _LegacyRootPathError(Exception):
+        def getErrorCode(self):
+            return error_code
+
+        def getErrorPacket(self):
+            return _LegacyPacket()
+
+    monkeypatch.setattr(collector, "SessionError", _LegacyRootPathError)
+    capabilities = collector._new_access_capabilities()
+
+    class _Connection:
+        def __init__(self):
+            self.paths = []
+            self.closed = []
+
+        def openFile(self, _tree_id, path, **_kwargs):
+            self.paths.append(path)
+            if path == "":
+                raise _LegacyRootPathError()
+            return "root-handle"
+
+        def closeFile(self, tree_id, file_id):
+            self.closed.append((tree_id, file_id))
+
+    connection = _Connection()
+    circuit = collector._SMBProbeCircuit()
+    collector._probe_smb_handle_access(
+        connection,
+        7,
+        "",
+        is_directory=True,
+        desired_access=collector.FILE_ADD_FILE,
+        capability="create_file",
+        capabilities=capabilities,
+        cancel_event=None,
+        probe_circuit=circuit,
+    )
+
+    assert connection.paths == ["", "\\"]
+    assert connection.closed == [(7, "root-handle")]
+    assert circuit.root_path == "\\"
+    assert capabilities["create_file"]["status"] == "allowed"
 
 
 def test_root_handle_probe_does_not_retry_authorization_denial(monkeypatch) -> None:

@@ -807,6 +807,89 @@ def test_scan_host_smb_reports_share_enumeration_denied_with_anonymous_hint(monk
     assert "--include-share" in error_record["hint"]
 
 
+@pytest.mark.parametrize(
+    ("status_code", "reason_code"),
+    [
+        (0xC000035C, "transport_failure"),  # STATUS_NETWORK_SESSION_EXPIRED
+        (0xC00000BB, "unsupported_request"),  # STATUS_NOT_SUPPORTED
+        (0xC00000A2, "write_protected"),  # not an enumeration authorization denial
+    ],
+)
+def test_scan_host_smb_treats_share_enumeration_session_failures_as_host_failures(
+    monkeypatch, status_code, reason_code
+) -> None:
+    collector = _load_collector_module()
+
+    class _SessionFailure(Exception):
+        def getErrorCode(self):
+            return status_code
+
+    monkeypatch.setattr(collector, "SessionError", _SessionFailure)
+
+    class _Conn:
+        def __init__(self, *_args, **_kwargs):
+            self.logged_off = False
+
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def getDialect(self):
+            return "768"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            raise _SessionFailure()
+
+        def logoff(self):
+            self.logged_off = True
+
+    connection = _Conn()
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: connection)
+
+    class _Writer:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=True,
+        username="",
+        password="",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=[],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=1,
+    )
+    writer = _Writer()
+    stats = collector.Stats()
+
+    ok = collector.scan_host_smb("10.0.0.7", args, "run-1", writer, stats, threading.Lock())
+
+    assert ok is False
+    assert connection.logged_off is True
+    assert stats.endpoints == 1
+    assert stats.resources == 0
+    assert stats.error_codes["LIST_SHARES_FAILED"] == 1
+    error_record = next(row for row in writer.records if row.get("type") == "error")
+    assert error_record["severity"] == "error"
+    assert error_record["code"] == "LIST_SHARES_FAILED"
+    assert reason_code in error_record["message"]
+    assert f"0x{status_code:08X}" in error_record["message"]
+
+
 def test_scan_host_smb_scans_user_specified_shares_without_enumeration(monkeypatch) -> None:
     collector = _load_collector_module()
 

@@ -129,6 +129,13 @@ SMB1_STATUS_REASONS = {
     (0x02, 0x0006): "share_unavailable",  # ERRSRV/ERRinvnetname
     (0x02, 0x0043): "invalid_request",  # ERRSRV/ERRfilespecs
 }
+SMB1_ROOT_PATH_FALLBACK_ERROR_PAIRS = frozenset(
+    {
+        (0x01, 0x0002),  # ERRDOS/ERRbadfile
+        (0x01, 0x0003),  # ERRDOS/ERRbadpath
+        (0x02, 0x0043),  # ERRSRV/ERRfilespecs
+    }
+)
 SMB1_FLAGS2_NT_STATUS = 0x4000
 SMB_DENIED_STATUS_CODES = frozenset(
     {
@@ -145,6 +152,14 @@ SMB_DENIED_STATUS_LABELS = (
     "STATUS_PRIVILEGE_NOT_HELD",
     "STATUS_MEDIA_WRITE_PROTECTED",
     "STATUS_CANNOT_DELETE",
+)
+SMB_SHARE_ENUMERATION_DENIAL_REASONS = frozenset(
+    {
+        "access_denied",
+        "network_access_denied",
+        "privilege_not_held",
+        "legacy_operation_refused",
+    }
 )
 SMB_STATUS_REASONS = {
     0xC0000022: "access_denied",  # STATUS_ACCESS_DENIED
@@ -1634,6 +1649,7 @@ def _classify_smb_probe_failure(exc: BaseException) -> _SMBProbeClassification:
             reason_code=reason_code,
             protocol_status=protocol_status,
             abort_remaining_probes=reason_code == "tree_session_invalid",
+            root_path_fallback=legacy_error_pair in SMB1_ROOT_PATH_FALLBACK_ERROR_PAIRS,
         )
 
     if status_code in SMB_DENIED_STATUS_CODES:
@@ -2774,23 +2790,47 @@ def scan_host_smb(
                 shares = conn.listShares()
             except SessionError as exc:
                 detail = _error_detail(exc)
-                message = f"SMB share enumeration failed: {detail}"
-                hint = (
-                    "Anonymous session established but share enumeration is blocked. Use SMB credentials or pass known names with --include-share."
-                    if attempted_auth == "anonymous"
-                    else "Credentials authenticated but are not allowed to enumerate shares. Use a higher-privilege account or --include-share."
+                classification = _classify_smb_probe_failure(exc)
+                access_denied = (
+                    classification.outcome == "denied"
+                    and classification.reason_code in SMB_SHARE_ENUMERATION_DENIAL_REASONS
                 )
+                protocol_suffix = (
+                    f", status={classification.protocol_status}"
+                    if classification.protocol_status
+                    else ""
+                )
+                message = (
+                    "SMB share enumeration denied"
+                    if access_denied
+                    else f"SMB share enumeration failed ({classification.reason_code}{protocol_suffix})"
+                )
+                message = f"{message}: {detail}"
+                if access_denied:
+                    hint = (
+                        "Anonymous session established but share enumeration is blocked. Use SMB credentials or pass known names with --include-share."
+                        if attempted_auth == "anonymous"
+                        else "Credentials authenticated but are not allowed to enumerate shares. Use a higher-privilege account or --include-share."
+                    )
+                elif classification.transport_fatal:
+                    hint = "The authenticated SMB session became unusable; verify network/server health and retry the host."
+                else:
+                    hint = "The SMB server rejected or could not process share enumeration; verify server compatibility and retry, or pass known names with --include-share."
+                code = "LIST_SHARES_DENIED" if access_denied else "LIST_SHARES_FAILED"
                 _emit_error(
                     writer,
                     run_id,
-                    severity="warn",
-                    code="LIST_SHARES_DENIED",
+                    severity="warn" if access_denied else "error",
+                    code=code,
                     message=message,
                     endpoint_key=endpoint_key,
                     hint=hint,
                 )
-                _record_error(stats, lock, "LIST_SHARES_DENIED", message)
-                return True
+                _record_error(stats, lock, code, message)
+                # A valid authenticated endpoint with explicitly denied share
+                # enumeration is useful partial evidence. Session, transport,
+                # and other protocol failures leave the host scan incomplete.
+                return access_denied
 
         eligible_shares = []
         seen_shares: set[str] = set()
@@ -4069,9 +4109,19 @@ def _abort_collection_output(
 ) -> int:
     """Discard incomplete buffers after an output failure and report it once."""
 
+    cleanup_interrupt: KeyboardInterrupt | SystemExit | None = None
     try:
         writer.close(keep_output=False)
-    except BaseException:
+    except (KeyboardInterrupt, SystemExit) as exc:
+        cleanup_interrupt = exc
+        # NDJSONWriter intentionally remains retryable when finalization is
+        # interrupted. Give discard one bounded second attempt, then preserve
+        # the original process-control exception for the caller.
+        try:
+            writer.close(keep_output=False)
+        except BaseException:
+            pass
+    except Exception:
         # The original emit failure is the useful operator-facing cause. The
         # close call still gets a chance to release every temporary buffer.
         pass
@@ -4086,6 +4136,8 @@ def _abort_collection_output(
                 file=sys.stderr,
             )
     print(f"output error: {_error_detail(error)}", file=sys.stderr)
+    if cleanup_interrupt is not None:
+        raise cleanup_interrupt
     return EXIT_FAILURE
 
 
