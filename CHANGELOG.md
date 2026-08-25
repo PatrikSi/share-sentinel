@@ -29,6 +29,8 @@ No user-visible changes yet.
 - SMB access results now explain connected-but-not-listable, connection-only, disabled, sample-limited, unavailable, and transport-inconclusive outcomes while retaining the existing compatibility access level and strictly non-mutating probes.
 - SharePoint lifecycle and library checks now keep only bounded request windows in flight, deduplicate site-collection roots, report progress, and mark unresolved lifecycle assessments partial; malformed item snapshots no longer emit a valid-looking subset.
 - SMB output failures now abort collection instead of being relabeled as per-share protocol failures, and SMB1 errors retain true NTSTATUS or legacy class/code evidence with clearer missing-object and missing-share reasons.
+- Rejected SharePoint libraries no longer consume the run-wide item budget, escaped invalid-target evidence stays ingestible, and folder-only libraries retain their item drill-down.
+- SMB enumeration now distinguishes authorization denial from failed sessions or protocol errors, preserves aborted-probe evidence through ingestion, and retries legacy-compatible share-root syntax safely.
 - Production UI smoke checks now verify that the visible footer version matches the repository release version.
 
 ## [1.1.0] - 2026-08-24
