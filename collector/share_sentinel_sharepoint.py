@@ -625,7 +625,7 @@ def run(args: argparse.Namespace) -> int:
                 "finished_at": datetime.now(tz=UTC).isoformat(),
                 "status": status,
                 "stats": {
-                    "endpoints": final_stats["sites_discovered"],
+                    "endpoints": final_stats["endpoints_emitted"],
                     "resources": final_stats["libraries_discovered"],
                     "items": final_stats["items"],
                     "errors": final_stats["graph_errors"],

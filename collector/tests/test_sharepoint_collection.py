@@ -1,3 +1,4 @@
+import hashlib
 import io
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from sharepoint.collection import (
     ITEM_NAME_MAX_CHARACTERS,
     ITEM_PATH_MAX_CHARACTERS,
     ITEM_SELECT,
+    SITE_SELECT,
     SharePointCollectionConfig,
     SharePointCollector,
     SharePointProgress,
@@ -22,6 +24,7 @@ from sharepoint.graph import GraphAPIError, GraphProtocolError
 from sharepoint.state import SharePointStateStore
 
 SITE_ID = "contoso.sharepoint.com,site-guid,web-guid"
+SITE_COLLECTION_ID = "contoso.sharepoint.com,site-guid"
 DELTA_1 = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=1"
 DELTA_2 = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=2"
 INITIAL_DELTA_1 = f"drives/drive-1/root/delta?$select={ITEM_SELECT}"
@@ -125,6 +128,10 @@ def _routes(delta_pages: object, *, delegated: bool = True, drives=None) -> dict
     discovery = "sites?search=*" if delegated else "sites/getAllSites"
     return {
         discovery: [{"value": [_site()]}],
+        f"sites/{SITE_COLLECTION_ID}?$select=id,siteCollection": {
+            "id": SITE_COLLECTION_ID,
+            "siteCollection": {"hostname": "contoso.sharepoint.com"},
+        },
         f"sites/{SITE_ID}/drives?$select=id,name,description,driveType,webUrl,createdDateTime,lastModifiedDateTime": [
             {"value": drives or [_drive()]}
         ],
@@ -206,12 +213,34 @@ def test_delegated_discovery_is_explicitly_security_trimmed() -> None:
     ],
 )
 def test_target_site_url_is_canonically_encoded_once(reference: str, graph_path: str) -> None:
-    client = FakeClient({graph_path: _site()})
+    selected_path = f"{graph_path}?$select={SITE_SELECT}"
+    client = FakeClient({selected_path: _site()})
 
     site = resolve_target_site(client, reference)
 
     assert site.site_id == SITE_ID
-    assert client.calls == [("get", graph_path)]
+    assert site.existence_status == "confirmed"
+    assert site.archive_status == "not_archived"
+    assert client.calls == [("get", selected_path)]
+
+
+def test_target_site_uses_authoritative_graph_archive_status() -> None:
+    reference = "https://contoso.sharepoint.com/sites/Finance"
+    graph_path = f"sites/contoso.sharepoint.com:/sites/Finance?$select={SITE_SELECT}"
+    raw_site = {
+        **_site(),
+        "siteCollection": {
+            "hostname": "contoso.sharepoint.com",
+            "archivalDetails": {"archiveStatus": "fullyArchived"},
+        },
+    }
+
+    site = resolve_target_site(FakeClient({graph_path: raw_site}), reference)
+
+    assert site.requested_target == reference
+    assert site.archive_status == "fully_archived"
+    assert site.archive_status_checked is True
+    assert site.archive_status_authoritative is True
 
 
 @pytest.mark.parametrize(
@@ -235,6 +264,68 @@ def test_target_site_url_rejects_unsupported_or_ambiguous_forms(reference: str) 
 def test_target_site_id_is_bounded_and_control_character_free(reference: str) -> None:
     with pytest.raises(GraphProtocolError, match="invalid_site_id"):
         resolve_target_site(FakeClient({}), reference)
+
+
+@pytest.mark.parametrize(
+    ("reference", "failure", "existence_status", "assessment"),
+    [
+        ("site-id\nforged", None, "invalid_target", "invalid_target"),
+        (
+            "https://contoso.sharepoint.com/sites/Missing",
+            GraphAPIError(status_code=404, code="itemNotFound"),
+            "not_found_or_not_visible",
+            "not_found_or_not_visible",
+        ),
+        (
+            "https://contoso.sharepoint.com/sites/Restricted",
+            GraphAPIError(status_code=403, code="accessDenied"),
+            "permission_denied",
+            "inaccessible",
+        ),
+        (
+            "https://contoso.sharepoint.com/sites/Auth",
+            GraphAPIError(status_code=401, code="invalidAuthenticationToken"),
+            "authentication_failed",
+            "authentication_failed",
+        ),
+        (
+            "https://contoso.sharepoint.com/sites/Unavailable",
+            GraphAPIError(status_code=503, code="serviceUnavailable", retryable=True),
+            "temporarily_unreachable",
+            "temporarily_unreachable",
+        ),
+    ],
+)
+def test_target_resolution_failures_emit_stable_scoped_endpoint_assessments(
+    tmp_path,
+    reference: str,
+    failure: GraphAPIError | None,
+    existence_status: str,
+    assessment: str,
+) -> None:
+    routes: dict[str, object] = {}
+    if failure is not None:
+        parsed_name = reference.rsplit("/", 1)[-1]
+        routes[f"sites/contoso.sharepoint.com:/sites/{parsed_name}?$select={SITE_SELECT}"] = failure
+    collector, _, writer = _collector(
+        tmp_path,
+        routes,
+        config=SharePointCollectionConfig(targeted_sites=(reference,), concurrency=1, quiet=True),
+    )
+
+    pending, status = collector.collect()
+
+    endpoint = next(record for record in writer.records if record["type"] == "endpoint")
+    expected_key = f"sharepoint-target:{hashlib.sha256(reference.strip().encode('utf-8')).hexdigest()[:32]}"
+    assert pending == []
+    assert status == "failed"
+    assert endpoint["endpoint_key"] == expected_key
+    assert endpoint["metadata"]["existence_status"] == existence_status
+    assert endpoint["metadata"]["assessment"] == assessment
+    assert endpoint["metadata"]["lifecycle_state"] == "indeterminate"
+    assert "\n" not in endpoint["metadata"]["requested_target"]
+    assert collector.stats.endpoints_emitted == 1
+    assert collector.stats.sites_failed == 1
 
 
 def test_progress_escapes_identity_and_remote_name_control_characters() -> None:
@@ -356,8 +447,8 @@ def test_drive_search_supports_graphrunner_and_sharepoint_id_shapes() -> None:
     client = FakeClient(
         {
             "search/query": search_response,
-            f"sites/{parent_site_id}": {**_site(), "id": parent_site_id},
-            f"sites/{ids_site_id}": {**_site(), "id": ids_site_id},
+            f"sites/{parent_site_id}?$select={SITE_SELECT}": {**_site(), "id": parent_site_id},
+            f"sites/{ids_site_id}?$select={SITE_SELECT}": {**_site(), "id": ids_site_id},
         }
     )
 
@@ -426,7 +517,7 @@ def test_drive_search_stops_immediately_at_site_limit() -> None:
                     }
                 ]
             },
-            f"sites/{site_id}": {**_site(), "id": site_id},
+            f"sites/{site_id}?$select={SITE_SELECT}": {**_site(), "id": site_id},
         }
     )
 
@@ -580,6 +671,124 @@ def test_malformed_drive_item_facets_are_rejected(changes: dict[str, object], ex
     assert error.value.code == expected_code
 
 
+def test_broad_discovery_enriches_archive_lifecycle_and_empty_library_state(tmp_path) -> None:
+    routes = _routes([{"value": [], "@odata.deltaLink": DELTA_1}])
+    routes[f"sites/{SITE_COLLECTION_ID}?$select=id,siteCollection"] = {
+        "id": SITE_COLLECTION_ID,
+        "siteCollection": {
+            "hostname": "contoso.sharepoint.com",
+            "archivalDetails": {"archiveStatus": "fullyArchived"},
+        },
+    }
+    collector, _, writer = _collector(tmp_path, routes)
+
+    pending, status = collector.collect()
+
+    endpoint = next(record for record in writer.records if record["type"] == "endpoint")
+    endpoint_metadata = endpoint["metadata"]
+    final_resource = [record for record in writer.records if record["type"] == "resource"][-1]
+    resource_metadata = final_resource["metadata"]
+    assert status == "success"
+    assert pending[0].item_count == 0
+    assert endpoint_metadata["existence_status"] == "confirmed_from_discovery"
+    assert endpoint_metadata["archive_status"] == "fully_archived"
+    assert endpoint_metadata["lifecycle_state"] == "archived"
+    assert endpoint_metadata["evidence"]["archive_status_scope"] == "site_collection"
+    assert endpoint_metadata["evidence"]["archive_status_site_collection_id"] == SITE_COLLECTION_ID
+    assert resource_metadata["enumeration_status"] == "complete"
+    assert resource_metadata["content_state"] == "empty"
+    assert resource_metadata["collection_complete"] is True
+    assert resource_metadata["file_count"] == 0
+    assert resource_metadata["folder_count"] == 0
+    assert resource_metadata["item_count"] == 0
+    assert resource_metadata["total_size_bytes"] == 0
+    assert final_resource["access_level"] == "list_only"
+    assert collector.stats.sites_archived == 1
+
+
+def test_archive_enrichment_failure_is_scoped_and_does_not_block_library_collection(tmp_path) -> None:
+    routes = _routes([{"value": [], "@odata.deltaLink": DELTA_1}])
+    routes[f"sites/{SITE_COLLECTION_ID}?$select=id,siteCollection"] = GraphAPIError(
+        status_code=503,
+        code="serviceUnavailable",
+        retryable=True,
+    )
+    collector, _, writer = _collector(tmp_path, routes)
+
+    pending, status = collector.collect()
+
+    endpoint = next(record for record in writer.records if record["type"] == "endpoint")
+    issue = next(record for record in writer.records if record.get("code") == "SITE_STATUS_TRANSIENT_FAILURE")
+    assert status == "success"
+    assert len(pending) == 1
+    assert endpoint["metadata"]["existence_status"] == "confirmed_from_discovery"
+    assert endpoint["metadata"]["archive_status"] == "unknown"
+    assert endpoint["metadata"]["lifecycle_state"] == "indeterminate"
+    assert issue["endpoint_key"] == f"sharepoint:{SITE_ID}"
+    assert collector.stats.sites_failed == 0
+    assert collector.stats.sites_indeterminate == 1
+    assert collector.stats.libraries_succeeded == 1
+
+
+def test_no_files_collection_marks_content_not_assessed_without_delta_call(tmp_path) -> None:
+    routes = _routes([{"value": [_file("unused", "unused.txt")], "@odata.deltaLink": DELTA_1}])
+    collector, _, writer = _collector(
+        tmp_path,
+        routes,
+        config=SharePointCollectionConfig(include_files=False, concurrency=1, quiet=True),
+    )
+
+    pending, status = collector.collect()
+
+    resource = next(record for record in writer.records if record["type"] == "resource")
+    metadata = resource["metadata"]
+    assert status == "success"
+    assert pending == []
+    assert metadata["enumeration_status"] == "not_requested"
+    assert metadata["content_state"] == "not_assessed"
+    assert metadata["collection_complete"] is False
+    assert metadata["item_count"] is None
+    assert resource["access_level"] == "unknown"
+    assert not any("/root/delta" in url for _method, url in collector.client.calls)
+
+
+def test_complete_library_reports_specific_items_counts_and_partial_observed_size(tmp_path) -> None:
+    unknown_size = _file("unknown-size", "unknown.bin")
+    unknown_size.pop("size")
+    folder = {
+        "id": "folder-1",
+        "name": "Plans",
+        "folder": {"childCount": 0},
+        "parentReference": {"path": "/drives/drive-1/root:"},
+    }
+    routes = _routes(
+        [
+            {
+                "value": [_file("known", "known.txt"), unknown_size, folder],
+                "@odata.deltaLink": DELTA_1,
+            }
+        ]
+    )
+    collector, _, writer = _collector(tmp_path, routes)
+
+    _, status = collector.collect()
+
+    items = [record for record in writer.records if record["type"] == "item"]
+    final_resource = [record for record in writer.records if record["type"] == "resource"][-1]
+    metadata = final_resource["metadata"]
+    assert status == "success"
+    assert {item["name"] for item in items} == {"known.txt", "unknown.bin", "Plans"}
+    assert next(item for item in items if item["provider_item_id"] == "folder-1")["metadata"][
+        "folder_child_count"
+    ] == 0
+    assert metadata["content_state"] == "populated"
+    assert metadata["file_count"] == 2
+    assert metadata["folder_count"] == 1
+    assert metadata["item_count"] == 3
+    assert metadata["total_size_bytes"] == 42
+    assert metadata["size_observation_complete"] is False
+
+
 def test_initial_then_incremental_collection_emits_full_materialized_snapshot(tmp_path) -> None:
     first_routes = _routes([{"value": [_file("a", "a.txt"), _file("b", "b.txt")], "@odata.deltaLink": DELTA_1}])
     first, state, first_writer = _collector(tmp_path, first_routes)
@@ -614,7 +823,7 @@ def test_initial_then_incremental_collection_emits_full_materialized_snapshot(tm
     )
     assert {item["provider_item_id"] for item in items} == {"a", "c"}
     assert next(item for item in items if item["provider_item_id"] == "a")["path"] == "/Moved/renamed.txt"
-    resource = next(record for record in first_writer.records if record["type"] == "resource")
+    resource = [record for record in first_writer.records if record["type"] == "resource"][-1]
     assert resource["access_level"] == "list_only"
     assert resource["exposure"] == "USER_VISIBLE"
     assert resource["exposure_evidence"]["classification_scope"] == "visibility_not_public_exposure"
@@ -717,6 +926,16 @@ def test_one_inaccessible_library_does_not_abort_other_libraries(tmp_path) -> No
     assert len(pending) == 1
     assert collector.stats.libraries_failed == 1
     assert any(record.get("code") == "LIBRARY_PERMISSION_DENIED" for record in writer.records)
+    restricted = [
+        record
+        for record in writer.records
+        if record.get("type") == "resource" and record.get("name") == "Restricted"
+    ][-1]
+    assert restricted["access_level"] == "unknown"
+    assert restricted["metadata"]["enumeration_status"] == "permission_denied"
+    assert restricted["metadata"]["content_state"] == "unknown"
+    assert restricted["metadata"]["collection_complete"] is False
+    assert restricted["metadata"]["item_count"] is None
 
 
 def test_malformed_item_is_reported_without_advancing_checkpoint(tmp_path) -> None:
