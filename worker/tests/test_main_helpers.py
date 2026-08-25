@@ -805,13 +805,23 @@ def test_validate_record_bounds_access_capabilities_and_preserves_probe_metadata
                 "allowed": 1,
                 "denied": -2,
                 "inconclusive": False,
+                "reason_code": "granted",
+                "protocol_status": "0x00000000",
+                "method": "non_mutating_handle_open",
+                "scope": "file",
             },
             "_metadata": {
                 "probe_method": "non_mutating_handle_open",
                 "coverage": "bounded_sample",
+                "assessment_summary": "read_observed",
+                "assessment_reason": "bounded_observation",
+                "share_presence": "confirmed",
                 "probe_limit": 3,
                 "partial": True,
                 "complete": True,
+                "finalized": True,
+                "degraded": False,
+                "transport_failed": False,
                 "listing_truncated": False,
                 "directory_candidates_seen": 7,
                 "file_candidates_seen": 11,
@@ -834,16 +844,26 @@ def test_validate_record_bounds_access_capabilities_and_preserves_probe_metadata
             "allowed": 1,
             "denied": 0,
             "inconclusive": 0,
+            "reason_code": "granted",
+            "protocol_status": "0x00000000",
+            "method": "non_mutating_handle_open",
+            "scope": "file",
         },
         "_metadata": {
             "probe_method": "non_mutating_handle_open",
             "coverage": "bounded_sample",
+            "assessment_summary": "read_observed",
+            "assessment_reason": "bounded_observation",
+            "share_presence": "confirmed",
             "probe_limit": 3,
             "directory_candidates_seen": 7,
             "file_candidates_seen": 11,
             "partial": True,
             "complete": True,
             "listing_truncated": False,
+            "finalized": True,
+            "degraded": False,
+            "transport_failed": False,
         },
         "bad": {
             "status": "not_tested",
@@ -880,11 +900,36 @@ def test_merge_access_capabilities_is_monotonic_and_idempotent() -> None:
     assert main._merge_access_capabilities(merged, final) == merged
 
     mixed = main._merge_access_capabilities(
-        {"read_file": {"status": "allowed", "attempted": 1, "allowed": 1}},
-        {"read_file": {"status": "denied", "attempted": 1, "denied": 1}},
+        {
+            "read_file": {
+                "status": "allowed",
+                "attempted": 1,
+                "allowed": 1,
+                "reason_code": "granted",
+                "protocol_status": "0x00000000",
+            }
+        },
+        {
+            "read_file": {
+                "status": "denied",
+                "attempted": 1,
+                "denied": 1,
+                "reason_code": "access_denied",
+                "protocol_status": "0xC0000022",
+            }
+        },
     )
     assert mixed["read_file"]["status"] == "mixed"
     assert mixed["read_file"]["attempted"] == 2
+    assert mixed["read_file"]["reason_code"] == "multiple_outcomes"
+    assert mixed["read_file"]["protocol_status"] == "multiple"
+
+    observed_after_no_sample = main._merge_access_capabilities(
+        {"read_file": {"status": "not_tested", "not_tested_reason": "no_visible_file_candidate"}},
+        {"read_file": {"status": "allowed", "attempted": 1, "allowed": 1, "reason_code": "granted"}},
+    )
+    assert observed_after_no_sample["read_file"]["status"] == "allowed"
+    assert "not_tested_reason" not in observed_after_no_sample["read_file"]
 
 
 def test_completed_capability_metadata_wins_regardless_of_replay_order() -> None:
@@ -911,6 +956,57 @@ def test_completed_capability_metadata_wins_regardless_of_replay_order() -> None
     reverse = main._merge_access_capabilities(final, stale_provisional)
 
     assert forward == reverse
+    assert forward["_metadata"] == final["_metadata"]
+
+
+def test_finalized_degraded_metadata_and_reason_fields_survive_stale_replay() -> None:
+    final = {
+        "read_file": {
+            "status": "not_tested",
+            "not_tested_reason": "transport_aborted",
+            "method": "non_mutating_handle_open",
+            "scope": "file",
+        },
+        "create_file": {
+            "status": "inconclusive",
+            "attempted": 1,
+            "inconclusive": 1,
+            "reason_code": "transport_failure",
+            "protocol_status": "0xC00000C9",
+        },
+        "_metadata": {
+            "probe_method": "non_mutating_handle_open",
+            "coverage": "bounded_sample",
+            "assessment_summary": "connected_only",
+            "assessment_reason": "partial_transport_failure",
+            "share_presence": "confirmed",
+            "complete": False,
+            "finalized": True,
+            "degraded": True,
+            "transport_failed": True,
+        },
+    }
+    stale_provisional = {
+        "read_file": {"status": "not_tested"},
+        "_metadata": {
+            "coverage": "disabled",
+            "assessment_summary": "not_assessed",
+            "assessment_reason": "pending",
+            "share_presence": "unverified",
+            "complete": False,
+            "finalized": False,
+            "degraded": False,
+            "transport_failed": False,
+        },
+    }
+
+    forward = main._merge_access_capabilities(stale_provisional, final)
+    reverse = main._merge_access_capabilities(final, stale_provisional)
+
+    assert forward == reverse
+    assert forward["read_file"]["not_tested_reason"] == "transport_aborted"
+    assert forward["create_file"]["reason_code"] == "transport_failure"
+    assert forward["create_file"]["protocol_status"] == "0xC00000C9"
     assert forward["_metadata"] == final["_metadata"]
 
 

@@ -684,6 +684,83 @@ def test_smb_connection_is_closed_when_authentication_fails(monkeypatch) -> None
     assert connection.closed is True
 
 
+def test_unexpected_smb_share_parser_failure_emits_degraded_final_and_continues(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _BrokenEntry:
+        def get_longname(self):
+            raise ValueError("malformed appliance directory entry")
+
+    class _Connection:
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def getDialect(self):
+            return "785"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            return [
+                {"shi1_netname": "Broken\x00", "shi1_remark": "\x00"},
+                {"shi1_netname": "Healthy\x00", "shi1_remark": "\x00"},
+            ]
+
+        def connectTree(self, share_name):
+            return {"Broken": 41, "Healthy": 42}[share_name]
+
+        def listPath(self, share_name, _wildcard):
+            return [_BrokenEntry()] if share_name == "Broken" else []
+
+        def disconnectTree(self, _tree_id):
+            return None
+
+        def logoff(self):
+            return None
+
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: _Connection())
+    writer = SimpleNamespace(records=[], emit=lambda record: writer.records.append(record))
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=True,
+        username="",
+        password="",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=[],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=10,
+        access_probe_limit=0,
+        cancel_event=threading.Event(),
+    )
+
+    assert collector.scan_host_smb(
+        "10.0.0.20", args, "run-parser-error", writer, collector.Stats(), threading.Lock()
+    ) is True
+
+    final_resources = {}
+    for record in writer.records:
+        if record.get("type") == "resource" and record["access_capabilities"]["_metadata"]["finalized"]:
+            final_resources[record["name"]] = record
+
+    broken_metadata = final_resources["Broken"]["access_capabilities"]["_metadata"]
+    healthy_metadata = final_resources["Healthy"]["access_capabilities"]["_metadata"]
+    assert broken_metadata["assessment_summary"] == "list_observed"
+    assert broken_metadata["assessment_reason"] == "collector_error"
+    assert broken_metadata["degraded"] is True
+    assert healthy_metadata["assessment_summary"] == "list_observed"
+    assert healthy_metadata["degraded"] is False
+    assert any(record.get("code") == "SMB_SHARE_ASSESSMENT_FAILED" for record in writer.records)
+
+
 def test_nfs_advertised_export_does_not_overstate_access(monkeypatch) -> None:
     collector = _load_collector_module()
 

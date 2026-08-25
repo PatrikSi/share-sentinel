@@ -81,6 +81,11 @@ The infrastructure collector scans SMB and NFS targets and writes schema-v1 NDJS
 
 For SMB, each resource keeps a compatibility `access_level` plus independent observed-capability evidence. Directory listing provides list evidence; bounded handle opens request narrow rights for file reading, file/directory creation, existing-file modification, deletion, ACL changes, and ownership changes. The collector always uses `FILE_OPEN` against existing objects and closes the handle without performing the requested mutation. Authorization denials, transient/inconclusive failures, and untested capabilities remain distinct. NFS export discovery does not imply mount or content access and is therefore recorded as unknown.
 
+SMB capability metadata also carries a bounded assessment summary, reason,
+share-presence state, and finalized/degraded/transport flags. This keeps
+connected-but-not-listable, write-only, unavailable, disabled, no-sample, and
+session-loss outcomes intelligible without expanding the legacy database enum.
+
 The SharePoint Online collector is a separate Microsoft Graph workflow with application and delegated assessment perspectives. It maps sites to endpoints, document libraries to resources, and drive items to items while retaining stable provider IDs separately from names and paths. It never requests document content. A local SQLite state database stores metadata snapshots and opaque per-library delta links; tokens are never stored there.
 
 Graph delta pages are staged before publication. Each successful run materializes the complete current library snapshot, including unchanged rows from local state, and advances both the item state and delta checkpoint only after the artifact is durable and any requested upload is accepted. Failed or truncated libraries retain their previous checkpoint and are reported as partial rather than silently appearing complete. This keeps run-to-run inventory semantics consistent while reducing steady-state Graph traffic.

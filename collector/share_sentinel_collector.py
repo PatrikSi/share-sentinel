@@ -137,6 +137,51 @@ SMB_DENIED_STATUS_LABELS = (
     "STATUS_MEDIA_WRITE_PROTECTED",
     "STATUS_CANNOT_DELETE",
 )
+SMB_STATUS_REASONS = {
+    0xC0000022: "access_denied",  # STATUS_ACCESS_DENIED
+    0xC00000CA: "network_access_denied",  # STATUS_NETWORK_ACCESS_DENIED
+    0xC0000061: "privilege_not_held",  # STATUS_PRIVILEGE_NOT_HELD
+    0xC00000A2: "write_protected",  # STATUS_MEDIA_WRITE_PROTECTED
+    0xC0000121: "cannot_delete",  # STATUS_CANNOT_DELETE
+    0xC00000CC: "share_unavailable",  # STATUS_BAD_NETWORK_NAME
+    0xC0000034: "object_not_found",  # STATUS_OBJECT_NAME_NOT_FOUND
+    0xC000003A: "object_not_found",  # STATUS_OBJECT_PATH_NOT_FOUND
+    0xC000003B: "invalid_request",  # STATUS_OBJECT_PATH_SYNTAX_BAD
+    0xC0000043: "sharing_violation",  # STATUS_SHARING_VIOLATION
+    0xC0000056: "object_state_changed",  # STATUS_DELETE_PENDING
+    0xC0000123: "object_state_changed",  # STATUS_FILE_DELETED
+    0xC00000BA: "object_type_mismatch",  # STATUS_FILE_IS_A_DIRECTORY
+    0xC0000103: "object_type_mismatch",  # STATUS_NOT_A_DIRECTORY
+    0xC0000024: "object_type_mismatch",  # STATUS_OBJECT_TYPE_MISMATCH
+    0xC00000BB: "unsupported_request",  # STATUS_NOT_SUPPORTED
+    0xC0000002: "unsupported_request",  # STATUS_NOT_IMPLEMENTED
+    0xC0000010: "unsupported_request",  # STATUS_INVALID_DEVICE_REQUEST
+    0xC000000D: "invalid_request",  # STATUS_INVALID_PARAMETER
+    0xC000007F: "capacity_constraint",  # STATUS_DISK_FULL
+    0xC0000044: "capacity_constraint",  # STATUS_QUOTA_EXCEEDED
+    0xC00000A3: "storage_unavailable",  # STATUS_DEVICE_NOT_READY
+    0xC00000C9: "transport_failure",  # STATUS_NETWORK_NAME_DELETED
+    0xC00000B5: "transport_failure",  # STATUS_IO_TIMEOUT
+    0xC00000C4: "transport_failure",  # STATUS_UNEXPECTED_NETWORK_ERROR
+    0xC000020C: "transport_failure",  # STATUS_CONNECTION_DISCONNECTED
+    0xC000020D: "transport_failure",  # STATUS_CONNECTION_RESET
+    0xC0000241: "transport_failure",  # STATUS_CONNECTION_ABORTED
+    0xC000035C: "transport_failure",  # STATUS_NETWORK_SESSION_EXPIRED
+    0xC0000203: "transport_failure",  # STATUS_USER_SESSION_DELETED
+}
+SMB_TRANSPORT_STATUS_CODES = frozenset(
+    status_code for status_code, reason_code in SMB_STATUS_REASONS.items() if reason_code == "transport_failure"
+)
+SMB_ROOT_PATH_FALLBACK_STATUS_CODES = frozenset(
+    {
+        0xC000000D,  # STATUS_INVALID_PARAMETER
+        0xC0000010,  # STATUS_INVALID_DEVICE_REQUEST
+        0xC0000034,  # STATUS_OBJECT_NAME_NOT_FOUND
+        0xC000003A,  # STATUS_OBJECT_PATH_NOT_FOUND
+        0xC000003B,  # STATUS_OBJECT_PATH_SYNTAX_BAD
+        0xC00000BB,  # STATUS_NOT_SUPPORTED
+    }
+)
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -176,6 +221,17 @@ class _SMBProbeCircuit:
     """Share-scoped circuit breaker for explicit handle probes."""
 
     transport_failed: bool = False
+    reason_code: str | None = None
+    root_path: str | None = None
+
+
+@dataclass(frozen=True)
+class _SMBProbeClassification:
+    outcome: str
+    reason_code: str
+    protocol_status: str | None = None
+    transport_fatal: bool = False
+    root_path_fallback: bool = False
 
 
 class _ScanCancelled:
@@ -1236,6 +1292,11 @@ def _record_capability(
     capabilities: dict[str, dict[str, object]],
     capability: str,
     outcome: str,
+    *,
+    reason_code: str | None = None,
+    protocol_status: str | None = None,
+    method: str | None = None,
+    scope: str | None = None,
 ) -> None:
     if capability not in capabilities or outcome not in SMB_CAPABILITY_OUTCOMES:
         return
@@ -1243,6 +1304,33 @@ def _record_capability(
     evidence["attempted"] = int(evidence.get("attempted", 0)) + 1
     evidence[outcome] = int(evidence.get(outcome, 0)) + 1
     evidence["status"] = _capability_status(evidence)
+
+    for field_name, raw_value, mixed_value in (
+        ("reason_code", reason_code, "multiple_outcomes"),
+        ("protocol_status", protocol_status, "multiple"),
+        ("method", method, "multiple"),
+        ("scope", scope, "mixed_sample"),
+    ):
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+        existing = str(evidence.get(field_name) or "").strip()
+        if existing and existing != value:
+            evidence[field_name] = mixed_value
+        else:
+            evidence[field_name] = value
+
+
+def _mark_capability_not_tested(
+    capabilities: dict[str, dict[str, object]],
+    capability: str,
+    reason_code: str,
+) -> None:
+    evidence = capabilities.get(capability)
+    if evidence is None or int(evidence.get("attempted", 0)) > 0:
+        return
+    if not str(evidence.get("not_tested_reason") or "").strip():
+        evidence["not_tested_reason"] = reason_code
 
 
 def _access_capability_snapshot(
@@ -1256,17 +1344,27 @@ def _access_capability_snapshot(
     directory_candidates_seen: int = 0,
     file_candidates_seen: int = 0,
     listing_truncated: bool = False,
+    assessment_summary: str = "not_assessed",
+    assessment_reason: str = "pending",
+    finalized: bool = False,
+    degraded: bool = False,
+    transport_failed: bool = False,
+    share_presence: str = "unverified",
 ) -> dict[str, dict[str, object]]:
-    snapshot = {
-        capability: {
+    snapshot: dict[str, dict[str, object]] = {}
+    for capability, evidence in capabilities.items():
+        capability_snapshot: dict[str, object] = {
             "status": str(evidence.get("status") or "not_tested"),
             "attempted": int(evidence.get("attempted", 0)),
             "allowed": int(evidence.get("allowed", 0)),
             "denied": int(evidence.get("denied", 0)),
             "inconclusive": int(evidence.get("inconclusive", 0)),
         }
-        for capability, evidence in capabilities.items()
-    }
+        for field_name in ("reason_code", "protocol_status", "not_tested_reason", "method", "scope"):
+            value = str(evidence.get(field_name) or "").strip()
+            if value:
+                capability_snapshot[field_name] = value
+        snapshot[capability] = capability_snapshot
     snapshot["_metadata"] = {
         "probe_method": "non_mutating_handle_open",
         "coverage": "bounded_sample" if probe_limit > 0 else "disabled",
@@ -1278,6 +1376,12 @@ def _access_capability_snapshot(
         "directory_candidates_seen": max(0, directory_candidates_seen),
         "file_candidates_seen": max(0, file_candidates_seen),
         "listing_truncated": bool(listing_truncated),
+        "assessment_summary": assessment_summary,
+        "assessment_reason": assessment_reason,
+        "finalized": bool(finalized),
+        "degraded": bool(degraded),
+        "transport_failed": bool(transport_failed),
+        "share_presence": share_presence,
     }
     return snapshot
 
@@ -1295,7 +1399,121 @@ def _legacy_access_level(capabilities: dict[str, dict[str, object]]) -> str:
     return "unknown"
 
 
-def _smb_probe_outcome(exc: BaseException) -> str:
+def _capability_observed(capabilities: dict[str, dict[str, object]], capability: str) -> bool:
+    evidence = capabilities.get(capability, {})
+    return int(evidence.get("allowed", 0)) > 0 or evidence.get("status") in {"allowed", "mixed"}
+
+
+def _capability_reason(capabilities: dict[str, dict[str, object]], capability: str) -> str | None:
+    evidence = capabilities.get(capability, {})
+    for field_name in ("reason_code", "not_tested_reason"):
+        value = str(evidence.get(field_name) or "").strip()
+        if value and value not in {"granted", "multiple_outcomes"}:
+            return value
+    return None
+
+
+def _smb_access_assessment(
+    capabilities: dict[str, dict[str, object]],
+    *,
+    probe_limit: int,
+    workflow_finished: bool,
+    interrupted: bool,
+    workflow_reason: str | None,
+    transport_failed: bool,
+    listing_truncated: bool,
+    file_samples: int,
+) -> tuple[str, str, bool]:
+    read_observed = _capability_observed(capabilities, "read_file")
+    list_observed = _capability_observed(capabilities, "list")
+    write_observed = any(
+        _capability_observed(capabilities, capability)
+        for capability in ("create_file", "create_directory", "modify_file", "delete")
+    )
+    control_observed = any(
+        _capability_observed(capabilities, capability) for capability in ("write_acl", "write_owner")
+    )
+    tree_observed = _capability_observed(capabilities, "tree_connect")
+    tree_denied = int(capabilities["tree_connect"].get("denied", 0)) > 0
+    list_denied = int(capabilities["list"].get("denied", 0)) > 0
+    any_inconclusive = any(
+        int(capabilities[capability].get("inconclusive", 0)) > 0 for capability in SMB_CAPABILITY_NAMES
+    )
+
+    if read_observed and write_observed:
+        summary = "read_write_observed"
+    elif read_observed:
+        summary = "read_observed"
+    elif list_observed and write_observed:
+        summary = "list_write_observed"
+    elif write_observed:
+        summary = "write_observed"
+    elif list_observed:
+        summary = "list_observed"
+    elif control_observed:
+        summary = "control_observed"
+    elif tree_denied:
+        summary = "tree_denied"
+    elif tree_observed and list_denied:
+        summary = "connected_list_denied"
+    elif tree_observed:
+        summary = "connected_only"
+    elif any_inconclusive:
+        summary = "inconclusive"
+    else:
+        summary = "not_assessed"
+
+    if transport_failed:
+        reason = "partial_transport_failure" if any(
+            (read_observed, list_observed, write_observed, control_observed, tree_observed)
+        ) else "transport_failure"
+    elif interrupted:
+        reason = "cancelled_after_observation" if any(
+            (read_observed, list_observed, write_observed, control_observed, tree_observed)
+        ) else "cancelled"
+    elif not workflow_finished and workflow_reason:
+        reason = workflow_reason
+    elif listing_truncated:
+        reason = "listing_truncated"
+    elif summary == "tree_denied":
+        reason = _capability_reason(capabilities, "tree_connect") or "access_denied"
+    elif summary == "connected_list_denied":
+        reason = _capability_reason(capabilities, "list") or "access_denied"
+    elif summary in {"connected_only", "inconclusive"}:
+        reason = (
+            _capability_reason(capabilities, "tree_connect")
+            or _capability_reason(capabilities, "list")
+            or "no_conclusive_evidence"
+        )
+    elif probe_limit <= 0 and not read_observed:
+        reason = "probes_disabled"
+    elif not read_observed and file_samples <= 0:
+        reason = "no_visible_file_candidate"
+    else:
+        reason = "bounded_observation"
+
+    degraded = bool(not workflow_finished or transport_failed or listing_truncated or any_inconclusive)
+    return summary, reason, degraded
+
+
+def _smb_share_presence(
+    capabilities: dict[str, dict[str, object]],
+    *,
+    enumerated: bool,
+) -> str:
+    if _capability_observed(capabilities, "tree_connect") or _capability_observed(capabilities, "list"):
+        return "confirmed"
+    tree_reason = _capability_reason(capabilities, "tree_connect")
+    if tree_reason == "share_unavailable":
+        return "unavailable"
+    if enumerated:
+        return "advertised"
+    if int(capabilities["tree_connect"].get("attempted", 0)) > 0:
+        return "indeterminate"
+    return "unverified"
+
+
+def _smb_error_identity(exc: BaseException) -> tuple[int | None, tuple[int, int] | None]:
     status_code = None
     get_error_code = getattr(exc, "getErrorCode", None)
     if callable(get_error_code):
@@ -1332,25 +1550,90 @@ def _smb_probe_outcome(exc: BaseException) -> str:
                 else:
                     legacy_error_pair = None
 
-    if legacy_error_pair in SMB1_DENIED_ERROR_PAIRS or status_code in SMB_DENIED_STATUS_CODES:
-        return "denied"
+    return status_code, legacy_error_pair
+
+
+def _smb_protocol_status(
+    status_code: int | None,
+    legacy_error_pair: tuple[int, int] | None,
+) -> str | None:
+    if status_code is not None:
+        return f"0x{status_code & 0xFFFFFFFF:08X}"
+    if legacy_error_pair is not None:
+        return f"SMB1:{legacy_error_pair[0]:02X}:{legacy_error_pair[1]:04X}"
+    return None
+
+
+def _classify_smb_probe_failure(exc: BaseException) -> _SMBProbeClassification:
+    status_code, legacy_error_pair = _smb_error_identity(exc)
+    protocol_status = _smb_protocol_status(status_code, legacy_error_pair)
+
+    if isinstance(exc, (NetBIOSError, NetBIOSTimeout, socket.timeout, TimeoutError, OSError)) and not isinstance(
+        exc, SessionError
+    ):
+        return _SMBProbeClassification(
+            outcome="inconclusive",
+            reason_code="transport_failure",
+            protocol_status=protocol_status,
+            transport_fatal=True,
+        )
+
+    if legacy_error_pair in SMB1_DENIED_ERROR_PAIRS:
+        return _SMBProbeClassification(
+            outcome="denied",
+            reason_code="legacy_operation_refused",
+            protocol_status=protocol_status,
+        )
+
+    if legacy_error_pair == (0x02, 0x0005):  # ERRSRV/ERRinvtid
+        return _SMBProbeClassification(
+            outcome="inconclusive",
+            reason_code="transport_failure",
+            protocol_status=protocol_status,
+            transport_fatal=True,
+        )
+
+    if status_code in SMB_DENIED_STATUS_CODES:
+        return _SMBProbeClassification(
+            outcome="denied",
+            reason_code=SMB_STATUS_REASONS.get(status_code, "access_denied"),
+            protocol_status=protocol_status,
+        )
+
+    if status_code in SMB_STATUS_REASONS:
+        return _SMBProbeClassification(
+            outcome="inconclusive",
+            reason_code=SMB_STATUS_REASONS[status_code],
+            protocol_status=protocol_status,
+            transport_fatal=status_code in SMB_TRANSPORT_STATUS_CODES,
+            root_path_fallback=status_code in SMB_ROOT_PATH_FALLBACK_STATUS_CODES,
+        )
 
     detail = _error_detail(exc).upper()
     if any(label in detail for label in SMB_DENIED_STATUS_LABELS):
-        return "denied"
-    return "inconclusive"
+        return _SMBProbeClassification(
+            outcome="denied",
+            reason_code="access_denied",
+            protocol_status=protocol_status,
+        )
+    return _SMBProbeClassification(
+        outcome="inconclusive",
+        reason_code="protocol_error",
+        protocol_status=protocol_status,
+    )
+
+
+def _smb_probe_outcome(exc: BaseException) -> str:
+    """Compatibility wrapper retained for callers and older focused tests."""
+
+    return _classify_smb_probe_failure(exc).outcome
 
 
 def _is_smb_transport_failure(exc: BaseException) -> bool:
     # Impacket reports server-side SMB status errors as SessionError. Its other
     # network exceptions mean the session itself is no longer reliable enough
     # to multiply the timeout across every remaining access-mask probe.
-    if isinstance(exc, SessionError):
-        return False
-    return isinstance(
-        exc,
-        (NetBIOSError, NetBIOSTimeout, socket.timeout, TimeoutError, OSError),
-    )
+    return _classify_smb_probe_failure(exc).transport_fatal
 
 
 def _smb_handle_path(path: str) -> str:
@@ -1375,25 +1658,75 @@ def _probe_smb_handle_access(
         return
     open_file = getattr(conn, "openFile", None)
     if not callable(open_file):
+        _mark_capability_not_tested(capabilities, capability, "probe_method_unavailable")
         return
 
     file_id = None
-    try:
-        file_id = open_file(
-            tree_id,
-            _smb_handle_path(path),
-            desiredAccess=desired_access,
-            shareMode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            creationOption=FILE_DIRECTORY_FILE if is_directory else FILE_NON_DIRECTORY_FILE,
-            creationDisposition=FILE_OPEN,
-        )
-    except (SessionError, NetBIOSError, NetBIOSTimeout, socket.timeout, TimeoutError, OSError) as exc:
-        _record_capability(capabilities, capability, _smb_probe_outcome(exc))
-        if probe_circuit is not None and _is_smb_transport_failure(exc):
-            probe_circuit.transport_failed = True
-        return
+    normalized_path = _smb_handle_path(path)
+    candidate_paths = [normalized_path]
+    # SMB2 accepts an empty share-root path. Some SMB1/Samba/NAS servers expect
+    # the explicit root marker instead. Retrying only path/compatibility failures
+    # remains non-mutating because both attempts use FILE_OPEN.
+    if is_directory and not normalized_path:
+        if probe_circuit is not None and probe_circuit.root_path is not None:
+            candidate_paths = [probe_circuit.root_path]
+        else:
+            candidate_paths.append("\\")
 
-    _record_capability(capabilities, capability, "allowed")
+    for candidate_index, candidate_path in enumerate(candidate_paths):
+        try:
+            file_id = open_file(
+                tree_id,
+                candidate_path,
+                desiredAccess=desired_access,
+                shareMode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                creationOption=FILE_DIRECTORY_FILE if is_directory else FILE_NON_DIRECTORY_FILE,
+                creationDisposition=FILE_OPEN,
+            )
+        except (SessionError, NetBIOSError, NetBIOSTimeout, socket.timeout, TimeoutError, OSError) as exc:
+            classification = _classify_smb_probe_failure(exc)
+            should_retry_root = (
+                candidate_index == 0
+                and len(candidate_paths) > 1
+                and classification.root_path_fallback
+                and not classification.transport_fatal
+            )
+            if should_retry_root:
+                continue
+            if (
+                is_directory
+                and not normalized_path
+                and candidate_index > 0
+                and not classification.root_path_fallback
+                and probe_circuit is not None
+            ):
+                probe_circuit.root_path = candidate_path
+            _record_capability(
+                capabilities,
+                capability,
+                classification.outcome,
+                reason_code=classification.reason_code,
+                protocol_status=classification.protocol_status,
+                method="non_mutating_handle_open",
+                scope="directory" if is_directory else "file",
+            )
+            if probe_circuit is not None and classification.transport_fatal:
+                probe_circuit.transport_failed = True
+                probe_circuit.reason_code = classification.reason_code
+            return
+        else:
+            if is_directory and not normalized_path and probe_circuit is not None:
+                probe_circuit.root_path = candidate_path
+            _record_capability(
+                capabilities,
+                capability,
+                "allowed",
+                reason_code="granted",
+                method="non_mutating_handle_open",
+                scope="directory" if is_directory else "file",
+            )
+            break
+
     close_file = getattr(conn, "closeFile", None)
     if callable(close_file) and file_id is not None:
         try:
@@ -2431,7 +2764,16 @@ def scan_host_smb(
         ) -> None:
             detail = _error_detail(exc)
             message = f"SMB share listing failed for {share_name}: {detail}"
-            _record_capability(capabilities, "list", _smb_probe_outcome(exc))
+            classification = _classify_smb_probe_failure(exc)
+            _record_capability(
+                capabilities,
+                "list",
+                classification.outcome,
+                reason_code=classification.reason_code,
+                protocol_status=classification.protocol_status,
+                method="directory_listing",
+                scope="directory",
+            )
             _emit_error(
                 writer,
                 run_id,
@@ -2471,6 +2813,7 @@ def scan_host_smb(
             capabilities = _new_access_capabilities()
             probe_limit = max(0, int(getattr(args, "access_probe_limit", 3)))
             cancel_event = getattr(args, "cancel_event", None)
+            share_was_enumerated = not bool(include_shares)
             resource_record = {
                 "type": "resource",
                 "run_id": run_id,
@@ -2485,6 +2828,10 @@ def scan_host_smb(
                     probe_limit=probe_limit,
                     partial=True,
                     complete=False,
+                    assessment_summary="not_assessed",
+                    assessment_reason="pending",
+                    finalized=False,
+                    share_presence="advertised" if share_was_enumerated else "unverified",
                 ),
             }
             writer.emit(resource_record)
@@ -2499,17 +2846,27 @@ def scan_host_smb(
             file_candidates_seen = 0
             listing_truncated = False
             workflow_finished = False
+            workflow_reason: str | None = None
             tree_id = None
             listed_directory_paths: set[str] = set()
             probe_circuit = _SMBProbeCircuit()
 
             def _handle_list_success(listed_path: str) -> None:
                 listed_directory_paths.add(_smb_handle_path(listed_path).casefold())
-                _record_capability(capabilities, "list", "allowed")
+                _record_capability(
+                    capabilities,
+                    "list",
+                    "allowed",
+                    reason_code="granted",
+                    method="directory_listing",
+                    scope="directory",
+                )
 
             def _handle_share_list_error(denied_path: str, exc: BaseException) -> None:
-                if _is_smb_transport_failure(exc):
+                classification = _classify_smb_probe_failure(exc)
+                if classification.transport_fatal:
                     probe_circuit.transport_failed = True
+                    probe_circuit.reason_code = classification.reason_code
                 _handle_list_error(
                     share_name,
                     denied_path,
@@ -2552,8 +2909,20 @@ def scan_host_smb(
                         TimeoutError,
                         OSError,
                     ) as exc:
-                        outcome = _smb_probe_outcome(exc)
-                        _record_capability(capabilities, "tree_connect", outcome)
+                        classification = _classify_smb_probe_failure(exc)
+                        outcome = classification.outcome
+                        _record_capability(
+                            capabilities,
+                            "tree_connect",
+                            outcome,
+                            reason_code=classification.reason_code,
+                            protocol_status=classification.protocol_status,
+                            method="tree_connect",
+                            scope="share",
+                        )
+                        if classification.transport_fatal:
+                            probe_circuit.transport_failed = True
+                            probe_circuit.reason_code = classification.reason_code
                         message = f"SMB tree connection failed for {share_name}: {_error_detail(exc)}"
                         code = "TREE_CONNECT_DENIED" if outcome == "denied" else "TREE_CONNECT_FAILED"
                         _emit_error(
@@ -2569,7 +2938,16 @@ def scan_host_smb(
                         )
                         _record_error(stats, lock, code, message)
                     else:
-                        _record_capability(capabilities, "tree_connect", "allowed")
+                        _record_capability(
+                            capabilities,
+                            "tree_connect",
+                            "allowed",
+                            reason_code="granted",
+                            method="tree_connect",
+                            scope="share",
+                        )
+                elif not callable(connect_tree):
+                    _mark_capability_not_tested(capabilities, "tree_connect", "probe_method_unavailable")
 
                 # Request access masks on existing objects only. FILE_OPEN plus
                 # these narrow masks cannot create, modify, take ownership, or
@@ -2667,10 +3045,26 @@ def scan_host_smb(
                         )
                 workflow_finished = not (cancel_event is not None and cancel_event.is_set())
             except SessionError as exc:
+                classification = _classify_smb_probe_failure(exc)
+                workflow_reason = classification.reason_code
+                if classification.transport_fatal:
+                    probe_circuit.transport_failed = True
+                    probe_circuit.reason_code = classification.reason_code
                 _handle_list_error(share_name, "\\", exc, capabilities)
-            except (socket.timeout, TimeoutError):
+            except (socket.timeout, TimeoutError) as exc:
                 message = f"SMB share listing timed out for {share_name}."
-                _record_capability(capabilities, "list", "inconclusive")
+                classification = _classify_smb_probe_failure(exc)
+                workflow_reason = classification.reason_code
+                probe_circuit.transport_failed = True
+                probe_circuit.reason_code = classification.reason_code
+                _record_capability(
+                    capabilities,
+                    "list",
+                    "inconclusive",
+                    reason_code=classification.reason_code,
+                    method="directory_listing",
+                    scope="directory",
+                )
                 _emit_error(
                     writer,
                     run_id,
@@ -2686,7 +3080,18 @@ def scan_host_smb(
             except OSError as exc:
                 detail = _error_detail(exc)
                 message = f"SMB share listing IO failure for {share_name}: {detail}"
-                _record_capability(capabilities, "list", "inconclusive")
+                classification = _classify_smb_probe_failure(exc)
+                workflow_reason = classification.reason_code
+                probe_circuit.transport_failed = True
+                probe_circuit.reason_code = classification.reason_code
+                _record_capability(
+                    capabilities,
+                    "list",
+                    "inconclusive",
+                    reason_code=classification.reason_code,
+                    method="directory_listing",
+                    scope="directory",
+                )
                 _emit_error(
                     writer,
                     run_id,
@@ -2700,7 +3105,30 @@ def scan_host_smb(
                 )
                 _record_error(stats, lock, "LIST_IO_ERROR", message)
             except (NetBIOSError, NetBIOSTimeout) as exc:
+                classification = _classify_smb_probe_failure(exc)
+                workflow_reason = classification.reason_code
+                probe_circuit.transport_failed = True
+                probe_circuit.reason_code = classification.reason_code
                 _handle_list_error(share_name, "\\", exc, capabilities)
+            except Exception as exc:
+                # Isolate a malformed appliance response or unexpected Impacket
+                # parsing failure to this share. The final resource record below
+                # preserves the degraded assessment and later shares still run.
+                detail = _error_detail(exc)
+                workflow_reason = "collector_error"
+                message = f"SMB share assessment failed for {share_name}: {detail}"
+                _emit_error(
+                    writer,
+                    run_id,
+                    severity="warn",
+                    code="SMB_SHARE_ASSESSMENT_FAILED",
+                    message=message,
+                    endpoint_key=endpoint_key,
+                    resource_name=share_name,
+                    path="\\",
+                    hint="Retry with higher verbosity; verify SMB server compatibility if the failure repeats.",
+                )
+                _record_error(stats, lock, "SMB_SHARE_ASSESSMENT_FAILED", message)
             finally:
                 if tree_id is not None:
                     disconnect_tree = getattr(conn, "disconnectTree", None)
@@ -2710,6 +3138,57 @@ def scan_host_smb(
                         except Exception:
                             pass
 
+            interrupted = bool(cancel_event is not None and cancel_event.is_set())
+            if int(capabilities["tree_connect"].get("attempted", 0)) <= 0:
+                _mark_capability_not_tested(
+                    capabilities,
+                    "tree_connect",
+                    "cancelled" if interrupted else workflow_reason or "not_reached",
+                )
+            if int(capabilities["list"].get("attempted", 0)) <= 0:
+                _mark_capability_not_tested(
+                    capabilities,
+                    "list",
+                    "cancelled"
+                    if interrupted
+                    else "transport_aborted"
+                    if probe_circuit.transport_failed
+                    else workflow_reason or "not_reached",
+                )
+
+            explicit_probe_capabilities = tuple(
+                capability for capability in SMB_CAPABILITY_NAMES if capability not in {"tree_connect", "list"}
+            )
+            for capability in explicit_probe_capabilities:
+                if probe_limit <= 0:
+                    reason = "probe_disabled"
+                elif interrupted:
+                    reason = "cancelled"
+                elif probe_circuit.transport_failed:
+                    reason = "transport_aborted"
+                elif workflow_reason:
+                    reason = workflow_reason
+                elif tree_id is None:
+                    reason = "tree_unavailable"
+                elif capability in {"read_file", "modify_file"} or (
+                    capability == "delete" and len(file_samples) <= 0
+                ):
+                    reason = "no_visible_file_candidate"
+                else:
+                    reason = "no_directory_candidate"
+                _mark_capability_not_tested(capabilities, capability, reason)
+
+            assessment_summary, assessment_reason, assessment_degraded = _smb_access_assessment(
+                capabilities,
+                probe_limit=probe_limit,
+                workflow_finished=workflow_finished,
+                interrupted=interrupted,
+                workflow_reason=workflow_reason,
+                transport_failed=probe_circuit.transport_failed,
+                listing_truncated=listing_truncated,
+                file_samples=len(file_samples),
+            )
+            share_presence = _smb_share_presence(capabilities, enumerated=share_was_enumerated)
             final_access_level = _legacy_access_level(capabilities)
             # These are observations from a bounded sample, never a complete
             # effective-permissions calculation for every object in the share.
@@ -2728,6 +3207,12 @@ def scan_host_smb(
                         directory_candidates_seen=directory_candidates_seen,
                         file_candidates_seen=file_candidates_seen,
                         listing_truncated=listing_truncated,
+                        assessment_summary=assessment_summary,
+                        assessment_reason=assessment_reason,
+                        finalized=True,
+                        degraded=assessment_degraded,
+                        transport_failed=probe_circuit.transport_failed,
+                        share_presence=share_presence,
                     ),
                 }
             )

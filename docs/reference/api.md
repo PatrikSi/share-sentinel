@@ -282,6 +282,14 @@ Share-level inventory view. Supports:
 
 Resource rows include the compatibility `access_level` (`unknown`, `no_access`, `list_only`, or `readable`) and an `access_capabilities` object. Known capabilities are `tree_connect`, `list`, `read_file`, `create_file`, `create_directory`, `modify_file`, `delete`, `write_acl`, and `write_owner`. Each contains a status (`allowed`, `denied`, `mixed`, `not_tested`, or `inconclusive`) and bounded evidence counts. A reserved `_metadata` object describes the non-mutating probe method and sample coverage. Its `complete` flag means a final per-share probe record was produced without cancellation, while `partial` describes limited or degraded coverage; both can truthfully be `true`.
 
+Current SMB artifacts additionally preserve bounded evidence fields such as
+`reason_code`, `protocol_status`, `not_tested_reason`, `method`, and `scope`.
+The `_metadata` object exposes `assessment_summary`, `assessment_reason`,
+`share_presence`, `finalized`, `degraded`, and `transport_failed`. Consumers
+should prefer the assessment summary for display while retaining
+`access_level` for compatibility. `finalized` means the final assessment record
+was emitted; it does not claim exhaustive coverage or a healthy dependency.
+
 SharePoint document-library rows use `resource_type=sharepoint_library`, retain a stable `provider_resource_id`, and carry separate exposure/evidence fields. Their compatibility `access_level` is conservative metadata-enumeration evidence; it is not proof that file content was opened or that a write would succeed.
 
 ### `GET /projects/{project_id}/inventory/endpoints`

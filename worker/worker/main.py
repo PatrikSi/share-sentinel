@@ -257,9 +257,22 @@ ACCESS_CAPABILITY_OUTCOME_LIMITS = (
     _ACCESS_CAPABILITY_OUTCOME_BASE_LIMIT,
     _ACCESS_CAPABILITY_OUTCOME_BASE_LIMIT,
 )
-ACCESS_CAPABILITY_EVIDENCE_FIELDS = {"method", "scope", "coverage"}
+ACCESS_CAPABILITY_EVIDENCE_FIELDS = {
+    "method",
+    "scope",
+    "coverage",
+    "reason_code",
+    "protocol_status",
+    "not_tested_reason",
+}
 ACCESS_CAPABILITY_MAX_EVIDENCE_LENGTH = 256
-ACCESS_CAPABILITY_METADATA_TEXT_FIELDS = {"probe_method", "coverage"}
+ACCESS_CAPABILITY_METADATA_TEXT_FIELDS = {
+    "probe_method",
+    "coverage",
+    "assessment_summary",
+    "assessment_reason",
+    "share_presence",
+}
 ACCESS_CAPABILITY_METADATA_COUNT_FIELDS = {
     "probe_limit",
     "directory_samples",
@@ -267,7 +280,14 @@ ACCESS_CAPABILITY_METADATA_COUNT_FIELDS = {
     "directory_candidates_seen",
     "file_candidates_seen",
 }
-ACCESS_CAPABILITY_METADATA_BOOLEAN_FIELDS = {"partial", "complete", "listing_truncated"}
+ACCESS_CAPABILITY_METADATA_BOOLEAN_FIELDS = {
+    "partial",
+    "complete",
+    "listing_truncated",
+    "finalized",
+    "degraded",
+    "transport_failed",
+}
 FILE_ATTRIBUTE_MAX_VALUES = 32
 FILE_ATTRIBUTE_MAX_LENGTH = 64
 GZIP_DECOMPRESSED_LIMIT_ERROR = "gzip artifact exceeds decompressed size limit"
@@ -1223,15 +1243,19 @@ def _capability_status_rank(status: str) -> int:
 def _merge_capability_metadata(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
     current_complete = current.get("complete") is True
     incoming_complete = incoming.get("complete") is True
-    completed_snapshot = None
-    if current_complete != incoming_complete:
-        completed_snapshot = current if current_complete else incoming
+    current_finalized = current.get("finalized") is True
+    incoming_finalized = incoming.get("finalized") is True
+    authoritative_snapshot = None
+    if current_finalized != incoming_finalized:
+        authoritative_snapshot = current if current_finalized else incoming
+    elif current_complete != incoming_complete:
+        authoritative_snapshot = current if current_complete else incoming
     metadata: dict[str, Any] = {}
     for field in ACCESS_CAPABILITY_METADATA_TEXT_FIELDS:
         current_value = current.get(field)
         incoming_value = incoming.get(field)
-        if completed_snapshot is not None and completed_snapshot.get(field):
-            selected = completed_snapshot[field]
+        if authoritative_snapshot is not None and authoritative_snapshot.get(field):
+            selected = authoritative_snapshot[field]
         else:
             values = sorted(value for value in (current_value, incoming_value) if value)
             selected = values[0] if values else None
@@ -1245,8 +1269,10 @@ def _merge_capability_metadata(current: dict[str, Any], incoming: dict[str, Any]
             continue
         if field == "complete":
             metadata[field] = current_complete or incoming_complete
-        elif completed_snapshot is not None and field in completed_snapshot:
-            metadata[field] = bool(completed_snapshot[field])
+        elif field == "finalized":
+            metadata[field] = current_finalized or incoming_finalized
+        elif authoritative_snapshot is not None and field in authoritative_snapshot:
+            metadata[field] = bool(authoritative_snapshot[field])
         else:
             metadata[field] = bool(current.get(field, False) or incoming.get(field, False))
     return metadata
@@ -1296,13 +1322,24 @@ def _merge_access_capabilities(current: Any, incoming: Any) -> dict[str, dict[st
         for evidence_field in ACCESS_CAPABILITY_EVIDENCE_FIELDS:
             current_evidence = current_value.get(evidence_field)
             incoming_evidence = incoming_value.get(evidence_field)
-            if incoming_rank > current_rank and incoming_evidence:
+            if evidence_field == "not_tested_reason" and status != "not_tested":
+                continue
+            if incoming_rank > current_rank:
                 chosen_evidence = incoming_evidence
-            elif current_rank > incoming_rank and current_evidence:
+            elif current_rank > incoming_rank:
                 chosen_evidence = current_evidence
             else:
                 values = sorted(value for value in (current_evidence, incoming_evidence) if value)
-                chosen_evidence = values[0] if values else None
+                if len(set(values)) <= 1:
+                    chosen_evidence = values[0] if values else None
+                elif evidence_field == "reason_code":
+                    chosen_evidence = "multiple_outcomes"
+                elif evidence_field in {"protocol_status", "method"}:
+                    chosen_evidence = "multiple"
+                elif evidence_field == "scope":
+                    chosen_evidence = "mixed_sample"
+                else:
+                    chosen_evidence = values[0]
             if chosen_evidence:
                 merged[key][evidence_field] = chosen_evidence
         if "sample_limit" in current_value or "sample_limit" in incoming_value:

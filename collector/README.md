@@ -372,6 +372,24 @@ reached its final record without cancellation; it does not mean coverage was
 exhaustive. Read it together with `_metadata.partial`, sample counts, and
 `listing_truncated`. A completed bounded scan can correctly be partial.
 
+New artifacts also include an operator-facing assessment under `_metadata`.
+`assessment_summary` distinguishes observations such as `read_write_observed`,
+`list_observed`, `write_observed`, `connected_list_denied`, `connected_only`,
+`tree_denied`, and `inconclusive`; the compatibility `access_level` remains
+unchanged for older consumers. `assessment_reason` explains important limits,
+including a disabled probe, no visible file candidate, listing truncation,
+cancellation, or a transport failure. `share_presence` distinguishes a share
+confirmed by tree/list access from one merely advertised by share enumeration,
+a configured name that was unavailable, and an indeterminate result.
+
+`_metadata.finalized` means the collector emitted its final assessment record.
+Read it separately from `complete`: a finalized assessment may be degraded.
+`degraded` and `transport_failed` make that state explicit. Untested individual
+capabilities include a bounded `not_tested_reason`; failed attempts retain a
+bounded `reason_code` and protocol status instead of collapsing every failure
+into an unexplained `unknown`. Expected authorization denial, storage policy,
+object races, compatibility errors, and session loss remain distinct.
+
 The default `--access-probe-limit 3` checks the share root plus up to three
 discovered directories and three discovered files. Candidate selection happens
 before `--extensions-only` output filtering, so an inventory display filter does
@@ -394,6 +412,12 @@ does not guarantee that a later operation will succeed under quotas, read-only
 storage, endpoint security controls, object-specific ACLs, or changed state.
 Handle opens can still produce ordinary SMB/authorization audit telemetry and
 may affect server-side last-access accounting.
+
+Share-root handle probes use the SMB2 empty-root form first and retry the
+explicit `\` root marker only for path-syntax or compatibility responses seen
+on some SMB1, Samba, and NAS implementations. Authorization denials are never
+retried. Both forms still use `FILE_OPEN`, so the fallback cannot create an
+object.
 
 Only scan systems for which you have explicit authorization. The collector performs concurrent authentication, share enumeration, and directory traversal and can create meaningful target load.
 

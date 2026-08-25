@@ -99,6 +99,126 @@ def test_smb1_ambiguous_or_non_denial_codes_remain_inconclusive(
     assert collector._smb_probe_outcome(_LegacySessionError()) == "inconclusive"
 
 
+@pytest.mark.parametrize(
+    ("status_code", "outcome", "reason_code", "transport_fatal", "root_path_fallback"),
+    [
+        (0xC0000022, "denied", "access_denied", False, False),
+        (0xC00000A2, "denied", "write_protected", False, False),
+        (0xC00000CC, "inconclusive", "share_unavailable", False, False),
+        (0xC0000043, "inconclusive", "sharing_violation", False, False),
+        (0xC00000C9, "inconclusive", "transport_failure", True, False),
+        (0xC000000D, "inconclusive", "invalid_request", False, True),
+    ],
+)
+def test_smb_probe_failures_retain_structured_protocol_reasons(
+    status_code, outcome, reason_code, transport_fatal, root_path_fallback
+) -> None:
+    collector = _load_collector_module()
+
+    class _SessionError(Exception):
+        def getErrorCode(self):
+            return status_code
+
+    classification = collector._classify_smb_probe_failure(_SessionError())
+
+    assert classification.outcome == outcome
+    assert classification.reason_code == reason_code
+    assert classification.protocol_status == f"0x{status_code:08X}"
+    assert classification.transport_fatal is transport_fatal
+    assert classification.root_path_fallback is root_path_fallback
+
+
+def test_root_handle_probe_retries_explicit_root_only_for_compatible_path_failure(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _InvalidRoot(Exception):
+        def getErrorCode(self):
+            return 0xC000000D
+
+    monkeypatch.setattr(collector, "SessionError", _InvalidRoot)
+    capabilities = collector._new_access_capabilities()
+
+    class _Connection:
+        def __init__(self):
+            self.paths = []
+            self.closed = []
+
+        def openFile(self, _tree_id, path, **_kwargs):
+            self.paths.append(path)
+            if path == "":
+                raise _InvalidRoot()
+            return "root-handle"
+
+        def closeFile(self, tree_id, file_id):
+            self.closed.append((tree_id, file_id))
+
+    connection = _Connection()
+    circuit = collector._SMBProbeCircuit()
+    collector._probe_smb_handle_access(
+        connection,
+        7,
+        "",
+        is_directory=True,
+        desired_access=collector.FILE_ADD_FILE,
+        capability="create_file",
+        capabilities=capabilities,
+        cancel_event=None,
+        probe_circuit=circuit,
+    )
+    collector._probe_smb_handle_access(
+        connection,
+        7,
+        "",
+        is_directory=True,
+        desired_access=collector.FILE_ADD_SUBDIRECTORY,
+        capability="create_directory",
+        capabilities=capabilities,
+        cancel_event=None,
+        probe_circuit=circuit,
+    )
+
+    assert connection.paths == ["", "\\", "\\"]
+    assert connection.closed == [(7, "root-handle"), (7, "root-handle")]
+    assert capabilities["create_file"]["status"] == "allowed"
+    assert capabilities["create_file"]["reason_code"] == "granted"
+    assert capabilities["create_directory"]["status"] == "allowed"
+
+
+def test_root_handle_probe_does_not_retry_authorization_denial(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _Denied(Exception):
+        def getErrorCode(self):
+            return 0xC0000022
+
+    monkeypatch.setattr(collector, "SessionError", _Denied)
+    capabilities = collector._new_access_capabilities()
+
+    class _Connection:
+        def __init__(self):
+            self.paths = []
+
+        def openFile(self, _tree_id, path, **_kwargs):
+            self.paths.append(path)
+            raise _Denied()
+
+    connection = _Connection()
+    collector._probe_smb_handle_access(
+        connection,
+        7,
+        "",
+        is_directory=True,
+        desired_access=collector.FILE_ADD_FILE,
+        capability="create_file",
+        capabilities=capabilities,
+        cancel_event=None,
+    )
+
+    assert connection.paths == [""]
+    assert capabilities["create_file"]["status"] == "denied"
+    assert capabilities["create_file"]["reason_code"] == "access_denied"
+
+
 def test_access_probe_limit_cli_supports_disable_and_rejects_unbounded_values(monkeypatch) -> None:
     monkeypatch.delenv("SHARE_SENTINEL_SMB_PASSWORD", raising=False)
     monkeypatch.delenv("SHARE_SENTINEL_SMB_HASHES", raising=False)
@@ -390,6 +510,12 @@ def test_scan_smb_emits_bounded_non_mutating_capabilities_and_disconnects(monkey
         "directory_candidates_seen": 1,
         "file_candidates_seen": 1,
         "listing_truncated": False,
+        "assessment_summary": "read_write_observed",
+        "assessment_reason": "bounded_observation",
+        "finalized": True,
+        "degraded": False,
+        "transport_failed": False,
+        "share_presence": "confirmed",
     }
     assert any(
         path == "secret.txt" and kwargs["desiredAccess"] == collector.FILE_READ_DATA
@@ -894,10 +1020,17 @@ def test_handle_probe_transport_failure_trips_share_circuit_breaker(monkeypatch)
         "allowed": 0,
         "denied": 0,
         "inconclusive": 1,
+        "reason_code": "transport_failure",
+        "method": "non_mutating_handle_open",
+        "scope": "directory",
     }
     assert final["access_capabilities"]["create_directory"]["status"] == "not_tested"
     assert final["access_capabilities"]["read_file"]["status"] == "not_tested"
     assert final["access_capabilities"]["_metadata"]["complete"] is True
+    assert final["access_capabilities"]["_metadata"]["assessment_summary"] == "list_observed"
+    assert final["access_capabilities"]["_metadata"]["assessment_reason"] == "partial_transport_failure"
+    assert final["access_capabilities"]["_metadata"]["transport_failed"] is True
+    assert final["access_capabilities"]["_metadata"]["degraded"] is True
     assert connection.disconnected == [19]
 
 
@@ -977,7 +1110,147 @@ def test_disabled_probes_keep_tree_allowed_list_denied_access_unknown(monkeypatc
     assert final["access_capabilities"]["tree_connect"]["status"] == "allowed"
     assert final["access_capabilities"]["list"]["status"] == "denied"
     assert final["access_capabilities"]["_metadata"]["coverage"] == "disabled"
+    assert final["access_capabilities"]["_metadata"]["assessment_summary"] == "connected_list_denied"
+    assert final["access_capabilities"]["_metadata"]["assessment_reason"] == "legacy_operation_refused"
+    assert final["access_capabilities"]["read_file"]["not_tested_reason"] == "probe_disabled"
     assert connection.disconnected == [21]
+
+
+def test_empty_visible_share_explains_missing_file_probe_candidate(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _Denied(Exception):
+        def getErrorCode(self):
+            return 0xC0000022
+
+    monkeypatch.setattr(collector, "SessionError", _Denied)
+
+    class _Connection:
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def getDialect(self):
+            return "785"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            return [{"shi1_netname": "Empty\x00", "shi1_remark": "\x00"}]
+
+        def connectTree(self, _share_name):
+            return 31
+
+        def openFile(self, *_args, **_kwargs):
+            raise _Denied()
+
+        def listPath(self, *_args):
+            return []
+
+        def disconnectTree(self, _tree_id):
+            return None
+
+        def logoff(self):
+            return None
+
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: _Connection())
+    writer = SimpleNamespace(records=[], emit=lambda record: writer.records.append(record))
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=True,
+        username="",
+        password="",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=[],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=10,
+        access_probe_limit=1,
+        cancel_event=threading.Event(),
+    )
+
+    assert collector.scan_host_smb(
+        "10.0.0.18", args, "run-empty-visible", writer, collector.Stats(), threading.Lock()
+    ) is True
+
+    final = [record for record in writer.records if record.get("type") == "resource"][-1]
+    metadata = final["access_capabilities"]["_metadata"]
+    assert final["access_level"] == "list_only"
+    assert metadata["assessment_summary"] == "list_observed"
+    assert metadata["assessment_reason"] == "no_visible_file_candidate"
+    assert metadata["share_presence"] == "confirmed"
+    assert final["access_capabilities"]["read_file"]["not_tested_reason"] == "no_visible_file_candidate"
+
+
+def test_configured_missing_share_is_reported_as_unavailable(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _MissingShare(Exception):
+        def getErrorCode(self):
+            return 0xC00000CC
+
+    monkeypatch.setattr(collector, "SessionError", _MissingShare)
+
+    class _Connection:
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def getDialect(self):
+            return "785"
+
+        def isSigningRequired(self):
+            return False
+
+        def connectTree(self, _share_name):
+            raise _MissingShare()
+
+        def listPath(self, *_args):
+            raise _MissingShare()
+
+        def logoff(self):
+            return None
+
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: _Connection())
+    writer = SimpleNamespace(records=[], emit=lambda record: writer.records.append(record))
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=True,
+        username="",
+        password="",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=["Archived"],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=10,
+        access_probe_limit=1,
+        cancel_event=threading.Event(),
+    )
+
+    assert collector.scan_host_smb(
+        "10.0.0.19", args, "run-missing-share", writer, collector.Stats(), threading.Lock()
+    ) is True
+
+    final = [record for record in writer.records if record.get("type") == "resource"][-1]
+    metadata = final["access_capabilities"]["_metadata"]
+    assert final["access_level"] == "unknown"
+    assert metadata["assessment_summary"] == "inconclusive"
+    assert metadata["assessment_reason"] == "share_unavailable"
+    assert metadata["share_presence"] == "unavailable"
+    assert final["access_capabilities"]["tree_connect"]["protocol_status"] == "0xC00000CC"
 
 
 def test_cancellation_closes_granted_handle_and_disconnects_tree(monkeypatch) -> None:
