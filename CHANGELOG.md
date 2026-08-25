@@ -10,6 +10,10 @@ The project follows a simple release-first workflow:
 
 ## Unreleased
 
+No user-visible changes yet.
+
+## [1.2.0] - 2026-08-25
+
 ### Added
 
 - Project inventory now exports filtered file, resource, or endpoint results as formula-safe, bounded-memory streaming CSV without the previous 20,000-row ceiling, with documented live high-watermark consistency and export admission controls.
