@@ -130,7 +130,7 @@ jobs:
           pip-audit -r collector/requirements-dev.txt
       - name: Build and audit UI
         working-directory: ui
-        run: npm ci && npm audit --audit-level=high && npm run build
+        run: npm ci && npm audit --audit-level=high && npm test && npm run build
       - name: Build all application images from source
         run: |
           cp .env.example .env

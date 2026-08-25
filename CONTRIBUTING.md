@@ -53,7 +53,7 @@ Examples:
 cd api && pip install -r requirements-dev.txt && pytest -q
 cd worker && pip install -r requirements-dev.txt && pytest -q
 cd collector && pip install -r requirements-dev.txt && pytest -q
-cd ui && npm ci && npm run typecheck && npm run build
+cd ui && npm ci && npm test && npm run typecheck && npm run build
 python scripts/validate-sample.py
 python scripts/check-release.py
 ```

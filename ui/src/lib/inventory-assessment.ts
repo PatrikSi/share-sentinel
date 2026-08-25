@@ -256,6 +256,7 @@ export function deriveSharePointAssessment({
   const recordedItemCount = metadataCount(metadata, "item_count", "items");
   const itemCount = recordedItemCount ?? (typeof rowItemCount === "number" && rowItemCount >= 0 ? rowItemCount : null);
   const totalSizeBytes = metadataCount(metadata, "total_size_bytes", "size_bytes");
+  const hasCollectedItems = [fileCount, folderCount, itemCount].some((count) => count !== null && count > 0);
   const enumerationStatus = metadataToken(metadata, "enumeration_status", "inventory_status");
   const syncMode = metadataText(metadata, "sync_mode");
   const errorCode = metadataText(metadata, "enumeration_error_code", "assessment_error_code");
@@ -304,6 +305,6 @@ export function deriveSharePointAssessment({
     unknownFileArchiveCount,
     itemCount,
     totalSizeBytes,
-    canViewItems: scope === "resource" && (fileCount !== null ? fileCount > 0 : itemCount !== null && itemCount > 0),
+    canViewItems: scope === "resource" && hasCollectedItems,
   };
 }

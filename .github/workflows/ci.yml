@@ -111,6 +111,9 @@ jobs:
       - name: Audit dependencies
         working-directory: ui
         run: npm audit --audit-level=high
+      - name: Test UI behavior
+        working-directory: ui
+        run: npm test
       - name: Typecheck and build
         working-directory: ui
         run: npm run build
