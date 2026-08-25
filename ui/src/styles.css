@@ -1157,6 +1157,10 @@ body {
   @apply bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200;
 }
 
+.inventory-value-badge.is-negative {
+  @apply bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-200;
+}
+
 .inventory-access-cell {
   @apply min-w-[260px] items-start;
 }
@@ -1179,6 +1183,10 @@ body {
 
 .inventory-access-scope {
   @apply whitespace-nowrap text-[10px] font-medium text-slate-500 dark:text-slate-400;
+}
+
+.inventory-access-reason {
+  @apply max-w-[240px] truncate text-[10px] font-medium text-slate-500 dark:text-slate-400;
 }
 
 .inventory-access-state.is-neutral {
@@ -1281,6 +1289,107 @@ body {
 
 .inventory-access-evidence li.inventory-capability-metadata {
   @apply bg-slate-50 dark:bg-slate-950;
+}
+
+.inventory-assessment-cell {
+  @apply grid min-w-[220px] max-w-[340px] gap-1;
+}
+
+.inventory-assessment-badges,
+.inventory-assessment-dialog-statuses {
+  @apply flex flex-wrap items-center gap-1;
+}
+
+.inventory-assessment-badge {
+  @apply inline-flex rounded px-1.5 py-0.5 text-[10px] font-semibold;
+}
+
+.inventory-assessment-badge.is-positive {
+  @apply bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200;
+}
+
+.inventory-assessment-badge.is-warning {
+  @apply bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100;
+}
+
+.inventory-assessment-badge.is-negative {
+  @apply bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-200;
+}
+
+.inventory-assessment-badge.is-neutral {
+  @apply bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200;
+}
+
+.inventory-assessment-content {
+  @apply truncate text-[10px] font-medium;
+}
+
+.inventory-assessment-content.is-positive {
+  @apply text-emerald-700 dark:text-emerald-300;
+}
+
+.inventory-assessment-content.is-warning {
+  @apply text-amber-700 dark:text-amber-300;
+}
+
+.inventory-assessment-content.is-negative {
+  @apply text-rose-700 dark:text-rose-300;
+}
+
+.inventory-assessment-content.is-neutral {
+  @apply text-slate-500 dark:text-slate-400;
+}
+
+.inventory-assessment-actions {
+  @apply flex flex-wrap items-center gap-1;
+}
+
+.inventory-assessment-actions button {
+  @apply rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800;
+}
+
+.inventory-assessment-unavailable {
+  @apply text-[10px] text-slate-400 dark:text-slate-500;
+}
+
+.inventory-assessment-dialog {
+  @apply grid gap-4;
+}
+
+.inventory-assessment-detail-grid {
+  @apply grid gap-px overflow-hidden rounded-md border bg-slate-200 sm:grid-cols-2 dark:bg-slate-700;
+  border-color: var(--app-border);
+}
+
+.inventory-assessment-detail-grid > div {
+  @apply min-w-0 bg-white px-3 py-2 dark:bg-slate-900;
+}
+
+.inventory-assessment-detail-grid dt {
+  @apply text-[10px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400;
+}
+
+.inventory-assessment-detail-grid dd {
+  @apply mt-0.5 break-words text-sm font-medium text-slate-800 dark:text-slate-100;
+}
+
+.inventory-assessment-evidence,
+.inventory-assessment-caveat {
+  @apply rounded-md border px-3 py-2;
+  border-color: var(--app-border);
+}
+
+.inventory-assessment-evidence h3 {
+  @apply text-xs font-semibold text-slate-800 dark:text-slate-100;
+}
+
+.inventory-assessment-evidence p,
+.inventory-assessment-caveat {
+  @apply mt-1 text-xs leading-5 text-slate-600 dark:text-slate-300;
+}
+
+.inventory-assessment-caveat {
+  @apply mt-0 bg-slate-50 dark:bg-slate-950;
 }
 
 .inventory-cell-actions {

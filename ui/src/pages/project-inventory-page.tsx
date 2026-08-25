@@ -5,10 +5,16 @@ import { AccessCapabilityCell, type AccessCapabilities } from "@/components/acce
 import { ColumnPicker } from "@/components/column-picker";
 import { Dialog } from "@/components/dialog";
 import { ExposureBadge, ProviderBadge } from "@/components/provider-context";
+import { SharePointAssessmentCell } from "@/components/sharepoint-assessment-cell";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
+import {
+  deriveSharePointAssessment,
+  formatAssessmentBytes,
+  type SharePointAssessment,
+} from "@/lib/inventory-assessment";
 import {
   endpointConnectionTarget,
   itemConnectionTarget,
@@ -176,6 +182,13 @@ type ItemColumnKey =
 type ResourceColumnKey =
   | "connection"
   | "name"
+  | "assessment"
+  | "existence_status"
+  | "lifecycle_status"
+  | "content_status"
+  | "file_count"
+  | "folder_count"
+  | "total_size_bytes"
   | "provider"
   | "assessment_scope"
   | "resource_type"
@@ -193,6 +206,9 @@ type ResourceColumnKey =
 type EndpointColumnKey =
   | "connection"
   | "endpoint_key"
+  | "assessment"
+  | "existence_status"
+  | "lifecycle_status"
   | "provider"
   | "assessment_scope"
   | "site_name"
@@ -215,10 +231,18 @@ type QueryFilterReflection = {
 };
 type Density = "compact" | "comfortable";
 type CellFilterField = InventoryQueryField | null;
+type SelectedSharePointAssessment = {
+  kind: "endpoint" | "resource";
+  title: string;
+  runName: string;
+  assessment: SharePointAssessment;
+  canonicalUrl: string | null;
+  resource: InventoryResource | null;
+};
 
 const DEFAULT_ITEM_COLUMNS: ItemColumnKey[] = ["path", "name", "is_dir", "connection", "provider", "resource_name", "access_level", "exposure", "size_bytes", "mtime", "run_name"];
-const DEFAULT_RESOURCE_COLUMNS: ResourceColumnKey[] = ["name", "connection", "provider", "resource_type", "exposure", "access_level", "hostname", "item_count", "run_name"];
-const DEFAULT_ENDPOINT_COLUMNS: EndpointColumnKey[] = ["endpoint_key", "connection", "provider", "site_name", "hostname", "resource_count", "item_count", "run_name"];
+const DEFAULT_RESOURCE_COLUMNS: ResourceColumnKey[] = ["name", "connection", "assessment", "provider", "resource_type", "exposure", "access_level", "hostname", "item_count", "run_name"];
+const DEFAULT_ENDPOINT_COLUMNS: EndpointColumnKey[] = ["endpoint_key", "connection", "assessment", "provider", "site_name", "hostname", "resource_count", "item_count", "run_name"];
 
 const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
   { key: "connection", label: "Connection" },
@@ -255,6 +279,13 @@ const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
 const RESOURCE_COLUMN_OPTIONS: Array<{ key: ResourceColumnKey; label: string }> = [
   { key: "connection", label: "Connection" },
   { key: "name", label: "Share / Library" },
+  { key: "assessment", label: "Assessment" },
+  { key: "existence_status", label: "Existence" },
+  { key: "lifecycle_status", label: "Lifecycle" },
+  { key: "content_status", label: "Content State" },
+  { key: "file_count", label: "Files" },
+  { key: "folder_count", label: "Folders" },
+  { key: "total_size_bytes", label: "Total Size" },
   { key: "provider", label: "Source" },
   { key: "assessment_scope", label: "Assessment Scope" },
   { key: "resource_type", label: "Resource Type" },
@@ -273,6 +304,9 @@ const RESOURCE_COLUMN_OPTIONS: Array<{ key: ResourceColumnKey; label: string }> 
 const ENDPOINT_COLUMN_OPTIONS: Array<{ key: EndpointColumnKey; label: string }> = [
   { key: "connection", label: "Connection" },
   { key: "endpoint_key", label: "Source Key" },
+  { key: "assessment", label: "Assessment" },
+  { key: "existence_status", label: "Existence" },
+  { key: "lifecycle_status", label: "Lifecycle" },
   { key: "provider", label: "Source" },
   { key: "assessment_scope", label: "Assessment Scope" },
   { key: "site_name", label: "Site / Host" },
@@ -587,7 +621,7 @@ type InventoryCellProps = {
   filterScopeLabel?: string;
   filterValue?: string;
   mono?: boolean;
-  badge?: "neutral" | "positive" | "warning";
+  badge?: "neutral" | "positive" | "warning" | "negative";
   onFilter: (field: InventoryQueryField, value: string, negated: boolean) => void;
   onCopy: (value: string, label: string) => void;
 };
@@ -781,20 +815,20 @@ export function ProjectInventoryPage() {
   );
   const [resourceColumns, setResourceColumns] = useState<ResourceColumnKey[]>(() =>
     readStoredColumns(
-      "share_sentinel_inventory_resource_columns_v2",
+      "share_sentinel_inventory_resource_columns_v3",
       RESOURCE_COLUMN_OPTIONS,
       DEFAULT_RESOURCE_COLUMNS,
-      "share_sentinel_inventory_resource_columns",
-      ["connection"],
+      "share_sentinel_inventory_resource_columns_v2",
+      ["assessment"],
     ),
   );
   const [endpointColumns, setEndpointColumns] = useState<EndpointColumnKey[]>(() =>
     readStoredColumns(
-      "share_sentinel_inventory_endpoint_columns_v2",
+      "share_sentinel_inventory_endpoint_columns_v3",
       ENDPOINT_COLUMN_OPTIONS,
       DEFAULT_ENDPOINT_COLUMNS,
-      "share_sentinel_inventory_endpoint_columns",
-      ["connection"],
+      "share_sentinel_inventory_endpoint_columns_v2",
+      ["assessment"],
     ),
   );
   const [showAdvancedQuery, setShowAdvancedQuery] = useState(false);
@@ -812,6 +846,7 @@ export function ProjectInventoryPage() {
     ].some(Boolean),
   );
   const [showViewsDialog, setShowViewsDialog] = useState(false);
+  const [selectedSharePointAssessment, setSelectedSharePointAssessment] = useState<SelectedSharePointAssessment | null>(null);
   const [density, setDensity] = useState<Density>(readStoredDensity);
   const [preferenceWarning, setPreferenceWarning] = useState<string | null>(null);
   const [copiedNotice, setCopiedNotice] = useState<string | null>(null);
@@ -1020,6 +1055,28 @@ export function ProjectInventoryPage() {
     } catch {
       showActionNotice("Copy failed. Select the value and copy it manually.");
     }
+  }
+
+  function viewCollectedResourceItems(row: InventoryResource) {
+    const provider = normalizedProvider(row.provider, row.share_type, row.resource_type);
+    const groups: InventoryQueryGroup[] = [[
+      { field: "provider", operator: "equals", value: provider, negated: false },
+      { field: "endpoint", operator: "equals", value: row.endpoint_key, negated: false },
+      { field: "share", operator: "equals", value: row.name, negated: false },
+    ]];
+    const serialized = serializeInventoryGroups(groups);
+    if (!serialized) {
+      setQueryError("The selected resource could not be represented as an exact inventory query.");
+      return;
+    }
+    setSelectedSharePointAssessment(null);
+    setActiveTab("items");
+    setSelectedRunIds([row.run_id]);
+    setRunScopeWarning(null);
+    setIncludeDeleted(false);
+    setInventoryQueryInput(serialized);
+    applyParsedInventoryQuery(groups, serialized);
+    window.requestAnimationFrame(() => tableScrollRef.current?.scrollTo({ top: 0 }));
   }
 
   async function exportInventoryCsv() {
@@ -1309,12 +1366,12 @@ export function ProjectInventoryPage() {
   }, [itemColumns]);
 
   useEffect(() => {
-    const persistenceError = persistInventoryPreference("share_sentinel_inventory_resource_columns_v2", JSON.stringify(resourceColumns));
+    const persistenceError = persistInventoryPreference("share_sentinel_inventory_resource_columns_v3", JSON.stringify(resourceColumns));
     if (persistenceError) setPreferenceWarning(persistenceError);
   }, [resourceColumns]);
 
   useEffect(() => {
-    const persistenceError = persistInventoryPreference("share_sentinel_inventory_endpoint_columns_v2", JSON.stringify(endpointColumns));
+    const persistenceError = persistInventoryPreference("share_sentinel_inventory_endpoint_columns_v3", JSON.stringify(endpointColumns));
     if (persistenceError) setPreferenceWarning(persistenceError);
   }, [endpointColumns]);
 
@@ -1787,6 +1844,16 @@ export function ProjectInventoryPage() {
     const siteId = metadataString(row.metadata, "site_id", "siteId");
     const siteName = metadataString(row.endpoint_metadata, "display_name", "displayName", "site_name", "siteName", "name");
     const webUrl = safeExternalUrl(row.web_url);
+    const collectionContext = runs.find((run) => run.id === row.run_id)?.collection_context;
+    const sharePointAssessment = provider === "sharepoint"
+      ? deriveSharePointAssessment({
+          scope: "resource",
+          metadata: row.metadata,
+          endpointMetadata: row.endpoint_metadata,
+          itemCount: row.item_count,
+          collectionContext,
+        })
+      : null;
     if (column === "connection") {
       return (
         <ConnectionCell
@@ -1804,6 +1871,37 @@ export function ProjectInventoryPage() {
         />
       );
     }
+    if (column === "assessment") {
+      if (!sharePointAssessment) return <span className="inventory-assessment-unavailable">See observed access</span>;
+      return (
+        <SharePointAssessmentCell
+          assessment={sharePointAssessment}
+          label={row.name}
+          onDetails={() => setSelectedSharePointAssessment({
+            kind: "resource",
+            title: row.name,
+            runName: row.run_name,
+            assessment: sharePointAssessment,
+            canonicalUrl: webUrl,
+            resource: row,
+          })}
+          onViewItems={() => viewCollectedResourceItems(row)}
+        />
+      );
+    }
+    if (column === "existence_status") {
+      return <InventoryCell text={sharePointAssessment?.availability.label || "—"} label={label} badge={sharePointAssessment?.availability.tone || "neutral"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    }
+    if (column === "lifecycle_status") {
+      return <InventoryCell text={sharePointAssessment?.lifecycle.label || "—"} label={label} badge={sharePointAssessment?.lifecycle.tone || "neutral"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    }
+    if (column === "content_status") {
+      const status = sharePointAssessment?.content;
+      return <InventoryCell text={status?.label || "—"} label={label} badge={status?.tone || "neutral"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    }
+    if (column === "file_count") return <InventoryCell text={sharePointAssessment?.fileCount?.toLocaleString() || "—"} filterValue={sharePointAssessment?.fileCount == null ? "" : String(sharePointAssessment.fileCount)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "folder_count") return <InventoryCell text={sharePointAssessment?.folderCount?.toLocaleString() || "—"} filterValue={sharePointAssessment?.folderCount == null ? "" : String(sharePointAssessment.folderCount)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "total_size_bytes") return <InventoryCell text={sharePointAssessment?.totalSizeBytes == null ? "—" : formatAssessmentBytes(sharePointAssessment.totalSizeBytes)} filterValue={sharePointAssessment?.totalSizeBytes == null ? "" : String(sharePointAssessment.totalSizeBytes)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "name") return <InventoryCell text={row.name} label={label} filterField="share" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "provider") return <InventoryCell content={<ProviderBadge provider={provider} />} text={providerLabel(provider)} filterField="provider" filterValue={provider} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "assessment_scope") return assessmentScopeCell(row.run_id, label);
@@ -1833,12 +1931,22 @@ export function ProjectInventoryPage() {
 
   function endpointCell(row: InventoryEndpoint, column: EndpointColumnKey): ReactNode {
     const label = ENDPOINT_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column;
-    const siteName = metadataString(row.metadata, "display_name", "displayName", "site_name", "siteName", "name");
+    const requestedTarget = metadataString(row.metadata, "requested_target", "requestedTarget");
+    const siteName = metadataString(row.metadata, "display_name", "displayName", "site_name", "siteName", "name") || requestedTarget;
     const rawWebUrl = metadataString(row.metadata, "web_url", "webUrl");
     const webUrl = safeExternalUrl(rawWebUrl);
     const siteId = metadataString(row.metadata, "site_id", "siteId");
     const provider = normalizedProvider(row.provider, metadataString(row.metadata, "provider"), siteId ? "sharepoint" : "network");
     const tenantId = metadataString(row.metadata, "tenant_id", "tenantId");
+    const collectionContext = runs.find((run) => run.id === row.run_id)?.collection_context;
+    const sharePointAssessment = provider === "sharepoint"
+      ? deriveSharePointAssessment({
+          scope: "endpoint",
+          metadata: row.metadata,
+          itemCount: row.item_count,
+          collectionContext,
+        })
+      : null;
     if (column === "connection") {
       return (
         <ConnectionCell
@@ -1853,6 +1961,29 @@ export function ProjectInventoryPage() {
           })}
         />
       );
+    }
+    if (column === "assessment") {
+      if (!sharePointAssessment) return <span className="inventory-assessment-unavailable">Not applicable</span>;
+      return (
+        <SharePointAssessmentCell
+          assessment={sharePointAssessment}
+          label={siteName || row.endpoint_key}
+          onDetails={() => setSelectedSharePointAssessment({
+            kind: "endpoint",
+            title: siteName || row.endpoint_key,
+            runName: row.run_name,
+            assessment: sharePointAssessment,
+            canonicalUrl: webUrl,
+            resource: null,
+          })}
+        />
+      );
+    }
+    if (column === "existence_status") {
+      return <InventoryCell text={sharePointAssessment?.availability.label || "—"} label={label} badge={sharePointAssessment?.availability.tone || "neutral"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    }
+    if (column === "lifecycle_status") {
+      return <InventoryCell text={sharePointAssessment?.lifecycle.label || "—"} label={label} badge={sharePointAssessment?.lifecycle.tone || "neutral"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     }
     if (column === "endpoint_key") return <InventoryCell text={row.endpoint_key} label={label} filterField="endpoint" filterScopeLabel="endpoint key, hostname, or IP" mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "provider") return <InventoryCell content={<ProviderBadge provider={provider} />} text={providerLabel(provider)} filterField={provider === "network" ? undefined : "provider"} filterValue={provider} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
@@ -2295,7 +2426,7 @@ export function ProjectInventoryPage() {
                     <option value="readable">Read observed</option>
                     <option value="list_only">List observed</option>
                     <option value="no_access">Access denied</option>
-                    <option value="unknown">Unknown</option>
+                    <option value="unknown">Unknown / inconclusive</option>
                   </select>
                 </label>
               ) : null}
@@ -2424,6 +2555,68 @@ export function ProjectInventoryPage() {
           </nav>
         </footer>
       </section>
+
+      <Dialog
+        description={selectedSharePointAssessment
+          ? `Evidence captured by ${selectedSharePointAssessment.runName}. Status describes the collection-time observation, not a live browser check.`
+          : undefined}
+        footer={selectedSharePointAssessment ? (
+          <>
+            {selectedSharePointAssessment.canonicalUrl ? (
+              <a className="inventory-button-secondary" href={selectedSharePointAssessment.canonicalUrl} rel="noreferrer" target="_blank">
+                Open SharePoint <span aria-hidden="true">↗</span>
+              </a>
+            ) : null}
+            {selectedSharePointAssessment.resource && selectedSharePointAssessment.assessment.canViewItems ? (
+              <button className="inventory-button-primary" onClick={() => viewCollectedResourceItems(selectedSharePointAssessment.resource as InventoryResource)} type="button">
+                View collected files &amp; folders
+              </button>
+            ) : null}
+            <button className="inventory-button-secondary" onClick={() => setSelectedSharePointAssessment(null)} type="button">
+              Close
+            </button>
+          </>
+        ) : null}
+        onClose={() => setSelectedSharePointAssessment(null)}
+        open={selectedSharePointAssessment !== null}
+        size="lg"
+        title={selectedSharePointAssessment ? `${selectedSharePointAssessment.title} assessment` : "SharePoint assessment"}
+      >
+        {selectedSharePointAssessment ? (
+          <div className="inventory-assessment-dialog">
+            <div className="inventory-assessment-dialog-statuses">
+              <span className={`inventory-assessment-badge is-${selectedSharePointAssessment.assessment.availability.tone}`}>
+                {selectedSharePointAssessment.assessment.availability.label}
+              </span>
+              <span className={`inventory-assessment-badge is-${selectedSharePointAssessment.assessment.lifecycle.tone}`}>
+                {selectedSharePointAssessment.assessment.lifecycle.label}
+              </span>
+              {selectedSharePointAssessment.assessment.content ? (
+                <span className={`inventory-assessment-badge is-${selectedSharePointAssessment.assessment.content.tone}`}>
+                  {selectedSharePointAssessment.assessment.content.label}
+                </span>
+              ) : null}
+            </div>
+            <dl className="inventory-assessment-detail-grid">
+              {selectedSharePointAssessment.assessment.details.map((detail) => (
+                <div key={`${detail.label}-${detail.value}`}>
+                  <dt>{detail.label}</dt>
+                  <dd title={detail.value}>{detail.value}</dd>
+                </div>
+              ))}
+            </dl>
+            {selectedSharePointAssessment.assessment.evidence ? (
+              <section className="inventory-assessment-evidence" aria-label="Provider evidence">
+                <h3>Provider evidence</h3>
+                <p>{selectedSharePointAssessment.assessment.evidence}</p>
+              </section>
+            ) : null}
+            <p className="inventory-assessment-caveat">
+              “Not found or not visible” is kept separate from “inaccessible” and “unknown.” Empty is shown only when the collector explicitly recorded a complete enumeration and an empty content state.
+            </p>
+          </div>
+        ) : null}
+      </Dialog>
 
       <Dialog
         description="Open a team view or save the current tab, run scope, and filters."

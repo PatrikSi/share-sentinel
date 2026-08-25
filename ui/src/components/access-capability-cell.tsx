@@ -22,17 +22,9 @@ type AccessCapabilityCellProps = {
 
 type AccessSummary = {
   icon: string;
-  label:
-    | "Read/write observed"
-    | "Read observed"
-    | "List/write observed"
-    | "List observed"
-    | "Write observed"
-    | "Control observed"
-    | "Access observed"
-    | "Access denied"
-    | "Unknown";
+  label: string;
   tone: "positive" | "warning" | "negative" | "neutral";
+  detail?: string;
 };
 
 const CAPABILITY_ORDER = [
@@ -76,6 +68,47 @@ const STATUS_PRESENTATION: Record<CapabilityStatus, { icon: string; label: strin
   inconclusive: { icon: "?", label: "Inconclusive" },
 };
 
+const SMB_ASSESSMENT_SUMMARIES: Record<string, AccessSummary> = {
+  read_write_observed: { icon: "RW", label: "Read/write observed", tone: "positive" },
+  read_observed: { icon: "R", label: "Read observed", tone: "positive" },
+  list_write_observed: { icon: "LW", label: "List/write observed", tone: "positive" },
+  list_observed: { icon: "L", label: "List observed", tone: "warning" },
+  write_observed: { icon: "W", label: "Write observed", tone: "positive" },
+  control_observed: { icon: "C", label: "Control observed", tone: "warning" },
+  connected_list_denied: { icon: "C", label: "Connected; list denied", tone: "warning" },
+  connected_only: { icon: "C", label: "Connection observed", tone: "neutral" },
+  tree_denied: { icon: "×", label: "Share connection denied", tone: "negative" },
+  inconclusive: { icon: "?", label: "Assessment inconclusive", tone: "warning" },
+  not_assessed: { icon: "—", label: "Not assessed", tone: "neutral" },
+};
+
+const SMB_ASSESSMENT_REASON_LABELS: Record<string, string> = {
+  pending: "Assessment had not finished",
+  listing_truncated: "Listing reached its configured limit",
+  partial_transport_failure: "Transport failed after partial evidence was collected",
+  cancelled_after_observation: "Assessment was cancelled after partial evidence was collected",
+  no_visible_file_candidate: "No visible file was available for file-level probes",
+  probes_disabled: "Capability probes were disabled",
+  share_unavailable: "The share could not be reached",
+  object_not_found: "The sampled object was no longer available",
+  sharing_violation: "The sampled object was locked or shared incompatibly",
+  object_state_changed: "The sampled object changed during assessment",
+  transport_failure: "The SMB transport failed before a conclusive result",
+  protocol_error: "The server returned an inconclusive SMB protocol error",
+  unsupported_request: "The server did not support the requested non-mutating probe",
+  invalid_request: "The server rejected the non-mutating probe request",
+  legacy_operation_refused: "The SMB1 server refused the operation without a precise status",
+  capacity_constraint: "The server could not evaluate the probe because of a capacity constraint",
+  storage_unavailable: "Backing storage was unavailable during the probe",
+  object_type_mismatch: "The sampled path changed type or did not match the requested probe",
+  collector_error: "The collector isolated an unexpected response to this share",
+  transport_aborted: "The remaining probes were stopped after a transport failure",
+  tree_unavailable: "A share tree connection was not available for this probe",
+  probe_method_unavailable: "The server did not expose the required non-mutating probe method",
+  not_reached: "Collection ended before this capability could be tested",
+  no_conclusive_evidence: "No conclusive list, read, or write evidence was collected",
+};
+
 function normalizeCapabilityStatus(value: unknown): CapabilityStatus {
   if (value === "allowed" || value === "denied" || value === "mixed" || value === "not_tested" || value === "inconclusive") {
     return value;
@@ -86,6 +119,26 @@ function normalizeCapabilityStatus(value: unknown): CapabilityStatus {
 function isObserved(evidence: AccessCapabilityEvidence | undefined): boolean {
   const status = normalizeCapabilityStatus(evidence?.status);
   return status === "allowed" || status === "mixed";
+}
+
+function capabilityMetadataString(capabilities: AccessCapabilities | null | undefined, key: string): string | null {
+  const value = capabilities?._metadata?.[key];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function capabilityMetadataBoolean(capabilities: AccessCapabilities | null | undefined, key: string): boolean | null {
+  const value = capabilities?._metadata?.[key];
+  return typeof value === "boolean" ? value : null;
+}
+
+function normalizedMetadataToken(value: string | null): string | null {
+  return value?.trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_") || null;
+}
+
+function assessmentReasonDetail(capabilities: AccessCapabilities | null | undefined): string | undefined {
+  const reason = normalizedMetadataToken(capabilityMetadataString(capabilities, "assessment_reason"));
+  if (!reason || reason === "bounded_observation") return undefined;
+  return SMB_ASSESSMENT_REASON_LABELS[reason] || humanizeIdentifier(reason);
 }
 
 function capabilityEvidence(
@@ -143,12 +196,49 @@ function accessSummary(accessLevel: string, capabilities: AccessCapabilities | n
     return { icon: "+", label: "Access observed", tone: "neutral" };
   }
 
-  const connectionDenied = normalizeCapabilityStatus(capabilityEvidence(capabilities, "tree_connect")?.status) === "denied";
+  const explicitSummary = normalizedMetadataToken(capabilityMetadataString(capabilities, "assessment_summary"));
+  const explicitPresentation = explicitSummary ? SMB_ASSESSMENT_SUMMARIES[explicitSummary] : null;
+  if (explicitPresentation) {
+    return { ...explicitPresentation, detail: assessmentReasonDetail(capabilities) };
+  }
+
+  const connectionStatus = normalizeCapabilityStatus(capabilityEvidence(capabilities, "tree_connect")?.status);
+  const listStatus = normalizeCapabilityStatus(capabilityEvidence(capabilities, "list")?.status);
+  const connectionDenied = connectionStatus === "denied";
   if (connectionDenied) {
-    return { icon: "×", label: "Access denied", tone: "negative" };
+    return { icon: "×", label: "Share connection denied", tone: "negative" };
+  }
+  if (connectionStatus === "allowed" && listStatus === "denied") {
+    return { icon: "C", label: "Connected; list denied", tone: "warning" };
+  }
+
+  const transportFailed = capabilityMetadataBoolean(capabilities, "transport_failed") === true;
+  const anyInconclusive = entries.some(([, evidence]) => normalizeCapabilityStatus(evidence.status) === "inconclusive");
+  if (transportFailed || anyInconclusive) {
+    return {
+      icon: "?",
+      label: "Assessment inconclusive",
+      tone: "warning",
+      detail: assessmentReasonDetail(capabilities) || (transportFailed ? "The SMB transport failed before a conclusive result" : undefined),
+    };
+  }
+
+  const coverage = normalizedMetadataToken(capabilityMetadataString(capabilities, "coverage"));
+  const allNotTested = entries.length > 0 && entries.every(([, evidence]) => normalizeCapabilityStatus(evidence.status) === "not_tested");
+  if (coverage === "disabled" || allNotTested) {
+    return { icon: "—", label: "Not assessed", tone: "neutral", detail: assessmentReasonDetail(capabilities) };
+  }
+
+  const finalized = capabilityMetadataBoolean(capabilities, "finalized");
+  const complete = capabilityMetadataBoolean(capabilities, "complete");
+  if (finalized === false || complete === false) {
+    return { icon: "…", label: "Assessment incomplete", tone: "warning", detail: assessmentReasonDetail(capabilities) };
+  }
+  if (connectionStatus === "allowed") {
+    return { icon: "C", label: "Connection observed", tone: "neutral", detail: assessmentReasonDetail(capabilities) };
   }
   if (entries.length > 0) {
-    return { icon: "?", label: "Unknown", tone: "neutral" };
+    return { icon: "?", label: "No conclusive evidence", tone: "neutral", detail: assessmentReasonDetail(capabilities) };
   }
   return legacyAccessSummary(accessLevel);
 }
@@ -198,12 +288,14 @@ function evidenceMetadata(evidence: AccessCapabilityEvidence): string[] {
       continue;
     }
     const directCounter = ["attempted", "allowed", "denied", "inconclusive"].includes(normalizedKey);
-    if (!normalizedKey.includes("count") && !normalizedKey.includes("method") && !directCounter) continue;
+    const evidenceDetail = ["scope", "coverage", "reason_code", "protocol_status", "not_tested_reason", "sample_limit"].includes(normalizedKey);
+    if (!normalizedKey.includes("count") && !normalizedKey.includes("method") && !directCounter && !evidenceDetail) continue;
     const formatted = formatMetadataValue(value);
     if (directCounter && Number(value) === 0) continue;
     if (formatted !== null) {
       const displayKey = normalizedKey.endsWith("_count") ? normalizedKey.slice(0, -6) : normalizedKey;
-      metadata.push(`${humanizeIdentifier(displayKey)} ${formatted}`);
+      const displayValue = typeof value === "string" && evidenceDetail ? humanizeIdentifier(formatted) : formatted;
+      metadata.push(`${humanizeIdentifier(displayKey)} ${displayValue}`);
     }
   }
   return metadata;
@@ -213,7 +305,24 @@ function capabilityMetadata(capabilities: AccessCapabilities | null | undefined)
   const metadata = capabilities?._metadata;
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return [];
 
-  const preferredOrder = ["probe_method", "coverage", "sample_count", "sampled_count", "probe_limit", "partial", "complete"];
+  const preferredOrder = [
+    "assessment_summary",
+    "assessment_reason",
+    "share_presence",
+    "probe_method",
+    "coverage",
+    "sample_count",
+    "sampled_count",
+    "probe_limit",
+    "directory_samples",
+    "file_samples",
+    "listing_truncated",
+    "transport_failed",
+    "degraded",
+    "partial",
+    "finalized",
+    "complete",
+  ];
   const entries = Object.entries(metadata).filter(([, value]) => formatMetadataValue(value) !== null);
   entries.sort(([left], [right]) => {
     const leftIndex = preferredOrder.indexOf(left);
@@ -232,7 +341,7 @@ function capabilityMetadata(capabilities: AccessCapabilities | null | undefined)
         ? value
           ? "Yes"
           : "No"
-        : typeof value === "string" && (key.includes("method") || key === "coverage")
+        : typeof value === "string" && (["assessment_summary", "assessment_reason", "share_presence", "coverage"].includes(key) || key.includes("method"))
           ? humanizeIdentifier(value)
           : formatted;
     return [`${humanizeIdentifier(key)} ${displayValue}`];
@@ -241,6 +350,8 @@ function capabilityMetadata(capabilities: AccessCapabilities | null | undefined)
 
 export function AccessCapabilityCell({ accessLevel, capabilities, evidenceScope, label, onCopy, onFilter }: AccessCapabilityCellProps) {
   const summary = accessSummary(accessLevel, capabilities);
+  const summaryDetail = summary.detail
+    || (capabilityMetadataBoolean(capabilities, "degraded") === true ? assessmentReasonDetail(capabilities) : undefined);
   const entries = capabilityEntries(capabilities);
   const probeMetadata = capabilityMetadata(capabilities);
   const observedWriteCapabilities = COMPACT_WRITE_CAPABILITIES.flatMap((key) => {
@@ -262,6 +373,7 @@ export function AccessCapabilityCell({ accessLevel, capabilities, evidenceScope,
             <span aria-hidden="true" className="inventory-access-state-icon">{summary.icon}</span>
             {summary.label}
           </span>
+          {summaryDetail ? <span className="inventory-access-reason" title={summaryDetail}>{summaryDetail}</span> : null}
           {evidenceScope ? (
             <span className="inventory-access-scope" title="Capability evidence is resource-level and may not apply to this exact item">
               {evidenceScope}

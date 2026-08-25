@@ -5,6 +5,8 @@ base_url="${1:?usage: check-ui-shell.sh BASE_URL [HOST_HEADER]}"
 host_header="${2:-}"
 base_url="${base_url%/}"
 temp_dir=$(mktemp -d)
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+expected_version=$(tr -d '[:space:]' < "$script_dir/../VERSION")
 
 cleanup() {
   rm -rf "$temp_dir"
@@ -61,6 +63,7 @@ printf '%s\n' "${asset_paths[@]}" | grep -Eq '^/assets/.+\.css$' || fail "UI she
 printf '%s\n' "${asset_paths[@]}" | grep -Fxq '/runtime-config.js' || fail "UI shell has no runtime configuration"
 printf '%s\n' "${asset_paths[@]}" | grep -Fxq '/startup-check.js' || fail "UI shell has no startup failure guard"
 
+javascript_bodies=()
 for path in "${asset_paths[@]}"; do
   safe_name=$(printf '%s' "$path" | tr -c 'A-Za-z0-9._-' '_')
   body="$temp_dir/$safe_name.body"
@@ -73,6 +76,7 @@ for path in "${asset_paths[@]}"; do
   case "$path" in
     *.js)
       [[ "$content_type" == *javascript* ]] || fail "UI asset $path has unexpected content type: ${content_type:-missing}"
+      javascript_bodies+=("$body")
       ;;
     *.css)
       [[ "$content_type" == text/css* ]] || fail "UI asset $path has unexpected content type: ${content_type:-missing}"
@@ -87,6 +91,9 @@ for path in "${asset_paths[@]}"; do
       fail "runtime UI asset $path can become stale"
   fi
 done
+
+grep -Fq 'Share Sentinel v' "${javascript_bodies[@]}" || fail "built UI does not contain the visible application version footer"
+grep -Fq "$expected_version" "${javascript_bodies[@]}" || fail "built UI version does not match VERSION ($expected_version)"
 
 missing_status=$(fetch_path "/assets/share-sentinel-intentionally-missing.js" "$temp_dir/missing.body" "$temp_dir/missing.headers")
 [[ "$missing_status" == "404" ]] ||
