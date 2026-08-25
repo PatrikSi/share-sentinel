@@ -761,6 +761,91 @@ def test_unexpected_smb_share_parser_failure_emits_degraded_final_and_continues(
     assert any(record.get("code") == "SMB_SHARE_ASSESSMENT_FAILED" for record in writer.records)
 
 
+def test_smb_artifact_write_failure_aborts_instead_of_becoming_share_failure(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _Entry:
+        def get_longname(self):
+            return "report.txt"
+
+        def is_directory(self):
+            return False
+
+        def get_filesize(self):
+            return 12
+
+    class _Connection:
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def getDialect(self):
+            return "785"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            return [{"shi1_netname": "Reports\x00", "shi1_remark": "\x00"}]
+
+        def connectTree(self, _share_name):
+            return 41
+
+        def listPath(self, _share_name, _wildcard):
+            return [_Entry()]
+
+        def disconnectTree(self, _tree_id):
+            return None
+
+        def logoff(self):
+            return None
+
+    class _FailingWriter:
+        def __init__(self):
+            self.records = []
+            self.write_failed = False
+
+        def emit(self, record):
+            if record.get("type") == "item":
+                self.write_failed = True
+                raise OSError("artifact disk write failed")
+            self.records.append(record)
+
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: _Connection())
+    writer = _FailingWriter()
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=True,
+        username="",
+        password="",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=[],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=10,
+        access_probe_limit=0,
+        cancel_event=threading.Event(),
+    )
+
+    with pytest.raises(OSError, match="artifact disk write failed"):
+        collector.scan_host_smb(
+            "10.0.0.21",
+            args,
+            "run-output-failure",
+            writer,
+            collector.Stats(),
+            threading.Lock(),
+        )
+
+    assert not any(record.get("code") == "SMB_SHARE_ASSESSMENT_FAILED" for record in writer.records)
+
+
 def test_nfs_advertised_export_does_not_overstate_access(monkeypatch) -> None:
     collector = _load_collector_module()
 

@@ -184,7 +184,13 @@ jq -e '(.items | length) == 1
   and .items[0].exposure_evidence.basis == "graph_delegated_read_context"
   and .items[0].metadata.site_id == "contoso.sharepoint.com,synthetic-site,synthetic-web"
   and .items[0].metadata.drive_id == "b!synthetic-drive-id"
-  and .items[0].metadata.access_observation == "graph_metadata_enumeration"' \
+  and .items[0].metadata.access_observation == "graph_item_metadata_enumeration"
+  and .items[0].metadata.enumeration_status == "complete"
+  and .items[0].metadata.content_state == "populated"
+  and .items[0].metadata.file_count == 1
+  and .items[0].metadata.folder_count == 1
+  and .items[0].metadata.archived_file_count == 1
+  and .items[0].metadata.unknown_file_archive_count == 0' \
   <<<"$resources_response" >/dev/null
 
 items_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" \
@@ -199,6 +205,7 @@ jq -e '(.items | length) == 2
       and .exposure_evidence.basis == "graph_delegated_read_context"
       and .metadata.drive_id == "b!synthetic-drive-id"
       and .metadata.etag == "file-etag-2"
+      and .metadata.file_archive_status == "fully_archived"
     )) | length) == 1' <<<"$items_response" >/dev/null
 
 endpoints_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" \
@@ -207,7 +214,12 @@ jq -e '(.items | length) == 1
   and .items[0].endpoint_key == "sharepoint:contoso.sharepoint.com,synthetic-site,synthetic-web"
   and .items[0].metadata.site_id == "contoso.sharepoint.com,synthetic-site,synthetic-web"
   and .items[0].metadata.web_url == "https://contoso.sharepoint.com/sites/Records"
-  and .items[0].metadata.assessed_identity == "synthetic.user@example.test"' \
+  and .items[0].metadata.assessed_identity == "synthetic.user@example.test"
+  and .items[0].metadata.existence_status == "confirmed"
+  and .items[0].metadata.lifecycle_state == "available"
+  and .items[0].metadata.archive_status == "not_archived"
+  and .items[0].metadata.evidence.archive_status_checked == true
+  and .items[0].metadata.evidence.archive_status_authoritative == false' \
   <<<"$endpoints_response" >/dev/null
 
 detail_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" \

@@ -100,6 +100,104 @@ def test_smb1_ambiguous_or_non_denial_codes_remain_inconclusive(
 
 
 @pytest.mark.parametrize(
+    ("error_class", "error_code", "reason_code", "transport_fatal", "abort_remaining_probes"),
+    [
+        (1, 2, "object_not_found", False, False),
+        (1, 3, "object_not_found", False, False),
+        (1, 67, "share_unavailable", False, False),
+        (2, 5, "tree_session_invalid", False, True),
+        (2, 6, "share_unavailable", False, False),
+        (2, 67, "invalid_request", False, False),
+    ],
+)
+def test_smb1_failures_retain_class_code_and_specific_reason(
+    error_class, error_code, reason_code, transport_fatal, abort_remaining_probes
+) -> None:
+    collector = _load_collector_module()
+
+    class _LegacyPacket:
+        def __getitem__(self, field_name):
+            return {"ErrorClass": error_class, "ErrorCode": error_code}[field_name]
+
+    class _LegacySessionError(Exception):
+        def getErrorCode(self):
+            return error_code
+
+        def getErrorPacket(self):
+            return _LegacyPacket()
+
+    classification = collector._classify_smb_probe_failure(_LegacySessionError())
+
+    assert classification.outcome == "inconclusive"
+    assert classification.reason_code == reason_code
+    assert classification.protocol_status == f"SMB1:{error_class:02X}:{error_code:04X}"
+    assert classification.transport_fatal is transport_fatal
+    assert classification.abort_remaining_probes is abort_remaining_probes
+
+
+def test_smb1_ntstatus_packet_is_not_reported_as_a_legacy_error_pair() -> None:
+    collector = _load_collector_module()
+    smb = pytest.importorskip("impacket.smb")
+
+    packet = smb.NewSMBPacket()
+    packet["ErrorClass"] = 0x22
+    packet["_reserved"] = 0
+    packet["ErrorCode"] = 0xC000
+    packet["Flags2"] = smb.SMB.FLAGS2_NT_STATUS
+    error = collector.SessionError(0xC0000022, packet)
+
+    classification = collector._classify_smb_probe_failure(error)
+
+    assert classification.outcome == "denied"
+    assert classification.reason_code == "access_denied"
+    assert classification.protocol_status == "0xC0000022"
+
+
+def test_invalid_smb1_tree_aborts_remaining_probes_without_claiming_transport_failure(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _LegacyPacket:
+        def __getitem__(self, field_name):
+            return {"ErrorClass": 2, "ErrorCode": 5}[field_name]
+
+    class _InvalidTree(Exception):
+        def getErrorCode(self):
+            return 5
+
+        def getErrorPacket(self):
+            return _LegacyPacket()
+
+    class _Connection:
+        def __init__(self):
+            self.attempts = 0
+
+        def openFile(self, *_args, **_kwargs):
+            self.attempts += 1
+            raise _InvalidTree()
+
+    monkeypatch.setattr(collector, "SessionError", _InvalidTree)
+    capabilities = collector._new_access_capabilities()
+    circuit = collector._SMBProbeCircuit()
+    connection = _Connection()
+
+    collector._probe_smb_directory_access(
+        connection,
+        1,
+        "",
+        capabilities,
+        None,
+        circuit,
+    )
+
+    assert connection.attempts == 1
+    assert circuit.probes_aborted is True
+    assert circuit.transport_failed is False
+    assert circuit.reason_code == "tree_session_invalid"
+    assert capabilities["create_file"]["reason_code"] == "tree_session_invalid"
+    assert capabilities["create_directory"]["attempted"] == 0
+
+
+@pytest.mark.parametrize(
     ("status_code", "outcome", "reason_code", "transport_fatal", "root_path_fallback"),
     [
         (0xC0000022, "denied", "access_denied", False, False),
@@ -515,6 +613,7 @@ def test_scan_smb_emits_bounded_non_mutating_capabilities_and_disconnects(monkey
         "finalized": True,
         "degraded": False,
         "transport_failed": False,
+        "probes_aborted": False,
         "share_presence": "confirmed",
     }
     assert any(
@@ -639,6 +738,118 @@ def test_default_depth_discovers_nested_only_file_for_bounded_access_probes(monk
     )
     assert len(connection.closed) == len(connection.opens)
     assert connection.disconnected == [17]
+
+
+def test_invalid_temporary_listing_tree_does_not_abort_explicit_tree_file_probe(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _Entry:
+        def __init__(self, name, is_directory):
+            self.name = name
+            self.directory = is_directory
+
+        def get_longname(self):
+            return self.name
+
+        def is_directory(self):
+            return self.directory
+
+        def get_filesize(self):
+            return 17
+
+    class _LegacyPacket:
+        def __getitem__(self, field_name):
+            return {"ErrorClass": 2, "ErrorCode": 5}[field_name]
+
+    class _InvalidTemporaryTree(Exception):
+        def getErrorCode(self):
+            return 5
+
+        def getErrorPacket(self):
+            return _LegacyPacket()
+
+    class _Connection:
+        def __init__(self, *_args, **_kwargs):
+            self.list_calls = []
+            self.opens = []
+            self.closed = []
+            self.disconnected = []
+
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def getDialect(self):
+            return "785"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            return [{"shi1_netname": "Data\x00", "shi1_remark": "\x00"}]
+
+        def connectTree(self, _share_name):
+            return 29
+
+        def listPath(self, _share_name, wildcard):
+            self.list_calls.append(wildcard)
+            if wildcard == "*":
+                return [_Entry("root.txt", False), _Entry("Nested", True)]
+            if wildcard == "Nested\\*":
+                raise _InvalidTemporaryTree()
+            raise AssertionError(f"unexpected wildcard: {wildcard}")
+
+        def openFile(self, tree_id, path, **kwargs):
+            self.opens.append((tree_id, path, kwargs))
+            return f"handle-{len(self.opens)}"
+
+        def closeFile(self, tree_id, file_id):
+            self.closed.append((tree_id, file_id))
+
+        def disconnectTree(self, tree_id):
+            self.disconnected.append(tree_id)
+
+        def logoff(self):
+            return None
+
+    connection = _Connection()
+    monkeypatch.setattr(collector, "SessionError", _InvalidTemporaryTree)
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: connection)
+    writer = SimpleNamespace(records=[], emit=lambda record: writer.records.append(record))
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=True,
+        username="",
+        password="",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=[],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=2,
+        max_entries_per_share=10,
+        access_probe_limit=2,
+        cancel_event=threading.Event(),
+    )
+
+    assert collector.scan_host_smb(
+        "10.0.0.12", args, "run-invalid-list-tree", writer, collector.Stats(), threading.Lock()
+    ) is True
+
+    final = [record for record in writer.records if record.get("type") == "resource"][-1]
+    assert final["access_level"] == "readable"
+    assert final["access_capabilities"]["read_file"]["status"] == "allowed"
+    assert final["access_capabilities"]["_metadata"]["probes_aborted"] is False
+    assert any(
+        path == "root.txt" and kwargs["desiredAccess"] == collector.FILE_READ_DATA
+        for _tree_id, path, kwargs in connection.opens
+    )
+    assert connection.list_calls == ["*", "Nested\\*"]
+    assert connection.disconnected == [29]
 
 
 def test_probe_discovery_uses_unlisted_directory_at_configured_depth_boundary(monkeypatch) -> None:

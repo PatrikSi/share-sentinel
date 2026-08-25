@@ -178,6 +178,7 @@ type ItemColumnKey =
   | "provider_parent_id"
   | "site_id"
   | "drive_id"
+  | "file_archive_status"
   | "deleted";
 type ResourceColumnKey =
   | "connection"
@@ -188,6 +189,10 @@ type ResourceColumnKey =
   | "content_status"
   | "file_count"
   | "folder_count"
+  | "archived_file_count"
+  | "reactivating_file_count"
+  | "active_file_count"
+  | "unknown_file_archive_count"
   | "total_size_bytes"
   | "provider"
   | "assessment_scope"
@@ -274,6 +279,7 @@ const ITEM_COLUMN_OPTIONS: Array<{ key: ItemColumnKey; label: string }> = [
   { key: "provider_parent_id", label: "Provider Parent ID" },
   { key: "site_id", label: "SharePoint Site ID" },
   { key: "drive_id", label: "SharePoint Drive ID" },
+  { key: "file_archive_status", label: "File Archive State" },
   { key: "deleted", label: "Deleted" },
 ];
 const RESOURCE_COLUMN_OPTIONS: Array<{ key: ResourceColumnKey; label: string }> = [
@@ -285,6 +291,10 @@ const RESOURCE_COLUMN_OPTIONS: Array<{ key: ResourceColumnKey; label: string }> 
   { key: "content_status", label: "Content State" },
   { key: "file_count", label: "Files" },
   { key: "folder_count", label: "Folders" },
+  { key: "archived_file_count", label: "Archived Files" },
+  { key: "reactivating_file_count", label: "Reactivating Files" },
+  { key: "active_file_count", label: "Files Not Archived" },
+  { key: "unknown_file_archive_count", label: "Unknown File Archive State" },
   { key: "total_size_bytes", label: "Total Size" },
   { key: "provider", label: "Source" },
   { key: "assessment_scope", label: "Assessment Scope" },
@@ -322,7 +332,7 @@ const ENDPOINT_COLUMN_OPTIONS: Array<{ key: EndpointColumnKey; label: string }> 
   { key: "run_name", label: "Run Name" },
   { key: "run_id", label: "Run ID" },
 ];
-const QUERYABLE_FIELDS: InventoryQueryField[] = ["search", "endpoint", "share", "path", "ext", "access", "provider", "source", "resource_type", "item_type", "exposure"];
+const QUERYABLE_FIELDS: InventoryQueryField[] = ["search", "endpoint", "share", "path", "ext", "access", "provider", "source", "resource_type", "item_type", "file_archive_status", "exposure"];
 const MAX_EXPLICIT_RUN_SELECTIONS = 100;
 const ACCESS_QUERY_ALIASES: Record<string, string> = {
   no_access: "no_access",
@@ -364,7 +374,7 @@ function normalizeReflectionValue(field: InventoryQueryField, value: string): st
   if (field === "access") {
     return ACCESS_QUERY_ALIASES[trimmed.toLowerCase().replaceAll(" ", "_")] || trimmed.toLowerCase();
   }
-  if (field === "provider" || field === "source" || field === "resource_type" || field === "item_type") return trimmed.toLowerCase().replaceAll(" ", "_");
+  if (field === "provider" || field === "source" || field === "resource_type" || field === "item_type" || field === "file_archive_status") return trimmed.toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
   if (field === "exposure") {
     const normalized = trimmed.toLowerCase().replaceAll(" ", "_");
     return EXPOSURE_QUERY_ALIASES[normalized] || trimmed.toUpperCase();
@@ -419,6 +429,7 @@ function blankQueryFilterReflections(): Record<InventoryQueryField, QueryFilterR
     source: { value: "", modeLabel: null, summary: null, selectValue: "" },
     resource_type: { value: "", modeLabel: null, summary: null, selectValue: "" },
     item_type: { value: "", modeLabel: null, summary: null, selectValue: "" },
+    file_archive_status: { value: "", modeLabel: null, summary: null, selectValue: "" },
     exposure: { value: "", modeLabel: null, summary: null, selectValue: "" },
   };
 }
@@ -454,11 +465,12 @@ const QUERY_FIELD_LABELS: Record<InventoryQueryField, string> = {
   share: "Share",
   path: "Path",
   ext: "Extension",
-  access: "Observed Access",
+  access: "Compatibility Access",
   provider: "Source",
   source: "Run Source",
   resource_type: "Resource Type",
   item_type: "Item Type",
+  file_archive_status: "File Archive State",
   exposure: "Exposure",
 };
 
@@ -1740,6 +1752,7 @@ export function ProjectInventoryPage() {
     const siteId = metadataString(row.metadata, "site_id", "siteId");
     const siteName = metadataString(row.endpoint_metadata, "display_name", "displayName", "site_name", "siteName", "name");
     const driveId = metadataString(row.metadata, "drive_id", "driveId");
+    const fileArchiveStatus = metadataString(row.metadata, "file_archive_status", "fileArchiveStatus");
     const webUrl = safeExternalUrl(row.web_url);
     if (column === "connection") {
       return (
@@ -1807,7 +1820,7 @@ export function ProjectInventoryPage() {
         <AccessCapabilityCell
           accessLevel={row.access_level}
           capabilities={row.access_capabilities}
-          evidenceScope={provider === "sharepoint" ? "Library scope" : "Share sample"}
+          evidenceScope={provider === "sharepoint" ? "Library scope" : provider === "smb" ? "Bounded share sample" : undefined}
           label={label}
           onCopy={copyExactValue}
           onFilter={(value, negated) => applyCellFilter("access", value, negated)}
@@ -1832,6 +1845,20 @@ export function ProjectInventoryPage() {
     if (column === "provider_parent_id") return <InventoryCell text={row.provider_parent_id || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "site_id") return <InventoryCell text={siteId || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "drive_id") return <InventoryCell text={driveId || "—"} label={label} mono onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "file_archive_status") {
+      if (provider !== "sharepoint" || row.is_dir) {
+        return <InventoryCell text="Not applicable" filterValue="" label={label} badge="neutral" onFilter={applyCellFilter} onCopy={copyExactValue} />;
+      }
+      const normalized = fileArchiveStatus?.toLowerCase().replaceAll("-", "_") || "unknown";
+      const presentation = normalized === "fully_archived"
+        ? { text: "Fully archived", badge: "warning" as const }
+        : normalized === "reactivating"
+          ? { text: "Reactivating", badge: "warning" as const }
+          : normalized === "not_archived"
+            ? { text: "Not archived", badge: "positive" as const }
+            : { text: "Unknown", badge: "neutral" as const };
+      return <InventoryCell text={presentation.text} filterField="file_archive_status" filterValue={fileArchiveStatus || ""} label={label} badge={presentation.badge} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    }
     if (column === "deleted") return <InventoryCell text={row.deleted ? "Deleted" : "Current"} label={label} badge={row.deleted ? "warning" : "positive"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     return <InventoryCell text={row.is_dir ? "Directory" : "File"} label={label} badge="neutral" filterField="item_type" filterValue={row.is_dir ? "directory" : "file"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
   }
@@ -1901,6 +1928,10 @@ export function ProjectInventoryPage() {
     }
     if (column === "file_count") return <InventoryCell text={sharePointAssessment?.fileCount?.toLocaleString() || "—"} filterValue={sharePointAssessment?.fileCount == null ? "" : String(sharePointAssessment.fileCount)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "folder_count") return <InventoryCell text={sharePointAssessment?.folderCount?.toLocaleString() || "—"} filterValue={sharePointAssessment?.folderCount == null ? "" : String(sharePointAssessment.folderCount)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "archived_file_count") return <InventoryCell text={sharePointAssessment?.archivedFileCount?.toLocaleString() || "—"} filterValue={sharePointAssessment?.archivedFileCount == null ? "" : String(sharePointAssessment.archivedFileCount)} label={label} badge={sharePointAssessment?.archivedFileCount ? "warning" : "neutral"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "reactivating_file_count") return <InventoryCell text={sharePointAssessment?.reactivatingFileCount?.toLocaleString() || "—"} filterValue={sharePointAssessment?.reactivatingFileCount == null ? "" : String(sharePointAssessment.reactivatingFileCount)} label={label} badge={sharePointAssessment?.reactivatingFileCount ? "warning" : "neutral"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "active_file_count") return <InventoryCell text={sharePointAssessment?.activeFileCount?.toLocaleString() || "—"} filterValue={sharePointAssessment?.activeFileCount == null ? "" : String(sharePointAssessment.activeFileCount)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
+    if (column === "unknown_file_archive_count") return <InventoryCell text={sharePointAssessment?.unknownFileArchiveCount?.toLocaleString() || "—"} filterValue={sharePointAssessment?.unknownFileArchiveCount == null ? "" : String(sharePointAssessment.unknownFileArchiveCount)} label={label} badge={sharePointAssessment?.unknownFileArchiveCount ? "warning" : "neutral"} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "total_size_bytes") return <InventoryCell text={sharePointAssessment?.totalSizeBytes == null ? "—" : formatAssessmentBytes(sharePointAssessment.totalSizeBytes)} filterValue={sharePointAssessment?.totalSizeBytes == null ? "" : String(sharePointAssessment.totalSizeBytes)} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "name") return <InventoryCell text={row.name} label={label} filterField="share" onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "provider") return <InventoryCell content={<ProviderBadge provider={provider} />} text={providerLabel(provider)} filterField="provider" filterValue={provider} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
@@ -1912,6 +1943,7 @@ export function ProjectInventoryPage() {
         <AccessCapabilityCell
           accessLevel={row.access_level}
           capabilities={row.access_capabilities}
+          evidenceScope={provider === "smb" ? "Bounded share sample" : provider === "sharepoint" ? "Library scope" : undefined}
           label={label}
           onCopy={copyExactValue}
           onFilter={(value, negated) => applyCellFilter("access", value, negated)}
@@ -2294,7 +2326,7 @@ export function ProjectInventoryPage() {
                     ["share", "Share", shareFilter],
                     ["path", "Path", pathPrefix],
                     ["ext", "Extension", extFilter],
-                    ["access", "Access", resourceAccess],
+                    ["access", "Compatibility Access", resourceAccess],
                     ["provider", "Source", providerFilter],
                     ["resource_type", "Resource Type", resourceTypeFilter],
                     ["item_type", "Item Type", itemTypeFilter],
@@ -2419,14 +2451,14 @@ export function ProjectInventoryPage() {
                 </label>
               ) : null}
               {activeTab === "resources" ? (
-                <label className={FILTER_LABEL_CLASS}>
-                  Access
+                <label className={FILTER_LABEL_CLASS} title="Filters the stable compatibility field; inspect Observed Access for richer sampled evidence">
+                  Compatibility access
                   <select className={FILTER_SELECT_CLASS} onChange={(event) => handleSimpleFilterChange(setResourceAccess, event.target.value)} value={resourceAccess}>
                     <option value="">Any access</option>
                     <option value="readable">Read observed</option>
                     <option value="list_only">List observed</option>
                     <option value="no_access">Access denied</option>
-                    <option value="unknown">Unknown / inconclusive</option>
+                    <option value="unknown">Other / no read-list classification</option>
                   </select>
                 </label>
               ) : null}
@@ -2456,7 +2488,7 @@ export function ProjectInventoryPage() {
                 placeholder={'provider = "sharepoint" AND exposure = "ANONYMOUS"'}
                 value={inventoryQueryInput}
               />
-              <p id="inventory-query-help">Fields: search, endpoint, share, path, ext, access, provider, source, resource_type, item_type, exposure. Operators: = exact, ~ contains, ^ starts with, AND, OR, ! not. Double a quote mark inside a quoted value.</p>
+              <p id="inventory-query-help">Fields: search, endpoint, share, path, ext, access, provider, source, resource_type, item_type, file_archive_status, exposure. Operators: = exact, ~ contains, ^ starts with, AND, OR, ! not. Double a quote mark inside a quoted value.</p>
             </div>
             <div className="inventory-query-actions">
               <button className="inventory-button-primary" onClick={handleInventoryQueryApply} type="button">Apply query</button>

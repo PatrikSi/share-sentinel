@@ -233,6 +233,106 @@ def test_main_reports_output_write_errors_instead_of_traceback(monkeypatch, tmp_
     assert "output error: failed to write output" in stderr_capture.getvalue().lower()
 
 
+def test_main_discards_output_when_dependency_warning_cannot_be_written(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "dependency-write-failed.ndjson"
+    args = _base_args(str(output_path))
+    stderr_capture = io.StringIO()
+    original_emit = collector.NDJSONWriter.emit
+
+    def _fail_warning_emit(self, record):
+        if record.get("code") == "SCAN_DEPENDENCY_WARNING":
+            raise OSError("disk quota exceeded")
+        return original_emit(self, record)
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        collector,
+        "_validate_runtime_dependencies",
+        lambda *_args, **_kwargs: (set(), ["optional scanner unavailable"], []),
+    )
+    monkeypatch.setattr(collector.NDJSONWriter, "emit", _fail_warning_emit)
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == collector.EXIT_FAILURE
+    assert not output_path.exists()
+    assert "output error: disk quota exceeded" in stderr_capture.getvalue().lower()
+
+
+def test_main_discards_output_when_interruption_record_cannot_be_written(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "interruption-write-failed.ndjson"
+    args = _base_args(str(output_path))
+    stderr_capture = io.StringIO()
+    original_emit = collector.NDJSONWriter.emit
+
+    def _fail_interruption_emit(self, record):
+        if record.get("code") == "SCAN_INTERRUPTED":
+            raise OSError("disk quota exceeded")
+        return original_emit(self, record)
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "SMBConnection", object())
+    monkeypatch.setattr(
+        collector,
+        "_scan_targets",
+        lambda *_args, **_kwargs: collector.ScanOutcome(
+            targets_submitted=1,
+            targets_completed=0,
+            host_failures=0,
+            interrupted=True,
+            targets_cancelled=1,
+        ),
+    )
+    monkeypatch.setattr(collector.NDJSONWriter, "emit", _fail_interruption_emit)
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == collector.EXIT_FAILURE
+    assert not output_path.exists()
+    assert "output error: disk quota exceeded" in stderr_capture.getvalue().lower()
+
+
+def test_main_discards_output_when_orchestration_error_record_cannot_be_written(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "orchestration-write-failed.ndjson"
+    args = _base_args(str(output_path))
+    stderr_capture = io.StringIO()
+    original_emit = collector.NDJSONWriter.emit
+
+    def _fail_orchestration_emit(self, record):
+        if record.get("code") == "SCAN_ORCHESTRATION_FAILED":
+            error = OSError("disk quota exceeded")
+            self._spool_error = error
+            raise error
+        return original_emit(self, record)
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "SMBConnection", object())
+    monkeypatch.setattr(
+        collector.concurrent.futures,
+        "ThreadPoolExecutor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("thread quota exhausted")),
+    )
+    monkeypatch.setattr(collector.NDJSONWriter, "emit", _fail_orchestration_emit)
+    monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
+
+    rc = collector.main()
+
+    assert rc == collector.EXIT_FAILURE
+    assert not output_path.exists()
+    assert "output error: disk quota exceeded" in stderr_capture.getvalue().lower()
+
+
 def test_main_reports_upload_errors_without_traceback_returns_partial(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
     output_path = tmp_path / "upload.json"

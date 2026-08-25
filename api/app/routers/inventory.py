@@ -355,6 +355,20 @@ def _item_type_match_expression(operator: str, value: str):
     return _string_match_expression(item_type, operator, normalized_value)
 
 
+def _file_archive_status_match_expression(operator: str, value: str):
+    normalized_value = value.strip().lower().replace("-", "_").replace(" ", "_")
+    normalized_value = {
+        "archived": "fully_archived",
+        "active": "not_archived",
+        "notarchived": "not_archived",
+    }.get(normalized_value, normalized_value)
+    return _string_match_expression(
+        Item.provider_metadata["file_archive_status"].astext,
+        operator,
+        normalized_value,
+    )
+
+
 def _apply_inventory_query_groups(stmt, groups: list[list[InventoryQueryClause]], clause_builder):
     if not groups:
         return stmt
@@ -430,6 +444,8 @@ def _item_inventory_clause_expression(clause: InventoryQueryClause):
         expression = _string_match_expression(Resource.resource_type, clause.operator, clause.value)
     elif clause.field == "item_type":
         expression = _item_type_match_expression(clause.operator, clause.value)
+    elif clause.field == "file_archive_status":
+        expression = _file_archive_status_match_expression(clause.operator, clause.value)
     elif clause.field == "exposure":
         expression = _string_match_expression(Item.exposure, clause.operator, clause.value)
     else:
@@ -524,6 +540,10 @@ def _resource_inventory_clause_expression(clause: InventoryQueryClause):
         item_subquery = item_subquery.where(_string_match_expression(Item.path, clause.operator, clause.value))
     elif clause.field == "item_type":
         item_subquery = item_subquery.where(_item_type_match_expression(clause.operator, clause.value))
+    elif clause.field == "file_archive_status":
+        item_subquery = item_subquery.where(
+            _file_archive_status_match_expression(clause.operator, clause.value)
+        )
     else:
         item_subquery = item_subquery.where(_ext_match_expression(ext_expr, clause.operator, clause.value))
 
@@ -658,6 +678,10 @@ def _endpoint_inventory_clause_expression(clause: InventoryQueryClause):
         item_subquery = item_subquery.where(_string_match_expression(Item.path, clause.operator, clause.value))
     elif clause.field == "item_type":
         item_subquery = item_subquery.where(_item_type_match_expression(clause.operator, clause.value))
+    elif clause.field == "file_archive_status":
+        item_subquery = item_subquery.where(
+            _file_archive_status_match_expression(clause.operator, clause.value)
+        )
     else:
         item_subquery = item_subquery.where(_ext_match_expression(ext_expr, clause.operator, clause.value))
 

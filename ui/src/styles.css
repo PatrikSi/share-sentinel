@@ -1189,6 +1189,10 @@ body {
   @apply max-w-[240px] truncate text-[10px] font-medium text-slate-500 dark:text-slate-400;
 }
 
+.inventory-access-compatibility {
+  @apply whitespace-nowrap rounded border border-dashed border-slate-300 px-1.5 py-0.5 font-mono text-[9px] text-slate-500 dark:border-slate-700 dark:text-slate-400;
+}
+
 .inventory-access-state.is-neutral {
   @apply bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200;
 }

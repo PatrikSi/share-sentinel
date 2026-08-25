@@ -1,5 +1,8 @@
+import concurrent.futures
 import hashlib
 import io
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -14,6 +17,7 @@ from sharepoint.collection import (
     SharePointCollector,
     SharePointProgress,
     SharePointStats,
+    Site,
     collection_context_record,
     discover_drives,
     discover_sites,
@@ -221,6 +225,8 @@ def test_target_site_url_is_canonically_encoded_once(reference: str, graph_path:
     assert site.site_id == SITE_ID
     assert site.existence_status == "confirmed"
     assert site.archive_status == "not_archived"
+    assert site.archive_status_checked is True
+    assert site.archive_status_authoritative is False
     assert client.calls == [("get", selected_path)]
 
 
@@ -400,6 +406,29 @@ def test_periodic_progress_omits_ambiguous_retry_placeholder() -> None:
     assert "progress:" in output
     assert "elapsed=" in output
     assert "retries_pending" not in output
+
+
+def test_site_lifecycle_progress_reports_phase_completion() -> None:
+    stream = io.StringIO()
+    stats = SharePointStats(sites_discovered=2)
+    progress = SharePointProgress(
+        stats,
+        quiet=False,
+        verbosity=1,
+        interval_seconds=0.001,
+        stream=stream,
+    )
+    site = SimpleNamespace(display_name="Finance", name="Finance")
+
+    progress.set_site_status_total(2)
+    progress.site_status_finished(site, succeeded=True)
+    progress.site_status_finished(site, succeeded=False)
+    progress.report(force=True)
+
+    output = stream.getvalue()
+    assert "lifecycle=2/2" in output
+    assert "site lifecycle Finance: ok" in output
+    assert "site lifecycle Finance: indeterminate" in output
 
 
 def test_drive_search_supports_graphrunner_and_sharepoint_id_shapes() -> None:
@@ -652,6 +681,7 @@ def test_item_name_and_library_relative_path_bounds_are_not_truncated() -> None:
         ({"parentReference": []}, "item_parent_reference_invalid"),
         ({"parentReference": {"id": []}}, "item_parent_id_invalid"),
         ({"file": []}, "item_file_facet_invalid"),
+        ({"file": {"archiveStatus": []}}, "item_file_archive_status_invalid"),
         ({"folder": []}, "item_folder_facet_invalid"),
         ({"folder": {}, "file": {}}, "item_conflicting_facets"),
     ],
@@ -669,6 +699,45 @@ def test_malformed_drive_item_facets_are_rejected(changes: dict[str, object], ex
         )
 
     assert error.value.code == expected_code
+
+
+@pytest.mark.parametrize(
+    ("raw_status", "expected"),
+    [
+        ("fullyArchived", "fully_archived"),
+        ("reactivating", "reactivating"),
+        ("notArchived", "not_archived"),
+        ("unknownFutureValue", "unknown"),
+        (None, "not_archived"),
+    ],
+)
+def test_file_archive_status_is_preserved_when_graph_returns_it(raw_status, expected) -> None:
+    raw = _file("item", "report.txt")
+    raw["file"]["archiveStatus"] = raw_status
+
+    item = normalize_drive_item(
+        raw,
+        site_id=SITE_ID,
+        drive_id="drive-1",
+        exposure="UNKNOWN",
+        exposure_evidence={},
+    )
+
+    assert item is not None
+    assert item["metadata"]["file_archive_status"] == expected
+
+
+def test_missing_file_archive_status_remains_unknown() -> None:
+    item = normalize_drive_item(
+        _file("item", "report.txt"),
+        site_id=SITE_ID,
+        drive_id="drive-1",
+        exposure="UNKNOWN",
+        exposure_evidence={},
+    )
+
+    assert item is not None
+    assert item["metadata"]["file_archive_status"] == "unknown"
 
 
 def test_broad_discovery_enriches_archive_lifecycle_and_empty_library_state(tmp_path) -> None:
@@ -706,6 +775,251 @@ def test_broad_discovery_enriches_archive_lifecycle_and_empty_library_state(tmp_
     assert collector.stats.sites_archived == 1
 
 
+def test_targeted_unknown_future_lifecycle_marks_run_partial(tmp_path) -> None:
+    reference = "https://contoso.sharepoint.com/sites/Finance"
+    routes = _routes([{"value": [], "@odata.deltaLink": DELTA_1}])
+    routes[f"sites/contoso.sharepoint.com:/sites/Finance?$select={SITE_SELECT}"] = {
+        **_site(),
+        "siteCollection": {
+            "hostname": "contoso.sharepoint.com",
+            "archivalDetails": {"archiveStatus": "unknownFutureValue"},
+        },
+    }
+    collector, _, writer = _collector(
+        tmp_path,
+        routes,
+        config=SharePointCollectionConfig(targeted_sites=(reference,), concurrency=1, quiet=True),
+    )
+
+    pending, status = collector.collect()
+
+    endpoint = next(record for record in writer.records if record["type"] == "endpoint")
+    issue = next(record for record in writer.records if record.get("code") == "SITE_STATUS_INDETERMINATE")
+    assert status == "partial"
+    assert len(pending) == 1
+    assert endpoint["metadata"]["archive_status"] == "unknown"
+    assert endpoint["metadata"]["lifecycle_state"] == "indeterminate"
+    assert issue["endpoint_key"] == f"sharepoint:{SITE_ID}"
+    assert collector.stats.sites_indeterminate == 1
+
+
+def test_broad_unknown_future_lifecycle_marks_run_partial_without_duplicate_lookup(tmp_path) -> None:
+    routes = _routes([{"value": [], "@odata.deltaLink": DELTA_1}])
+    routes["sites?search=*"] = [{
+        "value": [{
+            **_site(),
+            "siteCollection": {
+                "hostname": "contoso.sharepoint.com",
+                "archivalDetails": {"archiveStatus": "unknownFutureValue"},
+            },
+        }],
+    }]
+    collector, _, writer = _collector(tmp_path, routes)
+
+    _, status = collector.collect()
+
+    assert status == "partial"
+    assert collector.stats.sites_indeterminate == 1
+    assert any(record.get("code") == "SITE_STATUS_INDETERMINATE" for record in writer.records)
+    assert ("get", f"sites/{SITE_COLLECTION_ID}?$select=id,siteCollection") not in collector.client.calls
+
+
+def test_archive_enrichment_deduplicates_subsites_in_the_same_site_collection(tmp_path) -> None:
+    sites = [
+        Site(
+            site_id=f"contoso.sharepoint.com,site-guid,web-{index}",
+            name=f"Subsite {index}",
+            display_name=f"Subsite {index}",
+            web_url=f"https://contoso.sharepoint.com/sites/subsite-{index}",
+            hostname="contoso.sharepoint.com",
+            site_collection_hostname="contoso.sharepoint.com",
+            created_at=None,
+            modified_at=None,
+        )
+        for index in range(3)
+    ]
+    route = f"sites/{SITE_COLLECTION_ID}?$select=id,siteCollection"
+    collector, _, _ = _collector(
+        tmp_path,
+        {
+            route: {
+                "id": SITE_COLLECTION_ID,
+                "siteCollection": {
+                    "hostname": "contoso.sharepoint.com",
+                    "archivalDetails": {"archiveStatus": "fullyArchived"},
+                },
+            }
+        },
+        config=SharePointCollectionConfig(concurrency=3, quiet=True),
+    )
+
+    enriched = collector._enrich_site_statuses(sites)
+
+    assert [site.archive_status for site in enriched] == ["fully_archived"] * 3
+    assert collector.client.calls.count(("get", route)) == 1
+
+
+def test_archive_enrichment_reports_unknown_provider_status_as_indeterminate(tmp_path) -> None:
+    stream = io.StringIO()
+    site = Site(
+        site_id=SITE_ID,
+        name="Finance",
+        display_name="Finance",
+        web_url="https://contoso.sharepoint.com/sites/Finance",
+        hostname="contoso.sharepoint.com",
+        site_collection_hostname="contoso.sharepoint.com",
+        created_at=None,
+        modified_at=None,
+    )
+    collector, _, _ = _collector(
+        tmp_path,
+        {
+            f"sites/{SITE_COLLECTION_ID}?$select=id,siteCollection": {
+                "id": SITE_COLLECTION_ID,
+                "siteCollection": {
+                    "hostname": "contoso.sharepoint.com",
+                    "archivalDetails": {"archiveStatus": "unknownFutureValue"},
+                },
+            }
+        },
+        config=SharePointCollectionConfig(concurrency=1, quiet=False, verbosity=1),
+    )
+    collector.progress = SharePointProgress(
+        collector.stats,
+        quiet=False,
+        verbosity=1,
+        interval_seconds=0,
+        stream=stream,
+    )
+
+    enriched = collector._enrich_site_statuses([site])
+
+    assert enriched[0].archive_status == "unknown"
+    assert "site lifecycle Finance: indeterminate" in stream.getvalue()
+    assert "site lifecycle Finance: ok" not in stream.getvalue()
+
+
+def test_archive_enrichment_keeps_submitted_futures_bounded(monkeypatch, tmp_path) -> None:
+    sites = []
+    routes = {}
+    for index in range(20):
+        collection_id = f"contoso.sharepoint.com,collection-{index}"
+        sites.append(
+            Site(
+                site_id=f"{collection_id},web-{index}",
+                name=f"Site {index}",
+                display_name=f"Site {index}",
+                web_url=f"https://contoso.sharepoint.com/sites/site-{index}",
+                hostname="contoso.sharepoint.com",
+                site_collection_hostname="contoso.sharepoint.com",
+                created_at=None,
+                modified_at=None,
+            )
+        )
+        routes[f"sites/{collection_id}?$select=id,siteCollection"] = {
+            "id": collection_id,
+            "siteCollection": {"hostname": "contoso.sharepoint.com"},
+        }
+
+    collector, _, _ = _collector(
+        tmp_path,
+        routes,
+        config=SharePointCollectionConfig(concurrency=4, quiet=True),
+    )
+    original_get = collector.client.get
+
+    def slow_get(url):
+        time.sleep(0.01)
+        return original_get(url)
+
+    collector.client.get = slow_get
+    real_executor = concurrent.futures.ThreadPoolExecutor
+    counter_lock = threading.Lock()
+    counters = {"outstanding": 0, "maximum": 0}
+
+    class TrackingExecutor:
+        def __init__(self, *args, **kwargs):
+            self.inner = real_executor(*args, **kwargs)
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+        def submit(self, *args, **kwargs):
+            with counter_lock:
+                counters["outstanding"] += 1
+                counters["maximum"] = max(counters["maximum"], counters["outstanding"])
+            future = self.inner.submit(*args, **kwargs)
+
+            def finished(_future):
+                with counter_lock:
+                    counters["outstanding"] -= 1
+
+            future.add_done_callback(finished)
+            return future
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", TrackingExecutor)
+
+    enriched = collector._enrich_site_statuses(sites)
+
+    assert len(enriched) == 20
+    assert counters["maximum"] <= 4
+
+
+def test_library_processing_keeps_submitted_futures_bounded(monkeypatch, tmp_path) -> None:
+    drives = [_drive(f"drive-{index}", f"Documents {index}") for index in range(20)]
+    routes = _routes([{"value": [], "@odata.deltaLink": DELTA_1}], drives=drives)
+    collector, _, _ = _collector(
+        tmp_path,
+        routes,
+        config=SharePointCollectionConfig(concurrency=4, quiet=True),
+    )
+    real_executor = concurrent.futures.ThreadPoolExecutor
+    counter_lock = threading.Lock()
+    counters = {"outstanding": 0, "maximum": 0}
+    processed: list[str] = []
+
+    class TrackingExecutor:
+        def __init__(self, *args, **kwargs):
+            self.inner = real_executor(*args, **kwargs)
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+        def submit(self, *args, **kwargs):
+            with counter_lock:
+                counters["outstanding"] += 1
+                counters["maximum"] = max(counters["maximum"], counters["outstanding"])
+            future = self.inner.submit(*args, **kwargs)
+
+            def finished(_future):
+                with counter_lock:
+                    counters["outstanding"] -= 1
+
+            future.add_done_callback(finished)
+            return future
+
+    def slow_process(drive):
+        time.sleep(0.01)
+        with counter_lock:
+            processed.append(drive.drive_id)
+
+    collector._process_drive_safely = slow_process
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", TrackingExecutor)
+
+    collector.collect()
+
+    assert len(processed) == 20
+    assert counters["maximum"] <= 4
+
+
 def test_archive_enrichment_failure_is_scoped_and_does_not_block_library_collection(tmp_path) -> None:
     routes = _routes([{"value": [], "@odata.deltaLink": DELTA_1}])
     routes[f"sites/{SITE_COLLECTION_ID}?$select=id,siteCollection"] = GraphAPIError(
@@ -719,7 +1033,7 @@ def test_archive_enrichment_failure_is_scoped_and_does_not_block_library_collect
 
     endpoint = next(record for record in writer.records if record["type"] == "endpoint")
     issue = next(record for record in writer.records if record.get("code") == "SITE_STATUS_TRANSIENT_FAILURE")
-    assert status == "success"
+    assert status == "partial"
     assert len(pending) == 1
     assert endpoint["metadata"]["existence_status"] == "confirmed_from_discovery"
     assert endpoint["metadata"]["archive_status"] == "unknown"
@@ -753,8 +1067,11 @@ def test_no_files_collection_marks_content_not_assessed_without_delta_call(tmp_p
 
 
 def test_complete_library_reports_specific_items_counts_and_partial_observed_size(tmp_path) -> None:
+    known = _file("known", "known.txt")
+    known["file"]["archiveStatus"] = "fullyArchived"
     unknown_size = _file("unknown-size", "unknown.bin")
     unknown_size.pop("size")
+    unknown_size["file"]["archiveStatus"] = "reactivating"
     folder = {
         "id": "folder-1",
         "name": "Plans",
@@ -764,7 +1081,7 @@ def test_complete_library_reports_specific_items_counts_and_partial_observed_siz
     routes = _routes(
         [
             {
-                "value": [_file("known", "known.txt"), unknown_size, folder],
+                "value": [known, unknown_size, folder],
                 "@odata.deltaLink": DELTA_1,
             }
         ]
@@ -787,6 +1104,13 @@ def test_complete_library_reports_specific_items_counts_and_partial_observed_siz
     assert metadata["item_count"] == 3
     assert metadata["total_size_bytes"] == 42
     assert metadata["size_observation_complete"] is False
+    assert metadata["archived_file_count"] == 1
+    assert metadata["reactivating_file_count"] == 1
+    assert metadata["active_file_count"] == 0
+    assert metadata["unknown_file_archive_count"] == 0
+    assert next(item for item in items if item["provider_item_id"] == "known")["metadata"][
+        "file_archive_status"
+    ] == "fully_archived"
 
 
 def test_initial_then_incremental_collection_emits_full_materialized_snapshot(tmp_path) -> None:
@@ -953,7 +1277,7 @@ def test_malformed_item_is_reported_without_advancing_checkpoint(tmp_path) -> No
 
     assert status == "partial"
     assert pending == []
-    assert any(record.get("provider_item_id") == "valid" for record in writer.records)
+    assert not any(record.get("provider_item_id") == "valid" for record in writer.records)
     issue = next(record for record in writer.records if record.get("code") == "ITEM_METADATA_LIMIT")
     assert "x" * 256 not in str(issue)
     assert state.count_current_items(collector.scope_key, "tenant-1", SITE_ID, "drive-1") == 0

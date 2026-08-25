@@ -9,6 +9,7 @@ import pytest
 from sharepoint.auth import GraphTokenContext
 from sharepoint.state import (
     STALE_STAGE_SECONDS,
+    DriveState,
     SharePointStateStore,
     StateConflictError,
     StateStoreError,
@@ -193,15 +194,39 @@ def test_version_one_state_is_invalidated_for_hierarchy_safe_full_resync(tmp_pat
             """
         )
 
-    SharePointStateStore(state_path).initialize()
+    migrated_store = SharePointStateStore(state_path)
+    migrated_store.initialize()
 
     with sqlite3.connect(state_path) as conn:
         version = conn.execute("SELECT value FROM state_metadata WHERE key = 'schema_version'").fetchone()[0]
         item_columns = {row[1] for row in conn.execute("PRAGMA table_info(items)").fetchall()}
         item_count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-    assert version == "2"
+    assert version == "3"
     assert {"parent_id", "item_name"}.issubset(item_columns)
     assert item_count == 0
+
+
+def test_version_two_state_is_invalidated_to_backfill_file_archive_metadata(tmp_path) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    store = SharePointStateStore(state_path)
+    scope = state_scope_key(_context())
+    _begin(store, "full", scope, 0, "full")
+    _stage(store, "full", scope, [_item("a", "/a.txt")])
+    _complete(store, "full", scope, "https://graph.microsoft.com/v1.0/delta?token=1")
+    _commit(store, "full", scope)
+
+    with sqlite3.connect(state_path) as conn:
+        conn.execute("UPDATE state_metadata SET value = '2' WHERE key = 'schema_version'")
+        conn.commit()
+
+    migrated_store = SharePointStateStore(state_path)
+    migrated_store.initialize()
+
+    with sqlite3.connect(state_path) as conn:
+        version = conn.execute("SELECT value FROM state_metadata WHERE key = 'schema_version'").fetchone()[0]
+    assert version == "3"
+    assert migrated_store.count_current_items(scope, "tenant-1", "site-1", "drive-1") == 0
+    assert migrated_store.get_drive_state(scope, "tenant-1", "site-1", "drive-1") == DriveState()
 
 
 def test_delta_materializes_add_move_and_tombstone_by_stable_id(tmp_path) -> None:

@@ -14,7 +14,7 @@ from typing import Iterator
 
 from .auth import GraphTokenContext
 
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 MAX_DELTA_LINK_BYTES = 256 * 1024
 MAX_ITEM_PAYLOAD_BYTES = 256 * 1024
 MAX_PROVIDER_ITEM_ID_CHARACTERS = 512
@@ -183,7 +183,7 @@ class SharePointStateStore:
                     )
                     row = conn.execute("SELECT value FROM state_metadata WHERE key = 'schema_version'").fetchone()
                     existing_version = int(row[0]) if row is not None else None
-                    if existing_version not in {None, 1, STATE_SCHEMA_VERSION}:
+                    if existing_version not in {None, 1, 2, STATE_SCHEMA_VERSION}:
                         raise StateStoreError(f"unsupported SharePoint state schema version: {row[0]}")
                     conn.execute("BEGIN IMMEDIATE")
                     hierarchy_columns = {
@@ -200,10 +200,12 @@ class SharePointStateStore:
                                 raise StateStoreError("SharePoint state schema is missing hierarchy metadata")
                             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
                             missing_columns = True
-                    if existing_version == 1 or missing_columns:
-                        # Version 1 did not retain stable parent relationships,
-                        # so its paths cannot be made rename-safe. Invalidate it
-                        # transactionally and let the next run perform a full sync.
+                    if existing_version in {1, 2} or missing_columns:
+                        # Version 1 did not retain stable parent relationships.
+                        # Version 2 predates file archive-state metadata, which
+                        # delta cannot backfill for unchanged items. Invalidate
+                        # either snapshot transactionally and let the next run
+                        # perform one complete, checkpoint-safe metadata sync.
                         conn.execute("DELETE FROM staged_items")
                         conn.execute("DELETE FROM pending_syncs")
                         conn.execute("DELETE FROM items")

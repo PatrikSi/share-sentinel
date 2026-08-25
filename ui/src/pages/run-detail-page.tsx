@@ -2249,6 +2249,7 @@ export function RunDetailPage() {
                     <AccessCapabilityCell
                       accessLevel={resource.access_level}
                       capabilities={resource.access_capabilities}
+                      evidenceScope={provider === "smb" ? "Bounded share sample" : provider === "sharepoint" ? "Library scope" : undefined}
                       label={provider === "sharepoint" ? "Observed library access" : "Share access"}
                     />
                     {webUrl ? <a className="inline-flex text-xs font-semibold text-sky-700 underline underline-offset-2 dark:text-sky-300" href={webUrl} rel="noreferrer" target="_blank">Open resource <span aria-hidden="true" className="ml-1">↗</span></a> : resource.web_url ? <p className="text-xs font-semibold text-amber-700 dark:text-amber-300">Unsafe external URL blocked.</p> : null}

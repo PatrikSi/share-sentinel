@@ -22,6 +22,10 @@ export type SharePointAssessment = {
   evidence: string | null;
   fileCount: number | null;
   folderCount: number | null;
+  archivedFileCount: number | null;
+  reactivatingFileCount: number | null;
+  activeFileCount: number | null;
+  unknownFileArchiveCount: number | null;
   itemCount: number | null;
   totalSizeBytes: number | null;
   canViewItems: boolean;
@@ -133,30 +137,30 @@ function lifecycleStatus(
   const value = lifecycle || archive;
 
   if (archive === "fully_archived") {
-    return { key: "archived", label: "Fully archived", tone: "warning", detail: "Graph reported the site as fully archived." };
+    return { key: "archived", label: "Site collection: fully archived", tone: "warning", detail: "Graph reported the containing site collection as fully archived." };
   }
   if (archive === "recently_archived") {
-    return { key: "archived", label: "Recently archived", tone: "warning", detail: "Graph reported the site as recently archived." };
+    return { key: "archived", label: "Site collection: recently archived", tone: "warning", detail: "Graph reported the containing site collection as recently archived." };
   }
   if (value === "archived") {
-    return { key: "archived", label: "Archived", tone: "warning", detail: "Graph reported an archived lifecycle state." };
+    return { key: "archived", label: "Site collection: archived", tone: "warning", detail: "Graph reported an archived lifecycle state for the containing site collection." };
   }
   if (value === "reactivating") {
-    return { key: "reactivating", label: "Reactivating", tone: "warning", detail: "Graph reported that the site is being reactivated." };
+    return { key: "reactivating", label: "Site collection: reactivating", tone: "warning", detail: "Graph reported that the containing site collection is being reactivated." };
   }
   if (archive === "not_archived") {
-    return { key: "not_archived", label: "Not archived", tone: "positive", detail: "Graph returned authoritative archive evidence and no archival state." };
+    return { key: "not_archived", label: "Site collection: not archived (inferred)", tone: "neutral", detail: "An explicit Graph check of the containing site collection returned no archival details. This is recorded as an inference because provider behavior can vary by cloud." };
   }
   if (value === "available" || value === "active") {
-    return { key: "available", label: "Available", tone: "positive", detail: "Graph reported an available lifecycle state." };
+    return { key: "available", label: "Site collection: available", tone: "positive", detail: "Graph reported an available lifecycle state for the containing site collection." };
   }
   if (value === "not_found") {
     return { key: "not_found", label: "Lifecycle unavailable", tone: "neutral", detail: "A missing target has no observable lifecycle state." };
   }
   if (value === "inaccessible") {
-    return { key: "inaccessible", label: "Lifecycle unverified", tone: "neutral", detail: "Permissions prevented lifecycle inspection." };
+    return { key: "inaccessible", label: "Site collection lifecycle unverified", tone: "neutral", detail: "Permissions prevented inspection of the containing site collection lifecycle." };
   }
-  return { key: "unknown", label: "Lifecycle unknown", tone: "neutral", detail: "No authoritative archive state was recorded." };
+  return { key: "unknown", label: "Site collection lifecycle unknown", tone: "neutral", detail: "No authoritative archive state was recorded for the containing site collection." };
 }
 
 function contentStatus(
@@ -245,6 +249,10 @@ export function deriveSharePointAssessment({
   const content = scope === "resource" ? contentStatus(metadata, collectionContext) : null;
   const fileCount = metadataCount(metadata, "file_count", "files");
   const folderCount = metadataCount(metadata, "folder_count", "folders");
+  const archivedFileCount = metadataCount(metadata, "archived_file_count");
+  const reactivatingFileCount = metadataCount(metadata, "reactivating_file_count");
+  const activeFileCount = metadataCount(metadata, "active_file_count");
+  const unknownFileArchiveCount = metadataCount(metadata, "unknown_file_archive_count");
   const recordedItemCount = metadataCount(metadata, "item_count", "items");
   const itemCount = recordedItemCount ?? (typeof rowItemCount === "number" && rowItemCount >= 0 ? rowItemCount : null);
   const totalSizeBytes = metadataCount(metadata, "total_size_bytes", "size_bytes");
@@ -264,6 +272,12 @@ export function deriveSharePointAssessment({
   if (enumerationStatus) details.push({ label: "Enumeration", value: humanize(enumerationStatus) });
   if (fileCount !== null) details.push({ label: "Files", value: fileCount.toLocaleString() });
   if (folderCount !== null) details.push({ label: "Folders", value: folderCount.toLocaleString() });
+  if (archivedFileCount !== null) details.push({ label: "Archived files", value: archivedFileCount.toLocaleString() });
+  if (reactivatingFileCount !== null) details.push({ label: "Reactivating files", value: reactivatingFileCount.toLocaleString() });
+  if (activeFileCount !== null) details.push({ label: "Files not archived", value: activeFileCount.toLocaleString() });
+  if (unknownFileArchiveCount !== null) {
+    details.push({ label: "Files with unknown archive state", value: unknownFileArchiveCount.toLocaleString() });
+  }
   if (itemCount !== null) details.push({ label: recordedItemCount === null ? "Collected rows" : "Items", value: itemCount.toLocaleString() });
   if (totalSizeBytes !== null) {
     details.push({
@@ -284,6 +298,10 @@ export function deriveSharePointAssessment({
     evidence: evidenceSummary(metadata, endpointMetadata),
     fileCount,
     folderCount,
+    archivedFileCount,
+    reactivatingFileCount,
+    activeFileCount,
+    unknownFileArchiveCount,
     itemCount,
     totalSizeBytes,
     canViewItems: scope === "resource" && (fileCount !== null ? fileCount > 0 : itemCount !== null && itemCount > 0),

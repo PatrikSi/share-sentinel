@@ -170,6 +170,49 @@ def test_item_type_query_compiles_for_each_inventory_level() -> None:
     assert "items.is_dir is true" in endpoint_sql
 
 
+def test_file_archive_status_query_parses_aliases_and_compiles_for_each_inventory_level() -> None:
+    assert parse_inventory_query("file_archive_state=archived") == [[
+        InventoryQueryClause(
+            field="file_archive_status",
+            operator="equals",
+            value="archived",
+        ),
+    ]]
+    clause = InventoryQueryClause(
+        field="file_archive_status",
+        operator="equals",
+        value="fully_archived",
+    )
+
+    item_sql = str(
+        inventory_router._item_inventory_clause_expression(clause).compile(
+            compile_kwargs={"literal_binds": True}
+        )
+    ).lower()
+    resource_sql = str(
+        inventory_router._resource_inventory_clause_expression(clause).compile(
+            compile_kwargs={"literal_binds": True}
+        )
+    ).lower()
+    endpoint_sql = str(
+        inventory_router._endpoint_inventory_clause_expression(clause).compile(
+            compile_kwargs={"literal_binds": True}
+        )
+    ).lower()
+
+    assert "provider_metadata" in item_sql
+    assert "file_archive_status" in item_sql
+    assert "exists" in resource_sql
+    assert "file_archive_status" in resource_sql
+    assert "exists" in endpoint_sql
+    assert "file_archive_status" in endpoint_sql
+
+
+def test_generic_archive_status_is_not_accepted_as_a_file_status_alias() -> None:
+    with pytest.raises(HTTPException, match="unsupported inventory query field"):
+        parse_inventory_query("archive_status=fully_archived")
+
+
 def test_parse_inventory_query_normalizes_visibility_to_exposure() -> None:
     assert parse_inventory_query("visibility=EXTERNAL") == [[
         InventoryQueryClause(field="exposure", operator="equals", value="EXTERNAL"),

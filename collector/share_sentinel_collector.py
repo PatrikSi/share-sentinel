@@ -121,6 +121,15 @@ SMB1_DENIED_ERROR_PAIRS = frozenset(
         (0x02, 0x0004),  # ERRSRV/ERRaccess
     }
 )
+SMB1_STATUS_REASONS = {
+    (0x01, 0x0002): "object_not_found",  # ERRDOS/ERRbadfile
+    (0x01, 0x0003): "object_not_found",  # ERRDOS/ERRbadpath
+    (0x01, 0x0043): "share_unavailable",  # ERRDOS/ERRnosuchshare
+    (0x02, 0x0005): "tree_session_invalid",  # ERRSRV/ERRinvnid
+    (0x02, 0x0006): "share_unavailable",  # ERRSRV/ERRinvnetname
+    (0x02, 0x0043): "invalid_request",  # ERRSRV/ERRfilespecs
+}
+SMB1_FLAGS2_NT_STATUS = 0x4000
 SMB_DENIED_STATUS_CODES = frozenset(
     {
         0xC0000022,  # STATUS_ACCESS_DENIED
@@ -221,8 +230,13 @@ class _SMBProbeCircuit:
     """Share-scoped circuit breaker for explicit handle probes."""
 
     transport_failed: bool = False
+    probes_aborted: bool = False
     reason_code: str | None = None
     root_path: str | None = None
+
+    @property
+    def blocked(self) -> bool:
+        return self.transport_failed or self.probes_aborted
 
 
 @dataclass(frozen=True)
@@ -231,6 +245,7 @@ class _SMBProbeClassification:
     reason_code: str
     protocol_status: str | None = None
     transport_fatal: bool = False
+    abort_remaining_probes: bool = False
     root_path_fallback: bool = False
 
 
@@ -1349,6 +1364,8 @@ def _access_capability_snapshot(
     finalized: bool = False,
     degraded: bool = False,
     transport_failed: bool = False,
+    probes_aborted: bool = False,
+    probe_abort_reason: str | None = None,
     share_presence: str = "unverified",
 ) -> dict[str, dict[str, object]]:
     snapshot: dict[str, dict[str, object]] = {}
@@ -1381,8 +1398,11 @@ def _access_capability_snapshot(
         "finalized": bool(finalized),
         "degraded": bool(degraded),
         "transport_failed": bool(transport_failed),
+        "probes_aborted": bool(probes_aborted),
         "share_presence": share_presence,
     }
+    if probe_abort_reason:
+        snapshot["_metadata"]["probe_abort_reason"] = probe_abort_reason
     return snapshot
 
 
@@ -1471,7 +1491,7 @@ def _smb_access_assessment(
         reason = "cancelled_after_observation" if any(
             (read_observed, list_observed, write_observed, control_observed, tree_observed)
         ) else "cancelled"
-    elif not workflow_finished and workflow_reason:
+    elif workflow_reason and (not workflow_finished or any_inconclusive):
         reason = workflow_reason
     elif listing_truncated:
         reason = "listing_truncated"
@@ -1529,6 +1549,26 @@ def _smb_error_identity(exc: BaseException) -> tuple[int | None, tuple[int, int]
         except Exception:
             error_packet = None
         if error_packet is not None:
+            packet_flags2: int | None = None
+            try:
+                packet_flags2 = int(error_packet["Flags2"])  # type: ignore[index]
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+                get_flags2 = getattr(error_packet, "get_flags2", None)
+                if callable(get_flags2):
+                    try:
+                        packet_flags2 = int(get_flags2())
+                    except Exception:
+                        packet_flags2 = None
+
+            # In SMB1's NT-status mode ErrorClass/_reserved/ErrorCode are the
+            # byte layout of one 32-bit NTSTATUS, not a DOS class/code pair.
+            # Impacket exposes both views on the same packet; never publish the
+            # split bytes as fabricated legacy evidence.
+            uses_nt_status = bool(
+                packet_flags2 is not None and packet_flags2 & SMB1_FLAGS2_NT_STATUS
+            ) or bool(status_code is not None and status_code > 0xFFFF)
+            if uses_nt_status:
+                return status_code, None
             try:
                 # Impacket's SMB1 NewSMBPacket is a Structure with mapping
                 # fields, not the accessor methods exposed by SessionError.
@@ -1557,10 +1597,12 @@ def _smb_protocol_status(
     status_code: int | None,
     legacy_error_pair: tuple[int, int] | None,
 ) -> str | None:
-    if status_code is not None:
+    if status_code is not None and status_code > 0xFFFF:
         return f"0x{status_code & 0xFFFFFFFF:08X}"
     if legacy_error_pair is not None:
         return f"SMB1:{legacy_error_pair[0]:02X}:{legacy_error_pair[1]:04X}"
+    if status_code is not None:
+        return f"0x{status_code & 0xFFFFFFFF:08X}"
     return None
 
 
@@ -1585,12 +1627,13 @@ def _classify_smb_probe_failure(exc: BaseException) -> _SMBProbeClassification:
             protocol_status=protocol_status,
         )
 
-    if legacy_error_pair == (0x02, 0x0005):  # ERRSRV/ERRinvtid
+    if legacy_error_pair in SMB1_STATUS_REASONS:
+        reason_code = SMB1_STATUS_REASONS[legacy_error_pair]
         return _SMBProbeClassification(
             outcome="inconclusive",
-            reason_code="transport_failure",
+            reason_code=reason_code,
             protocol_status=protocol_status,
-            transport_fatal=True,
+            abort_remaining_probes=reason_code == "tree_session_invalid",
         )
 
     if status_code in SMB_DENIED_STATUS_CODES:
@@ -1653,7 +1696,7 @@ def _probe_smb_handle_access(
     probe_circuit: _SMBProbeCircuit | None = None,
 ) -> None:
     if (cancel_event is not None and cancel_event.is_set()) or (
-        probe_circuit is not None and probe_circuit.transport_failed
+        probe_circuit is not None and probe_circuit.blocked
     ):
         return
     open_file = getattr(conn, "openFile", None)
@@ -1710,9 +1753,13 @@ def _probe_smb_handle_access(
                 method="non_mutating_handle_open",
                 scope="directory" if is_directory else "file",
             )
-            if probe_circuit is not None and classification.transport_fatal:
-                probe_circuit.transport_failed = True
-                probe_circuit.reason_code = classification.reason_code
+            if probe_circuit is not None:
+                if classification.transport_fatal:
+                    probe_circuit.transport_failed = True
+                if classification.abort_remaining_probes:
+                    probe_circuit.probes_aborted = True
+                if classification.transport_fatal or classification.abort_remaining_probes:
+                    probe_circuit.reason_code = classification.reason_code
             return
         else:
             if is_directory and not normalized_path and probe_circuit is not None:
@@ -1763,7 +1810,7 @@ def _probe_smb_directory_access(
             cancel_event=cancel_event,
             probe_circuit=probe_circuit,
         )
-        if probe_circuit is not None and probe_circuit.transport_failed:
+        if probe_circuit is not None and probe_circuit.blocked:
             break
 
 
@@ -1791,7 +1838,7 @@ def _probe_smb_file_access(
             cancel_event=cancel_event,
             probe_circuit=probe_circuit,
         )
-        if probe_circuit is not None and probe_circuit.transport_failed:
+        if probe_circuit is not None and probe_circuit.blocked:
             break
 
 
@@ -1914,7 +1961,9 @@ def _discover_smb_probe_candidates(
     limit_reached = False
 
     while queue and directory_attempts < probe_limit and inspected < max_entries and len(file_samples) < probe_limit:
-        if cancel_event is not None and cancel_event.is_set():
+        if (cancel_event is not None and cancel_event.is_set()) or (
+            probe_circuit is not None and probe_circuit.blocked
+        ):
             break
 
         directory_path = queue.popleft()
@@ -1932,10 +1981,15 @@ def _discover_smb_probe_candidates(
                     on_list_error(directory_path, exc)
                 except Exception:
                     pass
-            if _is_smb_transport_failure(exc):
+            classification = _classify_smb_probe_failure(exc)
+            if classification.transport_fatal:
                 if probe_circuit is not None:
                     probe_circuit.transport_failed = True
+                    probe_circuit.reason_code = classification.reason_code
                 break
+            # Impacket listPath() connects and disconnects its own temporary
+            # tree. An invalid TID from that call does not invalidate the
+            # separate tree_id used by non-mutating handle probes.
             continue
 
         already_listed_paths.add(directory_key)
@@ -2922,6 +2976,9 @@ def scan_host_smb(
                         )
                         if classification.transport_fatal:
                             probe_circuit.transport_failed = True
+                        if classification.abort_remaining_probes:
+                            probe_circuit.probes_aborted = True
+                        if classification.transport_fatal or classification.abort_remaining_probes:
                             probe_circuit.reason_code = classification.reason_code
                         message = f"SMB tree connection failed for {share_name}: {_error_detail(exc)}"
                         code = "TREE_CONNECT_DENIED" if outcome == "denied" else "TREE_CONNECT_FAILED"
@@ -2993,7 +3050,7 @@ def scan_host_smb(
                     tree_id is not None
                     and probe_limit > 0
                     and len(file_samples) < probe_limit
-                    and not probe_circuit.transport_failed
+                    and not probe_circuit.blocked
                     and not (cancel_event is not None and cancel_event.is_set())
                 ):
                     (
@@ -3022,7 +3079,7 @@ def scan_host_smb(
                         _handle_share_list_limit(nested_inspected, 0)
                 if tree_id is not None and probe_limit > 0:
                     for directory_path in directory_samples:
-                        if probe_circuit.transport_failed:
+                        if probe_circuit.blocked:
                             break
                         _probe_smb_directory_access(
                             conn,
@@ -3033,7 +3090,7 @@ def scan_host_smb(
                             probe_circuit,
                         )
                     for file_path in file_samples:
-                        if probe_circuit.transport_failed:
+                        if probe_circuit.blocked:
                             break
                         _probe_smb_file_access(
                             conn,
@@ -3044,11 +3101,18 @@ def scan_host_smb(
                             probe_circuit,
                         )
                 workflow_finished = not (cancel_event is not None and cancel_event.is_set())
+            except ArtifactSpoolLimitError:
+                # Output exhaustion is run-fatal. Do not relabel it as a share
+                # protocol failure or keep probing after records cannot be kept.
+                raise
             except SessionError as exc:
                 classification = _classify_smb_probe_failure(exc)
                 workflow_reason = classification.reason_code
                 if classification.transport_fatal:
                     probe_circuit.transport_failed = True
+                if classification.abort_remaining_probes:
+                    probe_circuit.probes_aborted = True
+                if classification.transport_fatal or classification.abort_remaining_probes:
                     probe_circuit.reason_code = classification.reason_code
                 _handle_list_error(share_name, "\\", exc, capabilities)
             except (socket.timeout, TimeoutError) as exc:
@@ -3078,6 +3142,8 @@ def scan_host_smb(
                 )
                 _record_error(stats, lock, "LIST_TIMEOUT", message)
             except OSError as exc:
+                if bool(getattr(writer, "write_failed", False)):
+                    raise
                 detail = _error_detail(exc)
                 message = f"SMB share listing IO failure for {share_name}: {detail}"
                 classification = _classify_smb_probe_failure(exc)
@@ -3111,6 +3177,8 @@ def scan_host_smb(
                 probe_circuit.reason_code = classification.reason_code
                 _handle_list_error(share_name, "\\", exc, capabilities)
             except Exception as exc:
+                if bool(getattr(writer, "write_failed", False)):
+                    raise
                 # Isolate a malformed appliance response or unexpected Impacket
                 # parsing failure to this share. The final resource record below
                 # preserves the degraded assessment and later shares still run.
@@ -3146,14 +3214,18 @@ def scan_host_smb(
                     "cancelled" if interrupted else workflow_reason or "not_reached",
                 )
             if int(capabilities["list"].get("attempted", 0)) <= 0:
+                if interrupted:
+                    list_not_tested_reason = "cancelled"
+                elif probe_circuit.transport_failed:
+                    list_not_tested_reason = "transport_aborted"
+                elif probe_circuit.probes_aborted:
+                    list_not_tested_reason = probe_circuit.reason_code or "probe_aborted"
+                else:
+                    list_not_tested_reason = workflow_reason or "not_reached"
                 _mark_capability_not_tested(
                     capabilities,
                     "list",
-                    "cancelled"
-                    if interrupted
-                    else "transport_aborted"
-                    if probe_circuit.transport_failed
-                    else workflow_reason or "not_reached",
+                    list_not_tested_reason,
                 )
 
             explicit_probe_capabilities = tuple(
@@ -3166,6 +3238,8 @@ def scan_host_smb(
                     reason = "cancelled"
                 elif probe_circuit.transport_failed:
                     reason = "transport_aborted"
+                elif probe_circuit.probes_aborted:
+                    reason = probe_circuit.reason_code or "probe_aborted"
                 elif workflow_reason:
                     reason = workflow_reason
                 elif tree_id is None:
@@ -3183,7 +3257,7 @@ def scan_host_smb(
                 probe_limit=probe_limit,
                 workflow_finished=workflow_finished,
                 interrupted=interrupted,
-                workflow_reason=workflow_reason,
+                workflow_reason=workflow_reason or probe_circuit.reason_code,
                 transport_failed=probe_circuit.transport_failed,
                 listing_truncated=listing_truncated,
                 file_samples=len(file_samples),
@@ -3212,6 +3286,10 @@ def scan_host_smb(
                         finalized=True,
                         degraded=assessment_degraded,
                         transport_failed=probe_circuit.transport_failed,
+                        probes_aborted=probe_circuit.probes_aborted,
+                        probe_abort_reason=(
+                            probe_circuit.reason_code if probe_circuit.probes_aborted else None
+                        ),
                         share_presence=share_presence,
                     ),
                 }
@@ -3257,6 +3335,8 @@ def scan_host_smb(
         message = f"SMB NETBIOS transport error: {detail}"
         hint = "Verify SMB connectivity and check for transport-level resets or middlebox interference."
     except (OSError, ConnectionError) as exc:
+        if bool(getattr(writer, "write_failed", False)):
+            raise
         detail = _error_detail(exc)
         code = "SMB_NETWORK_FAILED"
         message = f"SMB network failure: {detail}"
@@ -3981,6 +4061,34 @@ def _scan_thread_endpoint_key(host: str, args: argparse.Namespace | None) -> str
     return None
 
 
+def _abort_collection_output(
+    writer: NDJSONWriter,
+    *,
+    temp_artifact: str | None,
+    error: BaseException,
+) -> int:
+    """Discard incomplete buffers after an output failure and report it once."""
+
+    try:
+        writer.close(keep_output=False)
+    except BaseException:
+        # The original emit failure is the useful operator-facing cause. The
+        # close call still gets a chance to release every temporary buffer.
+        pass
+    if temp_artifact:
+        try:
+            os.unlink(temp_artifact)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(
+                f"cleanup warning: unable to remove temporary artifact: {_error_detail(exc)}",
+                file=sys.stderr,
+            )
+    print(f"output error: {_error_detail(error)}", file=sys.stderr)
+    return EXIT_FAILURE
+
+
 def main() -> int:
     args = parse_args()
     if getattr(args, "use_session_creds", False):
@@ -4138,18 +4246,8 @@ def main() -> int:
     }
     try:
         writer.emit(run_meta_record)
-    except ArtifactSpoolLimitError as exc:
-        try:
-            writer.close(keep_output=False)
-        except Exception:
-            pass
-        if temp_artifact:
-            try:
-                os.unlink(temp_artifact)
-            except OSError:
-                pass
-        print(f"output error: {_error_detail(exc)}", file=sys.stderr)
-        return EXIT_FAILURE
+    except (OSError, ArtifactSpoolLimitError) as exc:
+        return _abort_collection_output(writer, temp_artifact=temp_artifact, error=exc)
 
     for warning in dependency_warnings:
         try:
@@ -4161,37 +4259,37 @@ def main() -> int:
                 message=warning,
                 hint="Install the missing dependency to enable all requested share types.",
             )
-        except ArtifactSpoolLimitError as exc:
-            try:
-                writer.close(keep_output=False)
-            except Exception:
-                pass
-            if temp_artifact:
-                try:
-                    os.unlink(temp_artifact)
-                except OSError:
-                    pass
-            print(f"output error: {_error_detail(exc)}", file=sys.stderr)
-            return EXIT_FAILURE
+        except (OSError, ArtifactSpoolLimitError) as exc:
+            return _abort_collection_output(writer, temp_artifact=temp_artifact, error=exc)
         _record_error(stats, lock, "SCAN_DEPENDENCY_WARNING", warning)
 
     reporter.start(workers=args.workers, share_types=selected_share_types)
     run_ccache = args.ccache_env_value if smb_auth_method == "kerberos" else None
-    with _run_scoped_kerberos_cache(run_ccache):
-        scan_outcome = _scan_targets(targets, args, run_id, writer, stats, lock)
+    try:
+        with _run_scoped_kerberos_cache(run_ccache):
+            scan_outcome = _scan_targets(targets, args, run_id, writer, stats, lock)
+    except (OSError, ArtifactSpoolLimitError) as exc:
+        if isinstance(exc, ArtifactSpoolLimitError) or writer.write_failed:
+            reporter.finish(status="failure")
+            return _abort_collection_output(writer, temp_artifact=temp_artifact, error=exc)
+        raise
 
     if scan_outcome.interrupted:
         interruption_message = (
             "Collection interrupted by operator; the artifact contains only completed and drained in-flight work."
         )
-        _emit_error(
-            writer,
-            run_id,
-            severity="warn",
-            code="SCAN_INTERRUPTED",
-            message=interruption_message,
-            hint="Review the partial artifact and rerun the original scope when ready.",
-        )
+        try:
+            _emit_error(
+                writer,
+                run_id,
+                severity="warn",
+                code="SCAN_INTERRUPTED",
+                message=interruption_message,
+                hint="Review the partial artifact and rerun the original scope when ready.",
+            )
+        except (OSError, ArtifactSpoolLimitError) as exc:
+            reporter.finish(status="failure")
+            return _abort_collection_output(writer, temp_artifact=temp_artifact, error=exc)
         _record_error(stats, lock, "SCAN_INTERRUPTED", interruption_message)
 
     try:

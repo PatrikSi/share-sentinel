@@ -12,6 +12,7 @@ CANONICAL_INVENTORY_QUERY_FIELDS = {
     "provider",
     "resource_type",
     "item_type",
+    "file_archive_status",
     "exposure",
     "source",
 }
@@ -46,6 +47,9 @@ INVENTORY_QUERY_FIELD_ALIASES = {
     "entry_type": "item_type",
     "entrytype": "item_type",
     "kind": "item_type",
+    "file_archive_status": "file_archive_status",
+    "filearchivestatus": "file_archive_status",
+    "file_archive_state": "file_archive_status",
     "exposure": "exposure",
     "visibility": "exposure",
 }

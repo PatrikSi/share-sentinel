@@ -69,11 +69,11 @@ const STATUS_PRESENTATION: Record<CapabilityStatus, { icon: string; label: strin
 };
 
 const SMB_ASSESSMENT_SUMMARIES: Record<string, AccessSummary> = {
-  read_write_observed: { icon: "RW", label: "Read/write observed", tone: "positive" },
+  read_write_observed: { icon: "RW", label: "Read/write observed", tone: "warning" },
   read_observed: { icon: "R", label: "Read observed", tone: "positive" },
-  list_write_observed: { icon: "LW", label: "List/write observed", tone: "positive" },
+  list_write_observed: { icon: "LW", label: "List/write observed", tone: "warning" },
   list_observed: { icon: "L", label: "List observed", tone: "warning" },
-  write_observed: { icon: "W", label: "Write observed", tone: "positive" },
+  write_observed: { icon: "W", label: "Write observed", tone: "warning" },
   control_observed: { icon: "C", label: "Control observed", tone: "warning" },
   connected_list_denied: { icon: "C", label: "Connected; list denied", tone: "warning" },
   connected_only: { icon: "C", label: "Connection observed", tone: "neutral" },
@@ -94,6 +94,8 @@ const SMB_ASSESSMENT_REASON_LABELS: Record<string, string> = {
   sharing_violation: "The sampled object was locked or shared incompatibly",
   object_state_changed: "The sampled object changed during assessment",
   transport_failure: "The SMB transport failed before a conclusive result",
+  tree_session_invalid: "The server invalidated the SMB share tree, so remaining probes were stopped",
+  probe_aborted: "The remaining non-mutating probes were stopped after the share session became unusable",
   protocol_error: "The server returned an inconclusive SMB protocol error",
   unsupported_request: "The server did not support the requested non-mutating probe",
   invalid_request: "The server rejected the non-mutating probe request",
@@ -175,16 +177,16 @@ function accessSummary(accessLevel: string, capabilities: AccessCapabilities | n
   const anyObserved = entries.some(([key, evidence]) => key !== "tree_connect" && isObserved(evidence));
 
   if (readObserved && writeObserved) {
-    return { icon: "RW", label: "Read/write observed", tone: "positive" };
+    return { icon: "RW", label: "Read/write observed", tone: "warning" };
   }
   if (readObserved) {
     return { icon: "R", label: "Read observed", tone: "positive" };
   }
   if (listObserved && writeObserved) {
-    return { icon: "LW", label: "List/write observed", tone: "positive" };
+    return { icon: "LW", label: "List/write observed", tone: "warning" };
   }
   if (writeObserved) {
-    return { icon: "W", label: "Write observed", tone: "positive" };
+    return { icon: "W", label: "Write observed", tone: "warning" };
   }
   if (listObserved) {
     return { icon: "L", label: "List observed", tone: "warning" };
@@ -318,6 +320,8 @@ function capabilityMetadata(capabilities: AccessCapabilities | null | undefined)
     "file_samples",
     "listing_truncated",
     "transport_failed",
+    "probes_aborted",
+    "probe_abort_reason",
     "degraded",
     "partial",
     "finalized",
@@ -341,7 +345,7 @@ function capabilityMetadata(capabilities: AccessCapabilities | null | undefined)
         ? value
           ? "Yes"
           : "No"
-        : typeof value === "string" && (["assessment_summary", "assessment_reason", "share_presence", "coverage"].includes(key) || key.includes("method"))
+        : typeof value === "string" && (["assessment_summary", "assessment_reason", "share_presence", "coverage"].includes(key) || key.includes("method") || key.includes("reason"))
           ? humanizeIdentifier(value)
           : formatted;
     return [`${humanizeIdentifier(key)} ${displayValue}`];
@@ -361,6 +365,8 @@ export function AccessCapabilityCell({ accessLevel, capabilities, evidenceScope,
   const visibleWriteCapabilities = observedWriteCapabilities.slice(0, 1);
   const remainingWriteCapabilityCount = observedWriteCapabilities.length - visibleWriteCapabilities.length;
   const exactValue = accessLevel.trim();
+  const compatibilitySummary = legacyAccessSummary(accessLevel);
+  const compatibilityValueDiffers = exactValue.length > 0 && compatibilitySummary.label !== summary.label;
 
   return (
     <div className="inventory-cell inventory-access-cell">
@@ -374,8 +380,16 @@ export function AccessCapabilityCell({ accessLevel, capabilities, evidenceScope,
             {summary.label}
           </span>
           {summaryDetail ? <span className="inventory-access-reason" title={summaryDetail}>{summaryDetail}</span> : null}
+          {compatibilityValueDiffers && (onCopy || onFilter) ? (
+            <span
+              className="inventory-access-compatibility"
+              title="Inline filter and copy actions use the stable compatibility access field, not the richer sampled assessment"
+            >
+              Compatibility value: {humanizeIdentifier(exactValue)}
+            </span>
+          ) : null}
           {evidenceScope ? (
-            <span className="inventory-access-scope" title="Capability evidence is resource-level and may not apply to this exact item">
+            <span className="inventory-access-scope" title="Evidence applies at resource scope; object-level coverage depends on the collection method">
               {evidenceScope}
             </span>
           ) : null}

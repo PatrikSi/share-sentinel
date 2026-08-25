@@ -34,6 +34,11 @@ GRAPH_ARCHIVE_STATUS = {
     "fullyArchived": "fully_archived",
     "reactivating": "reactivating",
 }
+GRAPH_FILE_ARCHIVE_STATUS = {
+    "notArchived": "not_archived",
+    "fullyArchived": "fully_archived",
+    "reactivating": "reactivating",
+}
 
 
 def _terminal_safe(value: object, maximum: int = 4096) -> str:
@@ -98,6 +103,10 @@ class PendingDrive:
     folder_count: int
     total_size_bytes: int | None
     size_observation_complete: bool
+    archived_file_count: int
+    reactivating_file_count: int
+    active_file_count: int
+    unknown_file_archive_count: int
 
 
 @dataclass(frozen=True)
@@ -112,6 +121,10 @@ class LibraryObservation:
     sync_mode: str
     size_observation_complete: bool | None = None
     enumeration_error_code: str | None = None
+    archived_file_count: int | None = None
+    reactivating_file_count: int | None = None
+    active_file_count: int | None = None
+    unknown_file_archive_count: int | None = None
 
 
 @dataclass
@@ -121,6 +134,7 @@ class SharePointStats:
     endpoints_emitted: int = 0
     sites_archived: int = 0
     sites_not_found: int = 0
+    sites_not_found_or_not_visible: int = 0
     sites_inaccessible: int = 0
     sites_indeterminate: int = 0
     libraries_discovered: int = 0
@@ -131,6 +145,8 @@ class SharePointStats:
     items_deleted: int = 0
     files: int = 0
     folders: int = 0
+    archived_files: int = 0
+    reactivating_files: int = 0
     delta_drives: int = 0
     full_drives: int = 0
     delta_resets: int = 0
@@ -160,6 +176,7 @@ class SharePointStats:
                 "endpoints_emitted": self.endpoints_emitted,
                 "sites_archived": self.sites_archived,
                 "sites_not_found": self.sites_not_found,
+                "sites_not_found_or_not_visible": self.sites_not_found_or_not_visible,
                 "sites_inaccessible": self.sites_inaccessible,
                 "sites_indeterminate": self.sites_indeterminate,
                 "libraries_discovered": self.libraries_discovered,
@@ -170,6 +187,8 @@ class SharePointStats:
                 "items_deleted": self.items_deleted,
                 "files": self.files,
                 "folders": self.folders,
+                "archived_files": self.archived_files,
+                "reactivating_files": self.reactivating_files,
                 "delta_drives": self.delta_drives,
                 "full_drives": self.full_drives,
                 "delta_resets": self.delta_resets,
@@ -233,6 +252,8 @@ class SharePointProgress:
         self._last_report = 0.0
         self._total_libraries: int | None = None
         self._processed_libraries = 0
+        self._total_site_statuses: int | None = None
+        self._processed_site_statuses = 0
 
     def start(self, context: GraphTokenContext, collection_mode: str) -> None:
         if self.quiet:
@@ -247,6 +268,22 @@ class SharePointProgress:
         with self._lock:
             self._total_libraries = total
         self.report(force=True)
+
+    def set_site_status_total(self, total: int) -> None:
+        with self._lock:
+            self._total_site_statuses = max(0, total)
+            self._processed_site_statuses = 0
+        self.report(force=True)
+
+    def site_status_finished(self, site: Site, *, succeeded: bool) -> None:
+        with self._lock:
+            self._processed_site_statuses += 1
+        if self.verbosity >= 1 and not self.quiet:
+            self._write(
+                f"site lifecycle {site.display_name or site.name}: "
+                f"{'ok' if succeeded else 'indeterminate'}"
+            )
+        self.report()
 
     def detail(self, message: str, *, level: int = 1) -> None:
         if not self.quiet and self.verbosity >= level:
@@ -271,12 +308,19 @@ class SharePointProgress:
             self._last_report = now
             processed = self._processed_libraries
             total = self._total_libraries
+            processed_site_statuses = self._processed_site_statuses
+            total_site_statuses = self._total_site_statuses
         stats = self.stats.snapshot()
         remaining = "unknown" if total is None else str(max(0, total - processed))
+        site_status = (
+            ""
+            if total_site_statuses is None
+            else f" lifecycle={processed_site_statuses}/{total_site_statuses}"
+        )
         elapsed = max(0.0, now - self.started)
         self._write(
             "progress: "
-            f"sites={stats['sites_discovered']} libraries={processed}/"
+            f"sites={stats['sites_discovered']}{site_status} libraries={processed}/"
             f"{total if total is not None else 'unknown'} remaining={remaining} "
             f"items={stats['items']} failures={stats['libraries_failed']} "
             f"elapsed={elapsed:.1f}s"
@@ -352,9 +396,11 @@ def _archive_status_from_graph(
     if raw_details is None:
         if explicitly_selected:
             # archiveStatus has no active value. When the siteCollection facet
-            # was explicitly selected, absence of archivalDetails is Graph's
-            # representation of a collection that is not archived.
-            return "not_archived", True, True
+            # was explicitly selected, absence of archivalDetails is consistent
+            # with a collection that is not archived. Graph does not explicitly
+            # guarantee that absence across every cloud, so record the check as
+            # an inference rather than authoritative provider evidence.
+            return "not_archived", True, False
         return "unknown", False, False
     if not isinstance(raw_details, dict):
         raise GraphProtocolError(status_code=None, code="site_archival_details_invalid")
@@ -708,13 +754,17 @@ def discover_sites(
     return sites, truncated
 
 
+def _site_collection_id(site: Site) -> str:
+    identity_parts = site.site_id.split(",")
+    return ",".join(identity_parts[:2]) if len(identity_parts) >= 2 else site.site_id
+
+
 def enrich_site_archive_status(client: GraphClient, site: Site) -> Site:
     """Resolve authoritative site-collection archival details for one site."""
 
     if site.archive_status_checked:
         return site
-    identity_parts = site.site_id.split(",")
-    collection_id = ",".join(identity_parts[:2]) if len(identity_parts) >= 2 else site.site_id
+    collection_id = _site_collection_id(site)
     raw = client.get(f"sites/{_graph_id_path(collection_id)}?$select=id,siteCollection")
     archive_status, checked, authoritative = _archive_status_from_graph(
         raw.get("siteCollection"),
@@ -798,6 +848,24 @@ def _canonical_parent_path(raw_parent_path: object) -> str:
     return "/" + "/".join(part for part in raw.split("/") if part)
 
 
+def _file_archive_status(file_facet: dict[str, object] | None) -> str | None:
+    if file_facet is None:
+        return None
+    if "archiveStatus" not in file_facet:
+        # Graph v1.0 documentation has not yet made this facet contractual in
+        # every cloud. Preserve uncertainty when the provider omits the field.
+        return "unknown"
+    raw_status = file_facet.get("archiveStatus")
+    if raw_status is None or (isinstance(raw_status, str) and not raw_status.strip()):
+        # Microsoft 365 Archive documents a blank value for active files.
+        return "not_archived"
+    if not isinstance(raw_status, str):
+        raise GraphProtocolError(status_code=None, code="item_file_archive_status_invalid")
+    if raw_status == "unknownFutureValue":
+        return "unknown"
+    return GRAPH_FILE_ARCHIVE_STATUS.get(raw_status, "unknown")
+
+
 def normalize_drive_item(
     raw: dict[str, object],
     *,
@@ -859,7 +927,9 @@ def normalize_drive_item(
     parent_id = _bounded_exact_text(raw_parent_id, PROVIDER_ID_MAX_CHARACTERS)
     if raw_parent_id is not None and parent_id is None:
         raise GraphProtocolError(status_code=None, code="item_parent_id_invalid")
-    mime_type = _bounded_text(file_facet.get("mimeType"), 255) if isinstance(file_facet, dict) else None
+    normalized_file_facet = file_facet if isinstance(file_facet, dict) else None
+    mime_type = _bounded_text(normalized_file_facet.get("mimeType"), 255) if normalized_file_facet else None
+    file_archive_status = _file_archive_status(normalized_file_facet)
     return {
         "provider": "sharepoint",
         "provider_resource_id": drive_id,
@@ -882,6 +952,7 @@ def normalize_drive_item(
             "etag": _bounded_text(raw.get("eTag"), METADATA_TEXT_MAX_CHARACTERS),
             "ctag": _bounded_text(raw.get("cTag"), METADATA_TEXT_MAX_CHARACTERS),
             "folder_child_count": folder_child_count,
+            "file_archive_status": file_archive_status,
         },
     }
 
@@ -1057,11 +1128,11 @@ class SharePointCollector:
             evidence["archive_status_site_collection_id"] = (
                 ",".join(identity_parts[:2]) if len(identity_parts) >= 2 else site.site_id
             )
-        if site.archive_status_authoritative:
+        if site.archive_status_checked:
             evidence["archive_status_source"] = (
                 "siteCollection.archivalDetails.archiveStatus"
                 if site.archive_status != "not_archived"
-                else "siteCollection.archivalDetails absent after explicit selection"
+                else "inferred from siteCollection.archivalDetails absence after explicit selection"
             )
         self.writer.emit(
             {
@@ -1129,7 +1200,7 @@ class SharePointCollector:
         )
         self.stats.increment("endpoints_emitted")
         if assessment == "not_found_or_not_visible":
-            self.stats.increment("sites_not_found")
+            self.stats.increment("sites_not_found_or_not_visible")
         elif assessment == "inaccessible":
             self.stats.increment("sites_inaccessible")
         else:
@@ -1162,6 +1233,10 @@ class SharePointCollector:
             "collection_complete": observation.collection_complete,
             "sync_mode": observation.sync_mode,
             "size_observation_complete": observation.size_observation_complete,
+            "archived_file_count": observation.archived_file_count,
+            "reactivating_file_count": observation.reactivating_file_count,
+            "active_file_count": observation.active_file_count,
+            "unknown_file_archive_count": observation.unknown_file_archive_count,
         }
         if observation.enumeration_error_code:
             metadata["enumeration_error_code"] = observation.enumeration_error_code
@@ -1184,57 +1259,132 @@ class SharePointCollector:
         )
 
     def _enrich_site_statuses(self, sites: list[Site]) -> list[Site]:
-        pending = [(index, site) for index, site in enumerate(sites) if not site.archive_status_checked]
-        if not pending:
+        pending_by_collection: dict[str, list[tuple[int, Site]]] = {}
+        for index, site in enumerate(sites):
+            if not site.archive_status_checked:
+                pending_by_collection.setdefault(_site_collection_id(site), []).append((index, site))
+        pending_groups = list(pending_by_collection.values())
+        if not pending_groups:
             return sites
 
         enriched = list(sites)
+        pending_site_count = sum(len(group) for group in pending_groups)
+        self.progress.set_site_status_total(pending_site_count)
 
-        def handle_result(index: int, site: Site) -> None:
+        def handle_result(group: list[tuple[int, Site]]) -> None:
+            representative = group[0][1]
             try:
-                enriched[index] = enrich_site_archive_status(self.client, site)
+                resolved = enrich_site_archive_status(self.client, representative)
             except GraphAPIError as exc:
-                self.stats.increment("sites_indeterminate")
+                self.stats.increment("sites_indeterminate", len(group))
                 self.emit_error(
                     _error_code(exc, prefix="SITE_STATUS"),
                     str(exc),
-                    endpoint_key=self._endpoint_key(site),
+                    endpoint_key=self._endpoint_key(representative),
                     hint=(
-                        "The site was discovered, but its archive lifecycle could not be confirmed; "
-                        "library enumeration continues."
+                        "The site collection was discovered, but its archive lifecycle could not be confirmed for "
+                        f"{len(group)} site(s); library enumeration continues."
                     ),
                 )
+                for _, site in group:
+                    self.progress.site_status_finished(site, succeeded=False)
+            else:
+                for index, site in group:
+                    enriched[index] = replace(
+                        site,
+                        archive_status=resolved.archive_status,
+                        archive_status_checked=resolved.archive_status_checked,
+                        archive_status_authoritative=resolved.archive_status_authoritative,
+                    )
+                    self.progress.site_status_finished(
+                        site,
+                        succeeded=resolved.archive_status != "unknown",
+                    )
 
-        max_workers = max(1, min(int(self.config.concurrency), 16, len(pending)))
+        max_workers = max(1, min(int(self.config.concurrency), 16, len(pending_groups)))
         if max_workers == 1:
-            for index, site in pending:
-                handle_result(index, site)
+            for group in pending_groups:
+                handle_result(group)
             return enriched
 
+        # Keep only one request per worker in flight. Large tenants can expose
+        # hundreds of thousands of sites, so submitting one Future per site
+        # would turn a bounded network phase into unbounded coordinator memory.
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="sharepoint-site-status",
         ) as executor:
-            futures = {
-                executor.submit(enrich_site_archive_status, self.client, site): (index, site)
-                for index, site in pending
-            }
-            for future in concurrent.futures.as_completed(futures):
-                index, site = futures[future]
+            pending_iterator = iter(pending_groups)
+            futures: dict[concurrent.futures.Future[Site], list[tuple[int, Site]]] = {}
+
+            def submit_next() -> bool:
                 try:
-                    enriched[index] = future.result()
-                except GraphAPIError as exc:
-                    self.stats.increment("sites_indeterminate")
-                    self.emit_error(
-                        _error_code(exc, prefix="SITE_STATUS"),
-                        str(exc),
-                        endpoint_key=self._endpoint_key(site),
-                        hint=(
-                            "The site was discovered, but its archive lifecycle could not be confirmed; "
-                            "library enumeration continues."
-                        ),
-                    )
+                    group = next(pending_iterator)
+                except StopIteration:
+                    return False
+                futures[executor.submit(enrich_site_archive_status, self.client, group[0][1])] = group
+                return True
+
+            for _ in range(max_workers):
+                if not submit_next():
+                    break
+
+            while futures:
+                completed, _ = concurrent.futures.wait(
+                    tuple(futures),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in completed:
+                    group = futures.pop(future)
+                    representative = group[0][1]
+                    try:
+                        resolved = future.result()
+                    except GraphAPIError as exc:
+                        self.stats.increment("sites_indeterminate", len(group))
+                        self.emit_error(
+                            _error_code(exc, prefix="SITE_STATUS"),
+                            str(exc),
+                            endpoint_key=self._endpoint_key(representative),
+                            hint=(
+                                "The site collection was discovered, but its archive lifecycle could not be confirmed "
+                                f"for {len(group)} site(s); library enumeration continues."
+                            ),
+                        )
+                        for _, site in group:
+                            self.progress.site_status_finished(site, succeeded=False)
+                    else:
+                        for index, site in group:
+                            enriched[index] = replace(
+                                site,
+                                archive_status=resolved.archive_status,
+                                archive_status_checked=resolved.archive_status_checked,
+                                archive_status_authoritative=resolved.archive_status_authoritative,
+                            )
+                            self.progress.site_status_finished(
+                                site,
+                                succeeded=resolved.archive_status != "unknown",
+                            )
+                    submit_next()
         return enriched
+
+    def _record_unknown_site_statuses(self, sites: list[Site]) -> None:
+        unknown_by_collection: dict[str, list[Site]] = {}
+        for site in sites:
+            if site.archive_status_checked and site.archive_status == "unknown":
+                unknown_by_collection.setdefault(_site_collection_id(site), []).append(site)
+        for group in unknown_by_collection.values():
+            representative = group[0]
+            self.stats.increment("sites_indeterminate", len(group))
+            self.emit_error(
+                "SITE_STATUS_INDETERMINATE",
+                "Microsoft Graph returned an unrecognized or future archive lifecycle value for "
+                f"{len(group)} site(s) in this site collection.",
+                endpoint_key=self._endpoint_key(representative),
+                hint=(
+                    "The sites remain in inventory and library enumeration continues, but this run is partial until "
+                    "the collector understands the provider lifecycle value."
+                ),
+            )
 
     def collect(self) -> tuple[list[PendingDrive], str]:
         self.state.initialize()
@@ -1290,8 +1440,9 @@ class SharePointCollector:
                 "SharePoint site discovery reached the configured safety limit.",
                 hint="Increase --max-sites after reviewing tenant scale.",
             )
-        sites = self._enrich_site_statuses(sites)
         self.stats.sites_discovered = len(sites)
+        sites = self._enrich_site_statuses(sites)
+        self._record_unknown_site_statuses(sites)
         for site in sites:
             self._emit_endpoint(site)
 
@@ -1373,16 +1524,43 @@ class SharePointCollector:
                 max_workers=max_workers,
                 thread_name_prefix="sharepoint-graph",
             ) as executor:
-                futures = [executor.submit(self._process_drive_safely, drive) for drive in drives]
-                for future in concurrent.futures.as_completed(futures):
-                    # Writer/state failures not handled as per-drive Graph errors
-                    # intentionally abort finalization so no checkpoint advances.
-                    future.result()
+                drive_iterator = iter(drives)
+                futures: set[concurrent.futures.Future[None]] = set()
+
+                def submit_next() -> bool:
+                    try:
+                        drive = next(drive_iterator)
+                    except StopIteration:
+                        return False
+                    futures.add(executor.submit(self._process_drive_safely, drive))
+                    return True
+
+                for _ in range(max_workers):
+                    if not submit_next():
+                        break
+
+                while futures:
+                    completed, _ = concurrent.futures.wait(
+                        tuple(futures),
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    for future in completed:
+                        futures.remove(future)
+                        # Writer/state failures not handled as per-drive Graph
+                        # errors intentionally abort finalization so no
+                        # checkpoint advances.
+                        future.result()
+                        submit_next()
         return list(self.pending_drives), self._status()
 
     def _status(self) -> str:
         snapshot = self.stats.snapshot()
-        incomplete = bool(snapshot["sites_failed"] or snapshot["libraries_failed"] or snapshot["truncated"])
+        incomplete = bool(
+            snapshot["sites_failed"]
+            or snapshot["sites_indeterminate"]
+            or snapshot["libraries_failed"]
+            or snapshot["truncated"]
+        )
         if incomplete:
             if snapshot["sites_discovered"] or snapshot["libraries_succeeded"]:
                 return "partial"
@@ -1408,6 +1586,10 @@ class SharePointCollector:
                     collection_complete=True,
                     sync_mode=pending.sync_mode,
                     size_observation_complete=pending.size_observation_complete,
+                    archived_file_count=pending.archived_file_count,
+                    reactivating_file_count=pending.reactivating_file_count,
+                    active_file_count=pending.active_file_count,
+                    unknown_file_archive_count=pending.unknown_file_archive_count,
                 ),
             )
             with self._pending_lock:
@@ -1526,6 +1708,18 @@ class SharePointCollector:
         folder_count = 0
         total_size_bytes = 0
         size_observation_complete = True
+        archived_file_count = 0
+        reactivating_file_count = 0
+        active_file_count = 0
+        unknown_file_archive_count = 0
+        if invalid_items:
+            # Do not emit a valid-looking subset for a library whose staged
+            # snapshot is known to be incomplete. The caller discards the stage
+            # and emits an explicit failed resource assessment.
+            raise StateStoreError(
+                "one or more item metadata records exceeded supported bounds; "
+                "the delta checkpoint was intentionally withheld"
+            )
         for item in self.state.iter_materialized_items(
             session_id=self.run_id,
             scope_key=self.scope_key,
@@ -1554,6 +1748,20 @@ class SharePointCollector:
             else:
                 file_count += 1
                 self.stats.increment("files")
+                item_metadata = item.get("metadata")
+                file_archive_status = (
+                    item_metadata.get("file_archive_status") if isinstance(item_metadata, dict) else None
+                )
+                if file_archive_status == "fully_archived":
+                    archived_file_count += 1
+                    self.stats.increment("archived_files")
+                elif file_archive_status == "reactivating":
+                    reactivating_file_count += 1
+                    self.stats.increment("reactivating_files")
+                elif file_archive_status == "not_archived":
+                    active_file_count += 1
+                else:
+                    unknown_file_archive_count += 1
                 item_size = item.get("size")
                 if isinstance(item_size, int) and not isinstance(item_size, bool) and item_size >= 0:
                     total_size_bytes += item_size
@@ -1562,11 +1770,6 @@ class SharePointCollector:
 
         self.stats.increment("items_changed", changed)
         self.stats.increment("items_deleted", deleted)
-        if invalid_items:
-            raise StateStoreError(
-                "one or more item metadata records exceeded supported bounds; "
-                "the delta checkpoint was intentionally withheld"
-            )
         if reset_happened:
             self.progress.detail(
                 f"library {drive.name}: delta reset completed with a replacement full snapshot",
@@ -1583,6 +1786,10 @@ class SharePointCollector:
             folder_count=folder_count,
             total_size_bytes=total_size_bytes,
             size_observation_complete=size_observation_complete,
+            archived_file_count=archived_file_count,
+            reactivating_file_count=reactivating_file_count,
+            active_file_count=active_file_count,
+            unknown_file_archive_count=unknown_file_archive_count,
         )
 
     def _stage_drive(
@@ -1642,6 +1849,7 @@ class SharePointCollector:
                         "item_deleted_facet_invalid",
                         "item_file_facet_invalid",
                         "item_folder_facet_invalid",
+                        "item_file_archive_status_invalid",
                         "item_parent_id_invalid",
                         "item_parent_reference_invalid",
                         "item_root_facet_invalid",
