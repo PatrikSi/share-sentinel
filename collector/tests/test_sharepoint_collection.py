@@ -12,6 +12,7 @@ from sharepoint.collection import (
     ITEM_NAME_MAX_CHARACTERS,
     ITEM_PATH_MAX_CHARACTERS,
     ITEM_SELECT,
+    METADATA_TEXT_MAX_CHARACTERS,
     SITE_SELECT,
     SharePointCollectionConfig,
     SharePointCollector,
@@ -332,6 +333,27 @@ def test_target_resolution_failures_emit_stable_scoped_endpoint_assessments(
     assert "\n" not in endpoint["metadata"]["requested_target"]
     assert collector.stats.endpoints_emitted == 1
     assert collector.stats.sites_failed == 1
+
+
+def test_invalid_target_evidence_remains_bounded_after_control_character_escaping(tmp_path) -> None:
+    reference = ("site\n" * 819) + "x"
+    collector, _, writer = _collector(
+        tmp_path,
+        {},
+        config=SharePointCollectionConfig(targeted_sites=(reference,), concurrency=1, quiet=True),
+    )
+
+    pending, status = collector.collect()
+
+    endpoint = next(record for record in writer.records if record["type"] == "endpoint")
+    requested_target = endpoint["metadata"]["requested_target"]
+    assert pending == []
+    assert status == "failed"
+    assert isinstance(requested_target, str)
+    assert len(requested_target) <= METADATA_TEXT_MAX_CHARACTERS
+    assert "\n" not in requested_target
+    assert "\\u000a" in requested_target
+    assert requested_target.endswith("…")
 
 
 def test_progress_escapes_identity_and_remote_name_control_characters() -> None:
@@ -1294,6 +1316,38 @@ def test_malformed_item_facet_is_reported_without_advancing_checkpoint(tmp_path)
     assert pending == []
     assert any(record.get("code") == "ITEM_METADATA_INVALID" for record in writer.records)
     assert state.get_drive_state(collector.scope_key, "tenant-1", SITE_ID, "drive-1").delta_link is None
+
+
+def test_rejected_library_does_not_consume_run_item_budget(tmp_path) -> None:
+    malformed = _file("bad", "x" * (ITEM_NAME_MAX_CHARACTERS + 1))
+    routes = _routes(
+        [{"value": [_file("discarded", "discarded.txt"), malformed], "@odata.deltaLink": DELTA_1}],
+        drives=[_drive("drive-1", "Malformed"), _drive("drive-2", "Healthy")],
+    )
+    healthy_delta = "https://graph.microsoft.com/v1.0/drives/drive-2/root/delta?token=1"
+    routes[f"drives/drive-2/root/delta?$select={ITEM_SELECT}"] = [
+        {"value": [_file("healthy", "healthy.txt")], "@odata.deltaLink": healthy_delta}
+    ]
+    collector, _, writer = _collector(
+        tmp_path,
+        routes,
+        config=SharePointCollectionConfig(max_items=1, concurrency=1, quiet=True),
+    )
+
+    pending, status = collector.collect()
+
+    emitted_items = [record for record in writer.records if record["type"] == "item"]
+    final_resources = {
+        record["name"]: record
+        for record in writer.records
+        if record["type"] == "resource" and record["metadata"]["enumeration_status"] != "in_progress"
+    }
+    assert status == "partial"
+    assert [drive.drive_id for drive in pending] == ["drive-2"]
+    assert [item["provider_item_id"] for item in emitted_items] == ["healthy"]
+    assert final_resources["Malformed"]["metadata"]["collection_complete"] is False
+    assert final_resources["Healthy"]["metadata"]["collection_complete"] is True
+    assert collector.stats.truncated is False
 
 
 def test_site_limit_marks_app_discovery_non_authoritative() -> None:

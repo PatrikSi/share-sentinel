@@ -43,18 +43,28 @@ GRAPH_FILE_ARCHIVE_STATUS = {
 
 def _terminal_safe(value: object, maximum: int = 4096) -> str:
     raw = str(value)
-    clipped = raw[:maximum]
+    limit = max(0, int(maximum))
     output: list[str] = []
-    for character in clipped:
+    output_length = 0
+    truncated = False
+    for character in raw:
         if character.isprintable():
-            output.append(character)
+            safe_character = character
         else:
             codepoint = ord(character)
             width = 4 if codepoint <= 0xFFFF else 8
             prefix = "u" if width == 4 else "U"
-            output.append(f"\\{prefix}{codepoint:0{width}x}")
-    if len(raw) > maximum:
-        output.append("…")
+            safe_character = f"\\{prefix}{codepoint:0{width}x}"
+        if output_length + len(safe_character) > limit:
+            truncated = True
+            break
+        output.append(safe_character)
+        output_length += len(safe_character)
+    if truncated and limit:
+        while output and output_length + 1 > limit:
+            output_length -= len(output.pop())
+        if output_length < limit:
+            output.append("…")
     return "".join(output)
 
 
@@ -990,7 +1000,7 @@ def _target_endpoint_key(reference: str) -> str:
 
 
 def _safe_requested_target(reference: str) -> str:
-    return _terminal_safe(str(reference or "").strip(), SITE_TARGET_MAX_BYTES)
+    return _terminal_safe(str(reference or "").strip(), METADATA_TEXT_MAX_CHARACTERS)
 
 
 def _target_hostname(reference: str) -> str | None:
@@ -1692,6 +1702,16 @@ class SharePointCollector:
         with self._pending_lock:
             self._sync_modes.add(sync_mode)
 
+        if invalid_items:
+            # Reject a known-incomplete snapshot before it can claim capacity
+            # from the run-wide item budget. No item records have been emitted
+            # for this library at this point, so later healthy libraries may
+            # still use the reviewed limit.
+            raise StateStoreError(
+                "one or more item metadata records exceeded supported bounds; "
+                "the delta checkpoint was intentionally withheld"
+            )
+
         count = self.state.count_materialized_items(
             session_id=self.run_id,
             scope_key=self.scope_key,
@@ -1712,14 +1732,6 @@ class SharePointCollector:
         reactivating_file_count = 0
         active_file_count = 0
         unknown_file_archive_count = 0
-        if invalid_items:
-            # Do not emit a valid-looking subset for a library whose staged
-            # snapshot is known to be incomplete. The caller discards the stage
-            # and emits an explicit failed resource assessment.
-            raise StateStoreError(
-                "one or more item metadata records exceeded supported bounds; "
-                "the delta checkpoint was intentionally withheld"
-            )
         for item in self.state.iter_materialized_items(
             session_id=self.run_id,
             scope_key=self.scope_key,
