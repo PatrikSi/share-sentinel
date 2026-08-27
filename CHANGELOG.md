@@ -26,6 +26,7 @@ No user-visible changes yet.
 - Evidence ingestion now fails closed for malformed or ambiguous principal data while preserving valid principal-less SharePoint link and invitation grants.
 - Collector telemetry validation accepts only explicitly supported bounded byte-count fields and rejects raw byte payloads or misleading aliases.
 - Incomplete collection and incompatible run contracts can no longer produce authoritative-looking absence or permission-change conclusions.
+- UI runtime builds now install available Alpine security updates so published Nginx images do not retain fixed OpenSSL vulnerabilities from their base-image snapshot.
 
 ### Operator notes
 

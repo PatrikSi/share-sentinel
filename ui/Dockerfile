@@ -6,7 +6,8 @@ COPY . .
 RUN npm run build
 
 FROM nginx:1.31.3-alpine
-RUN addgroup -S -g 10001 app \
+RUN apk upgrade --no-cache \
+    && addgroup -S -g 10001 app \
     && adduser -S -D -H -u 10001 -G app app
 COPY nginx-main.conf /etc/nginx/nginx.conf
 COPY --chown=10001:10001 nginx.conf /etc/nginx/conf.d/default.conf
