@@ -12,6 +12,26 @@ The project follows a simple release-first workflow:
 
 No user-visible changes yet.
 
+## [1.3.0] - 2026-08-27
+
+### Added
+
+- SMB and SharePoint collection now emits normalized, provider-aware permission evidence with principals, grants, capabilities, provenance, completeness, and explicit collection diagnostics.
+- Projects can create durable asynchronous comparisons between compatible runs, review exact added, removed, changed, and unchanged totals, and page through large result sets without loading the full diff into the browser.
+- Inventory and run views expose concise permission summaries with drill-down evidence, while the comparison workspace keeps scope, compatibility, partial-result, and truncation states visible to operators.
+- Permission evidence and comparison storage use provider-aware identity reconciliation, bounded ingestion, replay-safe job handling, and online indexes for large existing installations.
+
+### Fixed
+
+- Evidence ingestion now fails closed for malformed or ambiguous principal data while preserving valid principal-less SharePoint link and invitation grants.
+- Collector telemetry validation accepts only explicitly supported bounded byte-count fields and rejects raw byte payloads or misleading aliases.
+- Incomplete collection and incompatible run contracts can no longer produce authoritative-looking absence or permission-change conclusions.
+
+### Operator notes
+
+- Apply migrations `0012` and `0013` before starting the 1.3.0 API and worker. The second migration builds comparison indexes concurrently and must run outside a transaction.
+- Permission evidence can contain sensitive identity and authorization metadata. Apply the same access, retention, backup, and export controls used for collected resource paths.
+
 ## [1.2.0] - 2026-08-25
 
 ### Added

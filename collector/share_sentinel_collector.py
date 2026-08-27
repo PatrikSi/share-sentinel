@@ -92,7 +92,7 @@ except ImportError:
         """Fallback error type used when impacket is unavailable."""
 
 
-TOOL_VERSION = "1.2.0"
+TOOL_VERSION = "1.3.0"
 NETWORK_STRUCTURAL_COMPARISON_CONTRACT = "network_share_inventory_v1"
 SMB_CONTENT_COMPARISON_CONTRACT = "smb_tree_inventory_v1"
 SMB_CAPABILITY_COMPARISON_CONTRACT = "smb_nonmutating_capability_v1"

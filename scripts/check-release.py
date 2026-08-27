@@ -18,7 +18,7 @@ def _match_version(path: Path, pattern: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify release versions and changelog state.")
-    parser.add_argument("--tag", help="Optional release tag, for example v1.2.0.")
+    parser.add_argument("--tag", help="Optional release tag, for example v1.3.0.")
     args = parser.parse_args()
 
     expected = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
