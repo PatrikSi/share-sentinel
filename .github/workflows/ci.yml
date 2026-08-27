@@ -265,13 +265,13 @@ jobs:
         with:
           context: ${{ matrix.context }}
           push: true
+          pull: true
+          no-cache: true
           tags: ghcr.io/patriksi/share-sentinel-${{ matrix.component }}:candidate-sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=sha-${{ github.sha }}
-          cache-from: type=gha,scope=${{ matrix.component }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
           provenance: mode=max
           sbom: true
 
