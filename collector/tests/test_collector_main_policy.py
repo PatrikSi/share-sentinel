@@ -134,6 +134,69 @@ def test_main_persists_output_when_run_has_only_empty_endpoint(monkeypatch, tmp_
     assert payload["endpoints"][0]["shares"] == []
 
 
+def test_main_marks_structural_coverage_gaps_non_authoritative(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "coverage-gap.json"
+    args = _base_args(str(output_path))
+    args.smb_permissions = "root"
+    args.smb_permission_sample_limit = 2
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        with lock:
+            stats.endpoints += 1
+            stats.permission_assessments += 1
+            stats.errors += 1
+            stats.error_codes["LIST_SHARES_DENIED"] += 1
+            stats.structural_coverage_gaps += 1
+        return True
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+
+    rc = collector.main()
+
+    assert rc == collector.EXIT_PARTIAL
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    context = payload["collection_context"]
+    assert context["partial"] is True
+    assert context["discovery_completeness"] == "partial"
+    assert context["metadata"]["structural_complete"] is False
+    assert context["metadata"]["permissions_complete"] is False
+    assert context["metadata"]["structural_coverage_gaps"] == 1
+
+
+def test_main_does_not_claim_nfs_file_content_enumeration(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "nfs-exports-only.json"
+    args = _base_args(str(output_path))
+    args.share_types = "nfs"
+    args.cidr = ["10.0.0.5/32"]
+
+    def _scan_host(_host, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:2049"})
+        with lock:
+            stats.endpoints += 1
+        return True
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
+    monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(collector, "scan_host", _scan_host)
+
+    rc = collector.main()
+
+    assert rc == collector.EXIT_SUCCESS
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    context = payload["collection_context"]
+    assert context["metadata"]["structural_complete"] is True
+    assert context["metadata"]["files_included"] is False
+    assert context["metadata"]["content_complete"] is False
+
+
 def test_main_reports_dependency_error_without_writing_output(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
     output_path = tmp_path / "missing-dep.json"
@@ -160,7 +223,9 @@ def test_main_reports_session_credential_configuration_error(monkeypatch, tmp_pa
     stderr_capture = io.StringIO()
 
     monkeypatch.setattr(collector, "parse_args", lambda: args)
-    monkeypatch.setattr(collector, "_principal_from_ccache_env", lambda *_args, **_kwargs: (None, None, "cache missing principal"))
+    monkeypatch.setattr(
+        collector, "_principal_from_ccache_env", lambda *_args, **_kwargs: (None, None, "cache missing principal")
+    )
     monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
 
     rc = collector.main()
@@ -581,7 +646,9 @@ def test_main_reports_upload_errors_without_traceback_returns_failure(monkeypatc
     monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
     monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(collector, "scan_host", _scan_host)
-    monkeypatch.setattr(collector, "upload_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.HTTPError("status 503")))
+    monkeypatch.setattr(
+        collector, "upload_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.HTTPError("status 503"))
+    )
     monkeypatch.setattr(collector, "SMBConnection", object())
     monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
 
@@ -629,7 +696,11 @@ def test_main_keeps_generated_temp_artifact_on_upload_error_returns_partial(monk
     monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
     monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(collector, "scan_host", _scan_host)
-    monkeypatch.setattr(collector, "upload_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.ConnectionError("status 503")))
+    monkeypatch.setattr(
+        collector,
+        "upload_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.ConnectionError("status 503")),
+    )
     monkeypatch.setattr(collector.tempfile, "mkstemp", _fake_mkstemp)
     monkeypatch.setattr(collector, "SMBConnection", object())
     monkeypatch.setattr(collector.sys, "stderr", stderr_capture)
@@ -643,9 +714,7 @@ def test_main_keeps_generated_temp_artifact_on_upload_error_returns_partial(monk
     assert "artifact kept at" in stderr_value
 
 
-def test_main_keeps_generated_temp_artifact_when_upload_outcome_is_ambiguous(
-    monkeypatch, tmp_path
-) -> None:
+def test_main_keeps_generated_temp_artifact_when_upload_outcome_is_ambiguous(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
     output_path = tmp_path / "generated-upload-ambiguous.ndjson"
     args = _base_args(None)
@@ -713,7 +782,9 @@ def test_main_keeps_generated_temp_artifact_when_upload_is_interrupted(monkeypat
     monkeypatch.setattr(collector, "iter_targets", lambda *_args, **_kwargs: iter(["10.0.0.5"]))
     monkeypatch.setattr(collector, "parse_hosts_file", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(collector, "scan_host", _scan_host)
-    monkeypatch.setattr(collector, "upload_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr(
+        collector, "upload_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt())
+    )
     monkeypatch.setattr(collector.tempfile, "mkstemp", _fake_mkstemp)
     monkeypatch.setattr(collector, "SMBConnection", object())
     monkeypatch.setattr(collector.sys, "stderr", stderr_capture)

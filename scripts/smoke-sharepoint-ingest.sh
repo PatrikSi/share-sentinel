@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+trap 'status=$?; echo "FAIL: SharePoint ingest smoke failed near line ${LINENO} (exit ${status})" >&2; exit "${status}"' ERR
+
 base_url="${1:-http://localhost}"
 admin_email="${2:-admin@example.com}"
 admin_password="${SHARE_SENTINEL_SMOKE_PASSWORD:?set SHARE_SENTINEL_SMOKE_PASSWORD}"
@@ -174,6 +176,46 @@ jq -e '
       ))
     | length) == 1
 ' <<<"$diff_response" >/dev/null
+
+comparison_payload=$(jq -nc \
+  --arg baseline_run_id "$baseline_run_id" \
+  --arg current_run_id "$current_run_id" \
+  '{baseline_run_id: $baseline_run_id, current_run_id: $current_run_id}')
+comparison_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" -c "$cookies" \
+  -H "content-type: application/json" -H "x-csrf-token: $csrf" \
+  --data-binary @- "$api_base/projects/$project_id/comparisons" <<<"$comparison_payload")
+comparison_id=$(jq -er '.id' <<<"$comparison_response")
+comparison_state=$(jq -r '.state' <<<"$comparison_response")
+started_at=$(date +%s)
+while [[ "$comparison_state" != "complete" && "$comparison_state" != "failed" ]] \
+  && (( $(date +%s) - started_at < smoke_timeout_seconds )); do
+  sleep 1
+  comparison_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" \
+    "$api_base/projects/$project_id/comparisons/$comparison_id")
+  comparison_state=$(jq -r '.state' <<<"$comparison_response")
+done
+if [[ "$comparison_state" != "complete" ]]; then
+  echo "FAIL: materialized comparison ended in state $comparison_state" >&2
+  jq . <<<"$comparison_response" >&2
+  exit 1
+fi
+jq -e '
+  .summary.exact == false
+  and .summary.item_churn_computed == false
+  and .summary.total >= 1
+  and .progress.phase == "complete"
+' <<<"$comparison_response" >/dev/null
+comparison_changes=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" \
+  "$api_base/projects/$project_id/comparisons/$comparison_id/resource-changes?limit=100")
+jq -e '
+  (.items | length) >= 1
+  and (.items | map(select(
+    .provider_resource_id == "b!synthetic-drive-id"
+    and .change_type == "changed"
+    and (.change_categories | index("item_count")) != null
+    and .item_changes.state == "not_computed"
+  )) | length) == 1
+' <<<"$comparison_changes" >/dev/null
 
 resources_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" \
   "$api_base/projects/$project_id/inventory/resources?provider=sharepoint&resource_type=sharepoint_library&exposure=USER_VISIBLE&run_ids=$current_run_id")

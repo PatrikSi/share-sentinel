@@ -7,7 +7,7 @@ SharePoint collection supports two different assessment perspectives. Keep them 
 - **Application tenant inventory** is intended for scheduled monitoring. It runs unattended with an Entra application and enumerates the sites available to that application's granted `Sites.Read.All` permission.
 - **Delegated user view** is a quick, security-trimmed assessment of which metadata one signed-in identity can enumerate. It is useful for access reviews but is not an authoritative tenant inventory or a content-read test.
 
-The collector writes the same schema-v1 NDJSON format used by the rest of Share Sentinel. A SharePoint site is an endpoint, a document library is a `sharepoint_library` resource, and folders/files are items. Stable Graph site, drive, and driveItem IDs are retained separately from display paths so moves and renames remain correlatable.
+The default collector writes the schema-v1 NDJSON format used by the rest of Share Sentinel. Enabling direct permission evidence declares schema v2 and the `direct_permissions_v1` artifact feature in the first record. A SharePoint site is an endpoint, a document library is a `sharepoint_library` resource, and folders/files are items. Stable Graph site, drive, and driveItem IDs are retained separately from display paths so moves and renames remain correlatable.
 
 ## Install and run
 
@@ -143,6 +143,39 @@ Document-library records describe how far content enumeration actually got. A su
 
 In the web inventory, enable the optional **File Archive State** item column to inspect the result and use its inline exact/exclude shortcuts. The advanced inventory query field is `file_archive_status`, for example `provider=sharepoint AND file_archive_status=fully_archived`; filtering remains server-side for large inventories and CSV exports.
 
+## Direct permission and sharing evidence
+
+Direct permission collection is opt-in because it adds at least one Graph request per assessed object. Choose the smallest scope that answers the review question:
+
+```bash
+# Assess the root of every discovered document library.
+python collector/share_sentinel_sharepoint.py \
+  --auth app --permissions library_roots \
+  --output sharepoint-permissions.ndjson.gz --gzip
+
+# Assess every library root and every item in the complete materialized snapshot.
+python collector/share_sentinel_sharepoint.py \
+  --auth app --permissions all_items \
+  --max-permission-objects 10000 \
+  --max-permission-http-attempts 25000 \
+  --max-permission-entries 100000 \
+  --permission-concurrency 2 \
+  --output sharepoint-item-permissions.ndjson.gz --gzip
+```
+
+`--permissions none` is the default and preserves the schema-v1 artifact contract. `library_roots` checks only document-library roots. `all_items` checks roots plus every file and folder in the emitted snapshot, including unchanged items materialized from local delta state; it cannot be combined with `--no-files`. Permission requests are GET-only. Roots are assessed before item work, work is bounded by a small global concurrency limit, and HTTP attempt accounting includes permission pages, retries, and root-ID lookups. Object, request-attempt, and normalized-entry caps are run-wide. Hitting a cap, losing authorization, being throttled beyond the retry budget, or failing one object marks the affected evidence and the run partial without discarding successfully staged inventory or advancing a failed content checkpoint.
+
+The defaults (10,000 permission objects and 100,000 normalized entries) are the supported starting envelope, not a claim that the CLI hard ceilings are validated throughput targets. The hard ceilings only reject pathological configuration. Load-test the complete collect/upload/ingest/compare path against representative data before raising defaults substantially; for very large tenants, prefer targeted-site runs with stable scope. Monitor artifact size, Graph throttling, ingest duration, PostgreSQL statement time, and permission table growth.
+
+Each attempted object emits one `permission_assessment`, followed by bounded `permission_entry` records, under the `sharepoint_graph_permission_v1` semantics and `sharepoint_graph_permissions` surface. Assessments record selection, retrieval, provider-visibility, semantic, and principal-resolution coverage separately. Empty entries mean only that no entries were returned to this caller for this request; they never prove an object has no permissions. Stable assessment, subject, principal, entry, evidence, and complete entry-set hashes exclude mutable display paths and aliases. Display names and login names are retained only as bounded aliases. The collector preserves Graph's `inheritedFrom` source IDs if supplied, but Microsoft documents that SharePoint document libraries do not return this generic driveItem property, so an absent value remains inheritance `unknown` rather than being called direct. Group membership is not expanded and effective access is not computed.
+
+The [Graph driveItem permissions endpoint](https://learn.microsoft.com/graph/api/driveitem-list-permissions?view=graph-rest-1.0) exposes effective sharing permission objects, including direct and inherited sharing entries, not a complete SharePoint ACL/effective-access evaluation. Its result depends on the caller and authorization mode; a non-owner caller can receive only permissions applicable to that caller. Share Sentinel therefore makes only two positive exposure classifications from authoritative link scope returned in the response:
+
+- an `anonymous` sharing-link scope supports `ANONYMOUS`;
+- an `organization` sharing-link scope supports `BROAD_INTERNAL`.
+
+Specific-people links, invitations, principals, naming patterns such as `#EXT#`, empty results, and successful enumeration do not support `EXTERNAL` or `RESTRICTED`; those objects retain their prior `USER_VISIBLE` or `UNKNOWN` classification. Expired links remain evidence entries but do not support a current positive exposure label; Graph's `DateTime.MinValue` sentinel is treated as no expiration. Unknown future roles, permission facets, or link scopes make semantic coverage partial rather than being silently ignored. The normalized evidence never stores Graph `shareId`, sharing-link URLs, or embeddable HTML because those values may themselves grant or reveal access. See the [Graph permission resource](https://learn.microsoft.com/graph/api/resources/permission?view=graph-rest-1.0) for the provider contract.
+
 ## Incremental collection and local state
 
 The collector uses the [driveItem delta API](https://learn.microsoft.com/graph/api/driveitem-delta?view=graph-rest-1.0) for both initial enumeration and later change tracking. Its SQLite state database stores metadata snapshots and opaque per-drive delta links; it never stores access tokens or document contents.
@@ -183,7 +216,7 @@ Filename inventory and exposure analysis are separate dimensions:
 - `RESTRICTED` means the available evidence found no broad, external, or anonymous exposure.
 - `UNKNOWN` means the collector lacked enough evidence or permission to classify exposure.
 
-The initial collector labels delegated visibility as `USER_VISIBLE` with evidence describing that assessment perspective. Application visibility alone remains `UNKNOWN`. It does not perform exhaustive per-item permission calls, and it never infers public or anonymous access merely because an application or user can read an item. Targeted permission expansion and evidence-based sharing-link classification remain future work.
+Without opt-in permission evidence, the collector labels delegated visibility as `USER_VISIBLE` with evidence describing that assessment perspective, while application visibility alone remains `UNKNOWN`. With `--permissions library_roots` or `all_items`, an authoritative anonymous or organization link scope can strengthen the assessed object's label to `ANONYMOUS` or `BROAD_INTERNAL`. No label is strengthened merely because an application or user can enumerate metadata, and a partial or empty permission response never becomes a negative exposure conclusion.
 
 ## Upload to Share Sentinel
 
@@ -243,7 +276,7 @@ The collector requests read-only delegated `Sites.Read.All` and `Files.Read.All`
 - App authentication currently supports client secrets, not certificates or managed/workload identity.
 - The project does not ship a multi-tenant Share Sentinel public-client registration. Interactive and WAM users must provide a public-client ID; token mode works with an already authorized external session without a customer-created app.
 - Delegated Search discovery is useful but not tenant-authoritative.
-- Permission/exposure expansion is not exhaustive, and broad/internal/external/anonymous classifications are not guessed from ordinary read visibility.
+- Permission evidence is bounded, opt-in, caller-dependent sharing metadata rather than a complete SharePoint ACL, group-membership, inheritance, or effective-access evaluation. Only explicit anonymous and organization link scopes support positive exposure classification; external and restricted states are not guessed.
 - `--site` accepts canonical SharePoint site URLs and Graph site IDs. It does not redeem or enumerate arbitrary `/:f:/`, `/:x:/`, `1drv.ms`, or other sharing URLs; Graph sharing-link redemption can change sharing state and requires a different permission model, so those links are not presented as stale/valid findings.
 - Site pages, list rows outside document libraries, document contents, malware scanning, and content classification are outside this collector's scope.
 - Collection is read-only but still produces normal Entra, Graph, and SharePoint audit activity.

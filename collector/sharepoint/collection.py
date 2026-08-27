@@ -6,12 +6,19 @@ import re
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Iterable, Protocol
 from urllib.parse import quote, unquote, urlparse
 
 from .auth import GraphTokenContext
 from .graph import GraphAPIError, GraphClient, GraphProtocolError
+from .permissions import (
+    DirectPermissionCollector,
+    PermissionAssessmentResult,
+    PermissionSubject,
+    not_requested_permission_summary,
+)
 from .state import DriveState, SharePointStateStore, StateStoreError, state_scope_key
 
 DRIVE_SELECT = "id,name,description,driveType,webUrl,createdDateTime,lastModifiedDateTime"
@@ -39,6 +46,8 @@ GRAPH_FILE_ARCHIVE_STATUS = {
     "fullyArchived": "fully_archived",
     "reactivating": "reactivating",
 }
+SHAREPOINT_STRUCTURAL_COMPARISON_CONTRACT = "sharepoint_resource_inventory_v1"
+SHAREPOINT_CONTENT_COMPARISON_CONTRACT = "sharepoint_drive_inventory_v1"
 
 
 def _terminal_safe(value: object, maximum: int = 4096) -> str:
@@ -117,6 +126,7 @@ class PendingDrive:
     reactivating_file_count: int
     active_file_count: int
     unknown_file_archive_count: int
+    descendant_permission_summary: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +145,8 @@ class LibraryObservation:
     reactivating_file_count: int | None = None
     active_file_count: int | None = None
     unknown_file_archive_count: int | None = None
+    permission_result: PermissionAssessmentResult | None = None
+    descendant_permission_summary: dict[str, object] | None = None
 
 
 @dataclass
@@ -219,6 +231,11 @@ class SharePointCollectionConfig:
     max_libraries: int = 0
     max_items: int = 0
     concurrency: int = 4
+    permissions: str = "none"
+    max_permission_objects: int = 10_000
+    max_permission_http_attempts: int = 25_000
+    max_permission_entries: int = 100_000
+    permission_concurrency: int = 2
     quiet: bool = False
     verbosity: int = 0
     progress_interval: float = 5.0
@@ -289,10 +306,7 @@ class SharePointProgress:
         with self._lock:
             self._processed_site_statuses += 1
         if self.verbosity >= 1 and not self.quiet:
-            self._write(
-                f"site lifecycle {site.display_name or site.name}: "
-                f"{'ok' if succeeded else 'indeterminate'}"
-            )
+            self._write(f"site lifecycle {site.display_name or site.name}: {'ok' if succeeded else 'indeterminate'}")
         self.report()
 
     def detail(self, message: str, *, level: int = 1) -> None:
@@ -323,9 +337,7 @@ class SharePointProgress:
         stats = self.stats.snapshot()
         remaining = "unknown" if total is None else str(max(0, total - processed))
         site_status = (
-            ""
-            if total_site_statuses is None
-            else f" lifecycle={processed_site_statuses}/{total_site_statuses}"
+            "" if total_site_statuses is None else f" lifecycle={processed_site_statuses}/{total_site_statuses}"
         )
         elapsed = max(0.0, now - self.started)
         self._write(
@@ -1078,6 +1090,24 @@ class SharePointCollector:
         self._limited_collection_lock = threading.Lock()
         self.pending_drives: list[PendingDrive] = []
         self._sync_modes: set[str] = set()
+        self._root_permission_results: dict[tuple[str, str], PermissionAssessmentResult] = {}
+        self._permission_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._permission_submission_slots: threading.BoundedSemaphore | None = None
+        self._permissions = (
+            DirectPermissionCollector(
+                client=client,
+                run_id=run_id,
+                tenant_id=context.tenant_id,
+                mode=config.permissions,
+                max_objects=config.max_permission_objects,
+                max_http_attempts=config.max_permission_http_attempts,
+                max_entries=config.max_permission_entries,
+                concurrency=config.permission_concurrency,
+                on_error=self._permission_error,
+            )
+            if config.permissions != "none"
+            else None
+        )
 
     def emit_error(
         self,
@@ -1104,6 +1134,23 @@ class SharePointCollector:
         self.writer.emit(record)
         self.stats.record_error(code)
 
+    def _permission_error(
+        self,
+        code: str,
+        exc: BaseException,
+        subject: PermissionSubject,
+    ) -> None:
+        self.emit_error(
+            code,
+            str(exc),
+            endpoint_key=subject.endpoint_key,
+            resource_name=subject.resource_name,
+            hint=(
+                "Direct permission evidence is incomplete for at least one object; content inventory continues "
+                "and no missing permission is interpreted as revoked or restricted access."
+            ),
+        )
+
     def _endpoint_key(self, site: Site) -> str:
         return f"sharepoint:{site.site_id}"
 
@@ -1124,6 +1171,149 @@ class SharePointCollector:
                 "classification_scope": "inventory_only",
             },
         )
+
+    def _pending_permission_summary(self) -> dict[str, object] | None:
+        if self._permissions is None:
+            return None
+        return {
+            "assessment_key": None,
+            "assessment_state": "pending",
+            "selection_scope": self.config.permissions,
+            "selection_coverage": "pending",
+            "retrieval_coverage": "pending",
+            "provider_visibility": "caller_dependent_unverified",
+            "semantic_coverage": "pending",
+            "principal_resolution": "pending",
+            "effective_access_status": "not_computed",
+            "negative_conclusion_supported": False,
+            "entries_observed": 0,
+            "entries_emitted": 0,
+            "entries_omitted": 0,
+            "unknown_entries": 0,
+            "entry_set_hash": None,
+            "exposure": "UNKNOWN",
+            "positive_evidence": [],
+            "limitations": ["permission_assessment_pending"],
+        }
+
+    def _emit_permission_records(self, result: PermissionAssessmentResult | None) -> None:
+        if result is None or result.assessment_record is None:
+            return
+        self.writer.emit(result.assessment_record)
+        for entry in result.entry_records:
+            self.writer.emit(entry)
+
+    def _permission_subject(self, drive: Drive, item: dict[str, object] | None = None) -> PermissionSubject:
+        item_id = None
+        subject_kind = "resource"
+        subject_path = None
+        if item is not None:
+            raw_item_id = item.get("provider_item_id")
+            item_id = raw_item_id if isinstance(raw_item_id, str) else None
+            subject_kind = "item"
+            raw_path = item.get("path")
+            subject_path = raw_path if isinstance(raw_path, str) else None
+        return PermissionSubject(
+            endpoint_key=self._endpoint_key(drive.site),
+            resource_name=drive.name,
+            site_id=drive.site.site_id,
+            drive_id=drive.drive_id,
+            item_id=item_id,
+            subject_kind=subject_kind,
+            subject_path=subject_path,
+        )
+
+    def _assess_root_permissions(self, drive: Drive) -> PermissionAssessmentResult | None:
+        if self._permissions is None:
+            return None
+        exposure, evidence = self._exposure()
+        return self._permissions.assess_root(
+            self._permission_subject(drive),
+            base_exposure=exposure,
+            base_evidence=evidence,
+        )
+
+    def _assess_item_permissions(
+        self,
+        drive: Drive,
+        item: dict[str, object],
+    ) -> PermissionAssessmentResult | None:
+        if self._permissions is None or self.config.permissions != "all_items":
+            return None
+        exposure, evidence = self._exposure()
+        return self._permissions.assess_item(
+            self._permission_subject(drive, item),
+            base_exposure=exposure,
+            base_evidence=evidence,
+        )
+
+    def _submit_permission(self, callback, *args) -> concurrent.futures.Future:
+        executor = self._permission_executor
+        slots = self._permission_submission_slots
+        if executor is None or slots is None:
+            raise RuntimeError("permission executor is not active")
+        slots.acquire()
+        try:
+            future = executor.submit(callback, *args)
+        except BaseException:
+            slots.release()
+            raise
+        future.add_done_callback(lambda _future: slots.release())
+        return future
+
+    def _iter_items_with_permissions(
+        self,
+        drive: Drive,
+        items: Iterable[dict[str, object]],
+    ) -> Iterable[tuple[dict[str, object], PermissionAssessmentResult | None]]:
+        if self._permissions is None or self.config.permissions != "all_items":
+            for item in items:
+                yield item, None
+            return
+
+        pending: deque[tuple[dict[str, object], concurrent.futures.Future]] = deque()
+        iterator = iter(items)
+        window = max(1, int(self.config.permission_concurrency))
+
+        def fill() -> None:
+            while len(pending) < window:
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    return
+                pending.append((item, self._submit_permission(self._assess_item_permissions, drive, item)))
+
+        fill()
+        while pending:
+            item, future = pending.popleft()
+            yield item, future.result()
+            fill()
+
+    def _iter_roots_with_permissions(
+        self,
+        drives: Iterable[Drive],
+    ) -> Iterable[tuple[Drive, PermissionAssessmentResult | None]]:
+        if self._permissions is None:
+            for drive in drives:
+                yield drive, None
+            return
+        pending: deque[tuple[Drive, concurrent.futures.Future]] = deque()
+        iterator = iter(drives)
+        window = max(1, int(self.config.permission_concurrency))
+
+        def fill() -> None:
+            while len(pending) < window:
+                try:
+                    drive = next(iterator)
+                except StopIteration:
+                    return
+                pending.append((drive, self._submit_permission(self._assess_root_permissions, drive)))
+
+        fill()
+        while pending:
+            drive, future = pending.popleft()
+            yield drive, future.result()
+            fill()
 
     def _emit_endpoint(self, site: Site) -> None:
         lifecycle_state = _site_lifecycle_state(site)
@@ -1219,6 +1409,23 @@ class SharePointCollector:
 
     def _emit_resource(self, drive: Drive, observation: LibraryObservation) -> None:
         exposure, evidence = self._exposure()
+        permission_summary = None
+        if self._permissions is not None:
+            if observation.permission_result is not None:
+                exposure = observation.permission_result.exposure
+                evidence = observation.permission_result.exposure_evidence
+                permission_summary = observation.permission_result.permission_summary
+            else:
+                # The initial resource row exists only so following permission
+                # records have a stable parent. It must not contain a stronger
+                # exposure that a later failed assessment cannot replace.
+                exposure = "UNKNOWN"
+                permission_summary = self._pending_permission_summary()
+                evidence = {
+                    "basis": "permission_assessment_pending",
+                    "classification_scope": "positive_exposure_evidence_only",
+                    "permission_summary": permission_summary,
+                }
         access_level = "list_only" if observation.enumeration_status == "complete" else "unknown"
         metadata: dict[str, object] = {
             "tenant_id": self.context.tenant_id,
@@ -1248,6 +1455,10 @@ class SharePointCollector:
             "active_file_count": observation.active_file_count,
             "unknown_file_archive_count": observation.unknown_file_archive_count,
         }
+        if permission_summary is not None:
+            metadata["permission_summary"] = permission_summary
+        if observation.descendant_permission_summary is not None:
+            metadata["descendant_permission_summary"] = observation.descendant_permission_summary
         if observation.enumeration_error_code:
             metadata["enumeration_error_code"] = observation.enumeration_error_code
         self.writer.emit(
@@ -1264,6 +1475,7 @@ class SharePointCollector:
                 "access_level": access_level,
                 "exposure": exposure,
                 "exposure_evidence": evidence,
+                **({"permission_summary": permission_summary} if permission_summary is not None else {}),
                 "metadata": metadata,
             }
         )
@@ -1397,11 +1609,29 @@ class SharePointCollector:
             )
 
     def collect(self) -> tuple[list[PendingDrive], str]:
+        if self._permissions is None:
+            return self._collect_impl()
+        worker_count = max(1, min(int(self.config.permission_concurrency), 8))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="sharepoint-permissions",
+        ) as executor:
+            self._permission_executor = executor
+            self._permission_submission_slots = threading.BoundedSemaphore(worker_count * 2)
+            try:
+                return self._collect_impl()
+            finally:
+                self._permission_executor = None
+                self._permission_submission_slots = None
+
+    def _collect_impl(self) -> tuple[list[PendingDrive], str]:
         self.state.initialize()
         self.state.cleanup_stale_sessions()
         self.progress.start(self.context, self.collection_mode)
 
         def _site_discovery_error(site: Site | None, exc: BaseException) -> None:
+            if self._permissions is not None:
+                self._permissions.mark_selection_incomplete("site_discovery_failed")
             self.stats.increment("sites_failed")
             self.emit_error(
                 _error_code(exc, prefix="SITE_DISCOVERY"),
@@ -1411,6 +1641,8 @@ class SharePointCollector:
             )
 
         def _target_discovery_error(reference: str, exc: BaseException) -> None:
+            if self._permissions is not None:
+                self._permissions.mark_selection_incomplete("target_resolution_failed")
             self.stats.increment("sites_failed")
             endpoint_key = self._emit_target_endpoint(reference, exc)
             hint = "Other site targets continue; verify the target syntax, credentials, and Graph read permissions."
@@ -1435,6 +1667,8 @@ class SharePointCollector:
                 on_target_error=_target_discovery_error,
             )
         except GraphAPIError as exc:
+            if self._permissions is not None:
+                self._permissions.mark_selection_incomplete("site_discovery_failed")
             self.emit_error(
                 _error_code(exc, prefix="SITE_DISCOVERY"),
                 str(exc),
@@ -1444,6 +1678,8 @@ class SharePointCollector:
             return [], "failed"
 
         if sites_truncated:
+            if self._permissions is not None:
+                self._permissions.mark_selection_incomplete("site_limit_reached")
             self.stats.mark_truncated()
             self.emit_error(
                 "SITE_LIMIT_REACHED",
@@ -1457,6 +1693,8 @@ class SharePointCollector:
             self._emit_endpoint(site)
 
         def _site_error(site: Site, exc: BaseException) -> None:
+            if self._permissions is not None:
+                self._permissions.mark_selection_incomplete("library_discovery_failed")
             self.stats.increment("sites_failed")
             self.emit_error(
                 _error_code(exc, prefix="LIBRARY_DISCOVERY"),
@@ -1466,6 +1704,8 @@ class SharePointCollector:
             )
 
         def _drive_error(site: Site, exc: BaseException) -> None:
+            if self._permissions is not None:
+                self._permissions.mark_selection_incomplete("library_record_invalid")
             self.stats.increment("libraries_failed")
             self.emit_error(
                 _error_code(exc, prefix="LIBRARY_DISCOVERY"),
@@ -1482,6 +1722,8 @@ class SharePointCollector:
             on_drive_error=_drive_error,
         )
         if libraries_truncated:
+            if self._permissions is not None:
+                self._permissions.mark_selection_incomplete("library_limit_reached")
             self.stats.mark_truncated()
             self.emit_error(
                 "LIBRARY_LIMIT_REACHED",
@@ -1492,7 +1734,23 @@ class SharePointCollector:
         self.progress.set_library_total(len(drives))
 
         if not self.config.include_files:
-            for drive in drives:
+            if self._permissions is not None:
+                for drive in drives:
+                    self._emit_resource(
+                        drive,
+                        LibraryObservation(
+                            enumeration_status="not_requested",
+                            content_state="not_assessed",
+                            file_count=None,
+                            folder_count=None,
+                            item_count=None,
+                            total_size_bytes=None,
+                            collection_complete=False,
+                            sync_mode="metadata_only",
+                        ),
+                    )
+            for drive, permission_result in self._iter_roots_with_permissions(drives):
+                self._emit_permission_records(permission_result)
                 self._emit_resource(
                     drive,
                     LibraryObservation(
@@ -1504,6 +1762,19 @@ class SharePointCollector:
                         total_size_bytes=None,
                         collection_complete=False,
                         sync_mode="metadata_only",
+                        permission_result=permission_result,
+                        descendant_permission_summary=(
+                            {
+                                "assessment_state": "not_requested",
+                                "selection_scope": "items",
+                                "selection_coverage": "not_requested",
+                                "exposure": "UNKNOWN",
+                                "anonymous_items": 0,
+                                "broad_internal_items": 0,
+                            }
+                            if self._permissions is not None
+                            else None
+                        ),
                     ),
                 )
                 self.stats.increment("libraries_succeeded")
@@ -1524,6 +1795,13 @@ class SharePointCollector:
                     sync_mode="pending",
                 ),
             )
+
+        if self._permissions is not None:
+            for drive, permission_result in self._iter_roots_with_permissions(drives):
+                if permission_result is None:
+                    continue
+                self._root_permission_results[(drive.site.site_id, drive.drive_id)] = permission_result
+                self._emit_permission_records(permission_result)
 
         max_workers = max(1, min(int(self.config.concurrency), 16, len(drives) or 1))
         if max_workers == 1:
@@ -1565,11 +1843,14 @@ class SharePointCollector:
 
     def _status(self) -> str:
         snapshot = self.stats.snapshot()
+        permission_summary = self.permission_run_summary
+        permission_incomplete = permission_summary.get("request_coverage") not in {"not_requested", "complete"}
         incomplete = bool(
             snapshot["sites_failed"]
             or snapshot["sites_indeterminate"]
             or snapshot["libraries_failed"]
             or snapshot["truncated"]
+            or permission_incomplete
         )
         if incomplete:
             if snapshot["sites_discovered"] or snapshot["libraries_succeeded"]:
@@ -1578,6 +1859,7 @@ class SharePointCollector:
         return "success"
 
     def _process_drive_safely(self, drive: Drive) -> None:
+        permission_result = self._root_permission_results.get((drive.site.site_id, drive.drive_id))
         try:
             if self.config.max_items:
                 with self._limited_collection_lock:
@@ -1600,6 +1882,8 @@ class SharePointCollector:
                     reactivating_file_count=pending.reactivating_file_count,
                     active_file_count=pending.active_file_count,
                     unknown_file_archive_count=pending.unknown_file_archive_count,
+                    permission_result=permission_result,
+                    descendant_permission_summary=pending.descendant_permission_summary,
                 ),
             )
             with self._pending_lock:
@@ -1608,6 +1892,8 @@ class SharePointCollector:
             self.stats.increment("delta_drives" if pending.sync_mode == "delta" else "full_drives")
             self.progress.library_finished(drive, succeeded=True)
         except (GraphAPIError, StateStoreError) as exc:
+            if self._permissions is not None and self.config.permissions == "all_items":
+                self._permissions.mark_selection_incomplete("content_enumeration_failed")
             try:
                 self.state.discard_drive(
                     session_id=self.run_id,
@@ -1632,6 +1918,17 @@ class SharePointCollector:
                     collection_complete=False,
                     sync_mode="none",
                     enumeration_error_code=error_code,
+                    permission_result=permission_result,
+                    descendant_permission_summary=(
+                        {
+                            "assessment_state": "not_assessed",
+                            "selection_scope": "items",
+                            "selection_coverage": "content_enumeration_failed",
+                            "exposure": "UNKNOWN",
+                        }
+                        if self.config.permissions == "all_items"
+                        else None
+                    ),
                 ),
             )
             self.emit_error(
@@ -1732,13 +2029,39 @@ class SharePointCollector:
         reactivating_file_count = 0
         active_file_count = 0
         unknown_file_archive_count = 0
-        for item in self.state.iter_materialized_items(
+        descendant_permission_summary: dict[str, object] | None = None
+        if self.config.permissions == "all_items":
+            descendant_permission_summary = {
+                "assessment_state": "complete",
+                "selection_scope": "all_items",
+                "selection_coverage": "exhaustive_for_declared_scope",
+                "items_candidate": count,
+                "items_assessed": 0,
+                "items_complete": 0,
+                "items_failed": 0,
+                "items_skipped": 0,
+                "anonymous_items": 0,
+                "broad_internal_items": 0,
+                "unknown_or_user_visible_items": 0,
+                "highest_supported_exposure": "UNKNOWN",
+                "root_exposure_included": False,
+            }
+        elif self.config.permissions == "library_roots":
+            descendant_permission_summary = {
+                "assessment_state": "not_requested",
+                "selection_scope": "items",
+                "selection_coverage": "not_requested",
+                "highest_supported_exposure": "UNKNOWN",
+                "root_exposure_included": False,
+            }
+        materialized_items = self.state.iter_materialized_items(
             session_id=self.run_id,
             scope_key=self.scope_key,
             tenant_id=self.context.tenant_id,
             site_id=drive.site.site_id,
             drive_id=drive.drive_id,
-        ):
+        )
+        for item, permission_result in self._iter_items_with_permissions(drive, materialized_items):
             record = {
                 "type": "item",
                 "run_id": self.run_id,
@@ -1750,9 +2073,50 @@ class SharePointCollector:
             }
             # Older state rows can predate exposure fields; collection context
             # remains authoritative for this run.
-            record["exposure"] = exposure
-            record["exposure_evidence"] = evidence
+            if permission_result is not None:
+                record["exposure"] = permission_result.exposure
+                record["exposure_evidence"] = permission_result.exposure_evidence
+                raw_metadata = record.get("metadata")
+                item_metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+                item_metadata["permission_summary"] = permission_result.permission_summary
+                record["metadata"] = item_metadata
+                record["permission_summary"] = permission_result.permission_summary
+                assert descendant_permission_summary is not None
+                descendant_permission_summary["items_assessed"] = int(
+                    descendant_permission_summary["items_assessed"]
+                ) + (1 if permission_result.assessment_record is not None else 0)
+                if permission_result.complete:
+                    descendant_permission_summary["items_complete"] = (
+                        int(descendant_permission_summary["items_complete"]) + 1
+                    )
+                elif permission_result.assessment_record is None:
+                    descendant_permission_summary["items_skipped"] = (
+                        int(descendant_permission_summary["items_skipped"]) + 1
+                    )
+                else:
+                    descendant_permission_summary["items_failed"] = (
+                        int(descendant_permission_summary["items_failed"]) + 1
+                    )
+                if permission_result.exposure == "ANONYMOUS":
+                    descendant_permission_summary["anonymous_items"] = (
+                        int(descendant_permission_summary["anonymous_items"]) + 1
+                    )
+                    descendant_permission_summary["highest_supported_exposure"] = "ANONYMOUS"
+                elif permission_result.exposure == "BROAD_INTERNAL":
+                    descendant_permission_summary["broad_internal_items"] = (
+                        int(descendant_permission_summary["broad_internal_items"]) + 1
+                    )
+                    if descendant_permission_summary["highest_supported_exposure"] != "ANONYMOUS":
+                        descendant_permission_summary["highest_supported_exposure"] = "BROAD_INTERNAL"
+                else:
+                    descendant_permission_summary["unknown_or_user_visible_items"] = (
+                        int(descendant_permission_summary["unknown_or_user_visible_items"]) + 1
+                    )
+            else:
+                record["exposure"] = exposure
+                record["exposure_evidence"] = evidence
             self.writer.emit(record)
+            self._emit_permission_records(permission_result)
             self.stats.increment("items_emitted")
             if bool(item.get("is_dir")):
                 folder_count += 1
@@ -1780,6 +2144,15 @@ class SharePointCollector:
                 else:
                     size_observation_complete = False
 
+        if descendant_permission_summary is not None and self.config.permissions == "all_items":
+            if (
+                int(descendant_permission_summary["items_complete"]) != count
+                or int(descendant_permission_summary["items_failed"])
+                or int(descendant_permission_summary["items_skipped"])
+            ):
+                descendant_permission_summary["assessment_state"] = "partial"
+                descendant_permission_summary["selection_coverage"] = "partial"
+
         self.stats.increment("items_changed", changed)
         self.stats.increment("items_deleted", deleted)
         if reset_happened:
@@ -1802,6 +2175,7 @@ class SharePointCollector:
             reactivating_file_count=reactivating_file_count,
             active_file_count=active_file_count,
             unknown_file_archive_count=unknown_file_archive_count,
+            descendant_permission_summary=descendant_permission_summary,
         )
 
     def _stage_drive(
@@ -1941,6 +2315,12 @@ class SharePointCollector:
                 return next(iter(self._sync_modes))
             return "mixed"
 
+    @property
+    def permission_run_summary(self) -> dict[str, object]:
+        if self._permissions is None:
+            return not_requested_permission_summary()
+        return self._permissions.snapshot()
+
 
 def collection_context_record(
     context: GraphTokenContext,
@@ -1949,9 +2329,13 @@ def collection_context_record(
     status: str,
     sync_mode: str,
     partial: bool,
+    permission_summary: dict[str, object] | None = None,
+    structural_complete: bool | None = None,
+    content_complete: bool | None = None,
 ) -> dict[str, object]:
     collection_mode = "tenant_inventory" if context.auth_type == "application" else "delegated_user_view"
     authoritative = context.auth_type == "application" and not config.targeted_sites
+    structural_partial = partial if structural_complete is None else not structural_complete
     discovery = (
         "targeted"
         if config.targeted_sites
@@ -1959,7 +2343,7 @@ def collection_context_record(
     )
     if status == "failed":
         completeness = "failed"
-    elif partial:
+    elif structural_partial:
         completeness = "partial"
     elif config.targeted_sites:
         completeness = "targeted_scope"
@@ -1967,6 +2351,59 @@ def collection_context_record(
         completeness = "security_trimmed"
     else:
         completeness = "complete_for_granted_scope"
+    metadata: dict[str, object] = {
+        "sync_mode": sync_mode,
+        "snapshot_materialized": True,
+        "comparison_contracts": {
+            "structural": SHAREPOINT_STRUCTURAL_COMPARISON_CONTRACT,
+            "content": SHAREPOINT_CONTENT_COMPARISON_CONTRACT,
+        },
+        "discovery_strategy": discovery,
+        "discovery_authoritative": authoritative and not structural_partial,
+        "files_included": config.include_files,
+        "permissions_assessed": False,
+        "content_downloaded": False,
+        "delta_checkpoint_policy": "after_artifact_finalization_and_upload",
+    }
+    if structural_complete is not None:
+        metadata["structural_complete"] = structural_complete
+    if content_complete is not None:
+        metadata["content_complete"] = content_complete
+    if config.permissions != "none":
+        effective_permission_summary = permission_summary or {
+            "contract_version": 1,
+            "requested": True,
+            "mode": config.permissions,
+            "permission_surface": "sharepoint_graph_permissions",
+            "semantics": "sharepoint_graph_permission_v1",
+            "classification_policy": "positive_evidence_only_v1",
+            "response_scope": "effective_sharing_permissions",
+            "provider_visibility": "caller_dependent_unverified",
+            "request_coverage": "running",
+            "candidate_objects": 0,
+            "attempted_objects": 0,
+            "completed_objects": 0,
+            "failed_objects": 0,
+            "skipped_objects": 0,
+            "http_attempts": 0,
+            "entries_observed": 0,
+            "entries_emitted": 0,
+            "entries_omitted": 0,
+            "unknown_entries": 0,
+            "partial_reasons": [],
+            "budgets": {
+                "max_objects": config.max_permission_objects,
+                "max_http_attempts": config.max_permission_http_attempts,
+                "max_entries": config.max_permission_entries,
+                "concurrency": config.permission_concurrency,
+            },
+        }
+        completed_objects = effective_permission_summary.get("completed_objects")
+        metadata["permissions_assessed"] = (
+            isinstance(completed_objects, int) and not isinstance(completed_objects, bool) and completed_objects > 0
+        )
+        metadata["permissions_complete"] = effective_permission_summary.get("request_coverage") == "complete"
+        metadata["permission_assessment"] = effective_permission_summary
     return {
         "source": "sharepoint",
         "provider": "sharepoint",
@@ -1979,14 +2416,33 @@ def collection_context_record(
         "sync_mode": sync_mode,
         "materialized_snapshot": True,
         "discovery_completeness": completeness,
-        "metadata": {
-            "sync_mode": sync_mode,
-            "snapshot_materialized": True,
-            "discovery_strategy": discovery,
-            "discovery_authoritative": authoritative and not partial,
-            "files_included": config.include_files,
-            "permissions_assessed": False,
-            "content_downloaded": False,
-            "delta_checkpoint_policy": "after_artifact_finalization_and_upload",
-        },
+        "metadata": metadata,
     }
+
+
+def collection_dimension_completeness(
+    stats: dict[str, object],
+    config: SharePointCollectionConfig,
+    *,
+    status: str,
+) -> tuple[bool, bool]:
+    """Separate inventory/content truth from permission and lifecycle failures."""
+
+    error_codes = stats.get("error_codes") if isinstance(stats.get("error_codes"), dict) else {}
+    structural_error = any(
+        int(count or 0) > 0
+        and (
+            str(code) in {"SITE_LIMIT_REACHED", "LIBRARY_LIMIT_REACHED"}
+            or str(code).startswith("SITE_DISCOVERY")
+            or str(code).startswith("LIBRARY_DISCOVERY")
+        )
+        for code, count in error_codes.items()
+    )
+    structural_complete = bool(status != "failed" and int(stats.get("sites_failed") or 0) == 0 and not structural_error)
+    content_complete = bool(
+        structural_complete
+        and config.include_files
+        and int(stats.get("libraries_failed") or 0) == 0
+        and stats.get("truncated") is not True
+    )
+    return structural_complete, content_complete

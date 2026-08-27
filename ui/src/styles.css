@@ -1084,6 +1084,10 @@ body {
   @apply bg-emerald-50/50 dark:bg-emerald-950/20;
 }
 
+.inventory-table tbody tr.is-selected td {
+  @apply bg-emerald-50 dark:bg-emerald-950/30;
+}
+
 .inventory-table tbody tr.is-deleted td {
   @apply bg-slate-100/80 text-slate-500 dark:bg-slate-900/80 dark:text-slate-400;
 }
@@ -1546,7 +1550,628 @@ body {
   @apply translate-y-0 opacity-100;
 }
 
+/* Materialized resource comparisons */
+.comparison-workspace {
+  @apply grid gap-4;
+}
+
+.comparison-page-header {
+  @apply flex flex-wrap items-end justify-between gap-4;
+}
+
+.comparison-page-header nav {
+  @apply mb-2 flex flex-wrap items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400;
+}
+
+.comparison-page-header nav a {
+  @apply hover:text-slate-900 dark:hover:text-white;
+}
+
+.comparison-title-row {
+  @apply flex flex-wrap items-start gap-3;
+}
+
+.comparison-title-row > div > p {
+  @apply text-[10px] font-semibold uppercase tracking-[0.18em] text-emerald-700 dark:text-emerald-300;
+}
+
+.comparison-title-row h1 {
+  @apply mt-1 break-words text-2xl font-semibold tracking-tight;
+}
+
+.comparison-title-row h1 > span {
+  @apply text-slate-400;
+}
+
+.comparison-page-subtitle {
+  @apply mt-2 max-w-4xl text-sm text-slate-600 dark:text-slate-300;
+}
+
+.comparison-state {
+  @apply inline-flex rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider;
+}
+
+.comparison-state.is-success {
+  @apply bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200;
+}
+
+.comparison-state.is-error {
+  @apply bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-200;
+}
+
+.comparison-state.is-info,
+.comparison-state.is-warning {
+  @apply bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-200;
+}
+
+.comparison-header-actions {
+  @apply flex flex-wrap items-center gap-2;
+}
+
+.comparison-run-context {
+  @apply grid gap-px overflow-hidden rounded-lg border border-slate-200 bg-slate-200 sm:grid-cols-2 xl:grid-cols-4 dark:border-slate-800 dark:bg-slate-800;
+}
+
+.comparison-run-context > div {
+  @apply grid min-w-0 gap-1 bg-white p-3 dark:bg-slate-950;
+}
+
+.comparison-run-context span {
+  @apply text-[9px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400;
+}
+
+.comparison-run-context strong,
+.comparison-run-context small {
+  @apply min-w-0 truncate;
+}
+
+.comparison-run-context strong {
+  @apply text-sm;
+}
+
+.comparison-run-context small {
+  @apply text-xs text-slate-500 dark:text-slate-400;
+}
+
+.comparison-compatibility-grid {
+  @apply grid gap-2 sm:grid-cols-3;
+}
+
+.comparison-compatibility-grid > span {
+  @apply grid rounded-md border border-current px-2.5 py-2 text-xs;
+}
+
+.comparison-compatibility-grid strong {
+  @apply text-[9px] uppercase tracking-wider opacity-70;
+}
+
+.comparison-filter-bar,
+.comparison-results {
+  @apply rounded-lg border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-950;
+}
+
+.comparison-filter-bar {
+  @apply grid gap-3 p-3 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-end;
+}
+
+.comparison-count-filters {
+  @apply grid gap-2 sm:grid-cols-5;
+}
+
+.comparison-count-filters button {
+  @apply flex min-h-14 items-center justify-between gap-2 rounded-md border border-slate-200 px-3 py-2 text-left text-xs transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:border-slate-800 dark:hover:bg-slate-900;
+}
+
+.comparison-count-filters button.is-active {
+  @apply border-emerald-600 bg-emerald-50 text-emerald-900 dark:border-emerald-500 dark:bg-emerald-900/20 dark:text-emerald-100;
+}
+
+.comparison-count-filters button > span {
+  @apply font-semibold;
+}
+
+.comparison-count-filters button > strong {
+  @apply text-lg;
+}
+
+.comparison-query-filters {
+  @apply flex flex-wrap items-end gap-2;
+}
+
+.comparison-query-filters label {
+  @apply grid gap-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400;
+}
+
+.comparison-query-filters input,
+.comparison-query-filters select {
+  @apply min-h-10 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100;
+}
+
+.comparison-query-filters input {
+  @apply min-w-[260px];
+}
+
+.comparison-results {
+  @apply overflow-hidden;
+}
+
+.comparison-results > header {
+  @apply flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 px-3 py-3 dark:border-slate-800;
+}
+
+.comparison-results > header h2 {
+  @apply text-base font-semibold;
+}
+
+.comparison-results > header p,
+.comparison-results > header > span {
+  @apply mt-0.5 text-xs text-slate-500 dark:text-slate-400;
+}
+
+.comparison-results > [role="alert"],
+.comparison-results > [role="status"] {
+  @apply m-3;
+}
+
+.comparison-table-scroll {
+  @apply max-h-[calc(100vh-300px)] overflow-auto;
+}
+
+.comparison-table {
+  @apply min-w-[1380px] w-full border-collapse text-xs;
+}
+
+.comparison-table th {
+  @apply sticky top-0 z-10 border-b border-slate-300 bg-slate-100 px-2 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300;
+}
+
+.comparison-table td {
+  @apply max-w-[340px] border-b border-slate-200 px-2 py-2 align-top dark:border-slate-800;
+}
+
+.comparison-table tbody tr:hover td,
+.comparison-table tbody tr.is-selected td {
+  @apply bg-emerald-50/70 dark:bg-emerald-950/20;
+}
+
+.comparison-change-type {
+  @apply inline-flex whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-semibold;
+}
+
+.comparison-change-type.is-positive {
+  @apply bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200;
+}
+
+.comparison-change-type.is-negative {
+  @apply bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-200;
+}
+
+.comparison-change-type.is-warning {
+  @apply bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100;
+}
+
+.comparison-change-type.is-neutral {
+  @apply bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200;
+}
+
+.comparison-resource-button {
+  @apply grid min-w-[190px] max-w-[300px] gap-0.5 rounded text-left hover:text-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:hover:text-emerald-200;
+}
+
+.comparison-resource-button strong,
+.comparison-resource-button small {
+  @apply min-w-0 truncate;
+}
+
+.comparison-resource-button small,
+.comparison-match small,
+.comparison-dimension-list small {
+  @apply text-[10px] leading-4 text-slate-500 dark:text-slate-400;
+}
+
+.comparison-category-list {
+  @apply flex min-w-[150px] flex-wrap gap-1;
+}
+
+.comparison-category-list > span,
+.comparison-category-list > button,
+.comparison-change-summary > div > span {
+  @apply rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300;
+}
+
+.comparison-category-list > button {
+  @apply hover:bg-emerald-100 hover:text-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:hover:bg-emerald-950 dark:hover:text-emerald-200;
+}
+
+.comparison-category-list > button.is-active {
+  @apply bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200;
+}
+
+.comparison-before-after {
+  @apply grid min-w-[260px] grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-1.5;
+}
+
+.comparison-before-after > span:not([aria-hidden]) {
+  @apply grid min-w-0 truncate font-semibold;
+}
+
+.comparison-before-after small {
+  @apply text-[9px] font-normal uppercase tracking-wider text-slate-500 dark:text-slate-400;
+}
+
+.comparison-before-after > p {
+  @apply col-span-3 mt-1 text-[10px] leading-4 text-slate-500 dark:text-slate-400;
+}
+
+.comparison-dimension-list,
+.comparison-match {
+  @apply grid min-w-[180px] gap-0.5;
+}
+
+.comparison-dimension-list > span {
+  @apply whitespace-nowrap;
+}
+
+.comparison-inspect-button {
+  @apply min-h-8 rounded-md border border-slate-300 px-2 py-1 text-[10px] font-semibold hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:border-slate-700 dark:hover:bg-slate-800;
+}
+
+.comparison-change-summary {
+  @apply flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/60;
+}
+
+.comparison-change-summary > div {
+  @apply flex flex-wrap gap-1;
+}
+
+.comparison-snapshot-grid {
+  @apply grid gap-3 lg:grid-cols-2;
+}
+
+.comparison-snapshot {
+  @apply overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800;
+}
+
+.comparison-snapshot > header,
+.comparison-snapshot > h4 {
+  @apply flex items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold dark:border-slate-800 dark:bg-slate-900;
+}
+
+.comparison-snapshot > header a {
+  @apply text-[10px] font-semibold text-emerald-700 hover:underline dark:text-emerald-300;
+}
+
+.comparison-snapshot dl {
+  @apply grid gap-px bg-slate-200 sm:grid-cols-2 dark:bg-slate-800;
+}
+
+.comparison-snapshot dl > div {
+  @apply min-w-0 bg-white px-3 py-2 dark:bg-slate-950;
+}
+
+.comparison-snapshot dt {
+  @apply text-[9px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400;
+}
+
+.comparison-snapshot dd {
+  @apply mt-0.5 truncate text-xs font-medium;
+}
+
+.comparison-snapshot.is-empty {
+  @apply border-dashed;
+}
+
+.comparison-snapshot.is-empty > p {
+  @apply px-3 py-5 text-xs leading-5 text-slate-500 dark:text-slate-400;
+}
+
+/* Normalized access evidence */
+.access-evidence-summary-cell {
+  @apply grid min-w-[260px] max-w-[360px] gap-1;
+}
+
+.access-evidence-summary-trigger {
+  @apply grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-0.5 rounded-md border border-transparent px-1.5 py-1 text-left transition hover:border-slate-300 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:hover:border-slate-700 dark:hover:bg-slate-900;
+}
+
+.access-evidence-summary-state,
+.access-evidence-assessment-badges > span,
+.access-evidence-overall-badges > span {
+  @apply w-fit rounded px-1.5 py-0.5 text-[10px] font-semibold;
+}
+
+.access-evidence-summary-trigger > .access-evidence-summary-state {
+  @apply col-start-1 row-start-1;
+}
+
+.access-evidence-summary-state.is-positive,
+.access-evidence-assessment-badges > span.is-positive,
+.access-evidence-overall-badges > span.is-positive,
+.access-evidence-claims > li > span.is-positive {
+  @apply bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200;
+}
+
+.access-evidence-summary-state.is-warning,
+.access-evidence-assessment-badges > span.is-warning,
+.access-evidence-overall-badges > span.is-warning,
+.access-evidence-claims > li > span.is-warning {
+  @apply bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100;
+}
+
+.access-evidence-summary-state.is-negative,
+.access-evidence-assessment-badges > span.is-negative,
+.access-evidence-overall-badges > span.is-negative,
+.access-evidence-claims > li > span.is-negative {
+  @apply bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-200;
+}
+
+.access-evidence-summary-state.is-neutral,
+.access-evidence-assessment-badges > span,
+.access-evidence-overall-badges > span,
+.access-evidence-claims > li > span {
+  @apply bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200;
+}
+
+.access-evidence-summary-meta,
+.access-evidence-summary-permissions {
+  @apply min-w-0 truncate text-[10px] text-slate-500 dark:text-slate-400;
+}
+
+.access-evidence-summary-meta {
+  @apply col-start-1 row-start-2;
+}
+
+.access-evidence-summary-permissions {
+  @apply col-start-1 row-start-3;
+}
+
+.access-evidence-summary-action {
+  @apply col-start-2 row-span-3 row-start-1 self-center text-[10px] font-semibold text-emerald-700 dark:text-emerald-300;
+}
+
+.access-evidence-compatibility-actions {
+  @apply flex min-w-0 items-center gap-1 px-1.5 text-[9px] text-slate-500 dark:text-slate-400;
+}
+
+.access-evidence-compatibility-actions > span {
+  @apply min-w-0 flex-1 truncate;
+}
+
+.access-evidence-compatibility-actions > button {
+  @apply inline-flex h-5 min-w-5 items-center justify-center rounded border border-slate-300 bg-white px-1 font-mono font-semibold text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800;
+}
+
+.access-evidence-layer {
+  @apply pointer-events-auto fixed inset-0 z-50 flex justify-end bg-slate-950/10;
+}
+
+.access-evidence-panel {
+  @apply pointer-events-auto flex h-full w-full max-w-[620px] flex-col border-l border-slate-300 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950;
+}
+
+.access-evidence-panel-header {
+  @apply flex flex-none items-start justify-between gap-4 border-b border-slate-200 px-5 py-4 dark:border-slate-800;
+}
+
+.access-evidence-panel-header > div {
+  @apply min-w-0;
+}
+
+.access-evidence-panel-header span {
+  @apply text-[10px] font-semibold uppercase tracking-[0.18em] text-emerald-700 dark:text-emerald-300;
+}
+
+.access-evidence-panel-header h2 {
+  @apply mt-1 truncate text-xl font-semibold tracking-tight;
+}
+
+.access-evidence-panel-header p {
+  @apply mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400;
+}
+
+.access-evidence-panel-header > button {
+  @apply min-h-9 flex-none rounded-md border border-slate-300 px-3 py-1.5 text-xs font-semibold hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:border-slate-700 dark:hover:bg-slate-800;
+}
+
+.access-evidence-panel-body {
+  @apply grid flex-1 content-start gap-4 overflow-y-auto p-5;
+}
+
+.access-evidence-panel-loading {
+  @apply grid gap-2 text-sm text-slate-500 dark:text-slate-400;
+}
+
+.access-evidence-panel-loading > span {
+  @apply h-16 animate-pulse rounded-md bg-slate-100 dark:bg-slate-900;
+}
+
+.access-evidence-overall {
+  @apply grid gap-3 rounded-lg border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/60;
+}
+
+.access-evidence-overall h3,
+.access-evidence-section-heading h3 {
+  @apply text-sm font-semibold text-slate-900 dark:text-slate-100;
+}
+
+.access-evidence-overall p,
+.access-evidence-section-heading p {
+  @apply mt-1 text-xs leading-5 text-slate-600 dark:text-slate-300;
+}
+
+.access-evidence-overall-badges,
+.access-evidence-assessment-badges {
+  @apply flex flex-wrap items-center gap-1;
+}
+
+.access-evidence-section {
+  @apply grid gap-3 border-t border-slate-200 pt-4 dark:border-slate-800;
+}
+
+.access-evidence-section-heading {
+  @apply flex flex-wrap items-start justify-between gap-3;
+}
+
+.access-evidence-section-heading > div {
+  @apply min-w-0 flex-1;
+}
+
+.access-evidence-section-heading > span {
+  @apply rounded-full bg-slate-100 px-2 py-1 text-[10px] font-semibold text-slate-600 dark:bg-slate-800 dark:text-slate-300;
+}
+
+.access-evidence-assessment {
+  @apply grid gap-3 rounded-lg border border-slate-200 p-3 dark:border-slate-800;
+}
+
+.access-evidence-assessment > header {
+  @apply flex flex-wrap items-start justify-between gap-3;
+}
+
+.access-evidence-assessment > header > div:first-child {
+  @apply min-w-0 flex-1;
+}
+
+.access-evidence-assessment h4 {
+  @apply text-sm font-semibold;
+}
+
+.access-evidence-assessment header p {
+  @apply mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400;
+}
+
+.access-evidence-assessment header .access-evidence-assessment-subject {
+  @apply flex flex-wrap items-baseline gap-x-2 rounded-md bg-slate-50 px-2 py-1 dark:bg-slate-900;
+}
+
+.access-evidence-assessment-subject strong {
+  @apply text-[9px] uppercase tracking-wider;
+}
+
+.access-evidence-assessment-subject span {
+  @apply min-w-0 break-all font-mono text-[10px];
+}
+
+.access-evidence-inline-facts,
+.access-evidence-provenance,
+.access-evidence-provenance-disclosure dl {
+  @apply grid gap-px overflow-hidden rounded-md border border-slate-200 bg-slate-200 sm:grid-cols-3 dark:border-slate-800 dark:bg-slate-800;
+}
+
+.access-evidence-inline-facts > div,
+.access-evidence-provenance > div,
+.access-evidence-provenance-disclosure dl > div {
+  @apply min-w-0 bg-white px-2.5 py-2 dark:bg-slate-950;
+}
+
+.access-evidence-inline-facts dt,
+.access-evidence-provenance dt,
+.access-evidence-provenance-disclosure dt {
+  @apply text-[9px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400;
+}
+
+.access-evidence-inline-facts dd,
+.access-evidence-provenance dd,
+.access-evidence-provenance-disclosure dd {
+  @apply mt-0.5 truncate text-xs font-medium;
+}
+
+.access-evidence-inline-facts > .is-subject {
+  @apply sm:col-span-3;
+}
+
+.access-evidence-inline-facts > .is-subject dd {
+  @apply whitespace-normal break-all font-mono;
+}
+
+.access-evidence-claims,
+.access-evidence-permission-entries {
+  @apply grid gap-px overflow-hidden rounded-md border border-slate-200 bg-slate-200 dark:border-slate-800 dark:bg-slate-800;
+}
+
+.access-evidence-claims > li,
+.access-evidence-permission-entries > li {
+  @apply flex min-w-0 items-start justify-between gap-3 bg-white px-3 py-2 dark:bg-slate-950;
+}
+
+.access-evidence-claims > li > div,
+.access-evidence-permission-entries > li > div {
+  @apply min-w-0;
+}
+
+.access-evidence-claims strong,
+.access-evidence-claims small,
+.access-evidence-permission-entries strong,
+.access-evidence-permission-entries small {
+  @apply block;
+}
+
+.access-evidence-claims strong,
+.access-evidence-permission-entries strong {
+  @apply break-words text-xs font-semibold;
+}
+
+.access-evidence-claims small,
+.access-evidence-permission-entries small {
+  @apply mt-0.5 break-words text-[10px] leading-4 text-slate-500 dark:text-slate-400;
+}
+
+.access-evidence-claims > li > span {
+  @apply flex-none rounded px-1.5 py-0.5 text-[10px] font-semibold;
+}
+
+.access-evidence-permission-entries > li {
+  @apply grid sm:grid-cols-2;
+}
+
+.access-evidence-empty-detail {
+  @apply rounded-md border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400;
+}
+
+.access-evidence-limitations,
+.access-evidence-errors {
+  @apply rounded-md px-3 py-2 text-xs leading-5;
+}
+
+.access-evidence-limitations {
+  @apply bg-amber-50 text-amber-900 dark:bg-amber-900/20 dark:text-amber-100;
+}
+
+.access-evidence-errors {
+  @apply bg-rose-50 text-rose-800 dark:bg-rose-900/20 dark:text-rose-200;
+}
+
+.access-evidence-limitations ul,
+.access-evidence-errors ul {
+  @apply mt-1 list-disc pl-4;
+}
+
+.access-evidence-provenance-disclosure > summary {
+  @apply cursor-pointer rounded-md px-1 py-1 text-xs font-semibold text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 dark:text-slate-300 dark:hover:bg-slate-800;
+}
+
+.access-evidence-provenance-disclosure dl {
+  @apply mt-2;
+}
+
+.access-evidence-direct-list {
+  @apply grid gap-3;
+}
+
 @media (max-width: 767px) {
+  .access-evidence-layer {
+    @apply pointer-events-auto inset-0 bg-slate-950/50;
+  }
+
+  .access-evidence-panel {
+    @apply max-w-none border-l-0;
+  }
+
+  .access-evidence-panel-header,
+  .access-evidence-panel-body {
+    @apply px-4;
+  }
+
   .inventory-console-topline {
     @apply items-start px-2;
   }

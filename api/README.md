@@ -62,6 +62,8 @@ Alembic bootstrap uses separate migration budgets: `MIGRATION_DATABASE_CONNECT_T
 
 Synchronous run diff is intentionally bounded. `API_RUN_DIFF_MAX_ITEMS` defaults to `250000` total items across both runs; larger comparisons return an actionable `422` instead of risking process exhaustion. Detail arrays default to 500 records each (request maximum 2000), preserve exact aggregate counts, and return explicit truncation metadata.
 
+Asynchronous resource comparisons are admitted separately. `API_COMPARISON_MAX_ACTIVE_PER_PROJECT` defaults to `3`, while `API_COMPARISON_RATE_LIMIT` and `API_COMPARISON_RATE_WINDOW_SECONDS` default to `12` starts per actor/project per `60` seconds. The API persists dimension-specific compatibility and a durable queued row; workers recover the job from Postgres if Redis handoff fails. Result reads are keyset-paginated and support indexed provider, category, and trigram text filters.
+
 Provider-backed run diffs correlate items by stable provider identity within a resource. A path change is reported as a move/rename rather than one removal plus one addition. Diff responses also report whether collection perspectives are comparable; callers should treat a missing, partial, differently scoped, cross-tenant, or differently assessed identity context as a semantic warning even when structural differences are still returned.
 
 First-party artifact clients send the file itself as the request body to `POST /projects/{project_id}/runs/{run_id}/artifact` with:

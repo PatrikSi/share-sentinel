@@ -215,9 +215,31 @@ Lists shares for one endpoint within the run with `limit`, opaque `cursor`, and 
 
 Lists items for one share within the run.
 
+### `GET /projects/{project_id}/runs/{run_id}/resources/{resource_id}/access-evidence`
+
+Returns normalized provider permission assessments, bounded capability observations, coverage, limitations, errors, principal identity, and run provenance for one resource. It requires project viewer access plus `read:runs` and `read:inventory` token scopes.
+
+`assessment_limit`/`after_assessment_id` and `entry_limit`/`after_entry_id` form a two-level continuation contract: exhaust `next_entry_id` for the current assessment page before advancing `next_assessment_id`. An authoritative empty assessment, a response page with no entries, and an unassessed resource are separate states.
+
 ### `GET /projects/{project_id}/runs/{run_id}/search/items`
 
 Searches items within a run.
+
+## Materialized comparisons
+
+### `POST /projects/{project_id}/comparisons`
+
+Creates or returns the idempotent materialized comparison for a complete baseline/current run pair and the active algorithm/options. Requires project operator or admin access plus `write:runs` and `read:inventory`. Creation is rate limited and active comparisons are capped per project. Resubmitting a failed comparison explicitly requeues it; a completed or active comparison is returned unchanged.
+
+### `GET /projects/{project_id}/comparisons/{comparison_id}`
+
+Returns queued/running progress, delayed retry time, dimension-specific compatibility, terminal summary, or a bounded public error. Requires project viewer access plus both `read:runs` and `read:inventory`.
+
+### `GET /projects/{project_id}/comparisons/{comparison_id}/resource-changes`
+
+Returns a complete comparison's materialized resource changes using stable keyset pagination. Filters include `change_type`, `provider`, `category`, and `q`. Rows separate structural, access, and content states and include match provenance plus before/after snapshots. `appeared`, `disappeared`, `changed`, and `indeterminate` are distinct; a missing resource is definitive only when structural collection scope is comparable. The endpoint returns `409` until work completes. It requires project viewer access plus both `read:runs` and `read:inventory`.
+
+The summary's `resource_summary_exact` applies only to the published resource-level evidence scope. `exact` and `item_churn_computed` remain false because this workflow does not publish per-item added/removed/moved rows.
 
 ## Inventory
 

@@ -1,13 +1,17 @@
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
-import { AccessCapabilityCell, type AccessCapabilities } from "@/components/access-capability-cell";
+import type { AccessCapabilities } from "@/components/access-capability-cell";
+import { AccessEvidencePanel } from "@/components/access-evidence-panel";
+import { AccessEvidenceSummaryCell } from "@/components/access-evidence-summary";
 import { CollectionContextPanel, ExposureBadge, ProviderBadge } from "@/components/provider-context";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch } from "@/lib/api";
+import type { AccessEvidenceSummary } from "@/lib/access-evidence";
 import { useSession } from "@/lib/auth";
 import { copyText } from "@/lib/clipboard";
+import { canCreateMaterializedComparison } from "@/lib/comparisons";
 import {
   collectionContextProvider,
   compareCollectionContexts,
@@ -49,6 +53,7 @@ type RunCompareOption = {
   created_at: string;
   collection_context?: CollectionContext | null;
 };
+type ProjectRoleStatus = "idle" | "loading" | "ready" | "error";
 
 type Endpoint = {
   id: number;
@@ -64,6 +69,7 @@ type Resource = {
   name: string;
   access_level: string;
   access_capabilities: AccessCapabilities | null;
+  access_evidence_summary?: AccessEvidenceSummary | null;
   remark: string | null;
   share_type: string;
   resource_type?: string | null;
@@ -207,6 +213,17 @@ function readInitialRunDetailTab(): RunDetailTab {
   if (typeof window === "undefined") return "overview";
   const candidate = new URLSearchParams(window.location.search).get("view");
   return RUN_DETAIL_TABS.includes(candidate as RunDetailTab) ? (candidate as RunDetailTab) : "overview";
+}
+
+function readInitialEvidenceResource(): number | null {
+  if (typeof window === "undefined") return null;
+  const value = Number(new URLSearchParams(window.location.search).get("evidenceResource"));
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function readInitialBaselineRun(): string {
+  if (typeof window === "undefined") return "";
+  return new URLSearchParams(window.location.search).get("baselineRun")?.trim() || "";
 }
 
 function useDebouncedValue<T>(value: T, delayMs: number): T {
@@ -541,6 +558,7 @@ export function RunDetailPage() {
   const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
   const runRouteKey = `${projectId || ""}:${runId || ""}`;
   const [, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
   const session = useSession();
   const lastEndpointRequestKey = useRef<string | null>(null);
   const lastResourceRequestKey = useRef<string | null>(null);
@@ -556,9 +574,15 @@ export function RunDetailPage() {
   const [baselineOptionsError, setBaselineOptionsError] = useState<string | null>(null);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
-  const [selectedBaselineRunId, setSelectedBaselineRunId] = useState("");
+  const [selectedBaselineRunId, setSelectedBaselineRunId] = useState(readInitialBaselineRun);
   const [runDiff, setRunDiff] = useState<RunDiffResult | null>(null);
   const [activeTab, setActiveTab] = useState<RunDetailTab>(readInitialRunDetailTab);
+  const [selectedEvidenceResource, setSelectedEvidenceResource] = useState<number | null>(readInitialEvidenceResource);
+  const [creatingComparison, setCreatingComparison] = useState(false);
+  const [comparisonCreateError, setComparisonCreateError] = useState<string | null>(null);
+  const [projectRole, setProjectRole] = useState<string | null>(null);
+  const [projectRoleStatus, setProjectRoleStatus] = useState<ProjectRoleStatus>("idle");
+  const [projectRoleReloadNonce, setProjectRoleReloadNonce] = useState(0);
 
   const [endpointSearch, setEndpointSearch] = useState("");
   const [itemSearch, setItemSearch] = useState("");
@@ -664,8 +688,12 @@ export function RunDetailPage() {
     const next = new URLSearchParams(window.location.search);
     if (activeTab === "overview") next.delete("view");
     else next.set("view", activeTab);
+    if (selectedEvidenceResource) next.set("evidenceResource", String(selectedEvidenceResource));
+    else next.delete("evidenceResource");
+    if (selectedBaselineRunId) next.set("baselineRun", selectedBaselineRunId);
+    else next.delete("baselineRun");
     setSearchParams(next, { replace: true });
-  }, [activeTab, setSearchParams]);
+  }, [activeTab, selectedBaselineRunId, selectedEvidenceResource, setSearchParams]);
 
   useEffect(() => {
     if (!projectId || !runId) {
@@ -704,7 +732,7 @@ export function RunDetailPage() {
   }, [projectId, reloadNonce, runId, runRouteKey]);
 
   useEffect(() => {
-    if (!projectId) return;
+    if (!projectId || activeTab !== "diff") return;
     const controller = new AbortController();
     setProjectRuns([]);
     setBaselineOptionsError(null);
@@ -720,7 +748,30 @@ export function RunDetailPage() {
         }
       });
     return () => controller.abort();
-  }, [projectId, reloadNonce]);
+  }, [activeTab, projectId, reloadNonce]);
+
+  useEffect(() => {
+    if (!projectId || activeTab !== "diff") {
+      setProjectRole(null);
+      setProjectRoleStatus("idle");
+      return;
+    }
+    const controller = new AbortController();
+    setProjectRole(null);
+    setProjectRoleStatus("loading");
+    apiFetch(`/projects/${encodeURIComponent(projectId)}/my-role`, { signal: controller.signal })
+      .then((data) => {
+        if (controller.signal.aborted) return;
+        setProjectRole(typeof data?.role === "string" ? data.role.toLowerCase() : null);
+        setProjectRoleStatus("ready");
+      })
+      .catch((caught) => {
+        if (controller.signal.aborted || isAbortError(caught)) return;
+        setProjectRole(null);
+        setProjectRoleStatus("error");
+      });
+    return () => controller.abort();
+  }, [activeTab, projectId, projectRoleReloadNonce]);
 
   const baselineOptions = useMemo(() => {
     if (!runId) return [];
@@ -733,7 +784,7 @@ export function RunDetailPage() {
   }, [projectRuns, run, runId]);
 
   useEffect(() => {
-    setSelectedBaselineRunId("");
+    setSelectedBaselineRunId(readInitialBaselineRun());
     setRunDiff(null);
     setDiffError(null);
     setIssueSearch("");
@@ -747,6 +798,9 @@ export function RunDetailPage() {
     setActivityEvents([]);
     setActivityError(null);
     setArtifactCopyStatus(null);
+    setSelectedEvidenceResource(readInitialEvidenceResource());
+    setCreatingComparison(false);
+    setComparisonCreateError(null);
     setEndpointSearch("");
     setItemSearch("");
     setPathPrefix("");
@@ -790,6 +844,7 @@ export function RunDetailPage() {
 
   useEffect(() => {
     if (!projectId || !runId || !run) return;
+    if (activeTab !== "diff") return;
     if (run.status !== "COMPLETE") {
       setDiffLoading(false);
       setDiffError(null);
@@ -820,7 +875,7 @@ export function RunDetailPage() {
         if (!controller.signal.aborted) setDiffLoading(false);
       });
     return () => controller.abort();
-  }, [projectId, reloadNonce, run?.status, runId, selectedBaselineRunId]);
+  }, [activeTab, projectId, reloadNonce, run?.status, runId, selectedBaselineRunId]);
 
   const shouldPollRun = run?.status === "UPLOADED" || run?.status === "INGESTING";
 
@@ -1219,6 +1274,35 @@ export function RunDetailPage() {
     setReloadNonce((current) => current + 1);
   }
 
+  async function createScalableComparison() {
+    if (!canCreateMaterializedComparison(projectRole, projectRoleStatus)) {
+      setComparisonCreateError("Project operator or administrator access is required to start a materialized comparison.");
+      return;
+    }
+    const baselineRunId = selectedBaselineRunId || runDiff?.baseline_run?.id || baselineOptions[0]?.id;
+    if (!projectId || !runId || !baselineRunId) {
+      setComparisonCreateError("Choose an available complete baseline before starting a scalable comparison.");
+      return;
+    }
+    setCreatingComparison(true);
+    setComparisonCreateError(null);
+    try {
+      const data = await apiFetch(`/projects/${encodeURIComponent(projectId)}/comparisons`, {
+        method: "POST",
+        body: JSON.stringify({
+          current_run_id: runId,
+          baseline_run_id: baselineRunId,
+        }),
+      });
+      const comparisonId = typeof data?.id === "string" ? data.id : null;
+      if (!comparisonId) throw new Error("The API accepted the request but did not return a comparison identifier.");
+      navigate(`/projects/${projectId}/comparisons/${comparisonId}`);
+    } catch (caught) {
+      setComparisonCreateError(caught instanceof Error ? caught.message : "The comparison could not be started.");
+      setCreatingComparison(false);
+    }
+  }
+
   function handleTabKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, tab: RunDetailTab) {
     const currentIndex = RUN_DETAIL_TABS.indexOf(tab);
     let nextIndex: number | null = null;
@@ -1259,6 +1343,7 @@ export function RunDetailPage() {
     },
   ];
   const activeDiffSummary = runDiff?.baseline_run ? runDiff.summary : null;
+  const canCreateComparison = canCreateMaterializedComparison(projectRole, projectRoleStatus);
   const issuesBusy = issuesLoading || issueSearch !== debouncedIssueSearch;
   const endpointsBusy = endpointsLoading || endpointSearch !== debouncedEndpointSearch;
   const itemsBusy =
@@ -1290,6 +1375,13 @@ export function RunDetailPage() {
       : runDiff?.baseline_run && !apiDiffCompatibility && diffContextCompatibility && !diffContextCompatibility.compatible
         ? diffContextCompatibility
         : null;
+  const diffAbsenceClaimsSupported = Boolean(runDiff?.baseline_run) && !diffComparisonWarning;
+  const currentOnlyResourceLabel = diffAbsenceClaimsSupported
+    ? `New ${sharePointRun ? "Libraries" : "Resources"}`
+    : `Current-only ${sharePointRun ? "Libraries" : "Resources"}`;
+  const baselineOnlyResourceLabel = diffAbsenceClaimsSupported
+    ? `Disappeared ${sharePointRun ? "Libraries" : "Resources"}`
+    : `Baseline-only ${sharePointRun ? "Libraries" : "Resources"}`;
 
   if (!run || run.id.toLowerCase() !== runId?.toLowerCase()) {
     const activeError = errorRunRouteKey === runRouteKey ? error : null;
@@ -1409,17 +1501,21 @@ export function RunDetailPage() {
                   <div>
                     <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Baseline</p>
                     <p className="mt-1 text-sm font-semibold">
-                      {runDiff?.baseline_run ? runDiff.baseline_run.name : "Nearest previous complete run not available yet"}
+                      {runDiff?.baseline_run
+                        ? runDiff.baseline_run.name
+                        : activeTab === "diff" && diffLoading
+                          ? "Loading bounded preview baseline"
+                          : "Open Diff to load the bounded preview"}
                     </p>
                   </div>
                   {activeDiffSummary ? (
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div>
-                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">New {sharePointRun ? "Libraries" : "Resources"}</p>
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{currentOnlyResourceLabel}</p>
                         <p className="mt-1 text-sm font-semibold">{activeDiffSummary.new_shares.toLocaleString()}</p>
                       </div>
                       <div>
-                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Changed {sharePointRun ? "Libraries" : "Resources"}</p>
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{diffAbsenceClaimsSupported ? `Changed ${sharePointRun ? "Libraries" : "Resources"}` : "Observed snapshot differences"}</p>
                         <p className="mt-1 text-sm font-semibold">{activeDiffSummary.changed_shares.toLocaleString()}</p>
                       </div>
                     </div>
@@ -1636,11 +1732,13 @@ export function RunDetailPage() {
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">New {sharePointRun ? "Libraries" : "Resources"}</p>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{currentOnlyResourceLabel}</p>
                       <p className="mt-1 text-xl font-semibold">{runDiff.summary.new_shares.toLocaleString()}</p>
                     </div>
                     <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-800 dark:bg-slate-900/80">
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Added Items</p>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                        {diffAbsenceClaimsSupported ? "Added Items" : "Current-only Items"}
+                      </p>
                       <p className="mt-1 text-xl font-semibold">{runDiff.summary.added_items.toLocaleString()}</p>
                     </div>
                   </div>
@@ -1866,32 +1964,75 @@ export function RunDetailPage() {
           <div className="workspace-card">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <h2 className="text-lg font-semibold">Run-to-Run Diff</h2>
+                <h2 className="text-lg font-semibold">Bounded item-change preview</h2>
                 <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-                  Compare this run against a prior complete run to see new or disappeared resources, moves, renames, and item churn.
+                  Preview exact item churn for runs within the legacy comparison envelope. Start a scalable comparison for paginated resource-level investigation.
                 </p>
               </div>
-              <label className="block min-w-[280px] text-xs font-semibold uppercase tracking-wide text-slate-500">
-                Baseline run
-                <select
-                  aria-describedby={baselineOptionsError ? "baseline-options-error" : "baseline-options-help"}
-                  className="mt-1 w-full rounded-2xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
-                  disabled={run?.status !== "COMPLETE"}
-                  value={selectedBaselineRunId}
-                  onChange={(event) => setSelectedBaselineRunId(event.target.value)}
+              <div className="grid min-w-[280px] gap-2">
+                <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  Baseline run
+                  <select
+                    aria-describedby={baselineOptionsError ? "baseline-options-error" : "baseline-options-help"}
+                    className="mt-1 w-full rounded-2xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                    disabled={run?.status !== "COMPLETE"}
+                    value={selectedBaselineRunId}
+                    onChange={(event) => {
+                      setSelectedBaselineRunId(event.target.value);
+                      setComparisonCreateError(null);
+                    }}
+                  >
+                    <option value="">Nearest previous complete run</option>
+                    {baselineOptions.map((candidate) => (
+                      <option key={candidate.id} value={candidate.id}>
+                        {candidate.name} [{candidate.status}] {new Date(candidate.created_at).toLocaleString()}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="mt-1 block text-[11px] font-normal normal-case tracking-normal text-slate-500" id="baseline-options-help">
+                    Bounded to the 200 most recent runs. Automatic preview chooses the nearest prior complete run.
+                  </span>
+                </label>
+                <button
+                  aria-describedby="comparison-create-access-help"
+                  className="inventory-button-primary"
+                  disabled={!canCreateComparison || projectRoleStatus !== "ready" || creatingComparison || run?.status !== "COMPLETE" || (!selectedBaselineRunId && !runDiff?.baseline_run?.id && baselineOptions.length === 0)}
+                  onClick={createScalableComparison}
+                  type="button"
                 >
-                  <option value="">Nearest previous complete run</option>
-                  {baselineOptions.map((candidate) => (
-                    <option key={candidate.id} value={candidate.id}>
-                      {candidate.name} [{candidate.status}] {new Date(candidate.created_at).toLocaleString()}
-                    </option>
-                  ))}
-                </select>
-                <span className="mt-1 block text-[11px] font-normal normal-case tracking-normal text-slate-500" id="baseline-options-help">
-                  Bounded to the 200 most recent runs. Automatic comparison still chooses the nearest prior complete run.
-                </span>
-              </label>
+                  {creatingComparison ? "Starting comparison…" : "Start scalable resource comparison"}
+                </button>
+                <p className="text-[11px] leading-4 text-slate-500 dark:text-slate-400" id="comparison-create-access-help">
+                  {projectRoleStatus === "loading" || projectRoleStatus === "idle"
+                    ? "Checking permission to create a materialized comparison…"
+                    : projectRoleStatus === "error"
+                      ? "Comparison creation remains disabled because project access could not be confirmed."
+                      : canCreateComparison
+                        ? `Authorized as project ${projectRole}. Creating a comparison schedules server-side work.`
+                        : projectRole === "viewer"
+                          ? "Viewer access can inspect existing comparisons. Project operator or administrator access is required to create one."
+                          : "The recorded project role does not permit comparison creation. Project operator or administrator access is required."}
+                </p>
+              </div>
             </div>
+
+            {projectRoleStatus === "error" ? (
+              <div className="mt-3">
+                <StatusBanner tone="warning" title="Comparison creation access unavailable">
+                  <p>The project role lookup failed. Existing run data remains available, but the stateful comparison action is disabled.</p>
+                  <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={() => setProjectRoleReloadNonce((value) => value + 1)} type="button">Retry access check</button>
+                </StatusBanner>
+              </div>
+            ) : null}
+
+            {comparisonCreateError ? (
+              <div className="mt-3">
+                <StatusBanner tone="error" title="Comparison could not be started">
+                  <p>{comparisonCreateError}</p>
+                  <p className="mt-1">No comparison page was opened. Review the baseline and retry when the API is available.</p>
+                </StatusBanner>
+              </div>
+            ) : null}
 
             {baselineOptionsError ? (
               <div className="mt-3" id="baseline-options-error">
@@ -1949,7 +2090,7 @@ export function RunDetailPage() {
                   title={diffComparisonWarning.known ? "Collection perspectives are not directly comparable" : "Comparison context could not be verified"}
                 >
                   <p>
-                    Structural changes are still shown, but do not interpret them as confirmed access gain or loss without accounting for collection scope.
+                    Snapshot differences are shown as current-only or baseline-only observations. They do not prove that a resource appeared, disappeared, or changed access when collection scope differs or is unknown.
                   </p>
                   <ul className="mt-2 list-disc space-y-1 pl-5">
                     {diffComparisonWarning.reasons.map((reason) => <li key={reason}>{reason}</li>)}
@@ -1982,23 +2123,23 @@ export function RunDetailPage() {
 
                   <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
                     <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">New {sharePointRun ? "Libraries" : "Resources"}</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{currentOnlyResourceLabel}</p>
                       <p className="mt-1 text-2xl font-semibold">{runDiff.summary.new_shares}</p>
                     </div>
                     <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Disappeared {sharePointRun ? "Libraries" : "Resources"}</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{baselineOnlyResourceLabel}</p>
                       <p className="mt-1 text-2xl font-semibold">{runDiff.summary.disappeared_shares}</p>
                     </div>
                     <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Changed {sharePointRun ? "Libraries" : "Resources"}</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{diffAbsenceClaimsSupported ? `Changed ${sharePointRun ? "Libraries" : "Resources"}` : "Observed resource differences"}</p>
                       <p className="mt-1 text-2xl font-semibold">{runDiff.summary.changed_shares}</p>
                     </div>
                     <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Added Items</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{diffAbsenceClaimsSupported ? "Added Items" : "Current-only Items"}</p>
                       <p className="mt-1 text-2xl font-semibold">{runDiff.summary.added_items}</p>
                     </div>
                     <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
-                      <p className="text-[11px] uppercase tracking-wide text-slate-500">Removed Items</p>
+                      <p className="text-[11px] uppercase tracking-wide text-slate-500">{diffAbsenceClaimsSupported ? "Removed Items" : "Baseline-only Items"}</p>
                       <p className="mt-1 text-2xl font-semibold">{runDiff.summary.removed_items}</p>
                     </div>
                     <div className="rounded-2xl border border-slate-300 p-3 dark:border-slate-700">
@@ -2009,7 +2150,7 @@ export function RunDetailPage() {
                   {runDiff.truncation?.truncated ? (
                     <StatusBanner tone="warning" title="Detail lists are truncated">
                       <p>
-                        Summary totals are exact. Each affected detail section shows at most {runDiff.truncation.detail_limit.toLocaleString()} records to keep this comparison responsive.
+                        Summary totals are exact for the two returned snapshots, but interpretability still depends on collection compatibility. Each affected detail section shows at most {runDiff.truncation.detail_limit.toLocaleString()} records to keep this comparison responsive.
                       </p>
                     </StatusBanner>
                   ) : null}
@@ -2023,10 +2164,10 @@ export function RunDetailPage() {
           {runDiff?.baseline_run ? (
             <div className="grid gap-4 xl:grid-cols-3">
               <div className="workspace-card">
-                <h3 className="text-base font-semibold">New {sharePointRun ? "Libraries" : "Resources"}</h3>
-                <p className="mt-1 text-xs text-slate-500">Resources present now but absent in the baseline run.</p>
+                <h3 className="text-base font-semibold">{currentOnlyResourceLabel}</h3>
+                <p className="mt-1 text-xs text-slate-500">{diffAbsenceClaimsSupported ? "Resources present now but absent in the authoritative baseline scope." : "Resources observed in the current snapshot but not in the baseline snapshot; collection scope cannot prove they are new."}</p>
                 <ul className="mt-3 max-h-[320px] space-y-2 overflow-auto">
-                  {runDiff.new_shares.length === 0 ? <li className="text-sm text-slate-500">No newly discovered resources.</li> : null}
+                  {runDiff.new_shares.length === 0 ? <li className="text-sm text-slate-500">{diffAbsenceClaimsSupported ? "No newly discovered resources." : "No current-only resources in these snapshots."}</li> : null}
                   {runDiff.new_shares.map((share) => (
                     <li className="rounded-2xl border border-slate-300 p-3 text-xs dark:border-slate-700" key={`${share.endpoint_key}:${share.provider_resource_id || share.share_name}`}>
                       <div className="font-semibold">{share.share_name}</div>
@@ -2040,10 +2181,10 @@ export function RunDetailPage() {
               </div>
 
               <div className="workspace-card">
-                <h3 className="text-base font-semibold">Disappeared {sharePointRun ? "Libraries" : "Resources"}</h3>
-                <p className="mt-1 text-xs text-slate-500">Resources that existed in the baseline run but are gone now.</p>
+                <h3 className="text-base font-semibold">{baselineOnlyResourceLabel}</h3>
+                <p className="mt-1 text-xs text-slate-500">{diffAbsenceClaimsSupported ? "Resources present in the authoritative baseline scope and absent now." : "Resources observed in the baseline snapshot but not in the current snapshot; collection scope cannot prove they disappeared."}</p>
                 <ul className="mt-3 max-h-[320px] space-y-2 overflow-auto">
-                  {runDiff.disappeared_shares.length === 0 ? <li className="text-sm text-slate-500">No disappeared resources.</li> : null}
+                  {runDiff.disappeared_shares.length === 0 ? <li className="text-sm text-slate-500">{diffAbsenceClaimsSupported ? "No disappeared resources." : "No baseline-only resources in these snapshots."}</li> : null}
                   {runDiff.disappeared_shares.map((share) => (
                     <li className="rounded-2xl border border-slate-300 p-3 text-xs dark:border-slate-700" key={`${share.endpoint_key}:${share.provider_resource_id || share.share_name}`}>
                       <div className="font-semibold">{share.share_name}</div>
@@ -2057,25 +2198,27 @@ export function RunDetailPage() {
               </div>
 
               <div className="workspace-card">
-                <h3 className="text-base font-semibold">Resource Changes</h3>
-                <p className="mt-1 text-xs text-slate-500">Resources that remained in scope but changed contents or observed access between runs.</p>
+                <h3 className="text-base font-semibold">{diffAbsenceClaimsSupported ? "Resource Changes" : "Observed Snapshot Differences"}</h3>
+                <p className="mt-1 text-xs text-slate-500">{diffAbsenceClaimsSupported ? "Resources that remained in authoritative scope but changed contents or observed access between runs." : "Differences between the returned snapshots; incompatible collection scope prevents a definitive change claim."}</p>
                 <ul className="mt-3 max-h-[320px] space-y-2 overflow-auto">
-                  {runDiff.item_churn.length === 0 ? <li className="text-sm text-slate-500">No resource changes detected.</li> : null}
+                  {runDiff.item_churn.length === 0 ? <li className="text-sm text-slate-500">{diffAbsenceClaimsSupported ? "No resource changes detected." : "No snapshot differences detected."}</li> : null}
                   {runDiff.item_churn.map((share) => (
                     <li className="rounded-2xl border border-slate-300 p-3 text-xs dark:border-slate-700" key={`${share.endpoint_key}:${share.share_name}`}>
                       <div className="font-semibold">{share.share_name}</div>
                       <div className="mt-1 text-slate-500">{share.endpoint_key}</div>
                       <div className="mt-1 text-slate-500">
-                        +{share.added_items} / -{share.removed_items} / ↔{share.moved_items || 0} item(s)
+                        {diffAbsenceClaimsSupported
+                          ? `+${share.added_items} / -${share.removed_items} / ↔${share.moved_items || 0} item(s)`
+                          : `${share.added_items} current-only / ${share.removed_items} baseline-only / ${share.moved_items || 0} paired path difference(s)`}
                       </div>
                       {share.access_level_changed ? (
                         <div className="mt-2 rounded-xl bg-amber-50 px-2.5 py-2 text-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
-                          Observed access changed from {(share.previous_access_level || "unknown").replaceAll("_", " ")} to {(share.access_level || "unknown").replaceAll("_", " ")}.
+                          {diffAbsenceClaimsSupported ? "Observed access changed" : "The snapshots report different access labels"} from {(share.previous_access_level || "unknown").replaceAll("_", " ")} to {(share.access_level || "unknown").replaceAll("_", " ")}.
                         </div>
                       ) : null}
                       {share.added_examples.length > 0 ? (
                         <div className="mt-2">
-                          <p className="font-semibold text-emerald-700 dark:text-emerald-300">Added</p>
+                          <p className="font-semibold text-emerald-700 dark:text-emerald-300">{diffAbsenceClaimsSupported ? "Added" : "Current-only"}</p>
                           <ul className="mt-1 space-y-1 text-slate-500">
                             {share.added_examples.map((path) => (
                               <li className="break-all font-mono" key={`add:${share.endpoint_key}:${share.share_name}:${path}`}>
@@ -2087,7 +2230,7 @@ export function RunDetailPage() {
                       ) : null}
                       {share.removed_examples.length > 0 ? (
                         <div className="mt-2">
-                          <p className="font-semibold text-rose-700 dark:text-rose-300">Removed</p>
+                          <p className="font-semibold text-rose-700 dark:text-rose-300">{diffAbsenceClaimsSupported ? "Removed" : "Baseline-only"}</p>
                           <ul className="mt-1 space-y-1 text-slate-500">
                             {share.removed_examples.map((path) => (
                               <li className="break-all font-mono" key={`remove:${share.endpoint_key}:${share.share_name}:${path}`}>
@@ -2099,7 +2242,7 @@ export function RunDetailPage() {
                       ) : null}
                       {(share.moved_examples?.length || 0) > 0 ? (
                         <div className="mt-2">
-                          <p className="font-semibold text-sky-700 dark:text-sky-300">Moved or renamed</p>
+                          <p className="font-semibold text-sky-700 dark:text-sky-300">{diffAbsenceClaimsSupported ? "Moved or renamed" : "Paired path differences"}</p>
                           <ul className="mt-1 space-y-1 text-slate-500">
                             {share.moved_examples?.map((example, index) => {
                               const text =
@@ -2246,11 +2389,11 @@ export function RunDetailPage() {
                   </button>
                   <div className="space-y-2 border-t border-slate-200 bg-white/70 px-3 py-2 dark:border-slate-700 dark:bg-slate-950/30">
                     {exposure ? <div className="flex flex-wrap items-center gap-2"><ExposureBadge evidence={resource.exposure_evidence} exposure={exposure} /><span className="text-[11px] text-slate-500">{exposureLabel(exposure)}</span></div> : null}
-                    <AccessCapabilityCell
-                      accessLevel={resource.access_level}
-                      capabilities={resource.access_capabilities}
-                      evidenceScope={provider === "smb" ? "Bounded share sample" : provider === "sharepoint" ? "Library scope" : undefined}
-                      label={provider === "sharepoint" ? "Observed library access" : "Share access"}
+                    <AccessEvidenceSummaryCell
+                      compatibilityAccess={resource.access_level}
+                      onOpen={() => setSelectedEvidenceResource(resource.id)}
+                      resourceName={resource.name}
+                      summary={resource.access_evidence_summary}
                     />
                     {webUrl ? <a className="inline-flex text-xs font-semibold text-sky-700 underline underline-offset-2 dark:text-sky-300" href={webUrl} rel="noreferrer" target="_blank">Open resource <span aria-hidden="true" className="ml-1">↗</span></a> : resource.web_url ? <p className="text-xs font-semibold text-amber-700 dark:text-amber-300">Unsafe external URL blocked.</p> : null}
                   </div>
@@ -2459,6 +2602,16 @@ export function RunDetailPage() {
             </ul>
           </div>
         </div>
+      ) : null}
+
+      {projectId && runId && selectedEvidenceResource ? (
+        <AccessEvidencePanel
+          onClose={() => setSelectedEvidenceResource(null)}
+          projectId={projectId}
+          resourceId={selectedEvidenceResource}
+          resourceName={resources.find((resource) => resource.id === selectedEvidenceResource)?.name || `Resource ${selectedEvidenceResource}`}
+          runId={runId}
+        />
       ) : null}
     </section>
   );

@@ -6,7 +6,8 @@ The worker consumes ingest jobs, reads raw artifacts from shared storage, and no
 
 - consume `ingest_jobs` from Redis Streams
 - reopen raw artifacts from `ARTIFACT_STORAGE_PATH`
-- upsert endpoints, resources, items, and ingest errors
+- upsert endpoints, resources, items, normalized permission evidence, and ingest errors
+- materialize durable resource comparisons between complete runs
 - checkpoint `scan_runs.ingest_progress`
 - emit ingest audit events
 - recover some stranded `UPLOADED` or stale `INGESTING` runs
@@ -25,6 +26,8 @@ That is not just a convenience setting. The API writes uploads to local filesyst
 - Recovery candidates are claimed one at a time with `FOR UPDATE SKIP LOCKED`, so multiple replicas can make progress without a serial worker pre-claiming an entire batch.
 - Postgres is authoritative for the current project and artifact key, so delayed or duplicate Redis messages cannot ingest a superseded upload.
 - Upload attempts use immutable keys; committing a new database pointer precedes best-effort cleanup of the superseded file.
+- The framing and normalization passes independently stream-check the stored artifact against the size and SHA-256 accepted by the API, and the worker reopens it for one final bounded check immediately before `COMPLETE`. Missing provenance or changed bytes terminalize the run, discard all checkpointed inventory and permission evidence, and require a fresh upload; a resumed run can never combine old rows with a changed artifact and publish `COMPLETE`.
+- Before publishing `COMPLETE`, the worker reconciles valid persisted endpoint, resource, and item counts with the terminal producer counts. Rejected structural records fail closed for both inventory and content comparisons; rejected item records downgrade content only; undecodable or unclassified records downgrade both. The consumer-owned result is stored in `collection_context.metadata.inventory_ingest` and can only narrow producer completeness claims.
 - Gzip input is protected by decompression limits before parsing.
 - NDJSON reads are capped per record so a newline-free artifact cannot force an unbounded allocation.
 - Compact JSON is a compatibility format capped at 50 MiB decompressed; use NDJSON for large inventories so records remain independently bounded.
@@ -40,6 +43,8 @@ That is not just a convenience setting. The API writes uploads to local filesyst
 - Duplicate stream messages honor a future `next_retry_at`; they are acknowledged while the database recovery scan owns the due retry.
 - Retry backoff includes deterministic per-run jitter to avoid synchronized retries after a shared dependency recovers.
 - Endpoint and resource identity caches are bounded LRU maps rather than inventory-sized dictionaries.
+- Permission entries use bounded set-based inserts and a bounded principal cache; malformed key collisions fall back to isolated row validation so unrelated evidence can still ingest.
+- Comparison retries persist a due timestamp and use delayed deterministic jitter rather than consuming their retry budget in a tight loop.
 - `SIGTERM` and `SIGINT` stop new claims and cooperatively checkpoint active work. A paused run returns to `UPLOADED`, records `INGEST_PAUSED`, and can be resumed by another worker.
 
 ## Important caveats
@@ -86,6 +91,8 @@ At minimum, the worker needs:
 - `INGEST_RETRY_JITTER_RATIO` (default `0.2`; range `0` through `1`)
 - `INGEST_MAX_RETRIES` (default `4`, maximum `100`)
 - `INGEST_IDENTITY_CACHE_SIZE` (default `10000`, maximum `100000` entries per identity map)
+- `INGEST_PERMISSION_ENTRY_BATCH_SIZE` (default `500`, maximum `5000` normalized permission entries per set-based insert)
+- `INGEST_PERMISSION_ENTRY_BATCH_MAX_BYTES` (default `8388608`, maximum `67108864`; flushes entry batches by serialized size as well as count)
 
 The Compose file exposes the routinely tuned settings above and uses worker defaults for the others. Invalid values and values above the documented memory-safety ceilings stop worker startup with a configuration error instead of being silently clamped.
 

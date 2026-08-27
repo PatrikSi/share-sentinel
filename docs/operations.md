@@ -53,13 +53,13 @@ Scale API containers horizontally behind the gateway. Keep one Uvicorn process p
 
 Pagination limits protect response memory, but expensive low-selectivity substring filters still consume database CPU. Watch latency by route, database statement duration, timeouts, and connection-pool saturation. Add capacity by improving selectivity/indexes and sizing Postgres before multiplying API pools.
 
-Run diff is a guarded synchronous exception to ordinary collection pagination: exact totals and bounded detail are available only while both runs together remain under `API_RUN_DIFF_MAX_ITEMS` (250000 by default). Treat repeated larger comparisons as asynchronous analytics work rather than increasing the limit without memory measurements.
+Run diff is a guarded synchronous exception to ordinary collection pagination: exact item-path totals and bounded detail are available only while both runs together remain under `API_RUN_DIFF_MAX_ITEMS` (250000 by default). Larger resource comparisons are queued, processed in 5000-resource batches, rate/concurrency limited at creation, and read with keyset pagination. Monitor queued/running age, retry timestamps, comparison table growth, and the selectivity of search/category/provider filters rather than increasing the synchronous ceiling without measurements.
 
 ### Worker
 
 Scale worker containers only when Postgres and artifact storage have measured headroom. Workers claim different recoverable runs and use a per-run advisory lock as the final duplicate-execution guard. A bounded identity cache prevents a single huge artifact from consuming memory proportional to every endpoint/share identity.
 
-More workers reduce queue age only while database writes, index maintenance, and artifact reads are not saturated. Stop adding workers when ingest throughput flattens, database latency rises, lock timeouts grow, or interactive API latency breaches its target.
+More workers reduce queue and comparison age only while database writes, index maintenance, and artifact reads are not saturated. Permission entries use bounded set-based inserts and a bounded principal cache, but permission reconciliation and comparison materialization still consume Postgres CPU and WAL. Stop adding workers when throughput flattens, database latency rises, lock timeouts grow, or interactive API latency breaches its target.
 
 ### Postgres
 
@@ -187,6 +187,7 @@ The reference release still requires deployment-specific work for:
 - automated backup scheduling and restore orchestration
 - organization SSO, MFA, SCIM, and centralized policy integration
 - automatic artifact retention/orphan reconciliation
+- separate materialized-comparison retention and per-item comparison results
 - multi-region operation and disaster-recovery replication
 - a supported Kubernetes/operator distribution
 

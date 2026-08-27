@@ -68,6 +68,18 @@ class FakeSession:
         return response
 
 
+class AttemptBudget:
+    def __init__(self, maximum: int) -> None:
+        self.maximum = maximum
+        self.used = 0
+
+    def reserve_attempt(self) -> bool:
+        if self.used >= self.maximum:
+            return False
+        self.used += 1
+        return True
+
+
 def _client(session: FakeSession, **kwargs) -> GraphClient:
     return GraphClient(StaticProvider(), session=session, sleep=lambda _delay: None, **kwargs)
 
@@ -137,6 +149,51 @@ def test_graph_429_respects_retry_after_then_succeeds() -> None:
     assert client.get("sites") == {"value": []}
     assert sleeps == [7.0]
     assert client.retry_count == 1
+
+
+def test_attempt_budget_counts_retries_and_pages_before_sending_http() -> None:
+    retry_session = FakeSession(
+        [
+            FakeResponse(429, {"error": {"code": "tooManyRequests"}}, headers={"Retry-After": "0"}),
+            FakeResponse(200, {"value": []}),
+        ]
+    )
+    retry_budget = AttemptBudget(1)
+    retry_client = GraphClient(
+        StaticProvider(),
+        session=retry_session,
+        sleep=lambda _delay: None,
+        random_source=lambda: 0.0,
+    )
+
+    with pytest.raises(GraphAPIError) as retry_error:
+        retry_client.get("sites", attempt_budget=retry_budget)
+
+    assert retry_error.value.code == "request_budget_exhausted"
+    assert retry_budget.used == 1
+    assert len(retry_session.calls) == 1
+
+    page_session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "value": [{"id": "1"}],
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/sites?page=2",
+                },
+            ),
+            FakeResponse(200, {"value": [{"id": "2"}]}),
+        ]
+    )
+    page_budget = AttemptBudget(1)
+    pages = _client(page_session).iter_pages("sites", attempt_budget=page_budget)
+
+    assert next(pages)["value"] == [{"id": "1"}]
+    with pytest.raises(GraphAPIError) as page_error:
+        next(pages)
+    assert page_error.value.code == "request_budget_exhausted"
+    assert page_budget.used == 1
+    assert len(page_session.calls) == 1
 
 
 def test_retry_after_beyond_operator_budget_fails_without_early_retry() -> None:

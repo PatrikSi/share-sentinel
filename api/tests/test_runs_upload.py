@@ -49,9 +49,15 @@ def test_upload_stream_preserves_original_error_when_abort_fails(monkeypatch) ->
         return func(*args, **kwargs)
 
     monkeypatch.setattr(runs_router, "run_in_threadpool", _fake_run_in_threadpool)
-    monkeypatch.setattr(runs_router, "get_settings", lambda: SimpleNamespace(upload_chunk_bytes=8 * 1024 * 1024, upload_max_bytes=1024 * 1024))
+    monkeypatch.setattr(
+        runs_router,
+        "get_settings",
+        lambda: SimpleNamespace(upload_chunk_bytes=8 * 1024 * 1024, upload_max_bytes=1024 * 1024),
+    )
     monkeypatch.setattr(runs_router, "create_multipart_upload", lambda *_args, **_kwargs: "upload-1")
-    monkeypatch.setattr(runs_router, "upload_part", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("upload failed")))
+    monkeypatch.setattr(
+        runs_router, "upload_part", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("upload failed"))
+    )
 
     def _abort(key, upload_id):
         aborted.append((key, upload_id))
@@ -61,7 +67,7 @@ def test_upload_stream_preserves_original_error_when_abort_fails(monkeypatch) ->
     monkeypatch.setattr(runs_router, "complete_multipart_upload", lambda *_args, **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="upload failed"):
-        asyncio.run(_run_upload(_FakeUploadFile([b'{\"type\":\"run_meta\"}'])))
+        asyncio.run(_run_upload(_FakeUploadFile([b'{"type":"run_meta"}'])))
 
     assert aborted == [("projects/p/runs/r/artifact.ndjson", "upload-1")]
 
@@ -73,14 +79,20 @@ def test_upload_stream_aborts_and_raises_original_error(monkeypatch) -> None:
         return func(*args, **kwargs)
 
     monkeypatch.setattr(runs_router, "run_in_threadpool", _fake_run_in_threadpool)
-    monkeypatch.setattr(runs_router, "get_settings", lambda: SimpleNamespace(upload_chunk_bytes=8 * 1024 * 1024, upload_max_bytes=1024 * 1024))
+    monkeypatch.setattr(
+        runs_router,
+        "get_settings",
+        lambda: SimpleNamespace(upload_chunk_bytes=8 * 1024 * 1024, upload_max_bytes=1024 * 1024),
+    )
     monkeypatch.setattr(runs_router, "create_multipart_upload", lambda *_args, **_kwargs: "upload-2")
-    monkeypatch.setattr(runs_router, "upload_part", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("upload exploded")))
+    monkeypatch.setattr(
+        runs_router, "upload_part", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("upload exploded"))
+    )
     monkeypatch.setattr(runs_router, "abort_multipart_upload", lambda key, upload_id: aborted.append((key, upload_id)))
     monkeypatch.setattr(runs_router, "complete_multipart_upload", lambda *_args, **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="upload exploded"):
-        asyncio.run(_run_upload(_FakeUploadFile([b'{\"type\":\"run_meta\"}'])))
+        asyncio.run(_run_upload(_FakeUploadFile([b'{"type":"run_meta"}'])))
 
     assert aborted == [("projects/p/runs/r/artifact.ndjson", "upload-2")]
 
@@ -218,7 +230,7 @@ def test_clear_run_ingest_data_resets_summary_and_progress() -> None:
 
     runs_router._clear_run_ingest_data(fake_db, run)
 
-    assert len(fake_db.calls) == 4
+    assert len(fake_db.calls) == 6
     assert run.summary == runs_router.EMPTY_RUN_SUMMARY
     assert run.ingest_progress == {"line_offset": 0}
     assert run.collection_context == {}
@@ -477,7 +489,11 @@ def test_upload_pointer_cancellation_deletes_uncommitted_object(monkeypatch) -> 
 
     monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runs_router, "_get_run", lambda *_args, **_kwargs: run)
-    monkeypatch.setattr(runs_router, "_try_lock_run_for_mutation", lambda *_args, **_kwargs: (_ for _ in ()).throw(asyncio.CancelledError()))
+    monkeypatch.setattr(
+        runs_router,
+        "_try_lock_run_for_mutation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(asyncio.CancelledError()),
+    )
     monkeypatch.setattr(runs_router, "SessionLocal", _Db)
     monkeypatch.setattr(runs_router, "_delete_artifact_quietly", lambda key: events.append(f"delete:{key}"))
 

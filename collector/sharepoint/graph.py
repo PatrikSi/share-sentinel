@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Protocol
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -17,6 +17,12 @@ from .auth import GraphAuthProvider, GraphTokenContext
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0/"
 RETRIABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 SAFE_ERROR_CODE = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+
+
+class GraphAttemptBudget(Protocol):
+    """Thread-safe budget charged immediately before each HTTP attempt."""
+
+    def reserve_attempt(self) -> bool: ...
 
 
 class GraphAPIError(RuntimeError):
@@ -224,8 +230,8 @@ class GraphClient:
 
         return self._validated_url(url)
 
-    def get(self, url: str) -> dict[str, object]:
-        return self.request("GET", url)
+    def get(self, url: str, *, attempt_budget: GraphAttemptBudget | None = None) -> dict[str, object]:
+        return self.request("GET", url, attempt_budget=attempt_budget)
 
     def post(self, url: str, *, json_body: dict[str, object]) -> dict[str, object]:
         return self.request("POST", url, json_body=json_body)
@@ -236,11 +242,18 @@ class GraphClient:
         url: str,
         *,
         json_body: dict[str, object] | None = None,
+        attempt_budget: GraphAttemptBudget | None = None,
     ) -> dict[str, object]:
         absolute_url = self._validated_url(url)
         last_transport_error = False
         refreshed_after_401 = False
         for attempt in range(1, self.max_attempts + 1):
+            if attempt_budget is not None and not attempt_budget.reserve_attempt():
+                raise GraphAPIError(
+                    status_code=None,
+                    code="request_budget_exhausted",
+                    retryable=False,
+                )
             context = self._get_token_context()
             headers = {
                 "Authorization": f"Bearer {context.access_token}",
@@ -410,7 +423,12 @@ class GraphClient:
             self._retry_count += 1
         self._sleep(delay)
 
-    def iter_pages(self, url: str) -> Iterator[dict[str, object]]:
+    def iter_pages(
+        self,
+        url: str,
+        *,
+        attempt_budget: GraphAttemptBudget | None = None,
+    ) -> Iterator[dict[str, object]]:
         next_url: str | None = url
         seen: set[str] = set()
         page_count = 0
@@ -423,7 +441,7 @@ class GraphClient:
             if fingerprint in seen:
                 raise GraphProtocolError(status_code=None, code="pagination_cycle")
             seen.add(fingerprint)
-            payload = self.get(validated)
+            payload = self.get(validated, attempt_budget=attempt_budget)
             yield payload
             raw_next = payload.get("@odata.nextLink")
             if raw_next is None:

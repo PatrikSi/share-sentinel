@@ -1,6 +1,7 @@
 import concurrent.futures
 import hashlib
 import io
+import json
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -20,12 +21,14 @@ from sharepoint.collection import (
     SharePointStats,
     Site,
     collection_context_record,
+    collection_dimension_completeness,
     discover_drives,
     discover_sites,
     normalize_drive_item,
     resolve_target_site,
 )
 from sharepoint.graph import GraphAPIError, GraphProtocolError
+from sharepoint.permissions import PERMISSION_SELECT
 from sharepoint.state import SharePointStateStore
 
 SITE_ID = "contoso.sharepoint.com,site-guid,web-guid"
@@ -33,6 +36,8 @@ SITE_COLLECTION_ID = "contoso.sharepoint.com,site-guid"
 DELTA_1 = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=1"
 DELTA_2 = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=2"
 INITIAL_DELTA_1 = f"drives/drive-1/root/delta?$select={ITEM_SELECT}"
+ROOT_LOOKUP_1 = "drives/drive-1/root?$select=id"
+ROOT_PERMISSIONS_1 = f"drives/drive-1/items/root-1/permissions?$select={PERMISSION_SELECT}"
 
 
 def _context(*, delegated: bool = True) -> GraphTokenContext:
@@ -99,18 +104,24 @@ class FakeClient:
         self.retry_count = 0
         self.calls: list[tuple[str, str]] = []
 
-    def iter_pages(self, url: str):
+    def iter_pages(self, url: str, *, attempt_budget=None):
         self.calls.append(("pages", url))
         value = self.routes[url]
         if isinstance(value, BaseException):
+            if attempt_budget is not None and not attempt_budget.reserve_attempt():
+                raise GraphAPIError(status_code=None, code="request_budget_exhausted")
             raise value
         for page in value:
+            if attempt_budget is not None and not attempt_budget.reserve_attempt():
+                raise GraphAPIError(status_code=None, code="request_budget_exhausted")
             if isinstance(page, BaseException):
                 raise page
             yield page
 
-    def get(self, url: str):
+    def get(self, url: str, *, attempt_budget=None):
         self.calls.append(("get", url))
+        if attempt_budget is not None and not attempt_budget.reserve_attempt():
+            raise GraphAPIError(status_code=None, code="request_budget_exhausted")
         value = self.routes[url]
         if isinstance(value, BaseException):
             raise value
@@ -198,6 +209,77 @@ def test_delegated_discovery_is_explicitly_security_trimmed() -> None:
     assert context["collection_mode"] == "delegated_user_view"
     assert context["discovery_completeness"] == "security_trimmed"
     assert context["materialized_snapshot"] is True
+
+
+def test_dimension_completeness_keeps_permission_failures_independent() -> None:
+    stats = {
+        "sites_failed": 0,
+        "libraries_failed": 0,
+        "truncated": False,
+        "error_codes": {"PERMISSION_DENIED": 1},
+    }
+
+    structural_complete, content_complete = collection_dimension_completeness(
+        stats,
+        SharePointCollectionConfig(include_files=True, permissions="all_items"),
+        status="partial",
+    )
+    context = collection_context_record(
+        _context(delegated=False),
+        SharePointCollectionConfig(include_files=True, permissions="all_items"),
+        status="partial",
+        sync_mode="full",
+        partial=True,
+        structural_complete=structural_complete,
+        content_complete=content_complete,
+    )
+
+    assert structural_complete is True
+    assert content_complete is True
+    assert context["discovery_completeness"] == "complete_for_granted_scope"
+    assert context["metadata"]["discovery_authoritative"] is True
+    assert context["metadata"]["structural_complete"] is True
+    assert context["metadata"]["content_complete"] is True
+    assert context["metadata"]["comparison_contracts"] == {
+        "structural": "sharepoint_resource_inventory_v1",
+        "content": "sharepoint_drive_inventory_v1",
+    }
+
+
+@pytest.mark.parametrize(
+    ("stats", "expected"),
+    [
+        (
+            {
+                "sites_failed": 1,
+                "libraries_failed": 0,
+                "truncated": False,
+                "error_codes": {"SITE_DISCOVERY_FORBIDDEN": 1},
+            },
+            (False, False),
+        ),
+        (
+            {
+                "sites_failed": 0,
+                "libraries_failed": 1,
+                "truncated": False,
+                "error_codes": {"LIBRARY_REQUEST_FAILED": 1},
+            },
+            (True, False),
+        ),
+    ],
+)
+def test_dimension_completeness_separates_discovery_and_content_failures(
+    stats: dict[str, object], expected: tuple[bool, bool]
+) -> None:
+    assert (
+        collection_dimension_completeness(
+            stats,
+            SharePointCollectionConfig(include_files=True),
+            status="partial",
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -827,15 +909,19 @@ def test_targeted_unknown_future_lifecycle_marks_run_partial(tmp_path) -> None:
 
 def test_broad_unknown_future_lifecycle_marks_run_partial_without_duplicate_lookup(tmp_path) -> None:
     routes = _routes([{"value": [], "@odata.deltaLink": DELTA_1}])
-    routes["sites?search=*"] = [{
-        "value": [{
-            **_site(),
-            "siteCollection": {
-                "hostname": "contoso.sharepoint.com",
-                "archivalDetails": {"archiveStatus": "unknownFutureValue"},
-            },
-        }],
-    }]
+    routes["sites?search=*"] = [
+        {
+            "value": [
+                {
+                    **_site(),
+                    "siteCollection": {
+                        "hostname": "contoso.sharepoint.com",
+                        "archivalDetails": {"archiveStatus": "unknownFutureValue"},
+                    },
+                }
+            ],
+        }
+    ]
     collector, _, writer = _collector(tmp_path, routes)
 
     _, status = collector.collect()
@@ -1117,9 +1203,7 @@ def test_complete_library_reports_specific_items_counts_and_partial_observed_siz
     metadata = final_resource["metadata"]
     assert status == "success"
     assert {item["name"] for item in items} == {"known.txt", "unknown.bin", "Plans"}
-    assert next(item for item in items if item["provider_item_id"] == "folder-1")["metadata"][
-        "folder_child_count"
-    ] == 0
+    assert next(item for item in items if item["provider_item_id"] == "folder-1")["metadata"]["folder_child_count"] == 0
     assert metadata["content_state"] == "populated"
     assert metadata["file_count"] == 2
     assert metadata["folder_count"] == 1
@@ -1130,9 +1214,10 @@ def test_complete_library_reports_specific_items_counts_and_partial_observed_siz
     assert metadata["reactivating_file_count"] == 1
     assert metadata["active_file_count"] == 0
     assert metadata["unknown_file_archive_count"] == 0
-    assert next(item for item in items if item["provider_item_id"] == "known")["metadata"][
-        "file_archive_status"
-    ] == "fully_archived"
+    assert (
+        next(item for item in items if item["provider_item_id"] == "known")["metadata"]["file_archive_status"]
+        == "fully_archived"
+    )
 
 
 def test_initial_then_incremental_collection_emits_full_materialized_snapshot(tmp_path) -> None:
@@ -1273,15 +1358,49 @@ def test_one_inaccessible_library_does_not_abort_other_libraries(tmp_path) -> No
     assert collector.stats.libraries_failed == 1
     assert any(record.get("code") == "LIBRARY_PERMISSION_DENIED" for record in writer.records)
     restricted = [
-        record
-        for record in writer.records
-        if record.get("type") == "resource" and record.get("name") == "Restricted"
+        record for record in writer.records if record.get("type") == "resource" and record.get("name") == "Restricted"
     ][-1]
     assert restricted["access_level"] == "unknown"
     assert restricted["metadata"]["enumeration_status"] == "permission_denied"
     assert restricted["metadata"]["content_state"] == "unknown"
     assert restricted["metadata"]["collection_complete"] is False
     assert restricted["metadata"]["item_count"] is None
+
+
+def test_failed_content_enumeration_marks_all_item_permission_selection_partial(tmp_path) -> None:
+    routes = _routes(
+        [{"value": [_file("a", "a.txt")], "@odata.deltaLink": DELTA_1}],
+        drives=[_drive("drive-1", "Documents"), _drive("drive-2", "Restricted")],
+    )
+    routes[f"drives/drive-2/root/delta?$select={ITEM_SELECT}"] = GraphAPIError(
+        status_code=403,
+        code="accessDenied",
+    )
+    routes[ROOT_LOOKUP_1] = {"id": "root-1"}
+    routes[ROOT_PERMISSIONS_1] = [{"value": []}]
+    routes["drives/drive-2/root?$select=id"] = {"id": "root-2"}
+    routes[f"drives/drive-2/items/root-2/permissions?$select={PERMISSION_SELECT}"] = [{"value": []}]
+    routes[f"drives/drive-1/items/a/permissions?$select={PERMISSION_SELECT}"] = [{"value": []}]
+    collector, _, _ = _collector(
+        tmp_path,
+        routes,
+        config=SharePointCollectionConfig(
+            permissions="all_items",
+            permission_concurrency=1,
+            concurrency=1,
+            quiet=True,
+        ),
+    )
+
+    pending, status = collector.collect()
+
+    assert status == "partial"
+    assert [drive.drive_id for drive in pending] == ["drive-1"]
+    summary = collector.permission_run_summary
+    assert summary["candidate_objects"] == 3
+    assert summary["selection_incomplete_scopes"] == 1
+    assert summary["request_coverage"] == "partial"
+    assert "selection_content_enumeration_failed" in summary["partial_reasons"]
 
 
 def test_malformed_item_is_reported_without_advancing_checkpoint(tmp_path) -> None:
@@ -1361,3 +1480,296 @@ def test_site_limit_marks_app_discovery_non_authoritative() -> None:
 
     assert context["discovery_completeness"] == "partial"
     assert context["metadata"]["discovery_authoritative"] is False
+
+
+def test_library_root_permissions_emit_v2_records_after_parent_and_classify_anonymous(tmp_path) -> None:
+    routes = _routes([], drives=[_drive()])
+    routes[ROOT_LOOKUP_1] = {"id": "root-1"}
+    routes[ROOT_PERMISSIONS_1] = [
+        {
+            "value": [
+                {
+                    "id": "permission-1",
+                    "roles": ["read"],
+                    "shareId": "never-emit-this",
+                    "link": {
+                        "scope": "anonymous",
+                        "type": "view",
+                        "webUrl": "https://contoso.sharepoint.com/:w:/secret",
+                    },
+                }
+            ]
+        }
+    ]
+    collector, _, writer = _collector(
+        tmp_path,
+        routes,
+        config=SharePointCollectionConfig(
+            include_files=False,
+            permissions="library_roots",
+            permission_concurrency=2,
+            concurrency=1,
+            quiet=True,
+        ),
+    )
+
+    pending, status = collector.collect()
+
+    assert pending == []
+    assert status == "success"
+    types = [record["type"] for record in writer.records]
+    first_resource = types.index("resource")
+    assessment_index = types.index("permission_assessment")
+    entry_index = types.index("permission_entry")
+    assert first_resource < assessment_index < entry_index < len(types) - 1
+    final_resource = [record for record in writer.records if record["type"] == "resource"][-1]
+    assert final_resource["exposure"] == "ANONYMOUS"
+    assert final_resource["metadata"]["permission_summary"]["assessment_state"] == "complete"
+    assert final_resource["permission_summary"] == final_resource["metadata"]["permission_summary"]
+    assessment = writer.records[assessment_index]
+    assert assessment["permission_surface"] == "sharepoint_graph_permissions"
+    assert assessment["semantics"] == "sharepoint_graph_permission_v1"
+    assert assessment["provider_resource_id"] == "drive-1"
+    assert "provider_item_id" not in assessment
+    assert "never-emit-this" not in json.dumps(writer.records)
+    assert "/secret" not in json.dumps(writer.records)
+    summary = collector.permission_run_summary
+    assert summary["request_coverage"] == "complete"
+    assert summary["candidate_objects"] == 1
+    assert summary["http_attempts"] == 2
+
+
+def test_all_item_permissions_assess_materialized_snapshot_and_keep_child_exposure_separate(tmp_path) -> None:
+    routes = _routes(
+        [{"value": [_file("a", "a.txt"), _file("b", "b.txt")], "@odata.deltaLink": DELTA_1}],
+        delegated=False,
+    )
+    routes[ROOT_LOOKUP_1] = {"id": "root-1"}
+    routes[ROOT_PERMISSIONS_1] = [
+        {
+            "value": [
+                {
+                    "id": "root-permission",
+                    "roles": ["read"],
+                    "link": {"scope": "organization", "type": "view"},
+                }
+            ]
+        }
+    ]
+    routes[f"drives/drive-1/items/a/permissions?$select={PERMISSION_SELECT}"] = [
+        {
+            "value": [
+                {
+                    "id": "anonymous-file",
+                    "roles": ["read"],
+                    "link": {"scope": "anonymous", "type": "view"},
+                }
+            ]
+        }
+    ]
+    routes[f"drives/drive-1/items/b/permissions?$select={PERMISSION_SELECT}"] = [
+        {
+            "value": [
+                {
+                    "id": "specific-user",
+                    "roles": ["read"],
+                    "grantedToV2": {
+                        "user": {"id": "guest-user", "displayName": "Guest #EXT#"},
+                    },
+                }
+            ]
+        }
+    ]
+    collector, _, writer = _collector(
+        tmp_path,
+        routes,
+        delegated=False,
+        config=SharePointCollectionConfig(
+            permissions="all_items",
+            permission_concurrency=2,
+            concurrency=1,
+            quiet=True,
+        ),
+    )
+
+    pending, status = collector.collect()
+
+    assert status == "success"
+    assert len(pending) == 1
+    items = {record["provider_item_id"]: record for record in writer.records if record["type"] == "item"}
+    assert items["a"]["exposure"] == "ANONYMOUS"
+    assert items["b"]["exposure"] == "UNKNOWN"
+    assert items["b"]["metadata"]["permission_summary"]["negative_conclusion_supported"] is False
+    assert items["b"]["permission_summary"] == items["b"]["metadata"]["permission_summary"]
+    resources = [record for record in writer.records if record["type"] == "resource"]
+    final_resource = resources[-1]
+    assert final_resource["exposure"] == "BROAD_INTERNAL"
+    descendants = final_resource["metadata"]["descendant_permission_summary"]
+    assert descendants["highest_supported_exposure"] == "ANONYMOUS"
+    assert descendants["anonymous_items"] == 1
+    assert descendants["unknown_or_user_visible_items"] == 1
+    assert descendants["root_exposure_included"] is False
+    summary = collector.permission_run_summary
+    assert summary["candidate_objects"] == 3
+    assert summary["completed_objects"] == 3
+    assert summary["http_attempts"] == 4
+
+
+def test_permission_budget_partial_keeps_complete_content_snapshot_and_pending_checkpoint(tmp_path) -> None:
+    routes = _routes([{"value": [_file("a", "a.txt"), _file("b", "b.txt")], "@odata.deltaLink": DELTA_1}])
+    routes[ROOT_LOOKUP_1] = {"id": "root-1"}
+    routes[ROOT_PERMISSIONS_1] = [{"value": []}]
+    collector, _, writer = _collector(
+        tmp_path,
+        routes,
+        config=SharePointCollectionConfig(
+            permissions="all_items",
+            max_permission_objects=1,
+            permission_concurrency=2,
+            concurrency=1,
+            quiet=True,
+        ),
+    )
+
+    pending, status = collector.collect()
+
+    assert status == "partial"
+    assert len(pending) == 1
+    assert pending[0].item_count == 2
+    items = [record for record in writer.records if record["type"] == "item"]
+    assert len(items) == 2
+    assert all(item["metadata"]["permission_summary"]["assessment_state"] == "not_assessed" for item in items)
+    assert all(item["metadata"]["permission_summary"]["failure_reason"] == "budget_exhausted" for item in items)
+    assert not any(
+        record["type"] == "permission_assessment" and record.get("provider_item_id") in {"a", "b"}
+        for record in writer.records
+    )
+    summary = collector.permission_run_summary
+    assert summary["request_coverage"] == "budget_exhausted"
+    assert summary["attempted_objects"] == 1
+    assert summary["skipped_objects"] == 2
+    final_resource = [record for record in writer.records if record["type"] == "resource"][-1]
+    assert final_resource["metadata"]["collection_complete"] is True
+    assert final_resource["metadata"]["descendant_permission_summary"]["assessment_state"] == "partial"
+
+
+def test_item_permission_failure_is_scoped_and_does_not_discard_content_stage(tmp_path) -> None:
+    routes = _routes([{"value": [_file("a", "a.txt")], "@odata.deltaLink": DELTA_1}])
+    routes[ROOT_LOOKUP_1] = {"id": "root-1"}
+    routes[ROOT_PERMISSIONS_1] = [{"value": []}]
+    routes[f"drives/drive-1/items/a/permissions?$select={PERMISSION_SELECT}"] = GraphAPIError(
+        status_code=403,
+        code="accessDenied",
+    )
+    collector, _, writer = _collector(
+        tmp_path,
+        routes,
+        config=SharePointCollectionConfig(
+            permissions="all_items",
+            permission_concurrency=1,
+            concurrency=1,
+            quiet=True,
+        ),
+    )
+
+    pending, status = collector.collect()
+
+    assert status == "partial"
+    assert len(pending) == 1
+    item = next(record for record in writer.records if record["type"] == "item")
+    assert item["metadata"]["permission_summary"]["assessment_state"] == "failed"
+    assert item["metadata"]["permission_summary"]["failure_reason"] == "permission_denied"
+    assessment = next(
+        record
+        for record in writer.records
+        if record["type"] == "permission_assessment" and record.get("provider_item_id") == "a"
+    )
+    assert assessment["error_code"] == "PERMISSION_DENIED"
+    assert assessment["negative_conclusion_supported"] is False
+    assert sum(record.get("code") == "PERMISSION_DENIED" for record in writer.records) == 1
+
+
+def test_none_permission_mode_preserves_legacy_context_and_record_types(tmp_path) -> None:
+    collector, _, writer = _collector(
+        tmp_path,
+        _routes([{"value": [_file("a", "a.txt")], "@odata.deltaLink": DELTA_1}]),
+    )
+
+    _, status = collector.collect()
+    context = collection_context_record(
+        _context(),
+        SharePointCollectionConfig(),
+        status=status,
+        sync_mode=collector.sync_mode,
+        partial=False,
+    )
+
+    assert status == "success"
+    assert context["metadata"]["permissions_assessed"] is False
+    assert "permissions_complete" not in context["metadata"]
+    assert "permission_assessment" not in context["metadata"]
+    assert not any(record["type"].startswith("permission_") for record in writer.records)
+    assert not any(
+        "permission_summary" in record for record in writer.records if record["type"] in {"resource", "item"}
+    )
+
+
+def test_item_permission_work_uses_small_global_concurrency_bound(tmp_path) -> None:
+    class ConcurrencyClient(FakeClient):
+        def __init__(self, routes):
+            super().__init__(routes)
+            self._active_lock = threading.Lock()
+            self.active_permissions = 0
+            self.max_active_permissions = 0
+
+        def iter_pages(self, url: str, *, attempt_budget=None):
+            if "/permissions?" not in url:
+                yield from super().iter_pages(url, attempt_budget=attempt_budget)
+                return
+            self.calls.append(("pages", url))
+            if attempt_budget is not None and not attempt_budget.reserve_attempt():
+                raise GraphAPIError(status_code=None, code="request_budget_exhausted")
+            with self._active_lock:
+                self.active_permissions += 1
+                self.max_active_permissions = max(self.max_active_permissions, self.active_permissions)
+            try:
+                time.sleep(0.03)
+                yield from self.routes[url]
+            finally:
+                with self._active_lock:
+                    self.active_permissions -= 1
+
+    routes = _routes(
+        [
+            {
+                "value": [_file("a", "a.txt"), _file("b", "b.txt"), _file("c", "c.txt")],
+                "@odata.deltaLink": DELTA_1,
+            }
+        ]
+    )
+    routes[ROOT_LOOKUP_1] = {"id": "root-1"}
+    routes[ROOT_PERMISSIONS_1] = [{"value": []}]
+    for item_id in ("a", "b", "c"):
+        routes[f"drives/drive-1/items/{item_id}/permissions?$select={PERMISSION_SELECT}"] = [{"value": []}]
+    client = ConcurrencyClient(routes)
+    writer = MemoryWriter()
+    state = SharePointStateStore(tmp_path / "state.sqlite3")
+    collector = SharePointCollector(
+        client=client,
+        state=state,
+        writer=writer,
+        run_id="run-1",
+        context=_context(),
+        config=SharePointCollectionConfig(
+            permissions="all_items",
+            permission_concurrency=2,
+            concurrency=1,
+            quiet=True,
+        ),
+    )
+
+    pending, status = collector.collect()
+
+    assert status == "success"
+    assert len(pending) == 1
+    assert client.max_active_permissions == 2

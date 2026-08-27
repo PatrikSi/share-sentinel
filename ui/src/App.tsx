@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { lazy, Suspense, useEffect, useRef } from "react";
 import { Navigate, Route, Routes, useLocation, useParams } from "react-router-dom";
 
 import { AppFooter } from "@/components/app-footer";
@@ -20,6 +20,10 @@ import { SettingsLayout } from "@/pages/settings-layout";
 import { SettingsOverviewPage } from "@/pages/settings-overview-page";
 import { SettingsProjectDetailPage } from "@/pages/settings-project-detail-page";
 import { SettingsProjectsPage } from "@/pages/settings-projects-page";
+
+const ComparisonPage = lazy(() =>
+  import("@/pages/comparison-page").then((module) => ({ default: module.ComparisonPage })),
+);
 
 function RequireAuth({ children }: { children: JSX.Element }) {
   const location = useLocation();
@@ -67,6 +71,15 @@ function ProjectInventoryRoute() {
   return <ProjectInventoryPage key={projectId || ""} />;
 }
 
+function ComparisonRoute() {
+  const { projectId, comparisonId } = useParams<{ projectId: string; comparisonId: string }>();
+  return (
+    <Suspense fallback={<StatePanel description="Loading the resource comparison workspace." title="Loading comparison" />}>
+      <ComparisonPage key={`${projectId || ""}:${comparisonId || ""}`} />
+    </Suspense>
+  );
+}
+
 function ProjectImportRoute() {
   const { projectId } = useParams<{ projectId: string }>();
   return <ProjectImportPage key={projectId || ""} />;
@@ -110,6 +123,8 @@ export function App() {
       ? "Settings"
       : location.pathname.includes("/inventory")
         ? "Inventory"
+        : location.pathname.includes("/comparisons/")
+          ? "Resource comparison"
         : location.pathname.includes("/import")
           ? "Import scan"
           : location.pathname.includes("/runs/")
@@ -159,6 +174,14 @@ export function App() {
               element={
                 <RequireAuth>
                   <ProjectInventoryRoute />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/projects/:projectId/comparisons/:comparisonId"
+              element={
+                <RequireAuth>
+                  <ComparisonRoute />
                 </RequireAuth>
               }
             />

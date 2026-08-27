@@ -19,7 +19,18 @@ from app.db import SessionLocal, escape_like, get_db
 from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
 from app.enums import ErrorSeverity, ProjectRole, RunStatus
 from app.locking import lock_project_admin_guard
-from app.models import AuditEvent, Endpoint, IngestError, Item, Resource, ScanRun
+from app.models import (
+    AuditEvent,
+    Endpoint,
+    IngestError,
+    Item,
+    PermissionAssessment,
+    PermissionEntry,
+    PermissionPrincipal,
+    Resource,
+    RunComparison,
+    ScanRun,
+)
 from app.pagination import (
     KeysetColumn,
     apply_keyset_pagination,
@@ -29,7 +40,8 @@ from app.pagination import (
     parse_uuid_cursor_value,
 )
 from app.rate_limit import RateLimiter
-from app.schemas import IngestErrorOut, RunActivityEventOut, RunCreateIn, RunOut
+from app.schemas import AccessEvidenceOut, IngestErrorOut, RunActivityEventOut, RunCreateIn, RunOut
+from app.services.access_evidence import build_access_evidence_summary
 from app.services.audit import write_audit_event
 from app.services.queue import enqueue_ingest_job
 from app.services.storage import (
@@ -40,7 +52,7 @@ from app.services.storage import (
     upload_part,
 )
 from app.share_types import share_type_from_resource_type
-from app.token_scopes import SCOPE_READ_RUNS, SCOPE_WRITE_RUNS
+from app.token_scopes import SCOPE_READ_INVENTORY, SCOPE_READ_RUNS, SCOPE_WRITE_RUNS
 
 router = APIRouter(prefix="/projects/{project_id}/runs", tags=["runs"])
 rate_limiter = RateLimiter()
@@ -84,6 +96,8 @@ MAX_SEARCH_CHARS = 512
 MAX_PATH_PREFIX_CHARS = 4096
 MAX_RUN_DIFF_DETAIL_RECORDS = 2000
 DEFAULT_RUN_DIFF_DETAIL_RECORDS = 500
+ACCESS_EVIDENCE_ASSESSMENT_PAGE_MAX = 25
+ACCESS_EVIDENCE_ENTRY_PAGE_MAX = 100
 
 
 def _provider_from_resource_type_expression():
@@ -383,7 +397,68 @@ def _run_diff_compatibility(current_run: ScanRun, baseline_run: ScanRun | None) 
     }
 
 
+def _strict_run_diff_compatibility(current_run: ScanRun, baseline_run: ScanRun | None) -> dict:
+    """Gate legacy item previews with the current provider scope contracts.
+
+    The bounded diff still computes snapshot set differences for convenience,
+    but its single historical ``compatible`` flag may authorize New/Disappeared
+    and Added/Removed wording only when both structural and content dimensions
+    pass the provider-specific comparison contract. SMB also needs the worker's
+    endpoint identity preflight, which this synchronous endpoint cannot perform.
+    """
+
+    legacy = _run_diff_compatibility(current_run, baseline_run)
+    if baseline_run is None:
+        return legacy
+
+    # Local import avoids a module-import cycle: the comparison router reuses
+    # the generic helper above while this request-time adapter consumes its
+    # stricter dimension-specific contract.
+    from app.routers.comparisons import build_comparison_compatibility
+
+    strict = build_comparison_compatibility(current_run, baseline_run)
+    structural = strict.get("structural_interpretable") is True
+    content = strict.get("content_interpretable") is True
+    identity = strict.get("identity_applicable") is False or strict.get("identity_scope_exact") is True
+    compatible = bool(legacy.get("compatible") is True and structural and content and identity)
+
+    warnings = [str(legacy.get("warning") or "").strip()]
+    warnings.extend(str(reason).strip() for reason in strict.get("reasons", []) if str(reason).strip())
+    if not identity and strict.get("identity_applicable") is True:
+        warnings.append(
+            "Definitive SMB absence claims require the materialized comparison's endpoint identity preflight."
+        )
+    warnings = list(dict.fromkeys(warning for warning in warnings if warning))
+
+    mismatched = [str(field) for field in legacy.get("mismatched_fields", []) if str(field)]
+    if not structural:
+        mismatched.append("comparison.structural_scope")
+    if not content:
+        mismatched.append("comparison.content_scope")
+    if not identity:
+        mismatched.append("comparison.identity_scope")
+    return {
+        "compatible": compatible,
+        "warning": " ".join(warnings) if warnings else None,
+        "mismatched_fields": list(dict.fromkeys(mismatched)),
+        "dimensions": {
+            "structural_interpretable": structural,
+            "content_interpretable": content,
+            "identity_scope_exact": identity,
+        },
+    }
+
+
 def _clear_run_ingest_data(db: Session, run: ScanRun) -> None:
+    # A replacement artifact invalidates every materialized result involving
+    # this run. Delete comparison headers first so no stale partial result can
+    # survive while resource foreign keys are cleared.
+    db.execute(
+        delete(RunComparison).where(
+            or_(RunComparison.baseline_run_id == run.id, RunComparison.current_run_id == run.id)
+        )
+    )
+    db.execute(delete(PermissionPrincipal).where(PermissionPrincipal.run_id == run.id))
     db.execute(delete(Item).where(Item.run_id == run.id))
     db.execute(delete(Resource).where(Resource.run_id == run.id))
     db.execute(delete(Endpoint).where(Endpoint.run_id == run.id))
@@ -434,8 +509,12 @@ def _resource_identity(
     share_name: str,
     provider_resource_id: str | None = None,
 ) -> tuple[str, str, str]:
-    stable_identity = f"provider:{provider_resource_id}" if provider_resource_id else share_name or ""
-    return (endpoint_key or "", resource_type or "", stable_identity)
+    if provider_resource_id:
+        # Provider-native IDs survive DNS/IP/site aliases and endpoint
+        # renames. Retaining endpoint_key here would turn a move into a false
+        # disappear+appear pair.
+        return ("", resource_type or "", f"provider:{provider_resource_id}")
+    return (endpoint_key or "", resource_type or "", share_name or "")
 
 
 def _sorted_resource_keys(keys: Iterable[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
@@ -586,7 +665,10 @@ def _iter_run_diff_resources(db: Session, run_id: uuid.UUID):
         )
         .where(Resource.run_id == run_id)
         .order_by(
-            func.lower(Endpoint.endpoint_key),
+            case(
+                (Resource.provider_resource_id.is_not(None), ""),
+                else_=func.lower(Endpoint.endpoint_key),
+            ),
             case(
                 (
                     Resource.provider_resource_id.is_not(None),
@@ -1550,7 +1632,7 @@ def diff_run(
         le=MAX_RUN_DIFF_DETAIL_RECORDS,
     ),
     db: Session = Depends(get_db),
-    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS, SCOPE_READ_INVENTORY)),
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
@@ -1609,7 +1691,7 @@ def diff_run(
     )
     payload["current_run"] = _run_summary_payload(current_run)
     payload["baseline_run"] = _run_summary_payload(baseline_run)
-    payload["comparison_compatibility"] = _run_diff_compatibility(current_run, baseline_run)
+    payload["comparison_compatibility"] = _strict_run_diff_compatibility(current_run, baseline_run)
 
     _write_read_audit(
         db,
@@ -1892,11 +1974,256 @@ def endpoint_resources(
                 "metadata": getattr(r, "provider_metadata", None) or {},
                 "exposure": getattr(r, "exposure", None),
                 "exposure_evidence": getattr(r, "exposure_evidence", None) or {},
+                "access_evidence_summary": build_access_evidence_summary(
+                    getattr(r, "permission_summary", None),
+                    r.access_level,
+                    r.access_capabilities,
+                    getattr(r, "exposure", None),
+                ),
             }
             for r in resources
         ],
         "next_cursor": next_cursor,
     }
+
+
+@router.get("/{run_id}/resources/{resource_id}/access-evidence", response_model=AccessEvidenceOut)
+def resource_access_evidence(
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+    resource_id: int,
+    request: Request,
+    assessment_limit: int = Query(
+        default=ACCESS_EVIDENCE_ASSESSMENT_PAGE_MAX,
+        ge=1,
+        le=ACCESS_EVIDENCE_ASSESSMENT_PAGE_MAX,
+    ),
+    entry_limit: int = Query(
+        default=ACCESS_EVIDENCE_ENTRY_PAGE_MAX,
+        ge=1,
+        le=ACCESS_EVIDENCE_ENTRY_PAGE_MAX,
+    ),
+    after_assessment_id: int | None = Query(default=None, ge=0),
+    after_entry_id: int | None = Query(default=None, ge=0),
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
+    _inventory_scope: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    resource = _require_resource(db, project_id, run_id, resource_id)
+    run = _get_run(db, project_id, run_id)
+    endpoint = db.execute(
+        select(Endpoint).where(Endpoint.id == resource.endpoint_id, Endpoint.run_id == run_id)
+    ).scalar_one_or_none()
+
+    assessment_stmt = select(PermissionAssessment).where(
+        PermissionAssessment.run_id == run_id,
+        PermissionAssessment.resource_id == resource_id,
+    )
+    if after_assessment_id is not None:
+        assessment_stmt = assessment_stmt.where(PermissionAssessment.id > after_assessment_id)
+    assessments = (
+        db.execute(assessment_stmt.order_by(PermissionAssessment.id).limit(assessment_limit + 1)).scalars().all()
+    )
+    assessments_truncated = len(assessments) > assessment_limit
+    assessments = assessments[:assessment_limit]
+    assessment_ids = [assessment.id for assessment in assessments]
+
+    entry_rows: list[tuple[PermissionEntry, PermissionPrincipal | None]] = []
+    if assessment_ids:
+        entry_stmt = (
+            select(PermissionEntry, PermissionPrincipal)
+            .outerjoin(
+                PermissionPrincipal,
+                and_(
+                    PermissionPrincipal.id == PermissionEntry.principal_id,
+                    PermissionPrincipal.run_id == PermissionEntry.run_id,
+                ),
+            )
+            .where(
+                PermissionEntry.run_id == run_id,
+                PermissionEntry.assessment_id.in_(assessment_ids),
+            )
+            .order_by(PermissionEntry.id)
+            .limit(entry_limit + 1)
+        )
+        if after_entry_id is not None:
+            entry_stmt = entry_stmt.where(PermissionEntry.id > after_entry_id)
+        entry_rows = list(db.execute(entry_stmt).all())
+    entries_truncated = len(entry_rows) > entry_limit
+    visible_entry_rows = entry_rows[:entry_limit]
+    entries_by_assessment: dict[int, list[dict]] = {assessment_id: [] for assessment_id in assessment_ids}
+    for entry, principal in visible_entry_rows:
+        principal_payload = None
+        if principal is not None:
+            principal_payload = {
+                "principal_key": principal.principal_key,
+                "provider": principal.provider,
+                "identifier_namespace": principal.identifier_namespace,
+                "authority": principal.authority,
+                "native_id": principal.native_id,
+                "kind": principal.kind,
+                "display_name": principal.display_name,
+                "login_name": principal.login_name,
+                "email": principal.email,
+                "resolution": principal.resolution_state,
+                "resolution_source": principal.resolution_source,
+                "aliases": principal.aliases or [],
+            }
+        entries_by_assessment.setdefault(entry.assessment_id, []).append(
+            {
+                "id": entry.id,
+                "entry_key": entry.entry_key,
+                "provider_entry_id": entry.provider_entry_id,
+                "ordinal": entry.ordinal,
+                "entry_kind": entry.entry_kind,
+                "effect": entry.entry_effect,
+                "normalized_rights": entry.normalized_rights or [],
+                "inherited_state": entry.inherited_state,
+                "expiration_at": entry.expiration_at.isoformat() if entry.expiration_at else None,
+                "evidence_hash": entry.evidence_hash,
+                "principal": principal_payload,
+                "provider_details": entry.provider_details or {},
+            }
+        )
+
+    assessment_payloads = [
+        {
+            "id": assessment.id,
+            "assessment_key": assessment.assessment_key,
+            "provider": assessment.provider,
+            "semantics": assessment.semantics,
+            "permission_surface": assessment.permission_surface,
+            "method": assessment.method,
+            "subject": {
+                "kind": assessment.subject_kind,
+                "key": assessment.subject_key,
+                "provider_id": assessment.subject_provider_id,
+                "path": assessment.subject_path,
+                "item_id": assessment.item_id,
+            },
+            "assessment_state": assessment.assessment_state,
+            "state": assessment.assessment_state,
+            "coverage": {
+                "selection_scope": assessment.selection_scope,
+                "selection": assessment.selection_coverage,
+                "retrieval": assessment.retrieval_coverage,
+                "provider_visibility": assessment.provider_visibility,
+                "semantic": assessment.semantic_coverage,
+                "principal_resolution": assessment.principal_resolution,
+                "effective_access": assessment.effective_access_status,
+                "negative_conclusion_supported": assessment.negative_conclusion_supported,
+            },
+            "counts": {
+                "observed": assessment.entries_observed,
+                "emitted": assessment.entries_emitted,
+                "omitted": assessment.entries_omitted,
+                "unknown": assessment.unknown_entries,
+            },
+            "evidence_hash": assessment.evidence_hash,
+            "entry_set_hash": assessment.entry_set_hash,
+            "observed_at": assessment.observed_at.isoformat() if assessment.observed_at else None,
+            "limitations": assessment.limitations or [],
+            "error_code": assessment.error_code,
+            "errors": assessment.errors or [],
+            "summary": assessment.summary or {},
+            "provider_details": assessment.provider_details or {},
+            "entries": entries_by_assessment.get(assessment.id, []),
+        }
+        for assessment in assessments
+    ]
+    summary = build_access_evidence_summary(
+        resource.permission_summary,
+        resource.access_level,
+        resource.access_capabilities,
+        resource.exposure,
+    )
+    total_assessments = int(
+        db.execute(
+            select(func.count(PermissionAssessment.id)).where(
+                PermissionAssessment.run_id == run_id,
+                PermissionAssessment.resource_id == resource_id,
+            )
+        ).scalar()
+        or 0
+    )
+    total_entries = int(
+        db.execute(
+            select(func.count(PermissionEntry.id))
+            .join(
+                PermissionAssessment,
+                and_(
+                    PermissionAssessment.id == PermissionEntry.assessment_id,
+                    PermissionAssessment.run_id == PermissionEntry.run_id,
+                ),
+            )
+            .where(
+                PermissionEntry.run_id == run_id,
+                PermissionAssessment.run_id == run_id,
+                PermissionAssessment.resource_id == resource_id,
+            )
+        ).scalar()
+        or 0
+    )
+
+    _write_read_audit(
+        db,
+        request,
+        auth,
+        project_id,
+        action="ACCESS_EVIDENCE_VIEWED",
+        object_type="resource",
+        object_id=str(resource_id),
+        metadata={
+            "run_id": str(run_id),
+            "assessment_count": total_assessments,
+            "entry_count": total_entries,
+        },
+    )
+    db.commit()
+    return AccessEvidenceOut(
+        resource={
+            "id": resource.id,
+            "name": resource.name,
+            "resource_type": resource.resource_type.value
+            if hasattr(resource.resource_type, "value")
+            else str(resource.resource_type),
+            "provider": resource.provider or share_type_from_resource_type(resource.resource_type),
+            "provider_resource_id": resource.provider_resource_id,
+            "endpoint_key": endpoint.endpoint_key if endpoint else None,
+            "web_url": resource.web_url,
+        },
+        overall={
+            **summary,
+            "direct_assessment_available": total_assessments > 0,
+            "assessment_count": total_assessments,
+            "entry_count": total_entries,
+            "access_level": resource.access_level.value
+            if hasattr(resource.access_level, "value")
+            else str(resource.access_level),
+            "access_capabilities": resource.access_capabilities or {},
+            "exposure": resource.exposure,
+            "exposure_evidence": resource.exposure_evidence or {},
+        },
+        assessments=assessment_payloads,
+        provenance={
+            "run_id": str(run.id),
+            "run_name": run.name,
+            "run_created_at": run.created_at.isoformat() if run.created_at else None,
+            "collection_context": run.collection_context or {},
+            "pagination": {
+                "assessment_limit": assessment_limit,
+                "after_assessment_id": after_assessment_id,
+                "assessments_truncated": assessments_truncated,
+                "next_assessment_id": assessments[-1].id if assessments_truncated and assessments else None,
+                "entry_limit": entry_limit,
+                "after_entry_id": after_entry_id,
+                "entries_truncated": entries_truncated,
+                "next_entry_id": visible_entry_rows[-1][0].id if entries_truncated and visible_entry_rows else None,
+            },
+        },
+    )
 
 
 @router.get("/{run_id}/resources/{resource_id}/items")

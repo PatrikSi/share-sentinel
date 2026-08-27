@@ -32,6 +32,7 @@ from app.models import Endpoint, Item, Resource, SavedInvestigation, ScanRun, Us
 from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_int_cursor_value
 from app.rate_limit import RateLimiter
 from app.schemas import SavedInvestigationIn, SavedInvestigationOut, SavedInvestigationUpdateIn
+from app.services.access_evidence import build_access_evidence_summary
 from app.services.audit import write_audit_event
 from app.services.inventory_query import InventoryQueryClause, parse_inventory_query
 from app.share_types import share_type_from_resource_type
@@ -66,6 +67,7 @@ INVENTORY_EXPORT_COLUMNS: dict[str, tuple[str, ...]] = {
         "resource_type",
         "access_level",
         "access_capabilities",
+        "access_evidence_summary",
         "path",
         "name",
         "item_type",
@@ -100,6 +102,7 @@ INVENTORY_EXPORT_COLUMNS: dict[str, tuple[str, ...]] = {
         "resource_type",
         "access_level",
         "access_capabilities",
+        "access_evidence_summary",
         "provider_resource_id",
         "web_url",
         "exposure",
@@ -541,9 +544,7 @@ def _resource_inventory_clause_expression(clause: InventoryQueryClause):
     elif clause.field == "item_type":
         item_subquery = item_subquery.where(_item_type_match_expression(clause.operator, clause.value))
     elif clause.field == "file_archive_status":
-        item_subquery = item_subquery.where(
-            _file_archive_status_match_expression(clause.operator, clause.value)
-        )
+        item_subquery = item_subquery.where(_file_archive_status_match_expression(clause.operator, clause.value))
     else:
         item_subquery = item_subquery.where(_ext_match_expression(ext_expr, clause.operator, clause.value))
 
@@ -679,9 +680,7 @@ def _endpoint_inventory_clause_expression(clause: InventoryQueryClause):
     elif clause.field == "item_type":
         item_subquery = item_subquery.where(_item_type_match_expression(clause.operator, clause.value))
     elif clause.field == "file_archive_status":
-        item_subquery = item_subquery.where(
-            _file_archive_status_match_expression(clause.operator, clause.value)
-        )
+        item_subquery = item_subquery.where(_file_archive_status_match_expression(clause.operator, clause.value))
     else:
         item_subquery = item_subquery.where(_ext_match_expression(ext_expr, clause.operator, clause.value))
 
@@ -710,6 +709,7 @@ def _inventory_export_statement(
                 Resource.name.label("resource_name"),
                 Resource.access_level,
                 Resource.access_capabilities,
+                Item.permission_summary.label("access_evidence_summary"),
                 Resource.resource_type,
                 Item.path,
                 Item.name,
@@ -767,6 +767,7 @@ def _inventory_export_statement(
                 Resource.remark,
                 Resource.access_level,
                 Resource.access_capabilities,
+                Resource.permission_summary.label("access_evidence_summary"),
                 Resource.resource_type,
                 _resource_provider_expression().label("provider"),
                 Resource.provider_resource_id,
@@ -862,6 +863,12 @@ def _inventory_export_record(tab: str, row) -> dict[str, object]:
             "resource_type": resource_type,
             "access_level": _enum_value(row.access_level),
             "access_capabilities": row.access_capabilities or {},
+            "access_evidence_summary": build_access_evidence_summary(
+                getattr(row, "access_evidence_summary", None),
+                row.access_level,
+                row.access_capabilities,
+                getattr(row, "exposure", None),
+            ),
             "path": row.path,
             "name": row.name,
             "item_type": "directory" if row.is_dir else "file",
@@ -899,6 +906,12 @@ def _inventory_export_record(tab: str, row) -> dict[str, object]:
             "resource_type": resource_type,
             "access_level": _enum_value(row.access_level),
             "access_capabilities": row.access_capabilities or {},
+            "access_evidence_summary": build_access_evidence_summary(
+                getattr(row, "access_evidence_summary", None),
+                row.access_level,
+                row.access_capabilities,
+                getattr(row, "exposure", None),
+            ),
             "provider_resource_id": getattr(row, "provider_resource_id", None),
             "web_url": getattr(row, "web_url", None),
             "exposure": getattr(row, "exposure", None),
@@ -969,9 +982,7 @@ def _inventory_csv_chunks(
             yield _csv_record_bytes(columns)
         for row in rows:
             record = _inventory_export_record(tab, row)
-            yield _csv_record_bytes(
-                [_spreadsheet_safe_csv_value(record.get(column)) for column in columns]
-            )
+            yield _csv_record_bytes([_spreadsheet_safe_csv_value(record.get(column)) for column in columns])
 
     records = encoded_records()
     buffer = bytearray()
@@ -1381,6 +1392,7 @@ def create_saved_investigation(
     db.refresh(investigation)
     return _saved_investigation_out(investigation)
 
+
 @router.patch("/investigations/{investigation_id}", response_model=SavedInvestigationOut)
 def update_saved_investigation(
     project_id: uuid.UUID,
@@ -1460,7 +1472,9 @@ def delete_saved_investigation(
 def inventory_stats(
     project_id: uuid.UUID,
     request: Request,
-    run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
+    run_ids: str | None = Query(
+        default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"
+    ),
     db: Session = Depends(get_db),
     _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
     auth: AuthContext = Depends(get_auth_context),
@@ -1554,7 +1568,9 @@ def inventory_stats(
 def inventory_extensions(
     project_id: uuid.UUID,
     request: Request,
-    run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
+    run_ids: str | None = Query(
+        default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"
+    ),
     limit: int = Query(default=50, ge=1, le=500),
     db: Session = Depends(get_db),
     _: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
@@ -1738,7 +1754,9 @@ def inventory_items(
     resource_type: str | None = Query(default=None, max_length=64),
     exposure: str | None = Query(default=None, max_length=32),
     source: str | None = Query(default=None, max_length=64),
-    run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
+    run_ids: str | None = Query(
+        default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"
+    ),
     is_dir: bool | None = Query(default=None),
     include_deleted: bool = Query(default=False),
     limit: int = Query(default=200, ge=1, le=1000),
@@ -1763,6 +1781,7 @@ def inventory_items(
             Resource.name.label("resource_name"),
             Resource.access_level,
             Resource.access_capabilities,
+            Resource.permission_summary.label("access_evidence_summary"),
             Resource.resource_type,
             Item.path,
             Item.name,
@@ -1806,7 +1825,13 @@ def inventory_items(
     if endpoint:
         escaped = _escape_like(endpoint.strip())
         pattern = f"%{escaped}%"
-        stmt = stmt.where(or_(Endpoint.endpoint_key.ilike(pattern, escape="\\"), Endpoint.hostname.ilike(pattern, escape="\\"), Endpoint.ip.ilike(pattern, escape="\\")))
+        stmt = stmt.where(
+            or_(
+                Endpoint.endpoint_key.ilike(pattern, escape="\\"),
+                Endpoint.hostname.ilike(pattern, escape="\\"),
+                Endpoint.ip.ilike(pattern, escape="\\"),
+            )
+        )
     if provider:
         stmt = stmt.where(_item_provider_equals_expression(provider.strip().lower()))
     if resource_type:
@@ -1864,6 +1889,12 @@ def inventory_items(
             "resource_name": row.resource_name,
             "access_level": row.access_level.value if hasattr(row.access_level, "value") else row.access_level,
             "access_capabilities": row.access_capabilities or {},
+            "access_evidence_summary": build_access_evidence_summary(
+                getattr(row, "access_evidence_summary", None),
+                row.access_level,
+                row.access_capabilities,
+                getattr(row, "exposure", None),
+            ),
             "share_type": share_type_from_resource_type(row.resource_type),
             "resource_type": row.resource_type.value if hasattr(row.resource_type, "value") else row.resource_type,
             "path": row.path,
@@ -1876,8 +1907,7 @@ def inventory_items(
             "accessed_at": row.accessed_at.isoformat() if row.accessed_at else None,
             "changed_at": row.changed_at.isoformat() if row.changed_at else None,
             "file_attributes": row.file_attributes or [],
-            "provider": getattr(row, "provider", None)
-            or share_type_from_resource_type(row.resource_type),
+            "provider": getattr(row, "provider", None) or share_type_from_resource_type(row.resource_type),
             "provider_item_id": getattr(row, "provider_item_id", None),
             "provider_parent_id": getattr(row, "provider_parent_id", None),
             "web_url": getattr(row, "web_url", None),
@@ -1928,7 +1958,9 @@ def inventory_resources(
     resource_type: str | None = Query(default=None, max_length=64),
     exposure: str | None = Query(default=None, max_length=32),
     source: str | None = Query(default=None, max_length=64),
-    run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
+    run_ids: str | None = Query(
+        default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"
+    ),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -1961,6 +1993,7 @@ def inventory_resources(
             Resource.remark,
             Resource.access_level,
             Resource.access_capabilities,
+            Resource.permission_summary.label("access_evidence_summary"),
             Resource.resource_type,
             _resource_provider_expression().label("provider"),
             Resource.provider_resource_id,
@@ -1986,7 +2019,9 @@ def inventory_resources(
     if endpoint:
         escaped = _escape_like(endpoint.strip())
         pattern = f"%{escaped}%"
-        stmt = stmt.where(or_(Endpoint.endpoint_key.ilike(pattern, escape="\\"), Endpoint.hostname.ilike(pattern, escape="\\")))
+        stmt = stmt.where(
+            or_(Endpoint.endpoint_key.ilike(pattern, escape="\\"), Endpoint.hostname.ilike(pattern, escape="\\"))
+        )
     if provider:
         stmt = stmt.where(_resource_provider_equals_expression(provider.strip().lower()))
     if resource_type:
@@ -2032,10 +2067,15 @@ def inventory_resources(
             "remark": row.remark,
             "access_level": row.access_level.value if hasattr(row.access_level, "value") else row.access_level,
             "access_capabilities": row.access_capabilities or {},
+            "access_evidence_summary": build_access_evidence_summary(
+                getattr(row, "access_evidence_summary", None),
+                row.access_level,
+                row.access_capabilities,
+                getattr(row, "exposure", None),
+            ),
             "share_type": share_type_from_resource_type(row.resource_type),
             "resource_type": row.resource_type.value if hasattr(row.resource_type, "value") else row.resource_type,
-            "provider": getattr(row, "provider", None)
-            or share_type_from_resource_type(row.resource_type),
+            "provider": getattr(row, "provider", None) or share_type_from_resource_type(row.resource_type),
             "provider_resource_id": getattr(row, "provider_resource_id", None),
             "web_url": getattr(row, "web_url", None),
             "metadata": getattr(row, "provider_metadata", None) or {},
@@ -2077,7 +2117,9 @@ def inventory_endpoints(
     query_dsl: str | None = Query(default=None, max_length=MAX_QUERY_DSL_CHARS),
     provider: str | None = Query(default=None, max_length=32),
     source: str | None = Query(default=None, max_length=64),
-    run_ids: str | None = Query(default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"),
+    run_ids: str | None = Query(
+        default=None, max_length=MAX_RUN_IDS_FILTER_CHARS, description="comma-separated run UUIDs"
+    ),
     limit: int = Query(default=200, ge=1, le=1000),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),

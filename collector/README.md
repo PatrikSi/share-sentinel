@@ -98,7 +98,9 @@ Useful safety controls include `--max-sites`, `--max-libraries`, `--max-items`, 
 
 Progress goes to stderr: the default emits start, periodic, and final summaries; `-v` adds per-library detail, repeated `-v` adds more request context, `--progress-interval 0` disables periodic summaries, and `--quiet` suppresses progress. Terminal failures still return a non-zero status and an actionable error.
 
-SharePoint exposure labels are evidence-based. A delegated result is `USER_VISIBLE`, meaning only that the collector enumerated its metadata in the assessed identity's Graph context. App-only inventory is `UNKNOWN` unless future permission analysis provides evidence. The initial collector neither opens content nor enumerates per-item permissions, and it never equates visibility with public, anonymous, external, or broad-internal exposure.
+SharePoint exposure labels are evidence-based. A delegated result is `USER_VISIBLE`, meaning only that the collector enumerated its metadata in the assessed identity's Graph context. App-only inventory is `UNKNOWN` unless direct permission evidence provides stronger evidence. Opt-in `--permissions library_roots` checks library roots; `--permissions all_items` checks roots and every materialized file/folder. Only an explicit anonymous or organization link scope can strengthen an object to `ANONYMOUS` or `BROAD_INTERNAL`. Empty, partial, specific-people, and principal results never become guessed `RESTRICTED` or `EXTERNAL` conclusions.
+
+Permission collection is GET-only and declares schema v2 with the `direct_permissions_v1` feature. It emits a coverage-bearing `permission_assessment` followed by bounded `permission_entry` records and never stores a Graph `shareId`, link URL, or embeddable HTML. The default caps are 10,000 objects, 25,000 HTTP attempts (including retries/pages), 100,000 entries, and concurrency 2; tune them with `--max-permission-objects`, `--max-permission-http-attempts`, `--max-permission-entries`, and `--permission-concurrency`. Those defaults are the supported starting envelope; CLI hard ceilings are input guardrails, not validated throughput guarantees. Load-test representative collect/upload/ingest/compare runs before materially increasing them, or split very large tenants into stable targeted-site scopes. Graph permission visibility is caller-dependent. Source IDs are retained if `inheritedFrom` appears, but SharePoint document libraries normally omit it, so absence remains inheritance unknown; group membership is not expanded and effective access is not computed. A permission failure leaves successful content staging intact but makes the run partial.
 
 Direct upload uses the same durable raw-body artifact workflow as the network-share collector:
 
@@ -151,10 +153,17 @@ See [SharePoint Online collection](../docs/sharepoint.md) for permissions, every
 
 ## What it produces
 
-Both collectors use `.ndjson` or `.jsonl` output for normal collection. These schema-v1 records
+Both collectors use `.ndjson` or `.jsonl` output for normal collection. Records
 are spooled once and copied to the final artifact as a bounded stream; this is
 also the format written to stdout and used for upload-only temporary artifacts.
 Add `.gz` and `--gzip` for streaming compression.
+
+SMB/NFS artifacts remain schema v1 when direct SMB ACL collection is disabled,
+and SharePoint artifacts remain schema v1 with `--permissions none` (the
+default). Enabling SMB ACL collection or either SharePoint permission mode
+declares schema v2 and the `direct_permissions_v1` feature in the first
+`run_meta` record, before any endpoint records are emitted. This lets streaming
+consumers select the correct contract without looking ahead.
 
 For SMB/NFS only, `.json` remains available as a compact, nested compatibility format. Compact
 assembly is deliberately limited to 8 MiB of flat records per endpoint and
@@ -181,6 +190,7 @@ python share_sentinel_collector.py \
   --timeout 3 \
   --max-depth 1 \
   --access-probe-limit 3 \
+  --smb-permissions root \
   --progress-interval 5 \
   --output out.ndjson.gz \
   --gzip
@@ -333,6 +343,8 @@ Treat these flags as capacity levers:
 - `--max-depth`
 - `--max-entries-per-share`
 - `--access-probe-limit`
+- `--smb-permissions`
+- `--smb-permission-sample-limit`
 - `--max-targets`
 - target count and host list size
 
@@ -432,6 +444,54 @@ assessed with `--include-share`. Session loss, transport status responses, and
 other protocol failures during enumeration are reported as failed host
 assessments rather than being mislabeled as permission denial.
 
+### Direct SMB ACL evidence
+
+The default `--smb-permissions root` mode requests the owner, group, and DACL
+security information for each connected share root. `--smb-permissions sampled`
+adds up to `--smb-permission-sample-limit` directories and the same number of
+files selected deterministically from the already bounded inventory traversal.
+Use `--smb-permissions none` for the legacy schema-v1 artifact without direct
+ACL records.
+
+This is a read-only metadata request. The collector opens an existing object
+with `READ_CONTROL` and `FILE_OPEN`, requests only `OWNER`, `GROUP`, and `DACL`
+security information, and closes the handle in a `finally` path. It does not
+request a SACL, write an ACL, resolve domain principals over the network, read
+file content, create a probe object, or retain the raw security descriptor or
+callback ACE application data. SMB 2/3 uses Query Info Security; SMB 1 uses the
+equivalent NT transaction when the negotiated Impacket adapter supports it.
+
+Schema-v2 streams emit one `permission_assessment` followed by its bounded
+`permission_entry` records. Assessments identify the provider semantics as
+`smb_windows_acl_v1`, preserve NULL, absent, empty, and populated DACL states,
+and record ACE order, type, flags, access mask, SID, and decoded Windows file
+rights. Well-known SIDs may receive a local label; other SIDs remain unresolved.
+Every assessment records selection, retrieval, semantic, and principal-resolution
+coverage plus bounded limitations and errors. Compact `.json` stores the same
+assessment fields and entries under the associated share.
+
+These records are ACL structure evidence, not an effective-access calculation.
+They do not expand nested groups, apply token privileges, evaluate ACE order for
+a specific Windows access token, account for share-level ACLs, or classify a
+resource as public or exposed. `effective_access_status` is therefore always
+`not_computed`. A clean, untruncated DACL assessment sets
+`negative_conclusion_supported` to true only for exact direct-ACE comparison:
+an entry absent from that completely retrieved DACL was not present in that DACL
+at collection time. Partial and failed assessments keep it false, and the flag
+never means that access itself is denied. The existing `access_capabilities`
+observations remain separate: a successful DACL read does not mean the identity
+can list, read, or write content, and a denied DACL read does not mean content
+access is denied. The aggregate resource summary also keeps the flag false in
+sampled mode because objects outside the sample were not assessed.
+
+Resource use is capped even when the server returns malformed or unusually large
+descriptors: 65,535 descriptor bytes, 64 emitted ACEs per descriptor, 4,096
+scanned ACE headers, 10 directory and 10 file samples per share, and 256 emitted
+permission entries per share. Hitting a cap marks the assessment or resource
+summary partial/truncated instead of silently presenting it as complete. Handle
+opens can still generate normal SMB audit telemetry and can affect server-side
+last-access accounting on implementations that update it for metadata opens.
+
 ### Output and retry behavior
 
 - File artifacts are assembled into a private (`0600`) sibling temporary file, flushed, and atomically replaced. A failed final write does not truncate a previously good artifact at the destination.
@@ -452,7 +512,7 @@ When the API falls back to database-based recovery, the collector will emit an u
 
 ## Artifact compatibility
 
-The collector emits flat schema-v1 NDJSON/JSONL records for its streaming path
+The collector emits flat schema-v1 or schema-v2 NDJSON/JSONL records for its streaming path
 and the nested `share_sentinel_compact_json` document for `.json` compatibility.
 The API and worker accept both forms, including their gzip variants. Compact
 `.json.gz` uploads remain raw streams and send a canonical ASCII basename in

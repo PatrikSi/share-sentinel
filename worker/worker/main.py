@@ -1,9 +1,11 @@
 import gzip
 import hashlib
+import hmac
 import json
 import logging
 import math
 import os
+import re
 import signal
 import socket
 import sys
@@ -13,6 +15,7 @@ import uuid
 import zlib
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
@@ -119,6 +122,21 @@ BATCH_SIZE = _read_int_env(
     max_value=MAX_INGEST_BATCH_SIZE,
     strict=True,
 )
+PERMISSION_ENTRY_BATCH_SIZE = _read_int_env(
+    "INGEST_PERMISSION_ENTRY_BATCH_SIZE",
+    min(BATCH_SIZE, 500),
+    min_value=1,
+    max_value=5000,
+    strict=True,
+)
+PERMISSION_ENTRY_BATCH_MAX_BYTES = _read_int_env(
+    "INGEST_PERMISSION_ENTRY_BATCH_MAX_BYTES",
+    8 * 1024 * 1024,
+    min_value=64 * 1024,
+    max_value=64 * 1024 * 1024,
+    strict=True,
+)
+PERMISSION_ASSESSMENT_PIPELINE_SIZE = min(PERMISSION_ENTRY_BATCH_SIZE, 250)
 PROGRESS_EVERY_LINES = _read_int_env("INGEST_PROGRESS_EVERY_LINES", 2000, min_value=1)
 RECOVERY_SCAN_SECONDS = _read_int_env("INGEST_RECOVERY_SCAN_SECONDS", 8, min_value=1)
 RECOVERY_SCAN_LIMIT = _read_int_env("INGEST_RECOVERY_SCAN_LIMIT", 8, min_value=1)
@@ -297,6 +315,13 @@ NDJSON_RECORD_TOO_LARGE_ERROR = "NDJSON record exceeds configured size limit"
 INVALID_GZIP_ARTIFACT_ERROR = "invalid gzip artifact"
 JSON_COMPAT_LIMIT_ERROR = "JSON artifact exceeds non-streamable compatibility limit"
 INVALID_UTF8_ARTIFACT_ERROR = "artifact contains invalid UTF-8"
+ARTIFACT_INTEGRITY_METADATA_ERROR = "artifact integrity metadata is missing or invalid; upload the artifact again"
+ARTIFACT_INTEGRITY_MISMATCH_ERROR = (
+    "artifact integrity check failed; stored bytes no longer match the uploaded size and SHA-256; "
+    "upload the artifact again"
+)
+ARTIFACT_INTEGRITY_READ_CHUNK_BYTES = 1024 * 1024
+ARTIFACT_INTEGRITY_PROGRESS_BYTES = 8 * 1024 * 1024
 ARTIFACT_FRAMING_ERROR = (
     "artifact must contain exactly one run_meta as its first record and exactly one run_end as its last record"
 )
@@ -321,6 +346,7 @@ PROVIDER_METADATA_MAX_ENTRIES = 512
 PROVIDER_METADATA_MAX_LIST_ITEMS = 128
 PROVIDER_METADATA_MAX_KEY_LENGTH = 128
 PROVIDER_METADATA_MAX_TEXT_LENGTH = 4096
+TOKEN_EXPIRATION_MAX_LENGTH = 64
 MIME_TYPE_MAX_LENGTH = 255
 EXPOSURE_CLASSIFICATIONS = {
     "USER_VISIBLE",
@@ -356,6 +382,23 @@ FORBIDDEN_PROVIDER_METADATA_KEY_FINGERPRINTS = {
     "token",
     "tokenvalue",
 }
+# A very small set of non-secret observations uses otherwise sensitive words.
+# Keep this allowlist exact: aliases and versioned variants must be reviewed
+# rather than silently inheriting the exception.
+SAFE_PROVIDER_METADATA_KEY_FINGERPRINTS = {
+    "haspassword",
+    "tokenexpiration",
+}
+SENSITIVE_PROVIDER_METADATA_KEY_STEMS = {
+    "apikey",
+    "authorization",
+    "credential",
+    "deltalink",
+    "password",
+    "privatekey",
+    "secret",
+    "token",
+}
 AUTH_CONTEXT_TEXT_FIELDS = {
     "auth_mode",
     "auth_type",
@@ -376,6 +419,114 @@ COLLECTION_CONTEXT_TEXT_FIELDS = {
     "discovery_completeness",
     "sync_mode",
 }
+PERMISSION_RECORD_TYPES = {"permission_assessment", "permission_entry"}
+CONSUMER_STRUCTURAL_RECORD_ERROR = "CONSUMER_STRUCTURAL_RECORD_INVALID"
+CONSUMER_CONTENT_RECORD_ERROR = "CONSUMER_CONTENT_RECORD_INVALID"
+CONSUMER_UNCLASSIFIED_RECORD_ERROR = "CONSUMER_ARTIFACT_RECORD_INVALID"
+CONSUMER_UNCLASSIFIED_INVENTORY_ERROR_CODES = {
+    CONSUMER_UNCLASSIFIED_RECORD_ERROR,
+    # Keep resumptions started by an older worker fail closed. Before the
+    # dimension-specific codes existed, every rejected non-permission record
+    # used SCHEMA_INVALID.
+    "SCHEMA_INVALID",
+    "UTF8_DECODE_ERROR",
+    "JSON_DECODE_ERROR",
+}
+
+
+def _record_validation_error_code(record: dict[str, Any]) -> str:
+    record_type = record.get("type")
+    if record_type in PERMISSION_RECORD_TYPES:
+        return "PERMISSION_EVIDENCE_INVALID"
+    if record_type in {"endpoint", "resource"}:
+        return CONSUMER_STRUCTURAL_RECORD_ERROR
+    if record_type == "item":
+        return CONSUMER_CONTENT_RECORD_ERROR
+    return CONSUMER_UNCLASSIFIED_RECORD_ERROR
+
+
+PERMISSION_PROVIDERS = {"smb", "sharepoint"}
+PERMISSION_SEMANTICS = {
+    "smb": "smb_windows_acl_v1",
+    "sharepoint": "sharepoint_graph_permission_v1",
+}
+PERMISSION_SURFACES = {
+    "smb": {"smb_filesystem_dacl", "smb_share_acl"},
+    "sharepoint": {"sharepoint_graph_permissions"},
+}
+PERMISSION_MAX_LIST_VALUES = 128
+PERMISSION_MAX_TEXT_LENGTH = 1024
+PERMISSION_MAX_PATH_BYTES = 8192
+PERMISSION_MAX_COUNT = 2**31 - 1
+PERMISSION_SENSITIVE_KEY_FINGERPRINTS = {
+    "shareid",
+    "webhtml",
+    "invitationurl",
+    "linkurl",
+    "rawsecuritydescriptor",
+    "securitydescriptorbytes",
+    "rawdescriptor",
+    "rawsacl",
+    "sddl",
+}
+SAFE_PERMISSION_DETAIL_KEY_FINGERPRINTS = {
+    "daclacecount",
+    "daclreservedbyte",
+    "daclreservedword",
+    "daclrevision",
+    "daclsize",
+    "daclstate",
+    "descriptorcontrolflags",
+    "descriptorcontrolretained",
+    "descriptorrevision",
+    "descriptorsize",
+    "haspassword",
+    "invitationsigninrequired",
+    "linkscope",
+    "linktype",
+    "saclrequested",
+    "saclretained",
+}
+SAFE_PROVIDER_BYTE_COUNT_KEY_FINGERPRINTS = {
+    "allocationsizebytes",
+    "maxartifactbytes",
+    "sizebytes",
+    "totalsizebytes",
+}
+SAFE_PROVIDER_BYTE_COUNT_MAX = 2**63 - 1
+SAFE_PERMISSION_INTEGER_RANGES = {
+    "daclacecount": (0, 65_535),
+    "daclreservedbyte": (0, 255),
+    "daclreservedword": (0, 65_535),
+    "daclrevision": (0, 255),
+    "daclsize": (0, 65_535),
+    "descriptorcontrolretained": (0, 65_535),
+    "descriptorrevision": (0, 255),
+    "descriptorsize": (0, 65_535),
+}
+SAFE_PERMISSION_BOOLEAN_KEYS = {
+    "haspassword",
+    "invitationsigninrequired",
+    "saclrequested",
+    "saclretained",
+}
+SAFE_PERMISSION_ENUM_VALUES = {
+    "daclstate": frozenset({"absent", "null", "malformed", "empty", "present", "unknown"}),
+    "linkscope": frozenset({"anonymous", "organization", "users", "existing_access", "unknown"}),
+    "linktype": frozenset({"view", "edit", "embed", "unknown"}),
+}
+SAFE_DESCRIPTOR_CONTROL_FLAGS = frozenset(
+    {
+        "owner_defaulted",
+        "group_defaulted",
+        "dacl_present",
+        "dacl_defaulted",
+        "dacl_auto_inherit_required",
+        "dacl_auto_inherited",
+        "dacl_protected",
+        "self_relative",
+    }
+)
 
 _CacheKey = TypeVar("_CacheKey")
 
@@ -481,6 +632,172 @@ def open_artifact_stream(key: str):
     return open(_artifact_key_to_path(key), "rb")
 
 
+class ArtifactIntegrityError(RuntimeError):
+    """The persisted upload provenance cannot authenticate the stored bytes."""
+
+
+def _require_artifact_integrity(artifact_size: Any, artifact_sha256: Any) -> tuple[int, str]:
+    if isinstance(artifact_size, bool) or not isinstance(artifact_size, int) or artifact_size < 0:
+        raise ArtifactIntegrityError(ARTIFACT_INTEGRITY_METADATA_ERROR)
+    if not isinstance(artifact_sha256, str):
+        raise ArtifactIntegrityError(ARTIFACT_INTEGRITY_METADATA_ERROR)
+    digest = artifact_sha256.strip().lower()
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ArtifactIntegrityError(ARTIFACT_INTEGRITY_METADATA_ERROR)
+    return artifact_size, digest
+
+
+class _ArtifactIntegrityReader:
+    """Hash a raw artifact as callers stream it, then authenticate at EOF."""
+
+    def __init__(
+        self,
+        reader,
+        expected: tuple[int, str],
+        *,
+        progress_callback: Callable[[], None] | None = None,
+    ) -> None:
+        self._reader = reader
+        self._expected_size, self._expected_sha256 = expected
+        self._progress_callback = progress_callback
+        self._digest = hashlib.sha256()
+        self._size = 0
+        self._next_progress_size = ARTIFACT_INTEGRITY_PROGRESS_BYTES
+        self._verified = False
+        self._requires_full_rehash = False
+
+    def _reset_hash(self) -> None:
+        self._digest = hashlib.sha256()
+        self._size = 0
+        self._next_progress_size = ARTIFACT_INTEGRITY_PROGRESS_BYTES
+
+    def _track(self, chunk):
+        if chunk in {b"", ""}:
+            return chunk
+        if not isinstance(chunk, bytes):
+            raise ArtifactIntegrityError(ARTIFACT_INTEGRITY_MISMATCH_ERROR)
+        self._size += len(chunk)
+        if self._size > self._expected_size:
+            raise ArtifactIntegrityError(ARTIFACT_INTEGRITY_MISMATCH_ERROR)
+        self._digest.update(chunk)
+        if self._progress_callback is not None and self._size >= self._next_progress_size:
+            self._progress_callback()
+            self._next_progress_size = self._size + ARTIFACT_INTEGRITY_PROGRESS_BYTES
+        return chunk
+
+    def read(self, size: int = -1):
+        return self._track(self._reader.read(size))
+
+    def read1(self, size: int = -1):
+        read = getattr(self._reader, "read1", self._reader.read)
+        return self._track(read(size))
+
+    def readline(self, size: int = -1):
+        return self._track(self._reader.readline(size))
+
+    def readinto(self, buffer):
+        count = self._reader.readinto(buffer)
+        if count is not None and count > 0:
+            self._track(bytes(memoryview(buffer)[:count]))
+        return count
+
+    def readinto1(self, buffer):
+        readinto = getattr(self._reader, "readinto1", self._reader.readinto)
+        count = readinto(buffer)
+        if count is not None and count > 0:
+            self._track(bytes(memoryview(buffer)[:count]))
+        return count
+
+    def seek(self, offset: int, whence: int = 0):
+        position = self._reader.seek(offset, whence)
+        # Compact JSON parsing intentionally rewinds the stream for multiple
+        # bounded ijson projections. Do not count those passes cumulatively;
+        # verify() will perform one fresh bounded hash of the raw descriptor.
+        self._requires_full_rehash = True
+        self._reset_hash()
+        return position
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if line == b"":
+            raise StopIteration
+        return line
+
+    def close(self) -> None:
+        # The outer open_verified_artifact_stream context owns the raw stream.
+        # Some parser adapters close their input before this reader performs
+        # its final bounded drain, so an inner close must not close it early.
+        return None
+
+    def verify(self) -> None:
+        if self._verified:
+            return
+        if self._requires_full_rehash:
+            self._reader.seek(0)
+            self._reset_hash()
+        while True:
+            chunk = self.read(ARTIFACT_INTEGRITY_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+        if self._size != self._expected_size or not hmac.compare_digest(
+            self._digest.hexdigest(), self._expected_sha256
+        ):
+            raise ArtifactIntegrityError(ARTIFACT_INTEGRITY_MISMATCH_ERROR)
+        self._verified = True
+
+    def __getattr__(self, name: str):
+        return getattr(self._reader, name)
+
+
+@contextmanager
+def open_verified_artifact_stream(
+    key: str,
+    expected: tuple[int, str],
+    *,
+    progress_callback: Callable[[], None] | None = None,
+):
+    """Yield a raw stream and authenticate bytes before returning or surfacing parse failure."""
+
+    with open_artifact_stream(key) as body:
+        reader = _ArtifactIntegrityReader(body, expected, progress_callback=progress_callback)
+        try:
+            yield reader
+        except _GracefulWorkerShutdown:
+            # Shutdown checkpoints keep the run nonterminal. A resumed worker
+            # authenticates the artifact before consuming another record.
+            raise
+        except Exception as original_error:
+            try:
+                reader.verify()
+            except ArtifactIntegrityError as integrity_error:
+                # Stored-byte mutation is the authoritative failure: it also
+                # requires deleting rows committed by an earlier checkpoint.
+                raise integrity_error from original_error
+            except Exception as verification_error:
+                # Authentication itself failed (for example, shared storage
+                # disappeared). Surface that dependency error so normal retry
+                # policy rechecks provenance before any further processing.
+                raise verification_error from original_error
+            raise
+        else:
+            reader.verify()
+
+
+def verify_artifact_integrity(
+    key: str,
+    expected: tuple[int, str],
+    *,
+    progress_callback: Callable[[], None] | None = None,
+) -> None:
+    """Re-open and authenticate the current artifact object without materializing it."""
+
+    with open_verified_artifact_stream(key, expected, progress_callback=progress_callback):
+        pass
+
+
 def write_audit(
     conn: psycopg.Connection, project_id: str, action: str, object_type: str, object_id: str, metadata: dict[str, Any]
 ):
@@ -509,6 +826,24 @@ def update_run_collection_context(conn: psycopg.Connection, run_id: str, context
 def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) -> int:
     smb = rec.get("smb") if isinstance(rec.get("smb"), dict) else {}
     auth = rec.get("auth") if isinstance(rec.get("auth"), dict) else {}
+    raw_provider_metadata = rec.get("provider_metadata")
+    provider_metadata = dict(raw_provider_metadata) if isinstance(raw_provider_metadata, dict) else {}
+    top_level_provider_id = rec.get("provider_endpoint_id")
+    if top_level_provider_id and not provider_metadata.get("provider_endpoint_id"):
+        provider_metadata["provider_endpoint_id"] = top_level_provider_id
+    if not str(provider_metadata.get("provider_endpoint_id") or "").strip():
+        # Out-of-order resources create an endpoint placeholder with no
+        # provider identity.  A later identified endpoint may enrich it, but a
+        # subsequent ID-less duplicate must never rewrite immutable identity
+        # provenance on an already identified row.
+        for field in (
+            "provider_endpoint_id",
+            "identity_source",
+            "identity_strength",
+            "server_guid",
+            "advertised_names",
+        ):
+            provider_metadata.pop(field, None)
     row = conn.execute(
         """
         INSERT INTO endpoints (
@@ -526,6 +861,33 @@ def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) 
             auth_method = COALESCE(EXCLUDED.auth_method, endpoints.auth_method),
             provider = COALESCE(EXCLUDED.provider, endpoints.provider),
             provider_metadata = endpoints.provider_metadata || EXCLUDED.provider_metadata
+        WHERE
+            NULLIF(endpoints.provider_metadata->>'provider_endpoint_id', '') IS NULL
+            OR (
+                (
+                    NULLIF(EXCLUDED.provider_metadata->>'provider_endpoint_id', '') IS NULL
+                    OR endpoints.provider_metadata->>'provider_endpoint_id'
+                        = EXCLUDED.provider_metadata->>'provider_endpoint_id'
+                )
+                AND (
+                    NULLIF(endpoints.provider_metadata->>'identity_source', '') IS NULL
+                    OR NULLIF(EXCLUDED.provider_metadata->>'identity_source', '') IS NULL
+                    OR endpoints.provider_metadata->>'identity_source'
+                        = EXCLUDED.provider_metadata->>'identity_source'
+                )
+                AND (
+                    NULLIF(endpoints.provider_metadata->>'identity_strength', '') IS NULL
+                    OR NULLIF(EXCLUDED.provider_metadata->>'identity_strength', '') IS NULL
+                    OR endpoints.provider_metadata->>'identity_strength'
+                        = EXCLUDED.provider_metadata->>'identity_strength'
+                )
+                AND (
+                    NULLIF(endpoints.provider_metadata->>'server_guid', '') IS NULL
+                    OR NULLIF(EXCLUDED.provider_metadata->>'server_guid', '') IS NULL
+                    OR endpoints.provider_metadata->>'server_guid'
+                        = EXCLUDED.provider_metadata->>'server_guid'
+                )
+            )
         RETURNING id
         """,
         (
@@ -538,9 +900,11 @@ def upsert_endpoint(conn: psycopg.Connection, run_id: str, rec: dict[str, Any]) 
             _normalize_smb_signing(smb),
             auth.get("method"),
             rec.get("provider"),
-            json.dumps(rec.get("provider_metadata") or {}),
+            json.dumps(provider_metadata),
         ),
     ).fetchone()
+    if row is None:
+        raise ValueError("duplicate endpoint records contain conflicting immutable provider identity")
     return int(row[0])
 
 
@@ -558,7 +922,7 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
         existing = conn.execute(
             """
             SELECT id, access_level::text, access_capabilities, provider_metadata,
-                   exposure, exposure_evidence
+                   exposure, exposure_evidence, permission_summary
             FROM resources
             WHERE run_id = %s
               AND endpoint_id = %s
@@ -574,7 +938,7 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
             existing = conn.execute(
                 """
                 SELECT id, access_level::text, access_capabilities, provider_metadata,
-                       exposure, exposure_evidence
+                       exposure, exposure_evidence, permission_summary
                 FROM resources
                 WHERE run_id = %s
                   AND endpoint_id = %s
@@ -589,7 +953,7 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
         existing = conn.execute(
             """
             SELECT id, access_level::text, access_capabilities, provider_metadata,
-                   exposure, exposure_evidence
+                   exposure, exposure_evidence, permission_summary
             FROM resources
             WHERE run_id = %s
               AND endpoint_id = %s
@@ -607,9 +971,9 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
             INSERT INTO resources (
                 run_id, endpoint_id, resource_type, name, remark, access_level,
                 access_capabilities, provider, provider_resource_id, web_url,
-                provider_metadata, exposure, exposure_evidence
+                provider_metadata, exposure, exposure_evidence, permission_summary
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -626,6 +990,7 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
                 json.dumps(rec.get("provider_metadata") or {}),
                 rec.get("exposure"),
                 json.dumps(rec.get("exposure_evidence") or {}),
+                json.dumps(rec.get("permission_summary") or {}),
             ),
         ).fetchone()
     else:
@@ -633,6 +998,7 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
         existing_metadata = existing[3] if len(existing) > 3 and isinstance(existing[3], dict) else {}
         existing_exposure = existing[4] if len(existing) > 4 else None
         existing_exposure_evidence = existing[5] if len(existing) > 5 and isinstance(existing[5], dict) else {}
+        existing_permission_summary = existing[6] if len(existing) > 6 and isinstance(existing[6], dict) else {}
         merged_capabilities = _merge_access_capabilities(existing_capabilities, incoming_capabilities)
         merged_access = _reconcile_access_level_with_capabilities(
             _stronger_access_level(existing_access, incoming_access),
@@ -649,6 +1015,10 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
             **existing_exposure_evidence,
             **(rec.get("exposure_evidence") or {}),
         }
+        merged_permission_summary = {
+            **existing_permission_summary,
+            **(rec.get("permission_summary") or {}),
+        }
         row = conn.execute(
             """
             UPDATE resources
@@ -661,7 +1031,8 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
                 web_url = COALESCE(%s, web_url),
                 provider_metadata = %s,
                 exposure = %s,
-                exposure_evidence = %s
+                exposure_evidence = %s,
+                permission_summary = %s
             WHERE id = %s
             RETURNING id
             """,
@@ -676,17 +1047,1510 @@ def upsert_resource(conn: psycopg.Connection, run_id: str, endpoint_id: int, rec
                 json.dumps(merged_metadata),
                 merged_exposure,
                 json.dumps(merged_exposure_evidence),
+                json.dumps(merged_permission_summary),
                 existing_id,
             ),
         ).fetchone()
     return int(row[0])
 
 
+def resolve_permission_subject(
+    conn: psycopg.Connection,
+    run_id: str,
+    rec: dict[str, Any],
+    endpoint_cache: dict[str, int],
+    resource_cache: dict[tuple[str, str, str], int],
+) -> tuple[int, int | None]:
+    endpoint_key = str(rec.get("endpoint_key") or "")
+    resource_name = str(rec.get("resource_name") or "")
+    resource_type = "sharepoint_library" if rec.get("provider") == "sharepoint" else "smb_share"
+    key = _resource_cache_key(
+        endpoint_key,
+        resource_name,
+        resource_type,
+        rec.get("provider_resource_id"),
+    )
+    resource_id = resource_cache.get(key)
+    if resource_id is None:
+        row = conn.execute(
+            """
+            SELECT resource.id
+            FROM resources AS resource
+            JOIN endpoints AS endpoint
+              ON endpoint.id = resource.endpoint_id
+             AND endpoint.run_id = resource.run_id
+            WHERE resource.run_id = %s
+              AND endpoint.endpoint_key = %s
+              AND resource.resource_type = %s
+              AND (
+                    (%s IS NOT NULL AND resource.provider_resource_id = %s)
+                 OR (%s IS NULL AND resource.provider_resource_id IS NULL AND resource.name = %s)
+              )
+            ORDER BY resource.id
+            LIMIT 1
+            """,
+            (
+                run_id,
+                endpoint_key,
+                resource_type,
+                rec.get("provider_resource_id"),
+                rec.get("provider_resource_id"),
+                rec.get("provider_resource_id"),
+                resource_name,
+            ),
+        ).fetchone()
+        if row is None:
+            raise ValueError("permission evidence references a resource that has not been emitted")
+        resource_id = int(row[0])
+        resource_cache[key] = resource_id
+
+    subject_kind = str(rec.get("subject_kind") or "").strip().lower()
+    requires_item = subject_kind in {"item", "file", "directory", "folder", "drive_item"}
+    if not requires_item:
+        return resource_id, None
+
+    provider_item_id = rec.get("provider_item_id")
+    subject_path = rec.get("subject_path")
+    if provider_item_id:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM items
+            WHERE run_id = %s AND resource_id = %s AND provider_item_id = %s
+            LIMIT 1
+            """,
+            (run_id, resource_id, provider_item_id),
+        ).fetchone()
+    elif subject_path is not None:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM items
+            WHERE run_id = %s AND resource_id = %s AND path = %s
+            LIMIT 1
+            """,
+            (run_id, resource_id, subject_path),
+        ).fetchone()
+    else:
+        raise ValueError("item permission evidence requires provider_item_id or subject_path")
+    if row is None:
+        raise ValueError("permission evidence references an item that has not been emitted")
+    return resource_id, int(row[0])
+
+
+def upsert_permission_assessment(
+    conn: psycopg.Connection,
+    run_id: str,
+    resource_id: int,
+    item_id: int | None,
+    rec: dict[str, Any],
+) -> int:
+    subject_provider_id = rec.get("provider_item_id") or rec.get("provider_resource_id")
+    collision = conn.execute(
+        """
+        SELECT assessment_key, resource_id, item_id, provider, semantics,
+               permission_surface, subject_key, subject_kind,
+               subject_provider_id, subject_path, method
+        FROM permission_assessments
+        WHERE run_id = %s
+          AND (
+                assessment_key = %s
+             OR (
+                    resource_id = %s
+                AND subject_key = %s
+                AND semantics = %s
+                AND permission_surface = %s
+             )
+          )
+        FOR UPDATE
+        """,
+        (
+            run_id,
+            rec["assessment_key"],
+            resource_id,
+            rec["subject_key"],
+            rec["semantics"],
+            rec["permission_surface"],
+        ),
+    ).fetchone()
+    if collision is not None and (
+        collision[0] != rec["assessment_key"]
+        or int(collision[1]) != resource_id
+        or (int(collision[2]) if collision[2] is not None else None) != item_id
+        or collision[3] != rec["provider"]
+        or collision[4] != rec["semantics"]
+        or collision[5] != rec["permission_surface"]
+        or collision[6] != rec["subject_key"]
+        or collision[7] != rec["subject_kind"]
+        or collision[8] != subject_provider_id
+        or collision[9] != rec.get("subject_path")
+        or collision[10] != rec["method"]
+    ):
+        raise ValueError("permission assessment identity collides with a different subject or surface")
+    row = conn.execute(
+        """
+        INSERT INTO permission_assessments (
+            run_id, resource_id, item_id, assessment_key, subject_kind, subject_key,
+            subject_provider_id, subject_path, provider, semantics, permission_surface,
+            method, assessment_state, selection_scope, selection_coverage,
+            retrieval_coverage, provider_visibility, semantic_coverage,
+            principal_resolution, effective_access_status, negative_conclusion_supported,
+            entries_observed, entries_emitted, entries_omitted, unknown_entries,
+            evidence_hash, entry_set_hash, observed_at, limitations, error_code, errors,
+            provider_details, summary
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb
+        )
+        ON CONFLICT (run_id, assessment_key)
+        DO UPDATE SET
+            assessment_state = EXCLUDED.assessment_state,
+            selection_scope = EXCLUDED.selection_scope,
+            selection_coverage = EXCLUDED.selection_coverage,
+            retrieval_coverage = EXCLUDED.retrieval_coverage,
+            provider_visibility = EXCLUDED.provider_visibility,
+            semantic_coverage = EXCLUDED.semantic_coverage,
+            principal_resolution = EXCLUDED.principal_resolution,
+            effective_access_status = EXCLUDED.effective_access_status,
+            negative_conclusion_supported = EXCLUDED.negative_conclusion_supported,
+            entries_observed = EXCLUDED.entries_observed,
+            entries_emitted = EXCLUDED.entries_emitted,
+            entries_omitted = EXCLUDED.entries_omitted,
+            unknown_entries = EXCLUDED.unknown_entries,
+            evidence_hash = EXCLUDED.evidence_hash,
+            entry_set_hash = EXCLUDED.entry_set_hash,
+            observed_at = EXCLUDED.observed_at,
+            limitations = EXCLUDED.limitations,
+            error_code = EXCLUDED.error_code,
+            errors = EXCLUDED.errors,
+            provider_details = EXCLUDED.provider_details,
+            summary = EXCLUDED.summary
+        WHERE permission_assessments.resource_id = EXCLUDED.resource_id
+          AND permission_assessments.item_id IS NOT DISTINCT FROM EXCLUDED.item_id
+          AND permission_assessments.provider = EXCLUDED.provider
+          AND permission_assessments.semantics = EXCLUDED.semantics
+          AND permission_assessments.permission_surface = EXCLUDED.permission_surface
+          AND permission_assessments.subject_key = EXCLUDED.subject_key
+          AND permission_assessments.subject_kind = EXCLUDED.subject_kind
+          AND permission_assessments.subject_provider_id IS NOT DISTINCT FROM EXCLUDED.subject_provider_id
+          AND permission_assessments.subject_path IS NOT DISTINCT FROM EXCLUDED.subject_path
+          AND permission_assessments.method = EXCLUDED.method
+        RETURNING id
+        """,
+        (
+            run_id,
+            resource_id,
+            item_id,
+            rec["assessment_key"],
+            rec["subject_kind"],
+            rec["subject_key"],
+            subject_provider_id,
+            rec.get("subject_path"),
+            rec["provider"],
+            rec["semantics"],
+            rec["permission_surface"],
+            rec["method"],
+            rec["assessment_state"],
+            rec["selection_scope"],
+            rec["selection_coverage"],
+            rec["retrieval_coverage"],
+            rec["provider_visibility"],
+            rec["semantic_coverage"],
+            rec["principal_resolution"],
+            rec["effective_access_status"],
+            rec["negative_conclusion_supported"],
+            rec["entries_observed"],
+            rec["entries_emitted"],
+            rec["entries_omitted"],
+            rec["unknown_entries"],
+            rec.get("evidence_hash"),
+            rec.get("entry_set_hash"),
+            rec.get("observed_at"),
+            json.dumps(rec.get("limitations") or []),
+            rec.get("error_code"),
+            json.dumps(rec.get("errors") or []),
+            json.dumps(rec.get("provider_details") or {}),
+            json.dumps(rec.get("permission_summary") or {}),
+        ),
+    ).fetchone()
+    if row is None:
+        raise ValueError("assessment_key was reused for a different permission subject")
+    return int(row[0])
+
+
+def upsert_permission_principal(
+    conn: psycopg.Connection,
+    run_id: str,
+    principal: dict[str, Any] | None,
+) -> int | None:
+    if principal is None:
+        return None
+    row = conn.execute(
+        """
+        INSERT INTO permission_principals (
+            run_id, provider, principal_key, identifier_namespace, authority,
+            native_id, kind, display_name, login_name, email, resolution_state,
+            resolution_source, aliases
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (run_id, provider, principal_key)
+        DO UPDATE SET
+            authority = COALESCE(EXCLUDED.authority, permission_principals.authority),
+            native_id = COALESCE(EXCLUDED.native_id, permission_principals.native_id),
+            kind = CASE
+                WHEN permission_principals.kind = 'unknown' THEN EXCLUDED.kind
+                ELSE permission_principals.kind
+            END,
+            display_name = COALESCE(EXCLUDED.display_name, permission_principals.display_name),
+            login_name = COALESCE(EXCLUDED.login_name, permission_principals.login_name),
+            email = COALESCE(EXCLUDED.email, permission_principals.email),
+            resolution_state = CASE
+                WHEN permission_principals.resolution_state = 'unresolved' THEN EXCLUDED.resolution_state
+                ELSE permission_principals.resolution_state
+            END,
+            resolution_source = COALESCE(EXCLUDED.resolution_source, permission_principals.resolution_source),
+            aliases = CASE
+                WHEN jsonb_array_length(EXCLUDED.aliases) > jsonb_array_length(permission_principals.aliases)
+                THEN EXCLUDED.aliases
+                ELSE permission_principals.aliases
+            END
+        WHERE permission_principals.identifier_namespace = EXCLUDED.identifier_namespace
+          AND (
+              permission_principals.authority IS NULL
+              OR EXCLUDED.authority IS NULL
+              OR permission_principals.authority = EXCLUDED.authority
+          )
+          AND (
+              permission_principals.native_id IS NULL
+              OR EXCLUDED.native_id IS NULL
+              OR permission_principals.native_id = EXCLUDED.native_id
+          )
+          AND (
+              permission_principals.kind IS NULL
+              OR permission_principals.kind = 'unknown'
+              OR EXCLUDED.kind IS NULL
+              OR EXCLUDED.kind = 'unknown'
+              OR permission_principals.kind = EXCLUDED.kind
+          )
+        RETURNING id
+        """,
+        (
+            run_id,
+            principal["provider"],
+            principal["principal_key"],
+            principal["identifier_namespace"],
+            principal.get("authority"),
+            principal.get("native_id"),
+            principal["kind"],
+            principal.get("display_name"),
+            principal.get("login_name"),
+            principal.get("email"),
+            principal["resolution"],
+            principal.get("resolution_source"),
+            json.dumps(principal.get("aliases") or []),
+        ),
+    ).fetchone()
+    if row is None:
+        raise ValueError("principal_key was reused for a different permission principal")
+    return int(row[0])
+
+
+def upsert_permission_entry(
+    conn: psycopg.Connection,
+    run_id: str,
+    assessment_id: int,
+    principal_id: int | None,
+    rec: dict[str, Any],
+) -> int:
+    row = conn.execute(
+        """
+        INSERT INTO permission_entries (
+            run_id, assessment_id, principal_id, entry_key, provider_entry_id,
+            ordinal, entry_kind, entry_effect, normalized_rights, inherited_state,
+            expiration_at, evidence_hash, provider_details
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (assessment_id, entry_key)
+        DO UPDATE SET
+            principal_id = COALESCE(EXCLUDED.principal_id, permission_entries.principal_id),
+            provider_entry_id = COALESCE(EXCLUDED.provider_entry_id, permission_entries.provider_entry_id),
+            ordinal = COALESCE(EXCLUDED.ordinal, permission_entries.ordinal),
+            expiration_at = COALESCE(EXCLUDED.expiration_at, permission_entries.expiration_at)
+        WHERE permission_entries.run_id = EXCLUDED.run_id
+          AND permission_entries.evidence_hash = EXCLUDED.evidence_hash
+        RETURNING id
+        """,
+        (
+            run_id,
+            assessment_id,
+            principal_id,
+            rec["entry_key"],
+            rec.get("provider_entry_id"),
+            rec.get("ordinal"),
+            rec["entry_kind"],
+            rec["effect"],
+            json.dumps(rec.get("normalized_rights") or []),
+            rec["inherited_state"],
+            rec.get("expiration_at"),
+            rec["evidence_hash"],
+            json.dumps(rec.get("provider_details") or {}),
+        ),
+    ).fetchone()
+    if row is None:
+        raise ValueError("entry_key was reused with different permission evidence")
+    return int(row[0])
+
+
+def flush_permission_entry_batch(
+    conn: psycopg.Connection,
+    run_id: str,
+    rows: list[tuple[int, int | None, dict[str, Any]]],
+) -> None:
+    """Persist normalized entries set-wise while retaining collision checks."""
+
+    if not rows:
+        return
+    payload = [
+        {
+            "assessment_id": assessment_id,
+            "principal_id": principal_id,
+            "entry_key": rec["entry_key"],
+            "provider_entry_id": rec.get("provider_entry_id"),
+            "ordinal": rec.get("ordinal"),
+            "entry_kind": rec["entry_kind"],
+            "entry_effect": rec["effect"],
+            "normalized_rights": rec.get("normalized_rights") or [],
+            "inherited_state": rec["inherited_state"],
+            "expiration_at": rec["expiration_at"].isoformat() if rec.get("expiration_at") else None,
+            "evidence_hash": rec["evidence_hash"],
+            "provider_details": rec.get("provider_details") or {},
+        }
+        for assessment_id, principal_id, rec in rows
+    ]
+    serialized = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    collision = conn.execute(
+        """
+        WITH incoming AS (
+            SELECT *
+            FROM jsonb_to_recordset(%s::jsonb) AS entry(
+                assessment_id bigint,
+                entry_key text,
+                evidence_hash text
+            )
+        ),
+        collisions AS (
+            SELECT assessment_id, entry_key
+            FROM incoming
+            GROUP BY assessment_id, entry_key
+            HAVING COUNT(DISTINCT evidence_hash) > 1
+            UNION ALL
+            SELECT incoming.assessment_id, incoming.entry_key
+            FROM incoming
+            JOIN permission_entries AS existing
+              ON existing.assessment_id = incoming.assessment_id
+             AND existing.entry_key = incoming.entry_key
+            WHERE existing.run_id <> %s
+               OR existing.evidence_hash <> incoming.evidence_hash
+        )
+        SELECT 1 FROM collisions LIMIT 1
+        """,
+        (serialized, run_id),
+    ).fetchone()
+    if collision is not None:
+        raise ValueError("entry_key was reused with different permission evidence")
+
+    conn.execute(
+        """
+        WITH incoming AS (
+            SELECT *
+            FROM jsonb_to_recordset(%s::jsonb) AS entry(
+                assessment_id bigint,
+                principal_id bigint,
+                entry_key text,
+                provider_entry_id text,
+                ordinal integer,
+                entry_kind text,
+                entry_effect text,
+                normalized_rights jsonb,
+                inherited_state text,
+                expiration_at text,
+                evidence_hash text,
+                provider_details jsonb
+            )
+        ),
+        deduplicated AS (
+            SELECT DISTINCT ON (assessment_id, entry_key) *
+            FROM incoming
+            ORDER BY assessment_id, entry_key
+        )
+        INSERT INTO permission_entries (
+            run_id, assessment_id, principal_id, entry_key, provider_entry_id,
+            ordinal, entry_kind, entry_effect, normalized_rights, inherited_state,
+            expiration_at, evidence_hash, provider_details
+        )
+        SELECT
+            %s, assessment_id, principal_id, entry_key, provider_entry_id,
+            ordinal, entry_kind, entry_effect, normalized_rights, inherited_state,
+            NULLIF(expiration_at, '')::timestamptz, evidence_hash, provider_details
+        FROM deduplicated
+        ON CONFLICT (assessment_id, entry_key)
+        DO UPDATE SET
+            principal_id = COALESCE(EXCLUDED.principal_id, permission_entries.principal_id),
+            provider_entry_id = COALESCE(EXCLUDED.provider_entry_id, permission_entries.provider_entry_id),
+            ordinal = COALESCE(EXCLUDED.ordinal, permission_entries.ordinal),
+            expiration_at = COALESCE(EXCLUDED.expiration_at, permission_entries.expiration_at)
+        WHERE permission_entries.run_id = EXCLUDED.run_id
+          AND permission_entries.evidence_hash = EXCLUDED.evidence_hash
+        """,
+        (serialized, run_id),
+    )
+    rows.clear()
+
+
+def reconcile_permission_evidence_integrity(conn: psycopg.Connection, run_id: str) -> None:
+    """Verify persisted entry cardinality and derive a consumer-owned set hash.
+
+    Artifacts are input, not authority. A malformed or truncated entry record
+    must not leave its parent assessment looking complete or suitable for a
+    negative conclusion. The normalized hash intentionally uses only the
+    persisted evidence hashes and preserves duplicates.
+    """
+
+    conn.execute(
+        """
+        WITH classified_entries AS (
+            SELECT
+                entry.assessment_id,
+                entry.id AS entry_id,
+                entry.evidence_hash,
+                (
+                    entry.principal_id IS NULL
+                    AND NOT (
+                        assessment.provider = 'sharepoint'
+                        AND assessment.semantics = 'sharepoint_graph_permission_v1'
+                        AND assessment.permission_surface = 'sharepoint_graph_permissions'
+                        AND entry.entry_kind IN ('link', 'invitation')
+                    )
+                ) AS unresolved_principal,
+                NOT (
+                    (
+                        assessment.provider = 'smb'
+                        AND assessment.semantics = 'smb_windows_acl_v1'
+                        AND assessment.permission_surface IN ('smb_filesystem_dacl', 'smb_share_acl')
+                        AND entry.entry_kind = 'ace'
+                    )
+                    OR (
+                        assessment.provider = 'sharepoint'
+                        AND assessment.semantics = 'sharepoint_graph_permission_v1'
+                        AND assessment.permission_surface = 'sharepoint_graph_permissions'
+                        AND entry.entry_kind IN ('identity_grant', 'link', 'invitation')
+                    )
+                ) AS invalid_entry_kind
+            FROM permission_entries AS entry
+            JOIN permission_assessments AS assessment
+              ON assessment.id = entry.assessment_id
+             AND assessment.run_id = entry.run_id
+            WHERE entry.run_id = %s
+        ),
+        persisted AS (
+            SELECT
+                assessment.id AS assessment_id,
+                COUNT(entry.entry_id)::integer AS actual_entries,
+                COUNT(entry.entry_id) FILTER (WHERE entry.unresolved_principal)::integer
+                    AS unresolved_principal_entries,
+                COUNT(entry.entry_id) FILTER (WHERE entry.invalid_entry_kind)::integer
+                    AS invalid_entry_kind_entries,
+                COUNT(entry.entry_id) FILTER (
+                    WHERE entry.unresolved_principal OR entry.invalid_entry_kind
+                )::integer AS noncomparable_entries,
+                encode(
+                    sha256(
+                        convert_to(
+                            COALESCE(
+                                string_agg(
+                                    entry.evidence_hash,
+                                    E'\\n' ORDER BY entry.evidence_hash, entry.entry_id
+                                ),
+                                ''
+                            ),
+                            'UTF8'
+                        )
+                    ),
+                    'hex'
+                ) AS normalized_entries_hash
+            FROM permission_assessments AS assessment
+            LEFT JOIN classified_entries AS entry
+              ON entry.assessment_id = assessment.id
+            WHERE assessment.run_id = %s
+            GROUP BY assessment.id
+        ),
+        integrity AS (
+            SELECT
+                assessment.id AS assessment_id,
+                persisted.actual_entries,
+                persisted.unresolved_principal_entries,
+                persisted.invalid_entry_kind_entries,
+                persisted.noncomparable_entries,
+                encode(
+                    sha256(
+                        convert_to(
+                            COALESCE(assessment.evidence_hash, '-') || E'\\n' || persisted.normalized_entries_hash,
+                            'UTF8'
+                        )
+                    ),
+                    'hex'
+                ) AS normalized_entry_set_hash,
+                persisted.actual_entries = assessment.entries_emitted AS counts_match,
+                assessment.entry_set_hash IS NOT NULL
+                    AND assessment.evidence_hash IS NOT NULL
+                    AND assessment.assessment_state = 'complete'
+                    AND assessment.retrieval_coverage IN ('complete', 'full', 'all_returned')
+                    AND persisted.actual_entries = assessment.entries_emitted
+                    AND assessment.entries_observed = assessment.entries_emitted
+                    AND assessment.entries_omitted = 0
+                    AND assessment.unknown_entries = 0
+                    AND persisted.noncomparable_entries = 0
+                    AS hash_eligible,
+                assessment.assessment_state = 'complete'
+                    AND assessment.entry_set_hash IS NOT NULL
+                    AND assessment.evidence_hash IS NOT NULL
+                    AND assessment.retrieval_coverage IN ('complete', 'full', 'all_returned')
+                    AND persisted.actual_entries = assessment.entries_emitted
+                    AND assessment.entries_observed = assessment.entries_emitted
+                    AND assessment.entries_omitted = 0
+                    AND assessment.unknown_entries = 0
+                    AND persisted.noncomparable_entries = 0
+                    AND assessment.provider = 'smb'
+                    AND assessment.semantics = 'smb_windows_acl_v1'
+                    AND assessment.permission_surface = 'smb_filesystem_dacl'
+                    AND assessment.method = 'smb_query_security_info_read_control'
+                    AND assessment.effective_access_status = 'not_computed'
+                    AS negative_invariant
+            FROM permission_assessments AS assessment
+            JOIN persisted ON persisted.assessment_id = assessment.id
+            WHERE assessment.run_id = %s
+        )
+        UPDATE permission_assessments AS assessment
+        SET entry_set_hash = CASE
+                WHEN integrity.hash_eligible THEN integrity.normalized_entry_set_hash
+                ELSE NULL
+            END,
+            assessment_state = CASE
+                WHEN (NOT integrity.counts_match OR integrity.noncomparable_entries > 0)
+                     AND assessment.assessment_state = 'complete'
+                THEN 'partial'
+                ELSE assessment.assessment_state
+            END,
+            retrieval_coverage = CASE
+                WHEN (NOT integrity.counts_match OR integrity.noncomparable_entries > 0)
+                     AND assessment.retrieval_coverage IN ('complete', 'full', 'all_returned')
+                THEN 'partial'
+                ELSE assessment.retrieval_coverage
+            END,
+            unknown_entries = GREATEST(
+                assessment.unknown_entries,
+                integrity.noncomparable_entries
+            ),
+            negative_conclusion_supported = assessment.negative_conclusion_supported
+                AND integrity.negative_invariant,
+            error_code = CASE
+                WHEN NOT integrity.counts_match
+                THEN COALESCE(assessment.error_code, 'INGESTED_ENTRY_COUNT_MISMATCH')
+                WHEN integrity.invalid_entry_kind_entries > 0
+                THEN COALESCE(assessment.error_code, 'INGESTED_ENTRY_KIND_INVALID')
+                WHEN integrity.unresolved_principal_entries > 0
+                THEN COALESCE(assessment.error_code, 'INGESTED_ENTRY_PRINCIPAL_UNRESOLVED')
+                ELSE assessment.error_code
+            END,
+            errors = assessment.errors
+                || CASE
+                    WHEN NOT integrity.counts_match
+                     AND NOT EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements(assessment.errors) AS existing_error(value)
+                        WHERE existing_error.value->>'code' = 'INGESTED_ENTRY_COUNT_MISMATCH'
+                     )
+                    THEN jsonb_build_array(
+                    jsonb_build_object(
+                        'code', 'INGESTED_ENTRY_COUNT_MISMATCH',
+                        'message', 'Assessment declared '
+                            || assessment.entries_emitted::text
+                            || ' emitted entries but '
+                            || integrity.actual_entries::text
+                            || ' valid entries were persisted.'
+                    )
+                    )
+                    ELSE '[]'::jsonb
+                END
+                || CASE
+                    WHEN integrity.invalid_entry_kind_entries > 0
+                     AND NOT EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements(assessment.errors) AS existing_error(value)
+                        WHERE existing_error.value->>'code' = 'INGESTED_ENTRY_KIND_INVALID'
+                     )
+                    THEN jsonb_build_array(
+                        jsonb_build_object(
+                            'code', 'INGESTED_ENTRY_KIND_INVALID',
+                            'message', integrity.invalid_entry_kind_entries::text
+                                || ' persisted permission entries used an entry kind outside the reviewed provider contract.'
+                        )
+                    )
+                    ELSE '[]'::jsonb
+                END
+                || CASE
+                    WHEN integrity.unresolved_principal_entries > 0
+                     AND NOT EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements(assessment.errors) AS existing_error(value)
+                        WHERE existing_error.value->>'code' = 'INGESTED_ENTRY_PRINCIPAL_UNRESOLVED'
+                     )
+                    THEN jsonb_build_array(
+                        jsonb_build_object(
+                            'code', 'INGESTED_ENTRY_PRINCIPAL_UNRESOLVED',
+                            'message', integrity.unresolved_principal_entries::text
+                                || ' persisted permission entries did not have a stable provider principal identity.'
+                        )
+                    )
+                    ELSE '[]'::jsonb
+                END,
+            summary = assessment.summary || jsonb_build_object(
+                'entry_integrity', CASE
+                    WHEN NOT integrity.counts_match THEN 'mismatch'
+                    WHEN integrity.invalid_entry_kind_entries > 0 THEN 'entry_kind_invalid'
+                    WHEN integrity.unresolved_principal_entries > 0 THEN 'principal_unresolved'
+                    ELSE 'verified'
+                END,
+                'persisted_entries', integrity.actual_entries,
+                'unresolved_principal_entries', integrity.unresolved_principal_entries,
+                'invalid_entry_kind_entries', integrity.invalid_entry_kind_entries,
+                'noncomparable_entries', integrity.noncomparable_entries,
+                'entry_set_hash', CASE
+                    WHEN integrity.hash_eligible THEN integrity.normalized_entry_set_hash
+                    ELSE NULL
+                END
+            )
+        FROM integrity
+        WHERE assessment.id = integrity.assessment_id
+        """,
+        (run_id, run_id, run_id),
+    )
+
+
+def reconcile_permission_summaries(conn: psycopg.Connection, run_id: str) -> None:
+    """Derive bounded summaries from normalized evidence in set-based queries."""
+
+    conn.execute(
+        """
+        WITH classified_entries AS (
+            SELECT
+                entry.assessment_id,
+                (
+                    entry.principal_id IS NULL
+                    AND NOT (
+                        assessment.provider = 'sharepoint'
+                        AND assessment.semantics = 'sharepoint_graph_permission_v1'
+                        AND assessment.permission_surface = 'sharepoint_graph_permissions'
+                        AND entry.entry_kind IN ('link', 'invitation')
+                    )
+                ) AS unresolved_principal,
+                NOT (
+                    (
+                        assessment.provider = 'smb'
+                        AND assessment.semantics = 'smb_windows_acl_v1'
+                        AND assessment.permission_surface IN ('smb_filesystem_dacl', 'smb_share_acl')
+                        AND entry.entry_kind = 'ace'
+                    )
+                    OR (
+                        assessment.provider = 'sharepoint'
+                        AND assessment.semantics = 'sharepoint_graph_permission_v1'
+                        AND assessment.permission_surface = 'sharepoint_graph_permissions'
+                        AND entry.entry_kind IN ('identity_grant', 'link', 'invitation')
+                    )
+                ) AS invalid_entry_kind
+            FROM permission_entries AS entry
+            JOIN permission_assessments AS assessment
+              ON assessment.id = entry.assessment_id
+             AND assessment.run_id = entry.run_id
+            WHERE entry.run_id = %s
+        ),
+        persisted AS (
+            SELECT
+                assessment_id,
+                COUNT(*)::bigint AS entry_count,
+                COUNT(*) FILTER (WHERE unresolved_principal)::bigint
+                    AS unresolved_principal_entry_count,
+                COUNT(*) FILTER (WHERE invalid_entry_kind)::bigint
+                    AS invalid_entry_kind_count,
+                COUNT(*) FILTER (WHERE unresolved_principal OR invalid_entry_kind)::bigint
+                    AS noncomparable_entry_count
+            FROM classified_entries
+            GROUP BY assessment_id
+        ),
+        evidence AS (
+            SELECT
+                resource_id,
+                COUNT(*)::integer AS assessment_count,
+                COALESCE(SUM(persisted.entry_count), 0)::bigint AS entry_count,
+                COALESCE(SUM(entries_emitted), 0)::bigint AS declared_entry_count,
+                COALESCE(SUM(persisted.unresolved_principal_entry_count), 0)::bigint
+                    AS unresolved_principal_entry_count,
+                COALESCE(SUM(persisted.invalid_entry_kind_count), 0)::bigint
+                    AS invalid_entry_kind_count,
+                COALESCE(SUM(persisted.noncomparable_entry_count), 0)::bigint
+                    AS noncomparable_entry_count,
+                BOOL_AND(
+                    assessment_state = 'complete'
+                    AND retrieval_coverage IN ('complete', 'full', 'all_returned')
+                    AND entry_set_hash IS NOT NULL
+                    AND entries_observed = entries_emitted
+                    AND COALESCE(persisted.entry_count, 0) = entries_emitted
+                    AND COALESCE(persisted.noncomparable_entry_count, 0) = 0
+                    AND entries_omitted = 0
+                    AND unknown_entries = 0
+                ) AS comparable,
+                BOOL_AND(negative_conclusion_supported)
+                    AND BOOL_AND(
+                        selection_scope IN ('root', 'share_root', 'resource_root', 'library_root', 'complete')
+                    ) AS negative_supported,
+                BOOL_AND(
+                    negative_conclusion_supported
+                    AND selection_coverage IN (
+                        'exhaustive_for_scope', 'exhaustive_for_declared_scope',
+                        'complete', 'full', 'all_returned'
+                    )
+                ) AS scope_exact,
+                encode(
+                    sha256(
+                        convert_to(
+                            string_agg(
+                                encode(
+                                    sha256(
+                                        convert_to(
+                                            jsonb_build_array(
+                                                subject_key,
+                                                semantics,
+                                                permission_surface,
+                                                entry_set_hash,
+                                                entries_emitted
+                                            )::text,
+                                            'UTF8'
+                                        )
+                                    ),
+                                    'hex'
+                                ),
+                                E'\n' ORDER BY subject_key, semantics, permission_surface
+                            ),
+                            'UTF8'
+                        )
+                    ),
+                    'hex'
+                ) AS comparison_evidence_hash,
+                encode(
+                    sha256(
+                        convert_to(
+                            string_agg(
+                                encode(
+                                    sha256(
+                                        convert_to(
+                                            jsonb_build_array(
+                                                subject_key,
+                                                semantics,
+                                                permission_surface,
+                                                method,
+                                                assessment_state,
+                                                selection_scope,
+                                                selection_coverage,
+                                                retrieval_coverage,
+                                                provider_visibility,
+                                                semantic_coverage,
+                                                principal_resolution,
+                                                entries_omitted,
+                                                unknown_entries,
+                                                provider_details->>'assessed_identity_fingerprint'
+                                            )::text,
+                                            'UTF8'
+                                        )
+                                    ),
+                                    'hex'
+                                ),
+                                E'\n' ORDER BY subject_key, semantics, permission_surface
+                            ),
+                            'UTF8'
+                        )
+                    ),
+                    'hex'
+                ) AS comparison_quality_hash,
+                BOOL_AND(assessment_state = 'complete') AS all_complete,
+                BOOL_OR(assessment_state IN ('complete', 'partial')) AS any_observed,
+                ARRAY_AGG(DISTINCT semantics ORDER BY semantics) AS semantics,
+                ARRAY_AGG(DISTINCT permission_surface ORDER BY permission_surface) AS surfaces,
+                MAX(observed_at) AS observed_at
+            FROM permission_assessments AS assessment
+            LEFT JOIN persisted ON persisted.assessment_id = assessment.id
+            WHERE assessment.run_id = %s
+            GROUP BY resource_id
+        )
+        UPDATE resources AS resource
+        SET permission_summary = jsonb_build_object(
+            'evidence_available', TRUE,
+            'status', CASE
+                WHEN evidence.all_complete THEN 'complete'
+                WHEN evidence.any_observed THEN 'partial'
+                ELSE 'failed'
+            END,
+            'assessment_count', evidence.assessment_count,
+            'entry_count', evidence.entry_count,
+            'declared_entry_count', evidence.declared_entry_count,
+            'unresolved_principal_entry_count', evidence.unresolved_principal_entry_count,
+            'invalid_entry_kind_count', evidence.invalid_entry_kind_count,
+            'noncomparable_entry_count', evidence.noncomparable_entry_count,
+            'comparable', evidence.comparable,
+            'negative_conclusion_supported', evidence.negative_supported,
+            'scope_exact', evidence.scope_exact,
+            'comparison_evidence_hash', evidence.comparison_evidence_hash,
+            'comparison_quality_hash', evidence.comparison_quality_hash,
+            'semantics', to_jsonb(evidence.semantics),
+            'permission_surfaces', to_jsonb(evidence.surfaces),
+            'observed_at', evidence.observed_at
+        )
+        FROM evidence
+        WHERE resource.id = evidence.resource_id AND resource.run_id = %s
+        """,
+        (run_id, run_id, run_id),
+    )
+    conn.execute(
+        """
+        WITH classified_entries AS (
+            SELECT
+                entry.assessment_id,
+                (
+                    entry.principal_id IS NULL
+                    AND NOT (
+                        assessment.provider = 'sharepoint'
+                        AND assessment.semantics = 'sharepoint_graph_permission_v1'
+                        AND assessment.permission_surface = 'sharepoint_graph_permissions'
+                        AND entry.entry_kind IN ('link', 'invitation')
+                    )
+                ) AS unresolved_principal,
+                NOT (
+                    (
+                        assessment.provider = 'smb'
+                        AND assessment.semantics = 'smb_windows_acl_v1'
+                        AND assessment.permission_surface IN ('smb_filesystem_dacl', 'smb_share_acl')
+                        AND entry.entry_kind = 'ace'
+                    )
+                    OR (
+                        assessment.provider = 'sharepoint'
+                        AND assessment.semantics = 'sharepoint_graph_permission_v1'
+                        AND assessment.permission_surface = 'sharepoint_graph_permissions'
+                        AND entry.entry_kind IN ('identity_grant', 'link', 'invitation')
+                    )
+                ) AS invalid_entry_kind
+            FROM permission_entries AS entry
+            JOIN permission_assessments AS assessment
+              ON assessment.id = entry.assessment_id
+             AND assessment.run_id = entry.run_id
+            WHERE entry.run_id = %s
+        ),
+        persisted AS (
+            SELECT
+                assessment_id,
+                COUNT(*)::bigint AS entry_count,
+                COUNT(*) FILTER (WHERE unresolved_principal)::bigint
+                    AS unresolved_principal_entry_count,
+                COUNT(*) FILTER (WHERE invalid_entry_kind)::bigint
+                    AS invalid_entry_kind_count,
+                COUNT(*) FILTER (WHERE unresolved_principal OR invalid_entry_kind)::bigint
+                    AS noncomparable_entry_count
+            FROM classified_entries
+            GROUP BY assessment_id
+        ),
+        evidence AS (
+            SELECT
+                item_id,
+                COUNT(*)::integer AS assessment_count,
+                COALESCE(SUM(persisted.entry_count), 0)::bigint AS entry_count,
+                COALESCE(SUM(entries_emitted), 0)::bigint AS declared_entry_count,
+                COALESCE(SUM(persisted.unresolved_principal_entry_count), 0)::bigint
+                    AS unresolved_principal_entry_count,
+                COALESCE(SUM(persisted.invalid_entry_kind_count), 0)::bigint
+                    AS invalid_entry_kind_count,
+                COALESCE(SUM(persisted.noncomparable_entry_count), 0)::bigint
+                    AS noncomparable_entry_count,
+                BOOL_AND(
+                    assessment_state = 'complete'
+                    AND retrieval_coverage IN ('complete', 'full', 'all_returned')
+                    AND entry_set_hash IS NOT NULL
+                    AND entries_observed = entries_emitted
+                    AND COALESCE(persisted.entry_count, 0) = entries_emitted
+                    AND COALESCE(persisted.noncomparable_entry_count, 0) = 0
+                    AND entries_omitted = 0
+                    AND unknown_entries = 0
+                ) AS comparable,
+                BOOL_AND(negative_conclusion_supported) AS negative_supported,
+                BOOL_AND(assessment_state = 'complete') AS all_complete,
+                BOOL_OR(assessment_state IN ('complete', 'partial')) AS any_observed,
+                ARRAY_AGG(DISTINCT semantics ORDER BY semantics) AS semantics,
+                ARRAY_AGG(DISTINCT permission_surface ORDER BY permission_surface) AS surfaces,
+                MAX(observed_at) AS observed_at
+            FROM permission_assessments AS assessment
+            LEFT JOIN persisted ON persisted.assessment_id = assessment.id
+            WHERE assessment.run_id = %s AND item_id IS NOT NULL
+            GROUP BY item_id
+        )
+        UPDATE items AS item
+        SET permission_summary = jsonb_build_object(
+            'evidence_available', TRUE,
+            'status', CASE
+                WHEN evidence.all_complete THEN 'complete'
+                WHEN evidence.any_observed THEN 'partial'
+                ELSE 'failed'
+            END,
+            'assessment_count', evidence.assessment_count,
+            'entry_count', evidence.entry_count,
+            'declared_entry_count', evidence.declared_entry_count,
+            'unresolved_principal_entry_count', evidence.unresolved_principal_entry_count,
+            'invalid_entry_kind_count', evidence.invalid_entry_kind_count,
+            'noncomparable_entry_count', evidence.noncomparable_entry_count,
+            'comparable', evidence.comparable,
+            'negative_conclusion_supported', evidence.negative_supported,
+            'semantics', to_jsonb(evidence.semantics),
+            'permission_surfaces', to_jsonb(evidence.surfaces),
+            'observed_at', evidence.observed_at
+        )
+        FROM evidence
+        WHERE item.id = evidence.item_id AND item.run_id = %s
+        """,
+        (run_id, run_id, run_id),
+    )
+
+
+def _permission_collection_integrity(
+    collection_context: dict[str, Any],
+    *,
+    assessment_count: int,
+    assessed_resource_count: int,
+    incomplete_assessment_count: int,
+    relevant_resource_count: int,
+    rejected_record_count: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Derive permission coverage from evidence the consumer actually persisted.
+
+    Producer coverage is a necessary input, never the authority. This keeps an
+    omitted, malformed, or truncated permission stream from turning into an
+    exact negative conclusion merely because its final run metadata claimed
+    completion.
+    """
+
+    context = dict(collection_context) if isinstance(collection_context, dict) else {}
+    metadata = dict(context.get("metadata")) if isinstance(context.get("metadata"), dict) else {}
+    producer_summary = (
+        metadata.get("permission_assessment") if isinstance(metadata.get("permission_assessment"), dict) else {}
+    )
+    raw_expected_objects = producer_summary.get("candidate_objects")
+    expected_objects = (
+        int(raw_expected_objects)
+        if isinstance(raw_expected_objects, int)
+        and not isinstance(raw_expected_objects, bool)
+        and raw_expected_objects >= 0
+        else None
+    )
+
+    producer_complete = metadata.get("permissions_complete") is True
+    resource_coverage_complete = relevant_resource_count == 0 or assessed_resource_count >= relevant_resource_count
+    # A producer-declared candidate count is a framing invariant, not a lower
+    # bound. Extra persisted subjects can indicate duplicated or scope-drifted
+    # records just as missing subjects indicate truncation.
+    object_coverage_complete = expected_objects is None or assessment_count == expected_objects
+    permission_assessed = assessment_count > 0
+    permission_complete = bool(
+        producer_complete
+        and rejected_record_count == 0
+        and incomplete_assessment_count == 0
+        and resource_coverage_complete
+        and object_coverage_complete
+        and (relevant_resource_count == 0 or permission_assessed)
+    )
+
+    reasons: list[str] = []
+    if not producer_complete:
+        reasons.append("producer_did_not_declare_complete")
+    if rejected_record_count:
+        reasons.append("permission_records_rejected")
+    if incomplete_assessment_count:
+        reasons.append("assessment_integrity_incomplete")
+    if not resource_coverage_complete:
+        reasons.append("resource_coverage_incomplete")
+    if not object_coverage_complete:
+        reasons.append("declared_object_coverage_incomplete")
+
+    integrity = {
+        "contract_version": 1,
+        "status": "verified_complete" if permission_complete else "incomplete",
+        "producer_declared_complete": producer_complete,
+        "assessments_persisted": assessment_count,
+        "resources_assessed": assessed_resource_count,
+        "resources_expected": relevant_resource_count,
+        "incomplete_assessments": incomplete_assessment_count,
+        "rejected_records": rejected_record_count,
+        "expected_objects": expected_objects,
+        "reasons": reasons,
+    }
+    metadata["permissions_assessed"] = permission_assessed
+    metadata["permissions_complete"] = permission_complete
+    metadata["permission_ingest"] = integrity
+    context["metadata"] = metadata
+    return context, integrity
+
+
+def reconcile_permission_collection_context(conn: psycopg.Connection, run_id: str) -> dict[str, Any]:
+    """Persist consumer-owned permission coverage and return its diagnostics."""
+
+    row = conn.execute(
+        """
+        WITH assessment_metrics AS (
+            SELECT
+                COUNT(*)::integer AS assessment_count,
+                COUNT(DISTINCT resource_id)::integer AS assessed_resource_count,
+                COUNT(*) FILTER (
+                    WHERE assessment_state <> 'complete'
+                       OR retrieval_coverage NOT IN ('complete', 'full', 'all_returned')
+                       OR entry_set_hash IS NULL
+                       OR entries_observed <> entries_emitted
+                       OR entries_omitted <> 0
+                       OR unknown_entries <> 0
+                )::integer AS incomplete_assessment_count
+            FROM permission_assessments
+            WHERE run_id = %s
+        )
+        SELECT
+            run.collection_context,
+            assessment_metrics.assessment_count,
+            assessment_metrics.assessed_resource_count,
+            assessment_metrics.incomplete_assessment_count,
+            (
+                SELECT COUNT(*)::integer
+                FROM resources AS resource
+                WHERE resource.run_id = %s
+                  AND COALESCE(
+                      resource.provider,
+                      split_part(resource.resource_type::text, '_', 1)
+                  ) IN ('smb', 'sharepoint')
+            ) AS relevant_resource_count,
+            (
+                SELECT COUNT(*)::integer
+                FROM ingest_errors AS ingest_error
+                WHERE ingest_error.run_id = %s
+                  AND ingest_error.code = 'PERMISSION_EVIDENCE_INVALID'
+            ) AS rejected_record_count
+        FROM scan_runs AS run
+        CROSS JOIN assessment_metrics
+        WHERE run.id = %s
+        FOR UPDATE OF run
+        """,
+        (run_id, run_id, run_id, run_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError("run disappeared while reconciling permission evidence")
+
+    context, integrity = _permission_collection_integrity(
+        row[0] if isinstance(row[0], dict) else {},
+        assessment_count=int(row[1] or 0),
+        assessed_resource_count=int(row[2] or 0),
+        incomplete_assessment_count=int(row[3] or 0),
+        relevant_resource_count=int(row[4] or 0),
+        rejected_record_count=int(row[5] or 0),
+    )
+    conn.execute(
+        "UPDATE scan_runs SET collection_context = %s::jsonb WHERE id = %s",
+        (json.dumps(context, ensure_ascii=True, separators=(",", ":")), run_id),
+    )
+    return integrity
+
+
+def _validated_producer_inventory_counts(raw_stats: Any) -> dict[str, int] | None:
+    """Return the producer's exact inventory cardinalities when well formed."""
+
+    if not isinstance(raw_stats, dict):
+        return None
+    counts: dict[str, int] = {}
+    for field in ("endpoints", "resources", "items"):
+        value = raw_stats.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > 2**63 - 1:
+            return None
+        counts[field] = value
+    return counts
+
+
+def _inventory_collection_integrity(
+    collection_context: dict[str, Any],
+    *,
+    producer_counts: dict[str, int] | None,
+    persisted_counts: dict[str, int],
+    structural_rejected_records: int,
+    content_rejected_records: int,
+    unclassified_rejected_records: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fail closed when the consumer could not persist the producer's inventory.
+
+    Producer completeness remains necessary, but exact negative inventory
+    conclusions additionally require every inventory record to validate and
+    the terminal producer cardinalities to match the normalized rows. Keep the
+    structural and content dimensions separate so one malformed item does not
+    erase otherwise valid share/library presence observations.
+    """
+
+    context = dict(collection_context) if isinstance(collection_context, dict) else {}
+    metadata = dict(context.get("metadata")) if isinstance(context.get("metadata"), dict) else {}
+    persisted_inventory_counts = {
+        field: max(0, int(persisted_counts.get(field, 0))) for field in ("endpoints", "resources", "items")
+    }
+    count_mismatches: dict[str, dict[str, int]] = {}
+    if producer_counts is not None:
+        for field in ("endpoints", "resources", "items"):
+            producer_value = producer_counts[field]
+            persisted_value = persisted_inventory_counts[field]
+            if producer_value != persisted_value:
+                count_mismatches[field] = {
+                    "producer": producer_value,
+                    "persisted": persisted_value,
+                }
+
+    structural_rejected_records = max(0, int(structural_rejected_records))
+    content_rejected_records = max(0, int(content_rejected_records))
+    unclassified_rejected_records = max(0, int(unclassified_rejected_records))
+    producer_counts_valid = producer_counts is not None
+    structural_integrity_verified = bool(
+        producer_counts_valid
+        and structural_rejected_records == 0
+        and unclassified_rejected_records == 0
+        and not ({"endpoints", "resources"} & count_mismatches.keys())
+    )
+    content_integrity_verified = bool(
+        structural_integrity_verified and content_rejected_records == 0 and "items" not in count_mismatches
+    )
+
+    reasons: list[str] = []
+    if not producer_counts_valid:
+        reasons.append("producer_inventory_counts_missing_or_invalid")
+    if structural_rejected_records:
+        reasons.append("structural_records_rejected")
+    if content_rejected_records:
+        reasons.append("content_records_rejected")
+    if unclassified_rejected_records:
+        reasons.append("unclassified_artifact_records_rejected")
+    reasons.extend(f"{field}_count_mismatch" for field in count_mismatches)
+
+    integrity = {
+        "contract_version": 1,
+        "status": ("verified" if structural_integrity_verified and content_integrity_verified else "incomplete"),
+        "structural_integrity_verified": structural_integrity_verified,
+        "content_integrity_verified": content_integrity_verified,
+        "producer_counts": producer_counts,
+        "persisted_counts": persisted_inventory_counts,
+        "count_mismatches": count_mismatches,
+        "rejected_records": {
+            "structural": structural_rejected_records,
+            "content": content_rejected_records,
+            "unclassified": unclassified_rejected_records,
+        },
+        "reasons": reasons,
+    }
+    # A consumer can only narrow producer truth claims. It must never promote
+    # a producer-declared partial collection merely because row counts match.
+    metadata["structural_complete"] = bool(
+        metadata.get("structural_complete") is True and structural_integrity_verified
+    )
+    metadata["content_complete"] = bool(metadata.get("content_complete") is True and content_integrity_verified)
+    metadata["inventory_ingest"] = integrity
+    context["metadata"] = metadata
+    return context, integrity
+
+
+def reconcile_inventory_collection_context(
+    conn: psycopg.Connection,
+    run_id: str,
+    *,
+    producer_counts: dict[str, int] | None,
+    persisted_counts: dict[str, int],
+) -> dict[str, Any]:
+    """Persist consumer-owned inventory completeness and diagnostics."""
+
+    row = conn.execute(
+        """
+        SELECT
+            run.collection_context,
+            rejected.structural_rejected_records,
+            rejected.content_rejected_records,
+            rejected.unclassified_rejected_records
+        FROM scan_runs AS run
+        CROSS JOIN LATERAL (
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE ingest_error.code = %s
+                )::integer AS structural_rejected_records,
+                COUNT(*) FILTER (
+                    WHERE ingest_error.code = %s
+                )::integer AS content_rejected_records,
+                COUNT(*) FILTER (
+                    WHERE ingest_error.code = ANY(%s)
+                )::integer AS unclassified_rejected_records
+            FROM ingest_errors AS ingest_error
+            WHERE ingest_error.run_id = run.id
+        ) AS rejected
+        WHERE run.id = %s
+        FOR UPDATE OF run
+        """,
+        (
+            CONSUMER_STRUCTURAL_RECORD_ERROR,
+            CONSUMER_CONTENT_RECORD_ERROR,
+            sorted(CONSUMER_UNCLASSIFIED_INVENTORY_ERROR_CODES),
+            run_id,
+        ),
+    ).fetchone()
+    if row is None:
+        raise ValueError("run disappeared while reconciling inventory evidence")
+
+    context, integrity = _inventory_collection_integrity(
+        row[0] if isinstance(row[0], dict) else {},
+        producer_counts=producer_counts,
+        persisted_counts=persisted_counts,
+        structural_rejected_records=int(row[1] or 0),
+        content_rejected_records=int(row[2] or 0),
+        unclassified_rejected_records=int(row[3] or 0),
+    )
+    conn.execute(
+        "UPDATE scan_runs SET collection_context = %s::jsonb WHERE id = %s",
+        (json.dumps(context, ensure_ascii=True, separators=(",", ":")), run_id),
+    )
+    return integrity
+
+
+def prepare_run_identity_keys(conn: psycopg.Connection, run_id: str) -> None:
+    """Populate stable resource keys used by the materialized comparison."""
+
+    conn.execute(
+        """
+        UPDATE resources AS resource
+        SET identity_key = encode(
+            sha256(
+                convert_to(
+                    CASE
+                        WHEN resource.provider_resource_id IS NOT NULL THEN
+                            jsonb_build_array(
+                                COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)),
+                                resource.resource_type::text,
+                                COALESCE(run.collection_context->>'tenant_id', ''),
+                                'provider_id',
+                                resource.provider_resource_id
+                            )::text
+                        ELSE
+                            jsonb_build_array(
+                                COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)),
+                                resource.resource_type::text,
+                                COALESCE(run.collection_context->>'tenant_id', ''),
+                                'location',
+                                lower(endpoint.endpoint_key),
+                                CASE
+                                    WHEN COALESCE(
+                                        resource.provider,
+                                        split_part(resource.resource_type::text, '_', 1)
+                                    ) IN ('smb', 'sharepoint')
+                                    THEN lower(resource.name)
+                                    ELSE resource.name
+                                END
+                            )::text
+                    END,
+                    'UTF8'
+                )
+            ),
+            'hex'
+        )
+        FROM endpoints AS endpoint, scan_runs AS run
+        WHERE resource.run_id = %s
+          AND endpoint.run_id = resource.run_id
+          AND endpoint.id = resource.endpoint_id
+          AND run.id = resource.run_id
+        """,
+        (run_id,),
+    )
+
+
+def _smb_identity_rows_stable(rows: list[tuple[Any, ...]], baseline_run_id: str, current_run_id: str) -> bool:
+    planes: dict[str, dict[str, tuple[str, str, str]]] = {
+        baseline_run_id: {},
+        current_run_id: {},
+    }
+    valid_sources = {
+        ("server_guid", "strong"),
+        ("advertised_name", "moderate"),
+        ("scan_target", "weak"),
+    }
+
+    def provider_id_valid(provider_id: str, source: str) -> bool:
+        namespace = "smb-server-guid:v1:" if source == "server_guid" else "smb-server-name:v1:"
+        if not provider_id.startswith(namespace):
+            return False
+        digest = provider_id[len(namespace) :]
+        return len(digest) == 64 and all(character in "0123456789abcdef" for character in digest)
+
+    for raw_run_id, raw_endpoint_key, raw_provider_id, raw_source, raw_strength in rows:
+        run_id = str(raw_run_id)
+        if run_id not in planes:
+            return False
+        endpoint_key = str(raw_endpoint_key or "").strip().casefold()
+        provider_id = str(raw_provider_id or "").strip()
+        source = str(raw_source or "").strip().casefold()
+        strength = str(raw_strength or "").strip().casefold()
+        if (
+            not endpoint_key
+            or not provider_id
+            or (source, strength) not in valid_sources
+            or not provider_id_valid(provider_id, source)
+            or endpoint_key in planes[run_id]
+        ):
+            return False
+        planes[run_id][endpoint_key] = (provider_id, source, strength)
+    baseline = planes[baseline_run_id]
+    current = planes[current_run_id]
+    return bool(baseline) and baseline.keys() == current.keys() and baseline == current
+
+
+def _comparison_smb_identity_status(
+    conn: psycopg.Connection, baseline_run_id: str, current_run_id: str
+) -> tuple[bool, bool]:
+    row = conn.execute(
+        """
+        WITH smb_endpoints AS (
+            SELECT endpoint.run_id::text AS run_id,
+                   lower(btrim(endpoint.endpoint_key)) AS endpoint_key,
+                   btrim(endpoint.provider_metadata->>'provider_endpoint_id') AS provider_endpoint_id,
+                   lower(btrim(endpoint.provider_metadata->>'identity_source')) AS identity_source,
+                   lower(btrim(endpoint.provider_metadata->>'identity_strength')) AS identity_strength,
+                   lower(btrim(endpoint.provider_metadata->>'server_guid')) AS server_guid
+            FROM endpoints AS endpoint
+            WHERE endpoint.run_id IN (%s, %s)
+              AND (
+                  endpoint.provider = 'smb'
+                  OR endpoint.provider_metadata->>'identity_source'
+                     IN ('server_guid', 'advertised_name', 'scan_target')
+                  OR EXISTS (
+                      SELECT 1
+                      FROM resources AS resource
+                      WHERE resource.run_id = endpoint.run_id
+                        AND resource.endpoint_id = endpoint.id
+                        AND COALESCE(
+                            resource.provider,
+                            split_part(resource.resource_type::text, '_', 1)
+                        ) = 'smb'
+                  )
+              )
+        ),
+        plane_stats AS (
+            SELECT
+                COUNT(*) FILTER (WHERE run_id = %s) > 0 AS baseline_present,
+                COUNT(*) FILTER (WHERE run_id = %s) > 0 AS current_present,
+                COALESCE(BOOL_AND(COALESCE(
+                    endpoint_key <> ''
+                    AND provider_endpoint_id IS NOT NULL
+                    AND provider_endpoint_id <> ''
+                    AND (
+                        (
+                            identity_source = 'server_guid'
+                            AND identity_strength = 'strong'
+                            AND provider_endpoint_id ~ '^smb-server-guid:v1:[0-9a-f]{64}$'
+                            AND server_guid ~ '^[0-9a-f]{32}$'
+                        )
+                        OR (
+                            identity_source = 'advertised_name'
+                            AND identity_strength = 'moderate'
+                            AND provider_endpoint_id ~ '^smb-server-name:v1:[0-9a-f]{64}$'
+                        )
+                        OR (
+                            identity_source = 'scan_target'
+                            AND identity_strength = 'weak'
+                            AND provider_endpoint_id ~ '^smb-server-name:v1:[0-9a-f]{64}$'
+                        )
+                    ),
+                    FALSE
+                )), FALSE) AS metadata_valid,
+                COALESCE(BOOL_AND(
+                    identity_source = 'server_guid'
+                    AND identity_strength = 'strong'
+                ), FALSE) AS strong_identity_complete,
+                COUNT(*) = COUNT(DISTINCT (run_id, endpoint_key)) AS endpoint_keys_unique
+            FROM smb_endpoints
+        ),
+        baseline_minus_current AS (
+            SELECT endpoint_key, provider_endpoint_id, identity_source, identity_strength, server_guid
+            FROM smb_endpoints WHERE run_id = %s
+            EXCEPT
+            SELECT endpoint_key, provider_endpoint_id, identity_source, identity_strength, server_guid
+            FROM smb_endpoints WHERE run_id = %s
+        ),
+        current_minus_baseline AS (
+            SELECT endpoint_key, provider_endpoint_id, identity_source, identity_strength, server_guid
+            FROM smb_endpoints WHERE run_id = %s
+            EXCEPT
+            SELECT endpoint_key, provider_endpoint_id, identity_source, identity_strength, server_guid
+            FROM smb_endpoints WHERE run_id = %s
+        )
+        SELECT (
+                   plane_stats.baseline_present
+                   AND plane_stats.current_present
+                   AND plane_stats.metadata_valid
+                   AND plane_stats.endpoint_keys_unique
+                   AND NOT EXISTS (SELECT 1 FROM baseline_minus_current)
+                   AND NOT EXISTS (SELECT 1 FROM current_minus_baseline)
+               ) AS stable,
+               plane_stats.strong_identity_complete
+        FROM plane_stats
+        """,
+        (
+            baseline_run_id,
+            current_run_id,
+            baseline_run_id,
+            current_run_id,
+            baseline_run_id,
+            current_run_id,
+            current_run_id,
+            baseline_run_id,
+        ),
+    ).fetchone()
+    stable = bool(row and row[0] is True)
+    return stable, bool(stable and row and row[1] is True)
+
+
+def _comparison_smb_identity_stable(conn: psycopg.Connection, baseline_run_id: str, current_run_id: str) -> bool:
+    return _comparison_smb_identity_status(conn, baseline_run_id, current_run_id)[0]
+
+
+def _comparison_observes_smb_resources(conn: psycopg.Connection, baseline_run_id: str, current_run_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM resources AS resource
+            WHERE resource.run_id IN (%s, %s)
+              AND COALESCE(
+                  resource.provider,
+                  split_part(resource.resource_type::text, '_', 1)
+              ) = 'smb'
+        )
+        """,
+        (baseline_run_id, current_run_id),
+    ).fetchone()
+    return bool(row and row[0] is True)
+
+
 def flush_item_batch(conn: psycopg.Connection, rows: list[tuple]) -> None:
     if not rows:
         return
     padded_rows = [
-        row + (None, None, None, None, None, False, "{}", None, "{}") if len(row) == 12 else row for row in rows
+        row + (None, None, None, None, None, False, "{}", None, "{}", "{}") if len(row) == 12 else row for row in rows
     ]
     provider_rows = [row for row in padded_rows if row[13] is not None]
     legacy_rows = [row for row in padded_rows if row[13] is None]
@@ -696,11 +2560,11 @@ def flush_item_batch(conn: psycopg.Connection, rows: list[tuple]) -> None:
             run_id, resource_id, path, name, is_dir, size_bytes, allocation_size_bytes,
             mtime, created_at, accessed_at, changed_at, file_attributes, provider,
             provider_item_id, provider_parent_id, web_url, mime_type, deleted,
-            provider_metadata, exposure, exposure_evidence
+            provider_metadata, exposure, exposure_evidence, permission_summary
         )
         VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         )
     """
     common_updates = """
@@ -726,7 +2590,8 @@ def flush_item_batch(conn: psycopg.Connection, rows: list[tuple]) -> None:
                 THEN items.exposure
                 ELSE EXCLUDED.exposure
             END,
-            exposure_evidence = items.exposure_evidence || EXCLUDED.exposure_evidence
+            exposure_evidence = items.exposure_evidence || EXCLUDED.exposure_evidence,
+            permission_summary = items.permission_summary || EXCLUDED.permission_summary
     """
     with conn.cursor() as cur:
         if legacy_rows:
@@ -949,8 +2814,11 @@ def update_run_status(
 
 
 def clear_persisted_ingest_inventory(conn: psycopg.Connection, run_id: str) -> None:
-    """Remove any resumable partial inventory after terminal framing rejection."""
+    """Remove resumable rows after terminal artifact provenance/framing rejection."""
 
+    conn.execute("DELETE FROM permission_entries WHERE run_id = %s", (run_id,))
+    conn.execute("DELETE FROM permission_assessments WHERE run_id = %s", (run_id,))
+    conn.execute("DELETE FROM permission_principals WHERE run_id = %s", (run_id,))
     conn.execute("DELETE FROM items WHERE run_id = %s", (run_id,))
     conn.execute("DELETE FROM resources WHERE run_id = %s", (run_id,))
     conn.execute("DELETE FROM endpoints WHERE run_id = %s", (run_id,))
@@ -1500,23 +3368,40 @@ def _provider_metadata_key_fingerprint(raw_key: str) -> str:
     return "".join(character for character in raw_key.lower() if character.isalnum())
 
 
+def _normalize_token_expiration(raw_value: Any, *, field: str) -> str | None:
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, str):
+        raise ValueError(f"field {field} must be an RFC3339 timestamp or null")
+    value = raw_value.strip()
+    if len(value) > TOKEN_EXPIRATION_MAX_LENGTH or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})",
+        value,
+    ):
+        raise ValueError(f"field {field} must be an RFC3339 timestamp or null")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"field {field} must be an RFC3339 timestamp or null") from exc
+    if parsed.utcoffset() is None:
+        raise ValueError(f"field {field} must include an RFC3339 timezone offset")
+    return value
+
+
 def _is_forbidden_provider_metadata_key(raw_key: str) -> bool:
     normalized = raw_key.strip().lower().replace("-", "_").replace(" ", "_")
     fingerprint = _provider_metadata_key_fingerprint(raw_key)
+    if fingerprint in SAFE_PROVIDER_METADATA_KEY_FINGERPRINTS:
+        return False
     if normalized in FORBIDDEN_PROVIDER_METADATA_KEYS:
         return True
     if fingerprint in FORBIDDEN_PROVIDER_METADATA_KEY_FINGERPRINTS:
         return True
-    return fingerprint.startswith(
-        (
-            "accesstoken",
-            "authorizationheader",
-            "bearertoken",
-            "clientsecret",
-            "privatekey",
-            "refreshtoken",
-        )
-    )
+    # Artifact producers are untrusted and key aliases are effectively
+    # unbounded. After the exact telemetry exceptions above, fail closed on
+    # sensitive stems regardless of prefixes, suffixes, separators, or version
+    # tags (dbPasswordBackup, credentialsV2, authToken, and similar variants).
+    return any(stem in fingerprint for stem in SENSITIVE_PROVIDER_METADATA_KEY_STEMS)
 
 
 def _reject_secret_keys(raw_value: Any, *, field: str, depth: int = 0) -> None:
@@ -1524,19 +3409,39 @@ def _reject_secret_keys(raw_value: Any, *, field: str, depth: int = 0) -> None:
         return
     if isinstance(raw_value, dict):
         for raw_key, value in raw_value.items():
+            child_field = f"{field}.{raw_key}" if isinstance(raw_key, str) else field
             if isinstance(raw_key, str) and _is_forbidden_provider_metadata_key(raw_key):
-                raise ValueError(f"field {field}.{raw_key} is secret or sensitive operational state")
-            _reject_secret_keys(value, field=field, depth=depth + 1)
+                raise ValueError(f"field {child_field} is secret or sensitive operational state")
+            if isinstance(raw_key, str) and _provider_metadata_key_fingerprint(raw_key) == "tokenexpiration":
+                _normalize_token_expiration(value, field=child_field)
+            _reject_secret_keys(value, field=child_field, depth=depth + 1)
     elif isinstance(raw_value, list):
         for value in raw_value[: PROVIDER_METADATA_MAX_LIST_ITEMS + 1]:
-            _reject_secret_keys(value, field=field, depth=depth + 1)
+            _reject_secret_keys(value, field=f"{field}[]", depth=depth + 1)
 
 
-def _normalize_provider_metadata(raw_metadata: Any, *, field: str = "metadata") -> dict[str, Any]:
+def _normalize_provider_metadata(
+    raw_metadata: Any,
+    *,
+    field: str = "metadata",
+    allow_root_navigation_web_url: bool = False,
+) -> dict[str, Any]:
     if raw_metadata is None:
         return {}
     if not isinstance(raw_metadata, dict):
         raise ValueError(f"field {field} must be an object")
+
+    # Every provider-metadata surface is attacker-controlled artifact input.
+    # Apply the permission-material policy here, at the common persistence
+    # boundary, so a producer cannot bypass the dedicated permission fields by
+    # nesting raw ACL bytes, descriptors, or bearer-like Graph links beneath an
+    # arbitrary metadata key. The predicate retains only the explicitly
+    # reviewed semantic telemetry allowlist.
+    _reject_sensitive_permission_payload(
+        raw_metadata,
+        field=field,
+        allow_root_navigation_web_url=allow_root_navigation_web_url,
+    )
 
     entry_count = 0
 
@@ -1568,6 +3473,18 @@ def _normalize_provider_metadata(raw_metadata: Any, *, field: str = "metadata") 
                 key = raw_key.strip()
                 if _is_forbidden_provider_metadata_key(key):
                     raise ValueError(f"field {path}.{key} is secret or sensitive operational state")
+                if _provider_metadata_key_fingerprint(key) == "tokenexpiration":
+                    nested_value = _normalize_token_expiration(nested_value, field=f"{path}.{key}")
+                if "permissionsummary" in _provider_metadata_key_fingerprint(key):
+                    # Resource metadata intentionally carries a duplicate of
+                    # the normalized permission summary for provider-specific
+                    # presentation. Treat aliases and descendant summaries as
+                    # permission material instead of letting them pass through
+                    # the generic JSON normalizer alone.
+                    _reject_sensitive_permission_payload(
+                        nested_value,
+                        field=f"{path}.{key}",
+                    )
                 if len(key) > PROVIDER_METADATA_MAX_KEY_LENGTH:
                     raise ValueError(f"field {path} key exceeds {PROVIDER_METADATA_MAX_KEY_LENGTH} characters")
                 entry_count += 1
@@ -1610,7 +3527,10 @@ def _normalize_auth_context(raw_auth: Any) -> dict[str, Any]:
         raw_value = raw_auth.get(field)
         if raw_value is None:
             continue
-        value = _normalize_optional_provider_text(raw_value, PROVIDER_METADATA_MAX_TEXT_LENGTH)
+        if field == "token_expiration":
+            value = _normalize_token_expiration(raw_value, field="auth_context.token_expiration")
+        else:
+            value = _normalize_optional_provider_text(raw_value, PROVIDER_METADATA_MAX_TEXT_LENGTH)
         if value is not None:
             normalized[field] = value
     for field in ("scopes", "roles"):
@@ -1691,6 +3611,29 @@ def _normalize_collection_context(rec: dict[str, Any]) -> dict[str, Any]:
     context.update(auth)
     if "assessed_identity" not in context and auth.get("user_principal_name"):
         context["assessed_identity"] = auth["user_principal_name"]
+
+    raw_features = rec.get("artifact_features")
+    if raw_features is None:
+        raw_features = raw_context.get("artifact_features")
+    if raw_features is not None:
+        if not isinstance(raw_features, list) or len(raw_features) > 64:
+            raise ValueError("field artifact_features must be a list with at most 64 values")
+        features: list[str] = []
+        for raw_feature in raw_features:
+            feature = _normalize_optional_provider_text(raw_feature, 128)
+            if feature and feature not in features:
+                features.append(feature)
+        context["artifact_features"] = features
+
+    raw_schema_version = rec.get("schema_version", raw_context.get("artifact_schema_version"))
+    if raw_schema_version is not None:
+        try:
+            schema_version = int(raw_schema_version)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("field schema_version must be an integer") from exc
+        if schema_version not in {1, 2}:
+            raise ValueError("field schema_version is unsupported")
+        context["artifact_schema_version"] = schema_version
 
     metadata_input = rec.get("metadata")
     if metadata_input is None:
@@ -1773,9 +3716,557 @@ def _validate_optional_text_value(
     )
 
 
+def _permission_key(raw_value: Any, *, field: str, fallback: Any | None = None) -> str:
+    value = raw_value if raw_value not in (None, "") else fallback
+    if value in (None, ""):
+        raise ValueError(f"missing field: {field}")
+    normalized = str(value).strip().lower()
+    if len(normalized) == 64 and all(character in "0123456789abcdef" for character in normalized):
+        return normalized
+    if len(normalized) > 4096 or "\x00" in normalized:
+        raise ValueError(f"field {field} is not a valid stable identifier")
+    return hashlib.sha256(normalized.encode("utf-8", errors="strict")).hexdigest()
+
+
+def _permission_count(raw_value: Any, *, field: str, default: int = 0) -> int:
+    if raw_value is None:
+        return default
+    if isinstance(raw_value, bool):
+        raise ValueError(f"field {field} must be a non-negative integer")
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"field {field} must be a non-negative integer") from exc
+    if value < 0 or value > PERMISSION_MAX_COUNT:
+        raise ValueError(f"field {field} must be between 0 and {PERMISSION_MAX_COUNT}")
+    return value
+
+
+def _permission_text(
+    raw_value: Any,
+    *,
+    field: str,
+    max_length: int = PERMISSION_MAX_TEXT_LENGTH,
+    default: str | None = None,
+) -> str:
+    value = raw_value if raw_value not in (None, "") else default
+    if value is None:
+        raise ValueError(f"missing field: {field}")
+    normalized = _normalize_optional_provider_text(value, max_length)
+    if normalized is None:
+        raise ValueError(f"field {field} must not be empty")
+    return normalized
+
+
+def _permission_text_list(
+    raw_value: Any,
+    *,
+    field: str,
+    max_values: int = PERMISSION_MAX_LIST_VALUES,
+    max_length: int = PERMISSION_MAX_TEXT_LENGTH,
+) -> list[str]:
+    if raw_value is None:
+        return []
+    if not isinstance(raw_value, list) or len(raw_value) > max_values:
+        raise ValueError(f"field {field} must be a list with at most {max_values} values")
+    values: list[str] = []
+    for raw_item in raw_value:
+        item = _normalize_optional_provider_text(raw_item, max_length)
+        if item and item not in values:
+            values.append(item)
+    return values
+
+
+def _is_sensitive_permission_payload_key(raw_key: str) -> bool:
+    fingerprint = _provider_metadata_key_fingerprint(raw_key)
+    if fingerprint in SAFE_PERMISSION_DETAIL_KEY_FINGERPRINTS | SAFE_PROVIDER_BYTE_COUNT_KEY_FINGERPRINTS:
+        return False
+    if fingerprint in PERMISSION_SENSITIVE_KEY_FINGERPRINTS:
+        return True
+
+    # Raw security descriptors and ACL/SACL bytes must never be retained. The
+    # exact allowlist above contains every reviewed scalar fact emitted by the
+    # built-in collector; all other descriptor/ACL aliases fail closed.
+    if any(marker in fingerprint for marker in ("descriptor", "acl", "sddl")):
+        return True
+
+    # Graph invitation/share links are bearer-like material. Preserve only the
+    # reviewed semantic observations above (link scope/type and whether sign-in
+    # or a password is required), never provider URLs, HTML, hrefs, or IDs.
+    if "link" in fingerprint:
+        return True
+    if "invite" in fingerprint or "invitation" in fingerprint:
+        return True
+    if any(marker in fingerprint for marker in ("weburl", "weburi", "webhtml", "webhref")):
+        return True
+    # Permission-context locators and opaque/raw containers have no reviewed
+    # persisted semantics. Treat aliases as sensitive instead of relying on a
+    # producer to label a bearer URL or serialized descriptor honestly.
+    if fingerprint.endswith(("url", "uri", "href", "html")):
+        return True
+    if (
+        fingerprint == "raw"
+        or fingerprint.startswith("raw")
+        or fingerprint in {"bytes", "binary", "blob", "payload"}
+        or "bytes" in fingerprint
+        or fingerprint.endswith(("binary", "blob", "payload"))
+    ):
+        return True
+    if any(marker in fingerprint for marker in ("shareid", "sharingid")):
+        return True
+    if ("share" in fingerprint or "sharing" in fingerprint) and any(
+        locator in fingerprint for locator in ("url", "uri", "href", "html")
+    ):
+        return True
+    return False
+
+
+def _validate_safe_permission_telemetry(raw_key: str, raw_value: Any, *, field: str) -> None:
+    """Validate every exception to the permission-material deny policy.
+
+    These fields are retained because they are bounded semantic facts emitted
+    by the built-in collectors. An exact key match must not become a container
+    or free-form string escape hatch for raw descriptors or bearer URLs.
+    """
+
+    fingerprint = _provider_metadata_key_fingerprint(raw_key)
+    reviewed_keys = SAFE_PERMISSION_DETAIL_KEY_FINGERPRINTS | SAFE_PROVIDER_BYTE_COUNT_KEY_FINGERPRINTS
+    if fingerprint not in reviewed_keys or raw_value is None:
+        return
+
+    invalid = False
+    if fingerprint in SAFE_PROVIDER_BYTE_COUNT_KEY_FINGERPRINTS:
+        invalid = type(raw_value) is not int or raw_value < 0 or raw_value > SAFE_PROVIDER_BYTE_COUNT_MAX
+    elif fingerprint in SAFE_PERMISSION_INTEGER_RANGES:
+        minimum, maximum = SAFE_PERMISSION_INTEGER_RANGES[fingerprint]
+        invalid = type(raw_value) is not int or not minimum <= raw_value <= maximum
+    elif fingerprint in SAFE_PERMISSION_BOOLEAN_KEYS:
+        invalid = not isinstance(raw_value, bool)
+    elif fingerprint in SAFE_PERMISSION_ENUM_VALUES:
+        invalid = type(raw_value) is not str or raw_value not in SAFE_PERMISSION_ENUM_VALUES[fingerprint]
+    elif fingerprint == "descriptorcontrolflags":
+        invalid = (
+            not isinstance(raw_value, list)
+            or len(raw_value) > len(SAFE_DESCRIPTOR_CONTROL_FLAGS)
+            or any(type(value) is not str or value not in SAFE_DESCRIPTOR_CONTROL_FLAGS for value in raw_value)
+            or len(set(raw_value)) != len(raw_value)
+        )
+    else:  # Defensive: adding a safe key requires adding its value schema.
+        invalid = True
+
+    if invalid:
+        raise ValueError(f"field {field}.{raw_key} contains invalid permission telemetry")
+
+
+def _reject_sensitive_permission_payload(
+    raw_value: Any,
+    *,
+    field: str,
+    depth: int = 0,
+    allow_root_navigation_web_url: bool = False,
+) -> None:
+    if depth > PROVIDER_METADATA_MAX_DEPTH:
+        return
+    if isinstance(raw_value, dict):
+        for raw_key, nested in raw_value.items():
+            root_navigation_url = (
+                allow_root_navigation_web_url
+                and depth == 0
+                and isinstance(raw_key, str)
+                and raw_key.strip() == "web_url"
+            )
+            if isinstance(raw_key, str) and not root_navigation_url:
+                _validate_safe_permission_telemetry(raw_key, nested, field=field)
+                if _is_sensitive_permission_payload_key(raw_key):
+                    raise ValueError(f"field {field}.{raw_key} contains sensitive permission material")
+            _reject_sensitive_permission_payload(
+                nested,
+                field=field,
+                depth=depth + 1,
+                allow_root_navigation_web_url=allow_root_navigation_web_url,
+            )
+    elif isinstance(raw_value, list):
+        for nested in raw_value[: PROVIDER_METADATA_MAX_LIST_ITEMS + 1]:
+            _reject_sensitive_permission_payload(
+                nested,
+                field=field,
+                depth=depth + 1,
+                allow_root_navigation_web_url=allow_root_navigation_web_url,
+            )
+
+
+def _normalize_permission_details(raw_value: Any, *, field: str) -> dict[str, Any]:
+    _reject_sensitive_permission_payload(raw_value, field=field)
+    return _normalize_provider_metadata(raw_value, field=field)
+
+
+def _normalize_permission_errors(raw_value: Any, *, field: str) -> list[Any]:
+    if raw_value is None:
+        return []
+    if not isinstance(raw_value, list) or len(raw_value) > 64:
+        raise ValueError(f"field {field} must be a list with at most 64 values")
+    _reject_sensitive_permission_payload(raw_value, field=field)
+    wrapper = _normalize_provider_metadata({"values": raw_value}, field=field)
+    return list(wrapper.get("values") or [])
+
+
+def _normalize_permission_principal(raw_value: Any, *, provider: str) -> dict[str, Any] | None:
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, dict):
+        raise ValueError("field principal must be an object")
+    _reject_sensitive_permission_payload(raw_value, field="principal")
+    principal_provider = _permission_text(
+        raw_value.get("provider"), field="principal.provider", max_length=32, default=provider
+    ).lower()
+    if principal_provider != provider:
+        raise ValueError("field principal.provider must match the permission entry provider")
+    namespace_default = "windows_sid" if provider == "smb" else "microsoft_graph_identity"
+    identifier_namespace = _permission_text(
+        raw_value.get("identifier_namespace"),
+        field="principal.identifier_namespace",
+        max_length=80,
+        default=namespace_default,
+    )
+    native_id = _normalize_optional_provider_text(raw_value.get("native_id"), PROVIDER_ID_MAX_LENGTH)
+    authority = _normalize_optional_provider_text(raw_value.get("authority"), PROVIDER_ID_MAX_LENGTH)
+    if native_id is None or authority is None:
+        raise ValueError("field principal requires stable native_id and authority values")
+    kind = _permission_text(raw_value.get("kind"), field="principal.kind", max_length=40, default="unknown")
+    fallback = json.dumps(
+        [provider, identifier_namespace, authority or "", native_id or "", kind],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    # Provider keys are useful transport identifiers but not a trust boundary.
+    # Own the canonical key so a forged/reused producer key cannot make two
+    # different principals hash as the same evidence.
+    principal_key = _permission_key(None, field="principal.principal_key", fallback=fallback)
+    aliases = _permission_text_list(raw_value.get("aliases"), field="principal.aliases", max_values=32, max_length=1024)
+    resolution = _permission_text(
+        raw_value.get("resolution", raw_value.get("resolution_state")),
+        field="principal.resolution",
+        max_length=40,
+        default="unresolved",
+    )
+    return {
+        "provider": provider,
+        "identifier_namespace": identifier_namespace,
+        "principal_key": principal_key,
+        "kind": kind,
+        "native_id": native_id,
+        "authority": authority,
+        "display_name": _normalize_optional_provider_text(raw_value.get("display_name"), 1024),
+        "login_name": _normalize_optional_provider_text(raw_value.get("login_name"), 1024),
+        "email": _normalize_optional_provider_text(raw_value.get("email"), 1024),
+        "resolution": resolution,
+        "resolution_source": _normalize_optional_provider_text(raw_value.get("resolution_source"), 80),
+        "aliases": aliases,
+    }
+
+
+def _normalize_permission_common(rec: dict[str, Any]) -> tuple[str, str, str]:
+    provider = _permission_text(rec.get("provider"), field="provider", max_length=32).lower()
+    if provider not in PERMISSION_PROVIDERS:
+        raise ValueError("field provider must be smb or sharepoint for permission evidence")
+    semantics = _permission_text(rec.get("semantics", rec.get("provider_semantics")), field="semantics", max_length=80)
+    if semantics != PERMISSION_SEMANTICS[provider]:
+        raise ValueError(f"field semantics must be {PERMISSION_SEMANTICS[provider]} for provider {provider}")
+    surface = _permission_text(rec.get("permission_surface"), field="permission_surface", max_length=80)
+    if surface not in PERMISSION_SURFACES[provider]:
+        allowed = ", ".join(sorted(PERMISSION_SURFACES[provider]))
+        raise ValueError(f"field permission_surface must be one of: {allowed}")
+    return provider, semantics, surface
+
+
+def _permission_assessment_semantic_details(provider: str, details: dict[str, Any]) -> dict[str, Any]:
+    """Project provider payloads onto versioned, comparison-stable facts.
+
+    Transport provenance and presentation labels remain available to operators,
+    but must not make otherwise identical permission evidence compare as changed.
+    """
+
+    if provider != "smb":
+        return details
+
+    owner = details.get("owner") if isinstance(details.get("owner"), dict) else {}
+    group = details.get("group") if isinstance(details.get("group"), dict) else {}
+    return {
+        "contract": "smb_windows_acl_v1",
+        "descriptor_revision": details.get("descriptor_revision"),
+        "descriptor_control_retained": details.get("descriptor_control_retained"),
+        "owner_state": details.get("owner_state"),
+        "owner_sid": owner.get("native_id"),
+        "group_state": details.get("group_state"),
+        "group_sid": group.get("native_id"),
+        "dacl_state": details.get("dacl_state"),
+        "dacl_revision": details.get("dacl_revision"),
+        "dacl_ace_count": details.get("dacl_ace_count"),
+    }
+
+
+def _permission_entry_semantic_details(provider: str, details: dict[str, Any]) -> dict[str, Any]:
+    if provider != "smb":
+        return details
+    return {
+        "ace_type_code": details.get("ace_type_code"),
+        "ace_flags": details.get("ace_flags"),
+        "access_mask": details.get("access_mask"),
+        "compound_type": details.get("compound_type"),
+        "object_flags": details.get("object_flags"),
+        "object_type_guid": details.get("object_type_guid"),
+        "inherited_object_type_guid": details.get("inherited_object_type_guid"),
+        "application_data_present": details.get("application_data_present") is True,
+        "parse_error_present": bool(details.get("parse_error")),
+    }
+
+
+def _normalize_permission_assessment(rec: dict[str, Any]) -> None:
+    provider, semantics, surface = _normalize_permission_common(rec)
+    endpoint_key = _permission_text(rec.get("endpoint_key"), field="endpoint_key", max_length=ENDPOINT_KEY_MAX_LENGTH)
+    resource_name = _permission_text(
+        rec.get("resource_name", rec.get("name")), field="resource_name", max_length=RESOURCE_NAME_MAX_LENGTH
+    )
+    provider_resource_id = _normalize_optional_provider_text(rec.get("provider_resource_id"), PROVIDER_ID_MAX_LENGTH)
+    provider_item_id = _normalize_optional_provider_text(
+        rec.get("provider_item_id", rec.get("subject_id") if rec.get("subject_type") == "item" else None),
+        PROVIDER_ID_MAX_LENGTH,
+    )
+    raw_path = rec.get("subject_path")
+    if raw_path is not None:
+        if not isinstance(raw_path, str) or "\x00" in raw_path:
+            raise ValueError("field subject_path must be a string without null characters")
+        if len(raw_path.encode("utf-8")) > PERMISSION_MAX_PATH_BYTES:
+            raise ValueError(f"field subject_path exceeds {PERMISSION_MAX_PATH_BYTES} UTF-8 bytes")
+        subject_path = raw_path
+    else:
+        subject_path = None
+    subject_kind = _permission_text(rec.get("subject_kind"), field="subject_kind", max_length=32, default="share_root")
+    if provider_resource_id:
+        if provider_item_id:
+            provider_subject = ["provider_item", provider_item_id]
+        elif subject_kind in {"item", "file", "directory", "folder", "drive_item"}:
+            provider_subject = ["provider_path", subject_path or ""]
+        else:
+            provider_subject = ["resource_root"]
+        subject_identity = [provider, provider_resource_id, subject_kind, provider_subject]
+    else:
+        subject_identity = [provider, endpoint_key, resource_name, subject_kind, subject_path or ""]
+    subject_fallback = json.dumps(
+        subject_identity,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    # Paths in Samba-backed namespaces can be case-sensitive, so subject
+    # identity deliberately avoids _permission_key's case folding.
+    subject_key = hashlib.sha256(subject_fallback.encode("utf-8", errors="strict")).hexdigest()
+    assessment_fallback = f"{semantics}:{surface}:{subject_key}"
+    assessment_key = _permission_key(
+        rec.get("assessment_key", rec.get("assessment_id")),
+        field="assessment_key",
+        fallback=assessment_fallback,
+    )
+    coverage = rec.get("coverage") if isinstance(rec.get("coverage"), dict) else {}
+    observed = _permission_count(rec.get("entries_observed", rec.get("entries_expected")), field="entries_observed")
+    emitted = _permission_count(rec.get("entries_emitted"), field="entries_emitted")
+    omitted = _permission_count(rec.get("entries_omitted"), field="entries_omitted")
+    unknown = _permission_count(rec.get("unknown_entries"), field="unknown_entries")
+    if emitted + omitted > observed and observed != 0:
+        raise ValueError("entries_emitted plus entries_omitted cannot exceed entries_observed")
+    entry_set_hash_raw = rec.get("entry_set_hash")
+    entry_set_hash = None
+    if entry_set_hash_raw not in (None, ""):
+        entry_set_hash = _permission_key(entry_set_hash_raw, field="entry_set_hash")
+    observed_at = _normalize_item_mtime(rec.get("observed_at", rec.get("finished_at")))
+    if rec.get("observed_at", rec.get("finished_at")) is not None and observed_at is None:
+        raise ValueError("field observed_at must be a valid timestamp")
+    provider_details_raw = rec.get("provider_details", rec.get("provider_payload"))
+    details = _normalize_permission_details(provider_details_raw, field="provider_details")
+    summary = _normalize_permission_details(rec.get("permission_summary"), field="permission_summary")
+    # Producer hashes are hints only. Derive the stored assessment hash from
+    # the normalized, bounded semantic payload so a stale or forged digest
+    # cannot hide a descriptor-level change.
+    evidence_hash = _permission_key(
+        None,
+        field="evidence_hash",
+        fallback=json.dumps(
+            [provider, semantics, surface, _permission_assessment_semantic_details(provider, details)],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ),
+    )
+    negative = _normalize_boolean(
+        rec.get("negative_conclusion_supported"), field="negative_conclusion_supported", default=False
+    )
+    rec.update(
+        {
+            "assessment_key": assessment_key,
+            "provider": provider,
+            "semantics": semantics,
+            "permission_surface": surface,
+            "endpoint_key": endpoint_key,
+            "resource_name": resource_name,
+            "provider_resource_id": provider_resource_id,
+            "provider_item_id": provider_item_id,
+            "subject_kind": subject_kind,
+            "subject_key": subject_key,
+            "subject_path": subject_path,
+            "method": _permission_text(rec.get("method"), field="method", max_length=80),
+            "assessment_state": _permission_text(
+                rec.get("assessment_state"), field="assessment_state", max_length=40, default="unknown"
+            ),
+            "selection_scope": _permission_text(
+                rec.get("selection_scope", coverage.get("selection_scope")),
+                field="selection_scope",
+                max_length=64,
+                default="unknown",
+            ),
+            "selection_coverage": _permission_text(
+                rec.get("selection_coverage", coverage.get("selection")),
+                field="selection_coverage",
+                max_length=64,
+                default="unknown",
+            ),
+            "retrieval_coverage": _permission_text(
+                rec.get("retrieval_coverage", coverage.get("retrieval")),
+                field="retrieval_coverage",
+                max_length=64,
+                default="unknown",
+            ),
+            "provider_visibility": _permission_text(
+                rec.get("provider_visibility", rec.get("visibility", coverage.get("provider_visibility"))),
+                field="provider_visibility",
+                max_length=64,
+                default="unknown",
+            ),
+            "semantic_coverage": _permission_text(
+                rec.get("semantic_coverage", coverage.get("semantic")),
+                field="semantic_coverage",
+                max_length=64,
+                default="direct_entries_only",
+            ),
+            "principal_resolution": _permission_text(
+                rec.get("principal_resolution", coverage.get("principal_resolution")),
+                field="principal_resolution",
+                max_length=64,
+                default="unknown",
+            ),
+            "effective_access_status": _permission_text(
+                rec.get("effective_access_status"),
+                field="effective_access_status",
+                max_length=40,
+                default="not_computed",
+            ),
+            "negative_conclusion_supported": negative,
+            "entries_observed": observed,
+            "entries_emitted": emitted,
+            "entries_omitted": omitted,
+            "unknown_entries": unknown,
+            "evidence_hash": evidence_hash,
+            "entry_set_hash": entry_set_hash,
+            "observed_at": observed_at,
+            "limitations": _permission_text_list(
+                rec.get("limitations"), field="limitations", max_values=64, max_length=1024
+            ),
+            "error_code": _normalize_optional_provider_text(rec.get("error_code"), 128),
+            "errors": _normalize_permission_errors(rec.get("errors"), field="errors"),
+            "provider_details": details,
+            "permission_summary": summary,
+        }
+    )
+
+
+def _normalize_permission_entry(rec: dict[str, Any]) -> None:
+    provider, semantics, surface = _normalize_permission_common(rec)
+    assessment_key = _permission_key(rec.get("assessment_key", rec.get("assessment_id")), field="assessment_key")
+    principal = _normalize_permission_principal(rec.get("principal"), provider=provider)
+    principal_key = principal["principal_key"] if principal else None
+    provider_entry_id = _normalize_optional_provider_text(rec.get("provider_entry_id"), PROVIDER_ID_MAX_LENGTH)
+    rights = _permission_text_list(
+        rec.get("normalized_rights", rec.get("provider_rights")),
+        field="normalized_rights",
+        max_values=64,
+        max_length=80,
+    )
+    details = _normalize_permission_details(
+        rec.get("provider_details", rec.get("provider_payload")), field="provider_details"
+    )
+    entry_kind = _permission_text(rec.get("entry_kind"), field="entry_kind", max_length=64, default="permission_entry")
+    entry_effect = _permission_text(
+        rec.get("effect", rec.get("entry_effect")), field="effect", max_length=40, default="unknown"
+    ).lower()
+    inherited_state = _permission_text(
+        rec.get("inherited_state"), field="inherited_state", max_length=40, default="unknown"
+    )
+    ordinal = None
+    if rec.get("ordinal") is not None:
+        ordinal = _permission_count(rec.get("ordinal"), field="ordinal")
+    expiration_at = _normalize_item_mtime(rec.get("expiration_at"))
+    if rec.get("expiration_at") is not None and expiration_at is None:
+        raise ValueError("field expiration_at must be a valid timestamp")
+    entry_fallback = json.dumps(
+        [
+            assessment_key,
+            provider_entry_id or "",
+            ordinal,
+            entry_kind,
+            entry_effect,
+            principal_key or "",
+            rights,
+            details,
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    entry_key = _permission_key(rec.get("entry_key", rec.get("entry_id")), field="entry_key", fallback=entry_fallback)
+    evidence_fallback = json.dumps(
+        [
+            semantics,
+            surface,
+            entry_kind,
+            entry_effect,
+            principal_key or "",
+            rights,
+            inherited_state,
+            expiration_at.isoformat() if expiration_at else None,
+            ordinal if provider == "smb" else None,
+            _permission_entry_semantic_details(provider, details),
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    # Always own the canonical digest after normalization. SMB includes ACE
+    # order because DACL ordering is semantically relevant; Graph permission
+    # response ordering is intentionally excluded.
+    evidence_hash = _permission_key(None, field="evidence_hash", fallback=evidence_fallback)
+    rec.update(
+        {
+            "assessment_key": assessment_key,
+            "entry_key": entry_key,
+            "provider": provider,
+            "semantics": semantics,
+            "permission_surface": surface,
+            "provider_entry_id": provider_entry_id,
+            "ordinal": ordinal,
+            "principal_key": principal_key,
+            "principal": principal,
+            "entry_kind": entry_kind,
+            "effect": entry_effect,
+            "normalized_rights": rights,
+            "inherited_state": inherited_state,
+            "expiration_at": expiration_at,
+            "evidence_hash": evidence_hash,
+            "provider_details": details,
+        }
+    )
+
+
 def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
     rec_type = rec.get("type")
-    if rec_type not in {"run_meta", "endpoint", "resource", "item", "error", "run_end"}:
+    if rec_type not in {"run_meta", "endpoint", "resource", "item", "error", "run_end"} | PERMISSION_RECORD_TYPES:
         return False, "unknown record type"
     try:
         _reject_secret_keys(rec, field="record")
@@ -1802,6 +4293,8 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
         "resource": ("run_id", "endpoint_key", "name"),
         "item": ("run_id", "endpoint_key", "resource_name", "path"),
         "error": ("run_id", "severity", "code", "message"),
+        "permission_assessment": ("run_id",),
+        "permission_entry": ("run_id",),
         "run_end": ("run_id", "finished_at"),
     }
     for field in required[rec_type]:
@@ -1815,7 +4308,7 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
 
     if rec_type == "run_meta":
         try:
-            if int(rec.get("schema_version")) != 1:
+            if int(rec.get("schema_version")) not in {1, 2}:
                 return False, "unsupported schema_version"
         except (TypeError, ValueError):
             return False, "invalid schema_version"
@@ -1823,6 +4316,16 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
             rec["collection_context"] = _normalize_collection_context(rec)
         except ValueError as exc:
             return False, str(exc)
+
+    if rec_type in PERMISSION_RECORD_TYPES:
+        try:
+            if rec_type == "permission_assessment":
+                _normalize_permission_assessment(rec)
+            else:
+                _normalize_permission_entry(rec)
+        except ValueError as exc:
+            return False, str(exc)
+        return True, None
 
     if rec_type == "endpoint":
         reason = _validate_text_value(
@@ -1853,7 +4356,25 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
             rec["provider_metadata"] = _normalize_provider_metadata(
                 rec.get("provider_metadata", rec.get("metadata")),
                 field="metadata",
+                allow_root_navigation_web_url=True,
             )
+            provider_endpoint_id = _normalize_optional_provider_text(
+                rec.get("provider_endpoint_id"),
+                PROVIDER_ID_MAX_LENGTH,
+            )
+            metadata_endpoint_id = _normalize_optional_provider_text(
+                rec["provider_metadata"].get("provider_endpoint_id"),
+                PROVIDER_ID_MAX_LENGTH,
+            )
+            if (
+                provider_endpoint_id is not None
+                and metadata_endpoint_id is not None
+                and provider_endpoint_id != metadata_endpoint_id
+            ):
+                raise ValueError("field provider_endpoint_id conflicts with metadata.provider_endpoint_id")
+            effective_endpoint_id = provider_endpoint_id or metadata_endpoint_id
+            if effective_endpoint_id is not None:
+                rec["provider_metadata"]["provider_endpoint_id"] = effective_endpoint_id
             if rec["provider_metadata"].get("web_url") is not None:
                 rec["provider_metadata"]["web_url"] = _normalize_web_url(
                     rec["provider_metadata"]["web_url"],
@@ -1953,6 +4474,8 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
         rec["resource_type"] = _resource_type_from_share_type(share_type)
         try:
             provider = _normalize_provider(rec.get("provider"), share_type)
+            if provider != share_type:
+                raise ValueError("field provider conflicts with the provider implied by share_type/resource_type")
             rec["provider"] = provider
             if rec_type == "resource":
                 rec["provider_resource_id"] = _normalize_optional_provider_text(
@@ -1998,9 +4521,13 @@ def validate_record(rec: dict[str, Any]) -> tuple[bool, str | None]:
                     raw_metadata.setdefault(metadata_field, rec.get(metadata_field))
             rec["provider_metadata"] = _normalize_provider_metadata(raw_metadata, field="metadata")
             rec["exposure"] = _normalize_exposure(rec.get("exposure"), provider=provider)
-            rec["exposure_evidence"] = _normalize_provider_metadata(
+            rec["exposure_evidence"] = _normalize_permission_details(
                 rec.get("exposure_evidence"),
                 field="exposure_evidence",
+            )
+            rec["permission_summary"] = _normalize_permission_details(
+                rec.get("permission_summary"),
+                field="permission_summary",
             )
         except ValueError as exc:
             return False, str(exc)
@@ -2093,6 +4620,7 @@ def _iter_items_from_entries(
             "deleted": raw_entry.get("deleted", False),
             "exposure": raw_entry.get("exposure"),
             "exposure_evidence": raw_entry.get("exposure_evidence"),
+            "permission_summary": raw_entry.get("permission_summary"),
             "metadata": raw_entry.get("metadata"),
             "size": raw_entry.get("size"),
             "modified_at": raw_entry.get("modified_at"),
@@ -2120,6 +4648,11 @@ def _records_from_endpoint_payload(raw_endpoint: dict[str, Any], run_id: str) ->
         hostname = str(raw_endpoint.get("hostname") or "").strip()
         endpoint_key = f"{ip}:445" if ip else (f"{hostname}:445" if hostname else "unknown:445")
 
+    endpoint_metadata = (
+        dict(raw_endpoint.get("metadata") or {}) if isinstance(raw_endpoint.get("metadata"), dict) else {}
+    )
+    if raw_endpoint.get("provider_endpoint_id") is not None:
+        endpoint_metadata.setdefault("provider_endpoint_id", raw_endpoint.get("provider_endpoint_id"))
     records = [
         {
             "type": "endpoint",
@@ -2132,7 +4665,7 @@ def _records_from_endpoint_payload(raw_endpoint: dict[str, Any], run_id: str) ->
             "smb": raw_endpoint.get("smb") if isinstance(raw_endpoint.get("smb"), dict) else None,
             "nfs": raw_endpoint.get("nfs") if isinstance(raw_endpoint.get("nfs"), dict) else None,
             "provider": raw_endpoint.get("provider"),
-            "metadata": raw_endpoint.get("metadata"),
+            "metadata": endpoint_metadata,
         }
     ]
 
@@ -2166,6 +4699,7 @@ def _records_from_endpoint_payload(raw_endpoint: dict[str, Any], run_id: str) ->
                 "metadata": raw_share.get("metadata"),
                 "exposure": raw_share.get("exposure"),
                 "exposure_evidence": raw_share.get("exposure_evidence"),
+                "permission_summary": raw_share.get("permission_summary"),
             }
         )
 
@@ -2182,6 +4716,48 @@ def _records_from_endpoint_payload(raw_endpoint: dict[str, Any], run_id: str) ->
                     provider_resource_id=raw_share.get("provider_resource_id") or raw_share.get("drive_id"),
                 )
             )
+
+        raw_assessments = raw_share.get("permission_assessments")
+        if isinstance(raw_assessments, list):
+            for raw_assessment in raw_assessments:
+                if not isinstance(raw_assessment, dict):
+                    continue
+                assessment = dict(raw_assessment)
+                nested_permission_entries = assessment.pop("entries", None)
+                assessment.update(
+                    {
+                        "type": "permission_assessment",
+                        "run_id": run_id,
+                        "endpoint_key": assessment.get("endpoint_key") or endpoint_key,
+                        "resource_name": assessment.get("resource_name") or share_name,
+                        "provider": assessment.get("provider") or share_type,
+                        "provider_resource_id": assessment.get("provider_resource_id")
+                        or raw_share.get("provider_resource_id")
+                        or raw_share.get("drive_id"),
+                    }
+                )
+                records.append(assessment)
+                if isinstance(nested_permission_entries, list):
+                    for raw_permission_entry in nested_permission_entries:
+                        if not isinstance(raw_permission_entry, dict):
+                            continue
+                        permission_entry = dict(raw_permission_entry)
+                        permission_entry.update(
+                            {
+                                "type": "permission_entry",
+                                "run_id": run_id,
+                                "assessment_key": permission_entry.get("assessment_key")
+                                or assessment.get("assessment_key")
+                                or assessment.get("assessment_id"),
+                                "provider": permission_entry.get("provider") or assessment.get("provider"),
+                                "semantics": permission_entry.get("semantics")
+                                or assessment.get("semantics")
+                                or assessment.get("provider_semantics"),
+                                "permission_surface": permission_entry.get("permission_surface")
+                                or assessment.get("permission_surface"),
+                            }
+                        )
+                        records.append(permission_entry)
 
     return records
 
@@ -2220,6 +4796,9 @@ def _records_from_nested_json(doc: dict[str, Any], run_id: str) -> list[dict[str
             "collection_status": meta_raw.get("collection_status") or collection_raw.get("collection_status"),
             "partial": meta_raw.get("partial") if "partial" in meta_raw else collection_raw.get("partial"),
             "metadata": meta_raw.get("metadata") if isinstance(meta_raw.get("metadata"), dict) else None,
+            "artifact_features": doc.get("artifact_features")
+            if isinstance(doc.get("artifact_features"), list)
+            else meta_raw.get("artifact_features"),
         }
     )
 
@@ -2320,6 +4899,7 @@ def _iter_records_from_streamable_json_file(fp, run_id: str):
     collection_context_raw = _load_first_json_item(fp, "collection_context")
     summary_raw = _load_first_json_item(fp, "summary")
     schema_version = _load_first_json_item(fp, "schema_version")
+    artifact_features = _load_first_json_item(fp, "artifact_features")
     first_issue = _load_first_json_item(fp, "issue_summary.item")
     first_endpoint = _load_first_json_item(fp, "endpoints.item")
     started_at = (meta_raw or {}).get("started_at") if isinstance(meta_raw, dict) else None
@@ -2360,6 +4940,9 @@ def _iter_records_from_streamable_json_file(fp, run_id: str):
             "collection_status": (meta_raw or {}).get("collection_status") if isinstance(meta_raw, dict) else None,
             "partial": (meta_raw or {}).get("partial") if isinstance(meta_raw, dict) else None,
             "metadata": (meta_raw or {}).get("metadata") if isinstance(meta_raw, dict) else None,
+            "artifact_features": artifact_features
+            if isinstance(artifact_features, list)
+            else ((meta_raw or {}).get("artifact_features") if isinstance(meta_raw, dict) else None),
         }
 
     issue_seen = False
@@ -2585,15 +5168,20 @@ def _validate_artifact_framing(
     content_type: str,
     artifact_size: int | None,
     run_id: str,
+    artifact_integrity: tuple[int, str],
     *,
     progress_callback: Callable[[], None] | None = None,
 ) -> None:
-    """Validate framing in a read-only pass before any inventory is persisted."""
+    """Validate framing and stored-byte provenance before inventory writes."""
 
     json_candidate = _is_json_artifact(artifact_key, content_type)
     gzip_input = artifact_key.endswith(".gz")
     if not json_candidate:
-        with open_artifact_stream(artifact_key) as body:
+        with open_verified_artifact_stream(
+            artifact_key,
+            artifact_integrity,
+            progress_callback=progress_callback,
+        ) as body:
             if gzip_input:
                 with (
                     gzip.GzipFile(fileobj=body) as gzip_reader,
@@ -2609,7 +5197,11 @@ def _validate_artifact_framing(
         return
 
     try:
-        with open_artifact_stream(artifact_key) as body:
+        with open_verified_artifact_stream(
+            artifact_key,
+            artifact_integrity,
+            progress_callback=progress_callback,
+        ) as body:
             if gzip_input:
                 with (
                     gzip.GzipFile(fileobj=body) as gzip_reader,
@@ -2632,7 +5224,11 @@ def _validate_artifact_framing(
         if str(exc) == JSON_COMPAT_LIMIT_ERROR:
             raise
 
-    with open_artifact_stream(artifact_key) as body:
+    with open_verified_artifact_stream(
+        artifact_key,
+        artifact_integrity,
+        progress_callback=progress_callback,
+    ) as body:
         raw_json = _read_json_compat_bytes(
             body,
             gzip_input=gzip_input,
@@ -2645,6 +5241,8 @@ def _validate_artifact_framing(
 
 
 def _public_ingest_error(exc: BaseException) -> str:
+    if isinstance(exc, ArtifactIntegrityError):
+        return str(exc)
     if isinstance(exc, ArtifactFramingError):
         return str(exc)
     if isinstance(exc, (gzip.BadGzipFile, EOFError, zlib.error)):
@@ -2668,6 +5266,22 @@ def _public_ingest_error(exc: BaseException) -> str:
             return detail
         return "artifact validation failed during ingest"
     return "unexpected ingest failure"
+
+
+def _public_comparison_error(exc: BaseException) -> str:
+    if isinstance(exc, ValueError):
+        detail = str(exc).strip()
+        if detail in {
+            "comparison runs must both exist, belong to the project, and be COMPLETE",
+            "comparison identity is ambiguous; a run contains duplicate or unkeyed resources",
+        }:
+            return detail
+        return "comparison input or identity validation failed"
+    if isinstance(exc, psycopg.Error):
+        return "database operation failed while comparing runs"
+    if isinstance(exc, OSError):
+        return "a comparison dependency was unavailable"
+    return "unexpected comparison failure"
 
 
 def _is_retryable_ingest_error(exc: BaseException) -> bool:
@@ -2805,7 +5419,1116 @@ def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
     return discover_recoverable_runs(limit=limit)
 
 
+def discover_recoverable_comparisons(limit: int = 8) -> list[dict[str, str]]:
+    with connect_database() as conn:
+        rows = conn.execute(
+            """
+            WITH candidates AS (
+                SELECT id
+                FROM run_comparisons
+                WHERE (
+                        state = 'queued'
+                        AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                      )
+                   OR (
+                        state = 'running'
+                        AND COALESCE(heartbeat_at, started_at, created_at)
+                            <= NOW() - (%s * INTERVAL '1 second')
+                   )
+                ORDER BY created_at, id
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            UPDATE run_comparisons AS comparison
+            SET state = 'running',
+                heartbeat_at = NOW(),
+                progress = COALESCE(comparison.progress, '{}'::jsonb) || jsonb_build_object(
+                    'phase', 'recovery_claimed',
+                    'recovery_claimed_at', NOW(),
+                    'recovery_claimed_by', %s::text
+                )
+            FROM candidates
+            WHERE comparison.id = candidates.id
+            RETURNING comparison.id::text, comparison.project_id::text
+            """,
+            (STALE_INGESTING_SECONDS, max(1, limit), CONSUMER_NAME),
+        ).fetchall()
+    return [
+        {
+            "job_type": "comparison",
+            "comparison_id": row[0],
+            "project_id": row[1],
+        }
+        for row in rows
+    ]
+
+
+def _comparison_batch_keys(
+    conn: psycopg.Connection,
+    baseline_run_id: str,
+    current_run_id: str,
+    after_key: str | None,
+    limit: int,
+) -> list[str]:
+    return [
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT identity_key
+            FROM (
+                SELECT identity_key FROM resources WHERE run_id = %s
+                UNION
+                SELECT identity_key FROM resources WHERE run_id = %s
+            ) AS identities
+            WHERE identity_key IS NOT NULL
+              AND (%s::text IS NULL OR identity_key > %s::text)
+            ORDER BY identity_key
+            LIMIT %s
+            """,
+            (baseline_run_id, current_run_id, after_key, after_key, max(1, limit)),
+        ).fetchall()
+    ]
+
+
+def _materialize_comparison_batch(
+    conn: psycopg.Connection,
+    comparison_id: str,
+    baseline_run_id: str,
+    current_run_id: str,
+    identity_keys: list[str],
+    compatibility: dict[str, Any],
+) -> int:
+    if not identity_keys:
+        return 0
+    structural = compatibility.get("structural_interpretable") is True
+    content = compatibility.get("content_interpretable") is True
+    capability_access = compatibility.get("capability_interpretable") is True
+    direct_permissions_expected = compatibility.get("direct_permissions_interpretable") is True
+    row = conn.execute(
+        """
+        WITH baseline_counts AS (
+            SELECT item.resource_id, COUNT(*)::bigint AS item_count
+            FROM items AS item
+            JOIN resources AS resource
+              ON resource.id = item.resource_id AND resource.run_id = item.run_id
+            WHERE item.run_id = %(baseline_run_id)s
+              AND item.deleted IS FALSE
+              AND resource.identity_key = ANY(%(identity_keys)s)
+            GROUP BY item.resource_id
+        ),
+        current_counts AS (
+            SELECT item.resource_id, COUNT(*)::bigint AS item_count
+            FROM items AS item
+            JOIN resources AS resource
+              ON resource.id = item.resource_id AND resource.run_id = item.run_id
+            WHERE item.run_id = %(current_run_id)s
+              AND item.deleted IS FALSE
+              AND resource.identity_key = ANY(%(identity_keys)s)
+            GROUP BY item.resource_id
+        ),
+        baseline_permissions AS (
+            SELECT
+                resource.identity_key,
+                COALESCE(resource.permission_summary->>'evidence_available', 'false') = 'true'
+                    AS evidence_present,
+                COALESCE(resource.permission_summary->>'comparable', 'false') = 'true'
+                    AS evidence_comparable,
+                COALESCE(resource.permission_summary->>'scope_exact', 'false') = 'true'
+                    AS scope_exact,
+                resource.permission_summary->>'comparison_evidence_hash' AS evidence_hash,
+                resource.permission_summary->>'comparison_quality_hash' AS quality_hash
+            FROM resources AS resource
+            WHERE resource.run_id = %(baseline_run_id)s
+              AND resource.identity_key = ANY(%(identity_keys)s)
+        ),
+        current_permissions AS (
+            SELECT
+                resource.identity_key,
+                COALESCE(resource.permission_summary->>'evidence_available', 'false') = 'true'
+                    AS evidence_present,
+                COALESCE(resource.permission_summary->>'comparable', 'false') = 'true'
+                    AS evidence_comparable,
+                COALESCE(resource.permission_summary->>'scope_exact', 'false') = 'true'
+                    AS scope_exact,
+                resource.permission_summary->>'comparison_evidence_hash' AS evidence_hash,
+                resource.permission_summary->>'comparison_quality_hash' AS quality_hash
+            FROM resources AS resource
+            WHERE resource.run_id = %(current_run_id)s
+              AND resource.identity_key = ANY(%(identity_keys)s)
+        ),
+        permission_rollup AS (
+            SELECT
+                COALESCE(current_permissions.identity_key, baseline_permissions.identity_key) AS identity_key,
+                COALESCE(baseline_permissions.evidence_present, FALSE)
+                    OR COALESCE(current_permissions.evidence_present, FALSE) AS evidence_present,
+                baseline_permissions.evidence_present
+                    AND current_permissions.evidence_present
+                    AND baseline_permissions.evidence_comparable
+                    AND current_permissions.evidence_comparable
+                    AND baseline_permissions.quality_hash IS NOT NULL
+                    AND baseline_permissions.quality_hash = current_permissions.quality_hash
+                    AND baseline_permissions.evidence_hash IS NOT NULL
+                    AND current_permissions.evidence_hash IS NOT NULL
+                    AS directly_comparable,
+                baseline_permissions.scope_exact
+                    AND current_permissions.scope_exact AS scope_exact,
+                baseline_permissions.evidence_present
+                    AND current_permissions.evidence_present
+                    AND baseline_permissions.evidence_hash IS DISTINCT FROM current_permissions.evidence_hash
+                    AS evidence_difference,
+                baseline_permissions.evidence_present IS DISTINCT FROM current_permissions.evidence_present
+                    OR baseline_permissions.evidence_comparable IS DISTINCT FROM current_permissions.evidence_comparable
+                    OR baseline_permissions.quality_hash IS DISTINCT FROM current_permissions.quality_hash
+                    AS quality_difference
+            FROM baseline_permissions
+            FULL OUTER JOIN current_permissions USING (identity_key)
+        ),
+        baseline AS (
+            SELECT
+                resource.id,
+                resource.identity_key,
+                resource.resource_type::text AS resource_type,
+                COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)) AS provider,
+                resource.provider_resource_id,
+                endpoint.provider_metadata->>'identity_strength' AS identity_strength,
+                resource.name,
+                endpoint.endpoint_key,
+                resource.access_level::text AS access_level,
+                resource.access_capabilities,
+                COALESCE((
+                    SELECT jsonb_object_agg(
+                        capability.name,
+                        jsonb_build_object(
+                            'status', capability.evidence->>'status',
+                            'method', capability.evidence->>'method',
+                            'scope', capability.evidence->>'scope'
+                        )
+                        ORDER BY capability.name
+                    )
+                    FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                    WHERE capability.name <> '_metadata'
+                ), '{}'::jsonb) AS comparable_capabilities,
+                EXISTS (
+                    SELECT 1 FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                    WHERE capability.name <> '_metadata'
+                      AND capability.evidence->>'status' <> 'not_tested'
+                ) AS capability_observation_present,
+                resource.access_capabilities#>>'{_metadata,assessed_identity_fingerprint}'
+                    AS capability_identity_fingerprint,
+                CASE
+                    WHEN COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)) = 'smb'
+                    THEN COALESCE(resource.access_capabilities#>>'{_metadata,finalized}', 'false') = 'true'
+                         AND COALESCE(resource.access_capabilities#>>'{_metadata,degraded}', 'true') = 'false'
+                         AND COALESCE(resource.access_capabilities#>>'{_metadata,transport_failed}', 'true') = 'false'
+                         AND COALESCE(
+                             resource.access_capabilities#>>'{_metadata,assessed_identity_fingerprint}', ''
+                         ) <> ''
+                    ELSE FALSE
+                END AS capability_observation_valid,
+                CASE
+                    WHEN COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)) = 'smb'
+                    THEN COALESCE(resource.access_capabilities->'list'->>'status', '') = 'allowed'
+                         AND COALESCE(
+                             resource.access_capabilities#>>'{_metadata,listing_truncated}', 'true'
+                         ) = 'false'
+                    WHEN COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1))
+                         = 'sharepoint'
+                    THEN TRUE
+                    ELSE FALSE
+                END AS content_observation_complete,
+                resource.exposure,
+                resource.permission_summary,
+                resource.permission_summary || jsonb_build_object(
+                    'status', CASE
+                        WHEN COALESCE(resource.permission_summary->>'evidence_available', 'false') = 'true'
+                            THEN COALESCE(resource.permission_summary->>'status', 'available')
+                        WHEN EXISTS (
+                            SELECT 1 FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' <> 'not_tested'
+                        ) THEN 'observed_capabilities'
+                        ELSE 'not_assessed'
+                    END,
+                    'evidence_available',
+                        COALESCE(resource.permission_summary->>'evidence_available', 'false') = 'true'
+                        OR EXISTS (
+                            SELECT 1 FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' <> 'not_tested'
+                        ),
+                    'direct_permissions', resource.permission_summary,
+                    'capability_observations', jsonb_build_object(
+                        'evidence_available', EXISTS (
+                            SELECT 1 FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' <> 'not_tested'
+                        ),
+                        'allowed', COALESCE((
+                            SELECT jsonb_agg(capability.name ORDER BY capability.name)
+                            FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' IN ('allowed', 'mixed')
+                        ), '[]'::jsonb),
+                        'denied', COALESCE((
+                            SELECT jsonb_agg(capability.name ORDER BY capability.name)
+                            FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' IN ('denied', 'mixed')
+                        ), '[]'::jsonb),
+                        'inconclusive', COALESCE((
+                            SELECT jsonb_agg(capability.name ORDER BY capability.name)
+                            FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' = 'inconclusive'
+                        ), '[]'::jsonb),
+                        'raw', resource.access_capabilities
+                    ),
+                    'compatibility_access_level', resource.access_level::text,
+                    'exposure', resource.exposure
+                ) AS access_evidence_summary,
+                COALESCE(baseline_counts.item_count, 0) AS item_count
+            FROM resources AS resource
+            JOIN endpoints AS endpoint
+              ON endpoint.id = resource.endpoint_id AND endpoint.run_id = resource.run_id
+            LEFT JOIN baseline_counts ON baseline_counts.resource_id = resource.id
+            WHERE resource.run_id = %(baseline_run_id)s
+              AND resource.identity_key = ANY(%(identity_keys)s)
+        ),
+        current AS (
+            SELECT
+                resource.id,
+                resource.identity_key,
+                resource.resource_type::text AS resource_type,
+                COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)) AS provider,
+                resource.provider_resource_id,
+                endpoint.provider_metadata->>'identity_strength' AS identity_strength,
+                resource.name,
+                endpoint.endpoint_key,
+                resource.access_level::text AS access_level,
+                resource.access_capabilities,
+                COALESCE((
+                    SELECT jsonb_object_agg(
+                        capability.name,
+                        jsonb_build_object(
+                            'status', capability.evidence->>'status',
+                            'method', capability.evidence->>'method',
+                            'scope', capability.evidence->>'scope'
+                        )
+                        ORDER BY capability.name
+                    )
+                    FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                    WHERE capability.name <> '_metadata'
+                ), '{}'::jsonb) AS comparable_capabilities,
+                EXISTS (
+                    SELECT 1 FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                    WHERE capability.name <> '_metadata'
+                      AND capability.evidence->>'status' <> 'not_tested'
+                ) AS capability_observation_present,
+                resource.access_capabilities#>>'{_metadata,assessed_identity_fingerprint}'
+                    AS capability_identity_fingerprint,
+                CASE
+                    WHEN COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)) = 'smb'
+                    THEN COALESCE(resource.access_capabilities#>>'{_metadata,finalized}', 'false') = 'true'
+                         AND COALESCE(resource.access_capabilities#>>'{_metadata,degraded}', 'true') = 'false'
+                         AND COALESCE(resource.access_capabilities#>>'{_metadata,transport_failed}', 'true') = 'false'
+                         AND COALESCE(
+                             resource.access_capabilities#>>'{_metadata,assessed_identity_fingerprint}', ''
+                         ) <> ''
+                    ELSE FALSE
+                END AS capability_observation_valid,
+                CASE
+                    WHEN COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)) = 'smb'
+                    THEN COALESCE(resource.access_capabilities->'list'->>'status', '') = 'allowed'
+                         AND COALESCE(
+                             resource.access_capabilities#>>'{_metadata,listing_truncated}', 'true'
+                         ) = 'false'
+                    WHEN COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1))
+                         = 'sharepoint'
+                    THEN TRUE
+                    ELSE FALSE
+                END AS content_observation_complete,
+                resource.exposure,
+                resource.permission_summary,
+                resource.permission_summary || jsonb_build_object(
+                    'status', CASE
+                        WHEN COALESCE(resource.permission_summary->>'evidence_available', 'false') = 'true'
+                            THEN COALESCE(resource.permission_summary->>'status', 'available')
+                        WHEN EXISTS (
+                            SELECT 1 FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' <> 'not_tested'
+                        ) THEN 'observed_capabilities'
+                        ELSE 'not_assessed'
+                    END,
+                    'evidence_available',
+                        COALESCE(resource.permission_summary->>'evidence_available', 'false') = 'true'
+                        OR EXISTS (
+                            SELECT 1 FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' <> 'not_tested'
+                        ),
+                    'direct_permissions', resource.permission_summary,
+                    'capability_observations', jsonb_build_object(
+                        'evidence_available', EXISTS (
+                            SELECT 1 FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' <> 'not_tested'
+                        ),
+                        'allowed', COALESCE((
+                            SELECT jsonb_agg(capability.name ORDER BY capability.name)
+                            FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' IN ('allowed', 'mixed')
+                        ), '[]'::jsonb),
+                        'denied', COALESCE((
+                            SELECT jsonb_agg(capability.name ORDER BY capability.name)
+                            FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' IN ('denied', 'mixed')
+                        ), '[]'::jsonb),
+                        'inconclusive', COALESCE((
+                            SELECT jsonb_agg(capability.name ORDER BY capability.name)
+                            FROM jsonb_each(resource.access_capabilities) AS capability(name, evidence)
+                            WHERE capability.name <> '_metadata'
+                              AND capability.evidence->>'status' = 'inconclusive'
+                        ), '[]'::jsonb),
+                        'raw', resource.access_capabilities
+                    ),
+                    'compatibility_access_level', resource.access_level::text,
+                    'exposure', resource.exposure
+                ) AS access_evidence_summary,
+                COALESCE(current_counts.item_count, 0) AS item_count
+            FROM resources AS resource
+            JOIN endpoints AS endpoint
+              ON endpoint.id = resource.endpoint_id AND endpoint.run_id = resource.run_id
+            LEFT JOIN current_counts ON current_counts.resource_id = resource.id
+            WHERE resource.run_id = %(current_run_id)s
+              AND resource.identity_key = ANY(%(identity_keys)s)
+        ),
+        paired AS (
+            SELECT
+                COALESCE(current.identity_key, baseline.identity_key) AS identity_key,
+                baseline.id AS before_id,
+                current.id AS after_id,
+                COALESCE(current.provider, baseline.provider) AS provider,
+                COALESCE(current.resource_type, baseline.resource_type) AS resource_type,
+                COALESCE(current.provider_resource_id, baseline.provider_resource_id) AS provider_resource_id,
+                COALESCE(current.identity_strength, baseline.identity_strength) AS identity_strength,
+                baseline.name AS before_name,
+                current.name AS after_name,
+                baseline.endpoint_key AS before_endpoint,
+                current.endpoint_key AS after_endpoint,
+                baseline.access_level AS before_access,
+                current.access_level AS after_access,
+                baseline.access_capabilities AS before_capabilities,
+                current.access_capabilities AS after_capabilities,
+                baseline.comparable_capabilities AS before_comparable_capabilities,
+                current.comparable_capabilities AS after_comparable_capabilities,
+                baseline.capability_observation_present AS before_capability_present,
+                current.capability_observation_present AS after_capability_present,
+                baseline.capability_identity_fingerprint AS before_capability_identity,
+                current.capability_identity_fingerprint AS after_capability_identity,
+                baseline.capability_observation_valid AS before_capability_valid,
+                current.capability_observation_valid AS after_capability_valid,
+                (
+                    %(capability_access)s
+                    AND baseline.capability_observation_present
+                    AND current.capability_observation_present
+                    AND baseline.capability_observation_valid
+                    AND current.capability_observation_valid
+                    AND baseline.capability_identity_fingerprint = current.capability_identity_fingerprint
+                ) AS capability_access_comparable,
+                baseline.content_observation_complete AS before_content_complete,
+                current.content_observation_complete AS after_content_complete,
+                baseline.exposure AS before_exposure,
+                current.exposure AS after_exposure,
+                baseline.permission_summary AS before_permissions,
+                current.permission_summary AS after_permissions,
+                baseline.access_evidence_summary AS before_access_summary,
+                current.access_evidence_summary AS after_access_summary,
+                baseline.item_count AS before_items,
+                current.item_count AS after_items,
+                (%(direct_permissions)s AND COALESCE(permission_rollup.directly_comparable, FALSE))
+                    AS direct_access_comparable,
+                COALESCE(permission_rollup.evidence_present, FALSE) AS permission_evidence_present,
+                (
+                    COALESCE(permission_rollup.evidence_present, FALSE)
+                    OR baseline.capability_observation_present
+                    OR current.capability_observation_present
+                ) AS access_evidence_present,
+                COALESCE(permission_rollup.scope_exact, FALSE) AS direct_access_scope_exact,
+                COALESCE(permission_rollup.evidence_difference, FALSE) AS raw_permission_difference,
+                COALESCE(permission_rollup.quality_difference, FALSE) AS permission_quality_difference
+            FROM baseline
+            FULL OUTER JOIN current USING (identity_key)
+            LEFT JOIN permission_rollup
+              ON permission_rollup.identity_key = COALESCE(current.identity_key, baseline.identity_key)
+        ),
+        classified AS (
+            SELECT
+                paired.*,
+                (before_id IS NOT NULL AND after_id IS NOT NULL AND %(structural)s AND (
+                    CASE
+                        WHEN provider = 'smb'
+                        THEN lower(before_name) IS DISTINCT FROM lower(after_name)
+                        ELSE before_name IS DISTINCT FROM after_name
+                    END
+                    OR CASE
+                        WHEN provider IN ('smb', 'nfs')
+                        THEN lower(before_endpoint) IS DISTINCT FROM lower(after_endpoint)
+                        ELSE before_endpoint IS DISTINCT FROM after_endpoint
+                    END
+                )) AS location_changed,
+                (before_id IS NOT NULL AND after_id IS NOT NULL AND NOT %(structural)s AND (
+                    CASE
+                        WHEN provider = 'smb'
+                        THEN lower(before_name) IS DISTINCT FROM lower(after_name)
+                        ELSE before_name IS DISTINCT FROM after_name
+                    END
+                    OR CASE
+                        WHEN provider IN ('smb', 'nfs')
+                        THEN lower(before_endpoint) IS DISTINCT FROM lower(after_endpoint)
+                        ELSE before_endpoint IS DISTINCT FROM after_endpoint
+                    END
+                )) AS location_indeterminate,
+                (before_id IS NOT NULL AND after_id IS NOT NULL
+                    AND capability_access_comparable
+                    AND (
+                    before_access IS DISTINCT FROM after_access
+                    OR before_comparable_capabilities IS DISTINCT FROM after_comparable_capabilities
+                )) AS access_changed,
+                (before_id IS NOT NULL AND after_id IS NOT NULL AND direct_access_comparable
+                    AND raw_permission_difference) AS permissions_changed,
+                (before_id IS NOT NULL AND after_id IS NOT NULL AND %(content)s
+                    AND before_content_complete AND after_content_complete
+                    AND before_items IS DISTINCT FROM after_items) AS item_count_changed,
+                (before_id IS NOT NULL AND after_id IS NOT NULL
+                    AND (before_capability_present OR after_capability_present)
+                    AND (
+                        NOT %(capability_access)s
+                        OR before_capability_present IS DISTINCT FROM after_capability_present
+                        OR NOT before_capability_valid
+                        OR NOT after_capability_valid
+                        OR before_capability_identity IS DISTINCT FROM after_capability_identity
+                    )) AS access_indeterminate,
+                (before_id IS NOT NULL AND after_id IS NOT NULL
+                    AND before_exposure IS DISTINCT FROM after_exposure) AS exposure_indeterminate,
+                (before_id IS NOT NULL AND after_id IS NOT NULL AND (
+                    (permission_evidence_present AND NOT direct_access_comparable)
+                    OR (
+                        %(direct_permissions)s
+                        AND provider IN ('smb', 'sharepoint')
+                        AND NOT permission_evidence_present
+                    )
+                    OR permission_quality_difference
+                    OR (NOT direct_access_comparable AND raw_permission_difference)
+                )) AS permissions_indeterminate,
+                (before_id IS NOT NULL AND after_id IS NOT NULL
+                    AND before_items IS DISTINCT FROM after_items
+                    AND (
+                        NOT %(content)s
+                        OR NOT before_content_complete
+                        OR NOT after_content_complete
+                    )) AS content_indeterminate
+            FROM paired
+        ),
+        shaped AS (
+            SELECT
+                *,
+                ARRAY_REMOVE(ARRAY[
+                    CASE WHEN location_changed THEN 'location' END,
+                    CASE WHEN location_indeterminate THEN 'structure_not_comparable' END,
+                    CASE WHEN access_changed THEN 'access' END,
+                    CASE WHEN permissions_changed THEN 'permission_evidence' END,
+                    CASE WHEN item_count_changed THEN 'item_count' END,
+                    CASE WHEN access_indeterminate THEN 'access_not_comparable' END,
+                    CASE WHEN exposure_indeterminate THEN 'exposure_not_comparable' END,
+                    CASE WHEN permissions_indeterminate THEN 'permission_evidence_not_comparable' END,
+                    CASE WHEN content_indeterminate THEN 'item_count_not_comparable' END
+                ]::text[], NULL) AS categories,
+                CASE
+                    WHEN before_id IS NULL AND %(structural)s THEN 'appeared'
+                    WHEN before_id IS NULL THEN 'indeterminate'
+                    WHEN after_id IS NULL AND %(structural)s THEN 'disappeared'
+                    WHEN after_id IS NULL THEN 'indeterminate'
+                    WHEN location_changed OR access_changed OR permissions_changed OR item_count_changed THEN 'changed'
+                    WHEN location_indeterminate OR access_indeterminate OR exposure_indeterminate
+                         OR permissions_indeterminate OR content_indeterminate THEN 'indeterminate'
+                    ELSE NULL
+                END AS change_type
+            FROM classified
+        )
+        INSERT INTO comparison_resource_changes (
+            comparison_id, identity_key, change_type, provider, resource_type,
+            provider_resource_id, match_basis, match_quality, before_resource_id,
+            after_resource_id, endpoint_key_before, endpoint_key_after,
+            resource_name_before, resource_name_after, change_categories,
+            structural_state, access_state, content_state, access_interpretation,
+            item_count_before, item_count_after, before_snapshot, after_snapshot,
+            search_text, impact_rank
+        )
+        SELECT
+            %(comparison_id)s,
+            identity_key,
+            change_type,
+            provider,
+            resource_type,
+            provider_resource_id,
+            CASE WHEN provider_resource_id IS NOT NULL THEN 'provider_resource_id' ELSE 'location' END,
+            CASE
+                WHEN provider_resource_id IS NULL THEN 'weak'
+                WHEN provider = 'smb'
+                     AND %(identity_scope_exact)s
+                     AND identity_strength = 'strong' THEN 'strong'
+                WHEN provider = 'smb' AND identity_strength IN ('moderate', 'weak')
+                    THEN identity_strength
+                WHEN provider = 'smb' THEN 'weak'
+                ELSE 'strong'
+            END,
+            before_id,
+            after_id,
+            before_endpoint,
+            after_endpoint,
+            before_name,
+            after_name,
+            to_jsonb(categories),
+            CASE
+                WHEN before_id IS NULL AND %(structural)s THEN 'appeared'
+                WHEN before_id IS NULL THEN 'indeterminate'
+                WHEN after_id IS NULL AND %(structural)s THEN 'disappeared'
+                WHEN after_id IS NULL THEN 'indeterminate'
+                WHEN location_changed THEN 'changed'
+                WHEN location_indeterminate THEN 'indeterminate'
+                ELSE 'unchanged'
+            END,
+            CASE
+                WHEN before_id IS NULL OR after_id IS NULL THEN 'not_comparable'
+                WHEN access_changed OR permissions_changed THEN 'changed'
+                WHEN access_indeterminate OR exposure_indeterminate OR permissions_indeterminate
+                THEN 'not_comparable'
+                WHEN direct_access_comparable OR capability_access_comparable THEN 'unchanged'
+                WHEN NOT access_evidence_present THEN 'not_assessed'
+                ELSE 'not_comparable'
+            END,
+            CASE
+                WHEN before_id IS NULL OR after_id IS NULL THEN 'not_computed'
+                WHEN item_count_changed THEN 'changed'
+                WHEN content_indeterminate THEN 'not_comparable'
+                ELSE 'not_computed'
+            END,
+            CASE
+                WHEN permissions_changed AND direct_access_scope_exact
+                THEN 'scope-complete permission evidence changed; effective access was not computed'
+                WHEN permissions_changed
+                THEN 'observed permission evidence changed; negative and effective-access conclusions are unsupported'
+                WHEN access_changed
+                THEN 'bounded capability observations changed; effective access was not computed'
+                WHEN permissions_indeterminate OR exposure_indeterminate
+                THEN 'permission or exposure evidence is incomplete or not comparable; no negative conclusion can be drawn'
+                WHEN direct_access_comparable
+                THEN 'comparable direct-permission evidence was unchanged; effective access was not computed'
+                WHEN capability_access_comparable
+                THEN 'bounded capability observations were unchanged; effective access was not computed'
+                WHEN NOT access_evidence_present THEN 'access was not assessed for either run'
+                ELSE 'access evidence was not comparable'
+            END,
+            before_items,
+            after_items,
+            CASE WHEN before_id IS NULL THEN '{}'::jsonb ELSE jsonb_build_object(
+                'resource_id', before_id,
+                'endpoint_key', before_endpoint,
+                'name', before_name,
+                'access_level', before_access,
+                'access_capabilities', before_capabilities,
+                'exposure', before_exposure,
+                'access_evidence_summary', before_access_summary,
+                'item_count', before_items
+            ) END,
+            CASE WHEN after_id IS NULL THEN '{}'::jsonb ELSE jsonb_build_object(
+                'resource_id', after_id,
+                'endpoint_key', after_endpoint,
+                'name', after_name,
+                'access_level', after_access,
+                'access_capabilities', after_capabilities,
+                'exposure', after_exposure,
+                'access_evidence_summary', after_access_summary,
+                'item_count', after_items
+            ) END,
+            lower(concat_ws(
+                ' ',
+                before_name,
+                after_name,
+                before_endpoint,
+                after_endpoint,
+                provider_resource_id
+            )),
+            CASE
+                WHEN after_id IS NULL AND %(structural)s THEN 100
+                WHEN before_id IS NULL AND %(structural)s THEN 90
+                WHEN access_changed OR permissions_changed THEN 80
+                WHEN change_type = 'indeterminate' THEN 70
+                WHEN item_count_changed THEN 50
+                WHEN location_changed THEN 40
+                ELSE 10
+            END
+        FROM shaped
+        WHERE change_type IS NOT NULL
+        ON CONFLICT (comparison_id, identity_key) DO NOTHING
+        RETURNING id
+        """,
+        {
+            "comparison_id": comparison_id,
+            "baseline_run_id": baseline_run_id,
+            "current_run_id": current_run_id,
+            "identity_keys": identity_keys,
+            "structural": structural,
+            "content": content,
+            "capability_access": capability_access,
+            "direct_permissions": direct_permissions_expected,
+            "identity_scope_exact": compatibility.get("identity_scope_exact") is True,
+        },
+    ).fetchall()
+    return len(row)
+
+
+def _build_comparison_summary(
+    summary_rows: list[tuple[str, int]],
+    compatibility: dict[str, Any],
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "appeared": 0,
+        "disappeared": 0,
+        "changed": 0,
+        "indeterminate": 0,
+    }
+    for change_type, count in summary_rows:
+        if change_type in summary:
+            summary[str(change_type)] = int(count)
+    summary["total"] = sum(int(summary[key]) for key in ("appeared", "disappeared", "changed", "indeterminate"))
+    capability_applicable = compatibility.get("capability_applicable") is not False
+    compatibility_dimensions = {
+        "structural": compatibility.get("structural_interpretable") is True,
+        "content": compatibility.get("content_interpretable") is True,
+        # Stable target/name fallbacks are sufficient to compare observations
+        # at the same network location, but only strong server identities make
+        # the resulting resource summary exact across physical-server changes.
+        "identity_scope": compatibility.get("identity_scope_exact") is not False,
+        "identity_applicable": compatibility.get("identity_applicable") is not False,
+        "access": compatibility.get("access_interpretable") is True,
+        "capabilities": (compatibility.get("capability_interpretable") is True if capability_applicable else True),
+        "capabilities_applicable": capability_applicable,
+        "direct_permissions": compatibility.get("direct_permissions_interpretable") is True,
+        "direct_permission_scope": compatibility.get("direct_permissions_scope_exact") is True,
+    }
+    summary["dimensions"] = compatibility_dimensions
+    exact_dimension_values = (
+        value
+        for key, value in compatibility_dimensions.items()
+        if key not in {"capabilities_applicable", "identity_applicable"}
+    )
+    summary["resource_summary_exact"] = all(exact_dimension_values) and summary["indeterminate"] == 0
+    # Resource identity/access/count changes are materialized, but per-item
+    # additions, removals, and moves are intentionally not computed.
+    summary["item_churn_computed"] = False
+    summary["exact"] = False
+    return summary
+
+
+def _comparison_direct_permission_scope_exact(
+    conn: psycopg.Connection,
+    baseline_run_id: str,
+    current_run_id: str,
+) -> bool:
+    """Return whether both runs support scope-complete negative ACL conclusions.
+
+    Comparable Graph sharing responses and deterministic SMB samples can prove
+    that observed evidence changed, but they cannot make the whole comparison
+    exact. Keep that stronger claim tied to exhaustive, integrity-checked
+    assessment surfaces for every applicable resource in both runs.
+    """
+
+    rows = conn.execute(
+        """
+        SELECT
+            resource.run_id::text,
+            BOOL_AND(
+                COALESCE(resource.permission_summary->>'evidence_available', 'false') = 'true'
+                AND COALESCE(resource.permission_summary->>'comparable', 'false') = 'true'
+                AND COALESCE(resource.permission_summary->>'scope_exact', 'false') = 'true'
+                AND resource.permission_summary->>'comparison_evidence_hash' IS NOT NULL
+                AND resource.permission_summary->>'comparison_quality_hash' IS NOT NULL
+            ) AS scope_exact
+        FROM resources AS resource
+        WHERE resource.run_id IN (%s, %s)
+          AND COALESCE(
+              resource.provider,
+              split_part(resource.resource_type::text, '_', 1)
+          ) IN ('smb', 'sharepoint')
+        GROUP BY resource.run_id
+        """,
+        (baseline_run_id, current_run_id),
+    ).fetchall()
+    scope_by_run = {str(run_id): bool(scope_exact) for run_id, scope_exact in rows}
+    return scope_by_run.get(baseline_run_id) is True and scope_by_run.get(current_run_id) is True
+
+
+def _comparison_retry_is_deferred(
+    state: str,
+    next_retry_at: datetime | None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if state != "queued" or next_retry_at is None:
+        return False
+    due_at = next_retry_at if next_retry_at.tzinfo is not None else next_retry_at.replace(tzinfo=UTC)
+    return due_at > (now or datetime.now(tz=UTC))
+
+
+def process_comparison_job(fields: dict[str, str]) -> str:
+    comparison_id = _normalize_uuid_str(fields.get("comparison_id"))
+    if not comparison_id:
+        logger.error("invalid comparison job payload: %s", fields)
+        return "ignored"
+
+    with connect_database() as conn:
+        lock_key = advisory_lock_key(comparison_id)
+        if not conn.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]:
+            return "busy"
+        project_id: str | None = None
+        attempt_count = 0
+        try:
+            row = conn.execute(
+                """
+                SELECT project_id::text, baseline_run_id::text, current_run_id::text,
+                       state, compatibility, attempt_count, next_retry_at
+                FROM run_comparisons
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (comparison_id,),
+            ).fetchone()
+            if row is None:
+                return "ignored"
+            (
+                project_id,
+                baseline_run_id,
+                current_run_id,
+                state,
+                compatibility,
+                attempt_count,
+                next_retry_at,
+            ) = row
+            if state in {"complete", "failed"}:
+                return "ignored"
+            if _comparison_retry_is_deferred(str(state), next_retry_at):
+                logger.info(
+                    "comparison retry is not due yet comparison_id=%s next_retry_at=%s",
+                    comparison_id,
+                    next_retry_at.isoformat(),
+                )
+                return "deferred"
+            attempt_count = int(attempt_count or 0) + 1
+            run_states = conn.execute(
+                """
+                SELECT id::text, project_id::text, status::text
+                FROM scan_runs
+                WHERE id IN (%s, %s)
+                """,
+                (baseline_run_id, current_run_id),
+            ).fetchall()
+            if len(run_states) != 2 or any(run[1] != project_id or run[2] != "COMPLETE" for run in run_states):
+                raise ValueError("comparison runs must both exist, belong to the project, and be COMPLETE")
+            conn.execute(
+                """
+                UPDATE run_comparisons
+                SET state = 'running', started_at = COALESCE(started_at, NOW()),
+                    heartbeat_at = NOW(), attempt_count = %s,
+                    next_retry_at = NULL, error_code = NULL, error_message = NULL,
+                    progress = jsonb_build_object('phase', 'preparing_identities', 'processed', 0)
+                WHERE id = %s
+                """,
+                (attempt_count, comparison_id),
+            )
+            conn.execute("DELETE FROM comparison_resource_changes WHERE comparison_id = %s", (comparison_id,))
+            conn.commit()
+
+            compatibility = dict(compatibility) if isinstance(compatibility, dict) else {}
+            smb_declared = compatibility.get("smb_identity_required") is True
+            smb_observed = _comparison_observes_smb_resources(conn, baseline_run_id, current_run_id)
+            smb_context_conflict = smb_observed and not smb_declared
+            smb_identity_applicable = smb_declared or smb_observed
+            if smb_identity_applicable:
+                smb_identity_stable, smb_identity_scope_exact = _comparison_smb_identity_status(
+                    conn,
+                    baseline_run_id,
+                    current_run_id,
+                )
+            else:
+                smb_identity_stable = True
+                smb_identity_scope_exact = True
+            compatibility["identity_applicable"] = smb_identity_applicable
+            compatibility["identity_scope_exact"] = bool(smb_identity_scope_exact and not smb_context_conflict)
+            if smb_context_conflict or not smb_identity_stable:
+                compatibility["structural_interpretable"] = False
+                compatibility["content_interpretable"] = False
+                compatibility["status"] = (
+                    "partial"
+                    if any(
+                        compatibility.get(field) is True
+                        for field in (
+                            "access_interpretable",
+                            "capability_interpretable",
+                            "direct_permissions_interpretable",
+                        )
+                    )
+                    else "incompatible"
+                )
+                reasons = [str(reason) for reason in compatibility.get("reasons", []) if str(reason)]
+                if smb_context_conflict:
+                    context_reason = (
+                        "Persisted SMB resources contradict the declared provider scope; "
+                        "structural and content changes are indeterminate."
+                    )
+                    if context_reason not in reasons:
+                        reasons.append(context_reason)
+                identity_reason = (
+                    "SMB server identity changed or could not be verified consistently; "
+                    "structural and content changes are indeterminate."
+                )
+                if not smb_identity_stable and identity_reason not in reasons:
+                    reasons.append(identity_reason)
+                compatibility["reasons"] = reasons
+            elif smb_identity_applicable and not smb_identity_scope_exact:
+                # A stable advertised-name or scan-target identity proves that
+                # both runs observed the same requested location. It does not
+                # prove that the physical SMB server behind that location is
+                # unchanged, so keep resource counts bounded rather than exact.
+                if compatibility.get("status") == "compatible":
+                    compatibility["status"] = "partial"
+                reasons = [str(reason) for reason in compatibility.get("reasons", []) if str(reason)]
+                bounded_identity_reason = (
+                    "SMB identity continuity is location-bound; it does not prove physical server continuity."
+                )
+                if bounded_identity_reason not in reasons:
+                    reasons.append(bounded_identity_reason)
+                compatibility["reasons"] = reasons
+
+            prepare_run_identity_keys(conn, baseline_run_id)
+            prepare_run_identity_keys(conn, current_run_id)
+            ambiguous = conn.execute(
+                """
+                SELECT run_id::text, identity_key, COUNT(*)
+                FROM resources
+                WHERE run_id IN (%s, %s)
+                GROUP BY run_id, identity_key
+                HAVING identity_key IS NULL OR COUNT(*) > 1
+                LIMIT 1
+                """,
+                (baseline_run_id, current_run_id),
+            ).fetchone()
+            if ambiguous is not None:
+                raise ValueError("comparison identity is ambiguous; a run contains duplicate or unkeyed resources")
+            conn.commit()
+
+            direct_scope_exact = bool(
+                compatibility.get("direct_permissions_interpretable") is True
+                and _comparison_direct_permission_scope_exact(
+                    conn,
+                    baseline_run_id,
+                    current_run_id,
+                )
+            )
+            compatibility["direct_permissions_scope_exact"] = direct_scope_exact
+            if compatibility.get("direct_permissions_interpretable") is True and not direct_scope_exact:
+                reasons = [str(reason) for reason in compatibility.get("reasons", []) if str(reason)]
+                bounded_reason = (
+                    "Provider permission evidence is comparable but does not support "
+                    "scope-complete negative conclusions."
+                )
+                if bounded_reason not in reasons:
+                    reasons.append(bounded_reason)
+                compatibility["reasons"] = reasons
+            conn.execute(
+                "UPDATE run_comparisons SET compatibility = %s::jsonb WHERE id = %s",
+                (
+                    json.dumps(compatibility, ensure_ascii=True, separators=(",", ":")),
+                    comparison_id,
+                ),
+            )
+            conn.commit()
+            batch_size = 5000
+            after_key: str | None = None
+            processed = 0
+            emitted = 0
+            while not _shutdown_event.is_set():
+                keys = _comparison_batch_keys(
+                    conn,
+                    baseline_run_id,
+                    current_run_id,
+                    after_key,
+                    batch_size,
+                )
+                if not keys:
+                    break
+                emitted += _materialize_comparison_batch(
+                    conn,
+                    comparison_id,
+                    baseline_run_id,
+                    current_run_id,
+                    keys,
+                    compatibility,
+                )
+                processed += len(keys)
+                after_key = keys[-1]
+                conn.execute(
+                    """
+                    UPDATE run_comparisons
+                    SET heartbeat_at = NOW(),
+                        progress = jsonb_build_object(
+                            'phase', 'materializing',
+                            'processed', %s::bigint,
+                            'changes_emitted', %s::bigint,
+                            'last_identity_key', %s::text
+                        )
+                    WHERE id = %s
+                    """,
+                    (processed, emitted, after_key, comparison_id),
+                )
+                conn.commit()
+
+            if _shutdown_event.is_set():
+                conn.execute(
+                    """
+                    UPDATE run_comparisons
+                    SET state = 'queued', heartbeat_at = NOW(),
+                        progress = COALESCE(progress, '{}'::jsonb) || jsonb_build_object(
+                            'phase', 'paused', 'reason', 'worker_shutdown'
+                        )
+                    WHERE id = %s
+                    """,
+                    (comparison_id,),
+                )
+                conn.commit()
+                return "shutdown"
+
+            summary_rows = conn.execute(
+                """
+                SELECT change_type, COUNT(*)::integer
+                FROM comparison_resource_changes
+                WHERE comparison_id = %s
+                GROUP BY change_type
+                """,
+                (comparison_id,),
+            ).fetchall()
+            summary = _build_comparison_summary(summary_rows, compatibility)
+            conn.execute(
+                """
+                UPDATE run_comparisons
+                SET state = 'complete', completed_at = NOW(), heartbeat_at = NOW(),
+                    next_retry_at = NULL,
+                    progress = jsonb_build_object(
+                        'phase', 'complete',
+                        'processed', %s::bigint,
+                        'changes_emitted', %s::bigint
+                    ),
+                    summary = %s::jsonb, error_code = NULL, error_message = NULL
+                WHERE id = %s
+                """,
+                (processed, emitted, json.dumps(summary), comparison_id),
+            )
+            write_audit(
+                conn,
+                project_id,
+                "COMPARISON_COMPLETED",
+                "run_comparison",
+                comparison_id,
+                {"worker": CONSUMER_NAME, "summary": summary},
+            )
+            conn.commit()
+            return "complete"
+        except Exception as exc:
+            logger.exception("comparison failed comparison_id=%s", comparison_id)
+            try:
+                conn.rollback()
+            except psycopg.Error:
+                logger.exception("failed to roll back comparison transaction comparison_id=%s", comparison_id)
+            retryable = _is_retryable_ingest_error(exc)
+            should_retry = retryable and attempt_count < 3
+            retry_delay_seconds = (
+                _retry_backoff_seconds(attempt_count, jitter_key=comparison_id) if should_retry else None
+            )
+            next_retry_at = (
+                datetime.now(tz=UTC) + timedelta(seconds=retry_delay_seconds)
+                if retry_delay_seconds is not None
+                else None
+            )
+            error_code = (
+                "COMPARISON_RETRY_SCHEDULED"
+                if should_retry
+                else ("COMPARISON_INVALID" if isinstance(exc, ValueError) else "COMPARISON_FAILED")
+            )
+            error_message = _public_comparison_error(exc)
+            conn.execute(
+                """
+                UPDATE run_comparisons
+                SET state = %s, heartbeat_at = NOW(),
+                    completed_at = CASE WHEN %s = 'failed' THEN NOW() ELSE NULL END,
+                    next_retry_at = %s,
+                    error_code = %s, error_message = %s,
+                    progress = %s::jsonb
+                WHERE id = %s
+                """,
+                (
+                    "queued" if should_retry else "failed",
+                    "queued" if should_retry else "failed",
+                    next_retry_at,
+                    error_code,
+                    error_message,
+                    json.dumps(
+                        {
+                            "phase": "retry_queued" if should_retry else "failed",
+                            "attempt_count": attempt_count,
+                            "retryable": retryable,
+                            "retry_delay_seconds": retry_delay_seconds,
+                            "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+                        }
+                    ),
+                    comparison_id,
+                ),
+            )
+            if project_id:
+                write_audit(
+                    conn,
+                    project_id,
+                    "COMPARISON_RETRY_SCHEDULED" if should_retry else "COMPARISON_FAILED",
+                    "run_comparison",
+                    comparison_id,
+                    {
+                        "worker": CONSUMER_NAME,
+                        "error_code": error_code,
+                        "attempt_count": attempt_count,
+                        "retryable": retryable,
+                        "retry_delay_seconds": retry_delay_seconds,
+                        "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+                    },
+                )
+            conn.commit()
+            return "retry_scheduled" if should_retry else "failed"
+        finally:
+            try:
+                # Session advisory locks survive transaction rollback, while an
+                # error in status persistence can leave the transaction aborted.
+                # Clear that state before attempting the explicit unlock.
+                conn.rollback()
+                conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+            except psycopg.Error:
+                logger.exception("failed to release comparison advisory lock comparison_id=%s", comparison_id)
+
+
 def process_job(fields: dict[str, str]) -> str:
+    if str(fields.get("job_type") or "").strip().lower() == "comparison" or fields.get("comparison_id"):
+        return process_comparison_job(fields)
+
     run_id = _normalize_uuid_str(fields.get("run_id"))
     queued_project_id = _normalize_uuid_str(fields.get("project_id"))
     queued_artifact_key = fields.get("artifact_key")
@@ -2830,7 +6553,8 @@ def process_job(fields: dict[str, str]) -> str:
         try:
             row = conn.execute(
                 """
-                SELECT project_id::text, artifact_key, status::text, summary, ingest_progress, artifact_content_type, artifact_size
+                SELECT project_id::text, artifact_key, status::text, summary, ingest_progress,
+                       artifact_content_type, artifact_size, collection_context, artifact_sha256
                 FROM scan_runs
                 WHERE id = %s
                 """,
@@ -2841,8 +6565,10 @@ def process_job(fields: dict[str, str]) -> str:
                 return "ignored"
 
             db_project_id, db_artifact_key, status, summary_raw, progress_raw, artifact_content_type, artifact_size = (
-                row
+                row[:7]
             )
+            persisted_collection_context = row[7] if len(row) > 7 and isinstance(row[7], dict) else {}
+            artifact_sha256 = row[8] if len(row) > 8 else None
             authoritative_row_loaded = True
             project_id = db_project_id
             artifact_key = db_artifact_key
@@ -2881,9 +6607,20 @@ def process_job(fields: dict[str, str]) -> str:
             counts = parse_summary(summary_raw)
             line_offset = parse_offset(progress_raw)
             attempt_count = parse_attempt_count(progress_raw)
+            producer_run_end_counts = _validated_producer_inventory_counts(
+                progress_raw.get("producer_inventory_counts") if isinstance(progress_raw, dict) else None
+            )
             last_line_offset = line_offset
             last_counts = counts.copy()
             last_worker_heartbeat = 0.0
+            artifact_integrity = _require_artifact_integrity(artifact_size, artifact_sha256)
+
+            def ingest_progress_extra(**extra: Any) -> dict[str, Any]:
+                progress = {"attempt_count": attempt_count}
+                if producer_run_end_counts is not None:
+                    progress["producer_inventory_counts"] = producer_run_end_counts
+                progress.update(extra)
+                return progress
 
             def emit_processing_heartbeat(force: bool = False) -> None:
                 nonlocal last_worker_heartbeat
@@ -2894,7 +6631,12 @@ def process_job(fields: dict[str, str]) -> str:
 
             emit_processing_heartbeat(force=True)
             update_run_status(
-                conn, run_id, "INGESTING", line_offset, counts, extra_progress={"attempt_count": attempt_count}
+                conn,
+                run_id,
+                "INGESTING",
+                line_offset,
+                counts,
+                extra_progress=ingest_progress_extra(),
             )
             write_audit(
                 conn,
@@ -2908,12 +6650,55 @@ def process_job(fields: dict[str, str]) -> str:
 
             item_batch: list[tuple] = []
             error_batch: list[tuple] = []
+            permission_entry_batch: list[tuple[int, int | None, dict[str, Any]]] = []
+            permission_entry_batch_bytes = 0
+            permission_record_batch: list[dict[str, Any]] = []
+            permission_record_batch_bytes = 0
+            permission_assessment_batch_count = 0
+
+            def flush_permission_entries() -> None:
+                nonlocal counts, permission_entry_batch_bytes
+                if not permission_entry_batch:
+                    return
+                try:
+                    flush_permission_entry_batch(conn, run_id, permission_entry_batch)
+                    permission_entry_batch_bytes = 0
+                    return
+                except ValueError:
+                    # A collision is exceptional and normally isolated to one
+                    # malformed record. Preserve the established bounded-error
+                    # behavior by falling back only for this batch.
+                    pending = list(permission_entry_batch)
+                    permission_entry_batch.clear()
+                    permission_entry_batch_bytes = 0
+                for assessment_id, principal_id, entry_rec in pending:
+                    try:
+                        upsert_permission_entry(conn, run_id, assessment_id, principal_id, entry_rec)
+                    except ValueError as exc:
+                        error_batch.append(
+                            build_ingest_error_row(
+                                run_id,
+                                "error",
+                                "PERMISSION_EVIDENCE_INVALID",
+                                str(exc),
+                                entry_rec.get("endpoint_key"),
+                                entry_rec.get("resource_name"),
+                                entry_rec.get("subject_path"),
+                            )
+                        )
+                        counts["errors"] += 1
+                if len(error_batch) >= BATCH_SIZE:
+                    flush_error_batch(conn, error_batch)
 
             def checkpoint_shutdown_if_requested() -> None:
                 nonlocal last_line_offset, last_counts
                 if not _shutdown_event.is_set():
                     return
-                flush_item_batch(conn, item_batch)
+                if permission_record_batch:
+                    flush_permission_records()
+                else:
+                    flush_item_batch(conn, item_batch)
+                flush_permission_entries()
                 flush_error_batch(conn, error_batch)
                 update_run_status(
                     conn,
@@ -2921,12 +6706,11 @@ def process_job(fields: dict[str, str]) -> str:
                     "UPLOADED",
                     line_offset,
                     counts,
-                    extra_progress={
-                        "attempt_count": attempt_count,
-                        "paused_at": now_iso(),
-                        "paused_by": CONSUMER_NAME,
-                        "pause_reason": "worker_shutdown",
-                    },
+                    extra_progress=ingest_progress_extra(
+                        paused_at=now_iso(),
+                        paused_by=CONSUMER_NAME,
+                        pause_reason="worker_shutdown",
+                    ),
                 )
                 write_audit(
                     conn,
@@ -2955,6 +6739,7 @@ def process_job(fields: dict[str, str]) -> str:
                 str(artifact_content_type or "").lower(),
                 artifact_size,
                 run_id,
+                artifact_integrity,
                 progress_callback=report_preflight_progress,
             )
 
@@ -2964,16 +6749,168 @@ def process_job(fields: dict[str, str]) -> str:
             )
             if line_offset > 0:
                 endpoint_cache, resource_cache = load_resume_caches(conn, run_id)
-            producer_run_end_counts: dict[str, int] | None = None
+            persisted_schema_version = persisted_collection_context.get("artifact_schema_version")
+            artifact_schema_version: int | None = (
+                int(persisted_schema_version)
+                if isinstance(persisted_schema_version, int) and persisted_schema_version in {1, 2}
+                else None
+            )
+            persisted_features = persisted_collection_context.get("artifact_features")
+            artifact_features: set[str] = (
+                {str(feature).strip() for feature in persisted_features if isinstance(feature, str) and feature.strip()}
+                if isinstance(persisted_features, list)
+                else set()
+            )
+            if artifact_schema_version is None and "direct_permissions_v1" in artifact_features:
+                # Compatibility for a schema-v2 ingest checkpoint created by
+                # an earlier worker that persisted features but not the
+                # explicit schema version.
+                artifact_schema_version = 2
+            assessment_cache: dict[str, int] = _BoundedLRUCache[str](INGEST_IDENTITY_CACHE_SIZE)
+            principal_cache: dict[tuple[str, str, str], int] = _BoundedLRUCache[tuple[str, str, str]](
+                INGEST_IDENTITY_CACHE_SIZE
+            )
+
+            def permission_assessment_cache_key(rec: dict[str, Any]) -> str:
+                return ":".join(
+                    (
+                        rec["assessment_key"],
+                        rec["provider"],
+                        rec["semantics"],
+                        rec["permission_surface"],
+                    )
+                )
+
+            def process_permission_record(rec: dict[str, Any]) -> None:
+                nonlocal permission_entry_batch_bytes
+                if rec["type"] == "permission_assessment":
+                    resource_id, item_id = resolve_permission_subject(
+                        conn,
+                        run_id,
+                        rec,
+                        endpoint_cache,
+                        resource_cache,
+                    )
+                    assessment_id = upsert_permission_assessment(
+                        conn,
+                        run_id,
+                        resource_id,
+                        item_id,
+                        rec,
+                    )
+                    assessment_cache[permission_assessment_cache_key(rec)] = assessment_id
+                    return
+
+                cache_key = permission_assessment_cache_key(rec)
+                assessment_id = assessment_cache.get(cache_key)
+                if assessment_id is None:
+                    row = conn.execute(
+                        """
+                        SELECT id
+                        FROM permission_assessments
+                        WHERE run_id = %s
+                          AND assessment_key = %s
+                          AND provider = %s
+                          AND semantics = %s
+                          AND permission_surface = %s
+                        LIMIT 1
+                        """,
+                        (
+                            run_id,
+                            rec["assessment_key"],
+                            rec["provider"],
+                            rec["semantics"],
+                            rec["permission_surface"],
+                        ),
+                    ).fetchone()
+                    if row is None:
+                        raise ValueError("permission_entry references an assessment that has not been emitted")
+                    assessment_id = int(row[0])
+                    assessment_cache[cache_key] = assessment_id
+
+                principal = rec.get("principal")
+                principal_id = None
+                if principal is not None:
+                    presentation_hash = hashlib.sha256(
+                        json.dumps(
+                            principal,
+                            sort_keys=True,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    principal_cache_key = (
+                        principal["provider"],
+                        principal["principal_key"],
+                        presentation_hash,
+                    )
+                    principal_id = principal_cache.get(principal_cache_key)
+                    if principal_id is None:
+                        principal_id = upsert_permission_principal(conn, run_id, principal)
+                        if principal_id is not None:
+                            principal_cache[principal_cache_key] = principal_id
+
+                entry_size = len(
+                    json.dumps(
+                        rec,
+                        sort_keys=True,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ).encode("utf-8")
+                )
+                if (
+                    permission_entry_batch
+                    and permission_entry_batch_bytes + entry_size > PERMISSION_ENTRY_BATCH_MAX_BYTES
+                ):
+                    flush_permission_entries()
+                permission_entry_batch.append((assessment_id, principal_id, rec))
+                permission_entry_batch_bytes += entry_size
+                if len(permission_entry_batch) >= PERMISSION_ENTRY_BATCH_SIZE:
+                    flush_permission_entries()
+
+            def flush_permission_records() -> None:
+                nonlocal counts
+                nonlocal permission_record_batch_bytes, permission_assessment_batch_count
+                if not permission_record_batch:
+                    return
+                # SharePoint all-item streams interleave one item with its
+                # assessment. Delay subject resolution just enough to retain
+                # bulk item inserts, then preserve record order within this
+                # bounded pipeline.
+                flush_item_batch(conn, item_batch)
+                pending = list(permission_record_batch)
+                permission_record_batch.clear()
+                permission_record_batch_bytes = 0
+                permission_assessment_batch_count = 0
+                for permission_rec in pending:
+                    try:
+                        process_permission_record(permission_rec)
+                    except ValueError as exc:
+                        error_batch.append(
+                            build_ingest_error_row(
+                                run_id,
+                                "error",
+                                "PERMISSION_EVIDENCE_INVALID",
+                                str(exc),
+                                permission_rec.get("endpoint_key"),
+                                permission_rec.get("resource_name"),
+                                permission_rec.get("subject_path"),
+                            )
+                        )
+                        counts["errors"] += 1
+                if len(error_batch) >= BATCH_SIZE:
+                    flush_error_batch(conn, error_batch)
 
             def process_record(rec: dict[str, Any]) -> None:
-                nonlocal counts, producer_run_end_counts
+                nonlocal counts, producer_run_end_counts, artifact_schema_version, artifact_features
+                nonlocal permission_record_batch_bytes, permission_assessment_batch_count
                 if not isinstance(rec, dict):
                     error_batch.append(
                         build_ingest_error_row(
                             run_id,
                             "error",
-                            "SCHEMA_INVALID",
+                            CONSUMER_UNCLASSIFIED_RECORD_ERROR,
                             "record must be a JSON object",
                             None,
                             None,
@@ -2992,7 +6929,7 @@ def process_job(fields: dict[str, str]) -> str:
                         build_ingest_error_row(
                             run_id,
                             "error",
-                            "SCHEMA_INVALID",
+                            _record_validation_error_code(rec),
                             reason or "invalid record",
                             rec.get("endpoint_key"),
                             rec.get("resource_name"),
@@ -3007,6 +6944,17 @@ def process_job(fields: dict[str, str]) -> str:
                 rec_type = rec.get("type")
 
                 if rec_type == "run_meta":
+                    artifact_schema_version = int(rec.get("schema_version") or 1)
+                    raw_features = rec.get("artifact_features")
+                    artifact_features = (
+                        {
+                            str(feature).strip()
+                            for feature in raw_features
+                            if isinstance(feature, str) and feature.strip()
+                        }
+                        if isinstance(raw_features, list)
+                        else set()
+                    )
                     update_run_collection_context(conn, run_id, rec.get("collection_context") or {})
                 elif rec_type == "endpoint":
                     endpoint_id = upsert_endpoint(conn, run_id, rec)
@@ -3087,6 +7035,7 @@ def process_job(fields: dict[str, str]) -> str:
                             json.dumps(rec.get("provider_metadata") or {}),
                             rec.get("exposure"),
                             json.dumps(rec.get("exposure_evidence") or {}),
+                            json.dumps(rec.get("permission_summary") or {}),
                         )
                     )
                     counts["items"] += 1
@@ -3107,16 +7056,53 @@ def process_job(fields: dict[str, str]) -> str:
                     counts["errors"] += 1
                     if len(error_batch) >= BATCH_SIZE:
                         flush_error_batch(conn, error_batch)
+                elif rec_type in PERMISSION_RECORD_TYPES:
+                    if artifact_schema_version != 2 or "direct_permissions_v1" not in artifact_features:
+                        error_batch.append(
+                            build_ingest_error_row(
+                                run_id,
+                                "error",
+                                "PERMISSION_EVIDENCE_INVALID",
+                                "permission evidence requires schema_version 2 and artifact feature direct_permissions_v1",
+                                rec.get("endpoint_key"),
+                                rec.get("resource_name"),
+                                rec.get("subject_path"),
+                            )
+                        )
+                        counts["errors"] += 1
+                        if len(error_batch) >= BATCH_SIZE:
+                            flush_error_batch(conn, error_batch)
+                        return
+                    record_size = len(
+                        json.dumps(
+                            rec,
+                            sort_keys=True,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                            default=str,
+                        ).encode("utf-8")
+                    )
+                    if (
+                        permission_record_batch
+                        and permission_record_batch_bytes + record_size > PERMISSION_ENTRY_BATCH_MAX_BYTES
+                    ):
+                        flush_permission_records()
+                    permission_record_batch.append(rec)
+                    permission_record_batch_bytes += record_size
+                    if rec_type == "permission_assessment":
+                        permission_assessment_batch_count += 1
+                    if permission_assessment_batch_count >= PERMISSION_ASSESSMENT_PIPELINE_SIZE:
+                        flush_permission_records()
                 elif rec_type == "run_end":
-                    incoming = rec.get("stats")
-                    if isinstance(incoming, dict) and incoming:
-                        producer_run_end_counts = parse_summary(incoming)
+                    producer_run_end_counts = _validated_producer_inventory_counts(rec.get("stats"))
 
             def persist_periodic_progress() -> None:
                 nonlocal last_line_offset, last_counts
                 if line_offset % PROGRESS_EVERY_LINES != 0:
                     return
+                flush_permission_records()
                 flush_item_batch(conn, item_batch)
+                flush_permission_entries()
                 flush_error_batch(conn, error_batch)
                 update_run_status(
                     conn,
@@ -3124,7 +7110,7 @@ def process_job(fields: dict[str, str]) -> str:
                     "INGESTING",
                     line_offset,
                     counts,
-                    extra_progress={"attempt_count": attempt_count},
+                    extra_progress=ingest_progress_extra(),
                 )
                 conn.commit()
                 last_line_offset = line_offset
@@ -3211,7 +7197,11 @@ def process_job(fields: dict[str, str]) -> str:
 
             if json_candidate:
                 try:
-                    with open_artifact_stream(artifact_key) as body:
+                    with open_verified_artifact_stream(
+                        artifact_key,
+                        artifact_integrity,
+                        progress_callback=report_preflight_progress,
+                    ) as body:
                         if gzip_input:
                             with (
                                 gzip.GzipFile(fileobj=body) as gzip_reader,
@@ -3228,7 +7218,11 @@ def process_job(fields: dict[str, str]) -> str:
                 except ValueError as exc:
                     if str(exc) == JSON_COMPAT_LIMIT_ERROR:
                         raise
-                    with open_artifact_stream(artifact_key) as compat_body:
+                    with open_verified_artifact_stream(
+                        artifact_key,
+                        artifact_integrity,
+                        progress_callback=report_preflight_progress,
+                    ) as compat_body:
                         raw_json = _read_json_compat_bytes(
                             compat_body,
                             gzip_input=gzip_input,
@@ -3238,7 +7232,11 @@ def process_job(fields: dict[str, str]) -> str:
                     if json_records is None:
                         raise ValueError("unsupported JSON artifact format")
             else:
-                with open_artifact_stream(artifact_key) as body:
+                with open_verified_artifact_stream(
+                    artifact_key,
+                    artifact_integrity,
+                    progress_callback=report_preflight_progress,
+                ) as body:
                     if gzip_input:
                         with (
                             gzip.GzipFile(fileobj=body) as gzip_reader,
@@ -3256,18 +7254,55 @@ def process_job(fields: dict[str, str]) -> str:
                 process_record_iter(json_records)
 
             checkpoint_shutdown_if_requested()
+            flush_permission_records()
             flush_item_batch(conn, item_batch)
+            flush_permission_entries()
             flush_error_batch(conn, error_batch)
+            if artifact_schema_version == 2 and "direct_permissions_v1" in artifact_features:
+                reconcile_permission_evidence_integrity(conn, run_id)
+                reconcile_permission_summaries(conn, run_id)
+                permission_integrity = reconcile_permission_collection_context(conn, run_id)
+                if permission_integrity.get("status") != "verified_complete":
+                    logger.warning(
+                        "permission evidence coverage is incomplete run_id=%s diagnostics=%s",
+                        run_id,
+                        permission_integrity,
+                    )
+                prepare_run_identity_keys(conn, run_id)
             persisted_counts = load_persisted_summary(conn, run_id)
-            if producer_run_end_counts is not None and producer_run_end_counts != persisted_counts:
+            persisted_inventory_counts = {
+                field: persisted_counts[field] for field in ("endpoints", "resources", "items")
+            }
+            if producer_run_end_counts != persisted_inventory_counts:
                 logger.warning(
                     "producer summary differs from persisted inventory run_id=%s producer=%s persisted=%s",
                     run_id,
                     producer_run_end_counts,
-                    persisted_counts,
+                    persisted_inventory_counts,
+                )
+            inventory_integrity = reconcile_inventory_collection_context(
+                conn,
+                run_id,
+                producer_counts=producer_run_end_counts,
+                persisted_counts=persisted_counts,
+            )
+            if inventory_integrity.get("status") != "verified":
+                logger.warning(
+                    "inventory ingest coverage is incomplete run_id=%s diagnostics=%s",
+                    run_id,
+                    inventory_integrity,
                 )
             counts = persisted_counts
 
+            # The processing stream authenticates the exact bytes that drove
+            # normalization. Re-open the immutable key immediately before the
+            # terminal transition as a fail-closed guard against an external
+            # path replacement while reconciliation was running.
+            verify_artifact_integrity(
+                artifact_key,
+                artifact_integrity,
+                progress_callback=report_preflight_progress,
+            )
             update_run_status(conn, run_id, "COMPLETE", line_offset, counts)
             write_audit(
                 conn,
@@ -3295,13 +7330,14 @@ def process_job(fields: dict[str, str]) -> str:
                 raise
             public_error = _public_ingest_error(exc)
             retryable = _is_retryable_ingest_error(exc)
+            failure_code = "ARTIFACT_INTEGRITY_FAILED" if isinstance(exc, ArtifactIntegrityError) else None
             attempt_count = parse_attempt_count(progress_raw) + 1
             try:
                 conn.rollback()
             except psycopg.Error:
                 logger.exception("failed to rollback aborted ingest transaction run_id=%s", run_id)
             try:
-                if isinstance(exc, ArtifactFramingError):
+                if isinstance(exc, (ArtifactFramingError, ArtifactIntegrityError)):
                     clear_persisted_ingest_inventory(conn, run_id)
                     last_line_offset = 0
                     last_counts = {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
@@ -3354,6 +7390,7 @@ def process_job(fields: dict[str, str]) -> str:
                         "last_attempt_at": now_iso(),
                         "retryable": retryable,
                         "retry_exhausted": retryable and attempt_count > INGEST_MAX_RETRIES,
+                        **({"failure_code": failure_code} if failure_code else {}),
                     },
                 )
                 if project_id:
@@ -3369,6 +7406,7 @@ def process_job(fields: dict[str, str]) -> str:
                             "attempt_count": attempt_count,
                             "retryable": retryable,
                             "retry_exhausted": retryable and attempt_count > INGEST_MAX_RETRIES,
+                            **({"failure_code": failure_code} if failure_code else {}),
                         },
                     )
                 conn.commit()
@@ -3527,6 +7565,17 @@ def _run_worker_loop() -> None:
                     break
             if recovered_count:
                 logger.info("processed recoverable ingest runs count=%s", recovered_count)
+            if not _shutdown_event.is_set():
+                try:
+                    recoverable_comparisons = discover_recoverable_comparisons(limit=1)
+                except psycopg.Error as exc:
+                    now = time.time()
+                    if _should_log_redis_error(last_database_recovery_error_log, now):
+                        logger.warning("database comparison recovery scan failed; retrying: %s", exc)
+                        last_database_recovery_error_log = now
+                else:
+                    if recoverable_comparisons:
+                        process_job(recoverable_comparisons[0])
             last_recovery_scan = time.time()
 
         now = time.time()

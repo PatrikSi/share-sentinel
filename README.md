@@ -4,7 +4,7 @@
 
 Share Sentinel is a self-hostable workspace for ingesting SMB, NFS, and SharePoint Online collection artifacts, tracking project-scoped inventory, and reviewing run-to-run changes without losing analyst context.
 
-Version 1.2.0 adds evidence-backed SharePoint lifecycle and library assessment, clearer non-mutating SMB access checks, and expanded enterprise inventory workflows. HA operation, application MFA/SSO, and turnkey internet-facing deployment remain intentionally outside the current support boundary.
+Version 1.2.0 adds normalized SMB and SharePoint permission evidence, asynchronous resource comparisons across runs, evidence-backed SharePoint lifecycle and library assessment, clearer non-mutating SMB access checks, and expanded enterprise inventory workflows. HA operation, application MFA/SSO, and turnkey internet-facing deployment remain intentionally outside the current support boundary.
 
 It is built around one loop:
 
@@ -62,7 +62,7 @@ export SHARE_SENTINEL_SMOKE_PASSWORD='<the SEED_ADMIN_PASSWORD value>'
 unset SHARE_SENTINEL_SMOKE_PASSWORD
 ```
 
-The tracked mixed-provider fixture is available at [`examples/sample-artifact.json`](./examples/sample-artifact.json). The SharePoint smoke uses a full/delta-shaped fixture pair to validate assessment context and stable-ID move, rename, and deletion comparison end to end.
+The tracked mixed-provider fixture is available at [`examples/sample-artifact.json`](./examples/sample-artifact.json). The SharePoint smoke uses a full/delta-shaped fixture pair to validate assessment context, stable-ID move and rename handling, normalized permission ingestion, and a materialized resource comparison end to end.
 
 The bundled Compose file keeps the gateway on `127.0.0.1:80` by default. That is intentional. If you expose the stack on a real network, put it behind TLS and review [SECURITY.md](./SECURITY.md) first.
 
@@ -88,7 +88,7 @@ Project inventory supports three working views:
 - `Resources`
 - `Sites & Endpoints`
 
-The page supports guided filters, file/directory shortcuts, an optional query DSL, run scoping, numbered cursor pages, filtered streaming CSV export without a fixed row ceiling, copyable SMB/NFS connection paths, canonical SharePoint links, and project-shared saved investigations. SMB results distinguish observed listing, file-read, create-file, create-directory, modify, delete, ACL-change, and ownership-change capabilities instead of treating every listable share as equally readable.
+The page supports guided filters, file/directory shortcuts, an optional query DSL, run scoping, numbered cursor pages, filtered streaming CSV export without a fixed row ceiling, copyable SMB/NFS connection paths, canonical SharePoint links, project-shared saved investigations, and a drill-in evidence panel. The panel deliberately separates provider-declared permissions from collection-time capability observations, coverage, limitations, failures, and assessed identity. SMB results distinguish observed listing, file-read, create-file, create-directory, modify, delete, ACL-change, and ownership-change capabilities instead of treating every listable share as equally readable.
 
 SharePoint results retain stable site, library, and drive-item identities alongside display paths. Provider, resource type, exposure, collection perspective, and deleted-item filters make scheduled application inventories distinguishable from delegated user quick checks. A delegated `USER_VISIBLE` result means visible to the assessed identity; it does not mean public or anonymous.
 
@@ -104,6 +104,8 @@ Each run is split into five focused tabs:
 
 Run-scoped saved searches remain browser-local. Project-wide shared investigations live on the project inventory page.
 
+The Diff tab can start a server-materialized comparison between any two recent complete runs. The comparison workspace reports resources that appeared, disappeared, or changed, separates structural, access, and content interpretations, and marks absence as indeterminate when tenant, identity, scope, or collection coverage is not comparable. Resource results are processed asynchronously and paginated; item-level path churn remains available only through the explicitly bounded preview.
+
 ### Settings
 
 Sysadmins get five settings areas:
@@ -118,7 +120,8 @@ Sysadmins get five settings areas:
 
 - The API stores uploaded artifacts on the shared `/artifacts` volume.
 - The API enqueues ingest work into the `ingest_jobs` Redis stream.
-- The worker reads the artifact from the same shared storage and writes normalized inventory into Postgres.
+- The worker reads the artifact from the same shared storage and writes normalized inventory and permission evidence into Postgres.
+- The same worker materializes asynchronous resource comparisons and persists their progress and terminal result rows.
 - The UI reads only through the API.
 - The bootstrap container applies Alembic migrations and seeds the initial admin account.
 
@@ -155,7 +158,9 @@ See the [deployment guide](./docs/deployment.md) for the production configuratio
 - SMB capability checks are bounded observations made with the scan identity, not a guarantee for every object or for future writes. They request rights on existing handles without creating or modifying content; quotas, read-only storage, security products, and object-specific ACLs can still affect a later operation.
 - NFS collection currently discovers advertised exports but does not mount them, so NFS access remains `unknown` unless a richer external artifact supplies evidence.
 - SharePoint Online collection is metadata-only and does not download document content. Application mode supports tenant-wide scheduled inventory; delegated modes are security-trimmed quick checks and are explicitly non-authoritative for tenant completeness.
-- Initial SharePoint exposure evidence distinguishes assessed-user visibility from public exposure. Exhaustive per-item sharing-link and permission expansion is not yet implemented, so the collector does not guess broad, external, or anonymous exposure from ordinary read visibility.
+- SharePoint direct permission collection is opt-in (`library_roots` or `all_items`), GET-only, caller-dependent, and bounded by object, request, entry, and concurrency budgets. It records Graph sharing/permission entries but does not expand groups or compute effective access. Empty or partial responses never become a negative exposure conclusion.
+- Optional SMB permission collection records the filesystem security descriptor on the share root. It is distinct from SMB share-level permissions and from the bounded non-mutating capability probes, and it does not expand group membership or compute a user's effective access.
+- Scalable comparisons currently materialize resource-level appearance, disappearance, structural changes, access evidence changes, and aggregate item-count changes. They do not materialize per-item added/removed/moved rows; the bounded legacy preview remains the only exact item-path comparison.
 - The project is best treated as actively evolving rather than as a locked compatibility surface.
 
 ## Documentation
@@ -173,6 +178,7 @@ See the [deployment guide](./docs/deployment.md) for the production configuratio
 - [API service README](./api/README.md)
 - [Collector README](./collector/README.md)
 - [SharePoint Online collection](./docs/sharepoint.md)
+- [Permission evidence and run comparisons](./docs/permission-evidence-and-comparisons.md)
 - [Worker README](./worker/README.md)
 - [Security policy](./SECURITY.md)
 - [Contributing guide](./CONTRIBUTING.md)

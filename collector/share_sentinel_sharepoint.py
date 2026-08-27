@@ -33,6 +33,7 @@ from sharepoint.collection import (
     SharePointProgress,
     SharePointStats,
     collection_context_record,
+    collection_dimension_completeness,
 )
 from sharepoint.graph import GraphAPIError, GraphClient
 from sharepoint.state import (
@@ -52,6 +53,9 @@ DEFAULT_API_TOKEN_ENV = "SHARE_SENTINEL_API_TOKEN"
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 MAX_TARGETED_SITES = 128
 MAX_TARGETED_SITE_BYTES = 24 * 1024
+MAX_PERMISSION_OBJECTS_HARD_LIMIT = 1_000_000
+MAX_PERMISSION_HTTP_ATTEMPTS_HARD_LIMIT = 5_000_000
+MAX_PERMISSION_ENTRIES_HARD_LIMIT = 5_000_000
 
 
 def _terminal_safe(value: object, maximum: int = 4096) -> str:
@@ -201,6 +205,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum materialized items per run (0 means unlimited; default: 0)",
     )
     parser.add_argument(
+        "--permissions",
+        choices=("none", "library_roots", "all_items"),
+        default="none",
+        help=(
+            "collect direct Graph permission evidence: none, library roots only, or every materialized item "
+            "(default: none)"
+        ),
+    )
+    parser.add_argument(
+        "--max-permission-objects",
+        type=_positive_int,
+        default=10_000,
+        help="maximum library roots/items sent to the Graph permissions endpoint (default: 10000)",
+    )
+    parser.add_argument(
+        "--max-permission-http-attempts",
+        type=_positive_int,
+        default=25_000,
+        help="maximum permission HTTP attempts including pages and retries (default: 25000)",
+    )
+    parser.add_argument(
+        "--max-permission-entries",
+        type=_positive_int,
+        default=100_000,
+        help="maximum normalized permission-entry records emitted (default: 100000)",
+    )
+    parser.add_argument(
+        "--permission-concurrency",
+        type=_positive_int,
+        default=2,
+        help="concurrent direct-permission requests (1-8; default: 2)",
+    )
+    parser.add_argument(
         "--max-pages",
         type=_positive_int,
         default=100_000,
@@ -299,6 +336,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise TokenAcquisitionError("--graph-concurrency cannot exceed 16")
     if args.graph_attempts > 20:
         raise TokenAcquisitionError("--graph-attempts cannot exceed 20")
+    if args.permission_concurrency > 8:
+        raise TokenAcquisitionError("--permission-concurrency cannot exceed 8")
+    if args.max_permission_objects > MAX_PERMISSION_OBJECTS_HARD_LIMIT:
+        raise TokenAcquisitionError(f"--max-permission-objects cannot exceed {MAX_PERMISSION_OBJECTS_HARD_LIMIT}")
+    if args.max_permission_http_attempts > MAX_PERMISSION_HTTP_ATTEMPTS_HARD_LIMIT:
+        raise TokenAcquisitionError(
+            f"--max-permission-http-attempts cannot exceed {MAX_PERMISSION_HTTP_ATTEMPTS_HARD_LIMIT}"
+        )
+    if args.max_permission_entries > MAX_PERMISSION_ENTRIES_HARD_LIMIT:
+        raise TokenAcquisitionError(f"--max-permission-entries cannot exceed {MAX_PERMISSION_ENTRIES_HARD_LIMIT}")
+    if args.no_files and args.permissions == "all_items":
+        raise TokenAcquisitionError("--permissions all_items cannot be combined with --no-files")
     if len(args.site) > MAX_TARGETED_SITES:
         raise TokenAcquisitionError(f"--site can be repeated at most {MAX_TARGETED_SITES} times")
     targeted_site_bytes = 0
@@ -491,6 +540,11 @@ def run(args: argparse.Namespace) -> int:
         max_libraries=args.max_libraries,
         max_items=args.max_items,
         concurrency=args.graph_concurrency,
+        permissions=args.permissions,
+        max_permission_objects=args.max_permission_objects,
+        max_permission_http_attempts=args.max_permission_http_attempts,
+        max_permission_entries=args.max_permission_entries,
+        permission_concurrency=args.permission_concurrency,
         quiet=args.quiet,
         verbosity=args.verbose,
         progress_interval=args.progress_interval,
@@ -529,6 +583,8 @@ def run(args: argparse.Namespace) -> int:
                 pass
         raise
     started_at = datetime.now(tz=UTC).isoformat()
+    schema_version = 2 if args.permissions != "none" else 1
+    artifact_features = ["direct_permissions_v1"] if schema_version == 2 else None
     initial_context = collection_context_record(
         context,
         config,
@@ -552,16 +608,27 @@ def run(args: argparse.Namespace) -> int:
             "include_files": not args.no_files,
         },
     }
+    if args.permissions != "none":
+        collection_details["permissions"] = {
+            "mode": args.permissions,
+            "permission_surface": "sharepoint_graph_permissions",
+            "semantics": "sharepoint_graph_permission_v1",
+            "max_objects": args.max_permission_objects,
+            "max_http_attempts": args.max_permission_http_attempts,
+            "max_entries": args.max_permission_entries,
+            "concurrency": args.permission_concurrency,
+        }
     try:
         writer.emit(
             {
                 "type": "run_meta",
-                "schema_version": 1,
+                "schema_version": schema_version,
                 "tool": "share-sentinel-sharepoint-collector",
                 "tool_version": TOOL_VERSION,
                 "run_id": run_id,
                 "started_at": started_at,
                 "operator_label": args.operator_label,
+                **({"artifact_features": artifact_features} if artifact_features else {}),
                 **initial_context,
                 "collection": collection_details,
             }
@@ -593,12 +660,21 @@ def run(args: argparse.Namespace) -> int:
     upload_confirmed = False
     try:
         pending_drives, status = collector.collect()
+        final_stats = stats.snapshot()
+        structural_complete, content_complete = collection_dimension_completeness(
+            final_stats,
+            config,
+            status=status,
+        )
         final_context = collection_context_record(
             context,
             config,
             status=status,
             sync_mode=collector.sync_mode,
             partial=status == "partial",
+            permission_summary=getattr(collector, "permission_run_summary", None),
+            structural_complete=structural_complete,
+            content_complete=content_complete,
         )
         # NDJSONWriter retains run metadata out-of-band and replaces the
         # provisional header with this finalized header before atomically
@@ -606,18 +682,39 @@ def run(args: argparse.Namespace) -> int:
         writer.emit(
             {
                 "type": "run_meta",
-                "schema_version": 1,
+                "schema_version": schema_version,
                 "tool": "share-sentinel-sharepoint-collector",
                 "tool_version": TOOL_VERSION,
                 "run_id": run_id,
                 "started_at": started_at,
                 "operator_label": args.operator_label,
+                **({"artifact_features": artifact_features} if artifact_features else {}),
                 **final_context,
                 "collection": collection_details,
             }
         )
-        final_stats = stats.snapshot()
         final_stats["graph_retries"] = client.retry_count
+        permission_stats = getattr(collector, "permission_run_summary", None)
+        if isinstance(permission_stats, dict) and args.permissions != "none":
+            for field in (
+                "candidate_objects",
+                "attempted_objects",
+                "completed_objects",
+                "failed_objects",
+                "skipped_objects",
+                "http_attempts",
+                "entries_observed",
+                "entries_emitted",
+                "entries_omitted",
+                "unknown_entries",
+                "anonymous_objects",
+                "broad_internal_objects",
+                "selection_incomplete_scopes",
+            ):
+                value = permission_stats.get(field)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    final_stats[f"permission_{field}"] = value
+            final_stats["permission_partial"] = permission_stats.get("request_coverage") != "complete"
         writer.emit(
             {
                 "type": "run_end",
@@ -648,6 +745,7 @@ def run(args: argparse.Namespace) -> int:
                 "collection_mode": collector.collection_mode,
                 "tenant_id": context.tenant_id,
                 "targeted_sites": list(args.site),
+                **({"permissions": args.permissions} if args.permissions != "none" else {}),
             }
             upload_status = upload_artifact(args, run_id, str(output_path), hosts=[])
             upload_confirmed = upload_status in {"accepted", "recovered"}

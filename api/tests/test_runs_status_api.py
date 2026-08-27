@@ -59,6 +59,34 @@ def _clear_overrides():
     app.dependency_overrides.clear()
 
 
+def test_access_evidence_pages_enforce_response_memory_ceiling() -> None:
+    fake_db = _FakeDb()
+    client = _client_for_db(fake_db)
+    project_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    base = f"/projects/{project_id}/runs/{run_id}/resources/1/access-evidence"
+
+    try:
+        assessment_response = client.get(
+            base,
+            params={
+                "assessment_limit": runs_router.ACCESS_EVIDENCE_ASSESSMENT_PAGE_MAX + 1,
+            },
+        )
+        entry_response = client.get(
+            base,
+            params={
+                "entry_limit": runs_router.ACCESS_EVIDENCE_ENTRY_PAGE_MAX + 1,
+            },
+        )
+    finally:
+        _clear_overrides()
+
+    assert assessment_response.status_code == 422
+    assert entry_response.status_code == 422
+    assert fake_db.statements == []
+
+
 def test_to_run_out_includes_ingest_progress() -> None:
     run = SimpleNamespace(
         id=uuid.uuid4(),
@@ -198,9 +226,7 @@ def test_endpoint_resources_uses_bounded_keyset_pagination(monkeypatch) -> None:
 
     client = _client_for_db(fake_db)
     try:
-        response = client.get(
-            f"/projects/{project_id}/runs/{run_id}/endpoints/7/resources?limit=1"
-        )
+        response = client.get(f"/projects/{project_id}/runs/{run_id}/endpoints/7/resources?limit=1")
     finally:
         _clear_overrides()
 
@@ -229,9 +255,7 @@ def test_run_endpoints_searches_sharepoint_site_metadata_and_legacy_provider(
         provider="sharepoint",
         provider_metadata={"display_name": "Finance site"},
     )
-    fake_db = _FakeDb(
-        execute_queue=[_ExecuteResult([fake_run]), _ExecuteResult([endpoint])]
-    )
+    fake_db = _FakeDb(execute_queue=[_ExecuteResult([fake_run]), _ExecuteResult([endpoint])])
     monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runs_router, "write_audit_event", lambda *_args, **_kwargs: None)
 
@@ -245,9 +269,7 @@ def test_run_endpoints_searches_sharepoint_site_metadata_and_legacy_provider(
         _clear_overrides()
 
     assert response.status_code == 200
-    sql = str(
-        fake_db.statements[1].compile(compile_kwargs={"literal_binds": True})
-    ).lower()
+    sql = str(fake_db.statements[1].compile(compile_kwargs={"literal_binds": True})).lower()
     assert "display_name" in sql
     assert "site_name" in sql
     assert "resources.resource_type" in sql
@@ -262,9 +284,7 @@ def test_endpoint_resources_rejects_endpoint_outside_project_run(monkeypatch) ->
 
     client = _client_for_db(fake_db)
     try:
-        response = client.get(
-            f"/projects/{project_id}/runs/{run_id}/endpoints/999/resources"
-        )
+        response = client.get(f"/projects/{project_id}/runs/{run_id}/endpoints/999/resources")
     finally:
         _clear_overrides()
 
@@ -305,9 +325,7 @@ def test_run_item_search_returns_sharepoint_resource_and_site_context(monkeypatc
         exposure="USER_VISIBLE",
         exposure_evidence={"basis": "delegated_visibility"},
     )
-    fake_db = _FakeDb(
-        execute_queue=[_ExecuteResult([fake_run]), _ExecuteResult([item])]
-    )
+    fake_db = _FakeDb(execute_queue=[_ExecuteResult([fake_run]), _ExecuteResult([item])])
     monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runs_router, "write_audit_event", lambda *_args, **_kwargs: None)
 
@@ -326,9 +344,7 @@ def test_run_item_search_returns_sharepoint_resource_and_site_context(monkeypatc
     assert payload["provider_resource_id"] == "drive-1"
     assert payload["endpoint_key"] == "sharepoint:site-1"
     assert payload["endpoint_metadata"]["display_name"] == "Finance site"
-    sql = str(
-        fake_db.statements[1].compile(compile_kwargs={"literal_binds": True})
-    ).lower()
+    sql = str(fake_db.statements[1].compile(compile_kwargs={"literal_binds": True})).lower()
     assert "items.provider =" in sql
     assert "items.deleted is false" in sql
     assert "display_name" in sql

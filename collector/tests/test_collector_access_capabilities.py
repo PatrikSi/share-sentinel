@@ -80,9 +80,7 @@ def test_smb1_legacy_access_denials_use_exact_class_code_pair(error_class, error
 
 
 @pytest.mark.parametrize(("error_class", "error_code"), [(None, 4), (None, 5), (1, 4), (2, 5), (1, 12)])
-def test_smb1_ambiguous_or_non_denial_codes_remain_inconclusive(
-    error_class, error_code
-) -> None:
+def test_smb1_ambiguous_or_non_denial_codes_remain_inconclusive(error_class, error_code) -> None:
     collector = _load_collector_module()
 
     class _LegacyPacket:
@@ -437,9 +435,7 @@ def test_root_probe_uses_dialect_independent_empty_path_and_non_mutating_open(di
     assert kwargs["desiredAccess"] == collector.FILE_ADD_FILE
     assert kwargs["creationDisposition"] == collector.FILE_OPEN
     assert kwargs["creationOption"] == collector.FILE_DIRECTORY_FILE
-    assert kwargs["shareMode"] == (
-        collector.FILE_SHARE_READ | collector.FILE_SHARE_WRITE | collector.FILE_SHARE_DELETE
-    )
+    assert kwargs["shareMode"] == (collector.FILE_SHARE_READ | collector.FILE_SHARE_WRITE | collector.FILE_SHARE_DELETE)
     assert connection.closed == [(7, "handle-1")]
     assert capabilities["create_file"]["status"] == "allowed"
 
@@ -645,9 +641,7 @@ def test_scan_smb_emits_bounded_non_mutating_capabilities_and_disconnects(monkey
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.8", args, "run-access", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert collector.scan_host_smb("10.0.0.8", args, "run-access", writer, collector.Stats(), threading.Lock()) is True
 
     resources = [record for record in writer.records if record.get("type") == "resource"]
     assert resources[0]["access_level"] == "unknown"
@@ -682,15 +676,17 @@ def test_scan_smb_emits_bounded_non_mutating_capabilities_and_disconnects(monkey
         "transport_failed": False,
         "probes_aborted": False,
         "share_presence": "confirmed",
+        "assessed_identity_fingerprint": (
+            "smb-session-identity:v1:ea2a7798e848be36fd90da42524d689da140978342aa73d5efc7ef2bc20b9100"
+        ),
+        "session_kind": "anonymous",
+        "identity_source": "requested_identity",
     }
     assert any(
         path == "secret.txt" and kwargs["desiredAccess"] == collector.FILE_READ_DATA
         for path, kwargs in connection.opens
     )
-    assert not any(
-        record.get("type") == "item" and record.get("name") == "secret.txt"
-        for record in writer.records
-    )
+    assert not any(record.get("type") == "item" and record.get("name") == "secret.txt" for record in writer.records)
     assert connection.disconnected == [41]
     assert len(connection.closed) == 5
 
@@ -779,9 +775,7 @@ def test_default_depth_discovers_nested_only_file_for_bounded_access_probes(monk
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.11", args, "run-nested", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert collector.scan_host_smb("10.0.0.11", args, "run-nested", writer, collector.Stats(), threading.Lock()) is True
 
     final = [record for record in writer.records if record.get("type") == "resource"][-1]
     assert final["access_level"] == "readable"
@@ -795,13 +789,11 @@ def test_default_depth_discovers_nested_only_file_for_bounded_access_probes(monk
     assert metadata["file_samples"] == 1
     assert connection.list_calls == [("Data", "*"), ("Data", "OnlyFolder\\*")]
     assert any(
-        path == "OnlyFolder\\nested-only.txt"
-        and kwargs["desiredAccess"] == collector.FILE_READ_DATA
+        path == "OnlyFolder\\nested-only.txt" and kwargs["desiredAccess"] == collector.FILE_READ_DATA
         for _tree_id, path, kwargs in connection.opens
     )
     assert not any(
-        record.get("type") == "item" and record.get("name") == "nested-only.txt"
-        for record in writer.records
+        record.get("type") == "item" and record.get("name") == "nested-only.txt" for record in writer.records
     )
     assert len(connection.closed) == len(connection.opens)
     assert connection.disconnected == [17]
@@ -903,9 +895,10 @@ def test_invalid_temporary_listing_tree_does_not_abort_explicit_tree_file_probe(
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.12", args, "run-invalid-list-tree", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert (
+        collector.scan_host_smb("10.0.0.12", args, "run-invalid-list-tree", writer, collector.Stats(), threading.Lock())
+        is True
+    )
 
     final = [record for record in writer.records if record.get("type") == "resource"][-1]
     assert final["access_level"] == "readable"
@@ -1004,9 +997,9 @@ def test_probe_discovery_uses_unlisted_directory_at_configured_depth_boundary(mo
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.15", args, "run-boundary", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert (
+        collector.scan_host_smb("10.0.0.15", args, "run-boundary", writer, collector.Stats(), threading.Lock()) is True
+    )
 
     final = [record for record in writer.records if record.get("type") == "resource"][-1]
     assert final["access_level"] == "readable"
@@ -1014,14 +1007,10 @@ def test_probe_discovery_uses_unlisted_directory_at_configured_depth_boundary(mo
     assert final["access_capabilities"]["list"]["attempted"] == 3
     assert connection.list_calls == ["*", "A\\*", "A\\Boundary\\*"]
     assert any(
-        path == "A\\Boundary\\deep.txt"
-        and kwargs["desiredAccess"] == collector.FILE_READ_DATA
+        path == "A\\Boundary\\deep.txt" and kwargs["desiredAccess"] == collector.FILE_READ_DATA
         for _tree_id, path, kwargs in connection.opens
     )
-    assert not any(
-        record.get("type") == "item" and record.get("name") == "deep.txt"
-        for record in writer.records
-    )
+    assert not any(record.get("type") == "item" and record.get("name") == "deep.txt" for record in writer.records)
     assert len(connection.closed) == len(connection.opens)
 
 
@@ -1100,9 +1089,10 @@ def test_nested_listing_transport_failure_trips_share_probe_circuit(monkeypatch)
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.14", args, "run-nested-timeout", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert (
+        collector.scan_host_smb("10.0.0.14", args, "run-nested-timeout", writer, collector.Stats(), threading.Lock())
+        is True
+    )
 
     final = [record for record in writer.records if record.get("type") == "resource"][-1]
     list_evidence = final["access_capabilities"]["list"]
@@ -1198,9 +1188,10 @@ def test_inventory_transport_failure_stops_queued_lists_and_later_handle_probes(
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.16", args, "run-list-circuit", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert (
+        collector.scan_host_smb("10.0.0.16", args, "run-list-circuit", writer, collector.Stats(), threading.Lock())
+        is True
+    )
 
     final = [record for record in writer.records if record.get("type") == "resource"][-1]
     list_evidence = final["access_capabilities"]["list"]
@@ -1285,9 +1276,9 @@ def test_handle_probe_transport_failure_trips_share_circuit_breaker(monkeypatch)
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.12", args, "run-circuit", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert (
+        collector.scan_host_smb("10.0.0.12", args, "run-circuit", writer, collector.Stats(), threading.Lock()) is True
+    )
 
     final = [record for record in writer.records if record.get("type") == "resource"][-1]
     assert connection.open_calls == 1
@@ -1379,9 +1370,9 @@ def test_disabled_probes_keep_tree_allowed_list_denied_access_unknown(monkeypatc
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.13", args, "run-no-probes", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert (
+        collector.scan_host_smb("10.0.0.13", args, "run-no-probes", writer, collector.Stats(), threading.Lock()) is True
+    )
 
     final = [record for record in writer.records if record.get("type") == "resource"][-1]
     assert final["access_level"] == "unknown"
@@ -1454,9 +1445,10 @@ def test_empty_visible_share_explains_missing_file_probe_candidate(monkeypatch) 
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.18", args, "run-empty-visible", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert (
+        collector.scan_host_smb("10.0.0.18", args, "run-empty-visible", writer, collector.Stats(), threading.Lock())
+        is True
+    )
 
     final = [record for record in writer.records if record.get("type") == "resource"][-1]
     metadata = final["access_capabilities"]["_metadata"]
@@ -1518,9 +1510,10 @@ def test_configured_missing_share_is_reported_as_unavailable(monkeypatch) -> Non
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.19", args, "run-missing-share", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert (
+        collector.scan_host_smb("10.0.0.19", args, "run-missing-share", writer, collector.Stats(), threading.Lock())
+        is True
+    )
 
     final = [record for record in writer.records if record.get("type") == "resource"][-1]
     metadata = final["access_capabilities"]["_metadata"]
@@ -1595,9 +1588,7 @@ def test_cancellation_closes_granted_handle_and_disconnects_tree(monkeypatch) ->
         cancel_event=cancel_event,
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.9", args, "run-cancel", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert collector.scan_host_smb("10.0.0.9", args, "run-cancel", writer, collector.Stats(), threading.Lock()) is True
 
     final = [record for record in writer.records if record.get("type") == "resource"][-1]
     assert final["access_capabilities"]["_metadata"]["complete"] is False
@@ -1666,9 +1657,7 @@ def test_scan_marks_listing_truncation_in_final_capability_metadata(monkeypatch)
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.10", args, "run-limit", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert collector.scan_host_smb("10.0.0.10", args, "run-limit", writer, collector.Stats(), threading.Lock()) is True
 
     final = [record for record in writer.records if record.get("type") == "resource"][-1]
     metadata = final["access_capabilities"]["_metadata"]

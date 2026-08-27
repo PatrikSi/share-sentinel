@@ -10,7 +10,7 @@ In scope:
 - project and membership management
 - run creation and artifact upload
 - asynchronous ingest into normalized tables
-- inventory review, diffing, search, saved investigations, and audit
+- inventory review, normalized permission evidence, bounded and materialized run comparisons, search, saved investigations, and audit
 
 Out of scope:
 
@@ -34,12 +34,12 @@ The FastAPI service is the control plane. It owns:
 - user auth and browser session cookies
 - API token issuance and revocation
 - sysadmin settings and audit APIs
-- project, membership, run, and inventory APIs
+- project, membership, run, inventory, access-evidence, and comparison APIs
 - artifact upload validation and queue handoff
 
 ### Worker
 
-The worker consumes `ingest_jobs` from Redis Streams, reads uploaded artifacts from shared storage, and writes normalized inventory into Postgres.
+The worker consumes `ingest_jobs` from Redis Streams, reads uploaded artifacts from shared storage, writes normalized inventory and permission evidence into Postgres, and materializes asynchronous resource comparisons. Postgres recovery scans make the queue a delivery accelerator rather than the authority for accepted work.
 
 ### Postgres
 
@@ -49,6 +49,8 @@ Postgres stores the durable application state:
 - API tokens and refresh tokens
 - runs and ingest progress
 - endpoints, resources, items, and ingest errors
+- normalized permission assessments, principals, and entries
+- materialized run-comparison state and resource-change rows
 - audit events
 - saved investigations
 
@@ -106,19 +108,27 @@ The worker consumes the queued job, opens the artifact, parses the records, and 
 - endpoints
 - resources
 - items, including optional size, allocation, timestamp, and file-attribute metadata
+- permission assessments, principals, entries, integrity hashes, and bounded evidence summaries when schema-v2 evidence is present
 - ingest errors
 
 The worker updates `scan_runs.summary` and `scan_runs.ingest_progress` as it goes.
 
 If Redis queue handoff falls back, the run can remain `UPLOADED` until the worker discovers it through its recovery scan.
 
-### 4. Query and review
+Permission entries are normalized under consumer-owned identity keys and written in bounded set-based batches. The final reconciliation verifies persisted cardinality, derives comparison hashes from stored rows, and removes unsupported negative conclusions.
+
+### 4. Materialized comparison
+
+For large resource histories, the API stores an idempotent queued comparison instead of loading both inventories into an HTTP process. The worker validates run state and collection compatibility, derives tenant/provider-aware resource identities, and inserts changed or indeterminate resource rows in bounded batches. Retryable dependency failures use delayed jittered retries; stale work is recoverable from Postgres. Per-item change rows are intentionally not materialized in this release.
+
+### 5. Query and review
 
 The UI and API clients query Postgres-backed endpoints for:
 
 - project inventory
 - run detail and issues
 - run-to-run diff
+- paginated resource comparisons and before/after evidence
 - audit history
 - user and token administration
 
@@ -185,7 +195,7 @@ Current caveats:
 - the default Compose deployment is for local operation, not HA orchestration
 - inventory views can include data from `INGESTING` runs until ingest settles
 - delegated SharePoint discovery is security-trimmed and can be incomplete; its collection context is preserved with the run so it is not confused with an authoritative application inventory
-- synchronous diff has an explicit item envelope and bounded detail arrays; larger comparisons need an asynchronous/materialized workflow
+- synchronous diff has an explicit item envelope and bounded detail arrays; larger resource comparisons use the asynchronous materialized workflow, while exact item-path churn remains bounded
 
 ## ADR-style decisions
 
@@ -204,3 +214,11 @@ Interactive browser use and automation use different credential types. This keep
 ### ADR 4: Shared artifact volume instead of object storage in the default stack
 
 The bundled deployment favors a simpler local-first topology. Raw artifacts are written to a shared volume so the API and worker can coordinate without introducing external object storage as a required dependency.
+
+### ADR 5: Evidence dimensions instead of one access verdict
+
+Provider permission records, bounded capability observations, exposure evidence, coverage, and effective-access computation are different claims. They are stored and presented separately; a missing or denied observation cannot be promoted into a negative permission conclusion.
+
+### ADR 6: Materialized resource comparison with explicit indeterminacy
+
+Large comparisons run in the worker and persist paginated resource results. Appearance or disappearance is definitive only under equivalent authoritative structural scope. Unmatched resources or suspected changes from incompatible collection planes are marked indeterminate rather than silently treated as change.

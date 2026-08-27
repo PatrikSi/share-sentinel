@@ -15,11 +15,13 @@ import random
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -32,6 +34,7 @@ import requests
 try:
     from impacket.nmb import NetBIOSError, NetBIOSTimeout
     from impacket.smb3structs import (
+        DACL_SECURITY_INFORMATION,
         DELETE,
         FILE_ADD_FILE,
         FILE_ADD_SUBDIRECTORY,
@@ -44,6 +47,11 @@ try:
         FILE_SHARE_READ,
         FILE_SHARE_WRITE,
         FILE_WRITE_DATA,
+        GROUP_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION,
+        READ_CONTROL,
+        SMB2_0_INFO_SECURITY,
+        SMB2_SEC_INFO_00,
         WRITE_DAC,
         WRITE_OWNER,
     )
@@ -67,6 +75,12 @@ except ImportError:
     FILE_SHARE_READ = 0x00000001
     FILE_SHARE_WRITE = 0x00000002
     FILE_SHARE_DELETE = 0x00000004
+    READ_CONTROL = 0x00020000
+    OWNER_SECURITY_INFORMATION = 0x00000001
+    GROUP_SECURITY_INFORMATION = 0x00000002
+    DACL_SECURITY_INFORMATION = 0x00000004
+    SMB2_0_INFO_SECURITY = 0x03
+    SMB2_SEC_INFO_00 = 0
 
     class SessionError(Exception):
         """Fallback error type used when impacket is unavailable."""
@@ -79,6 +93,9 @@ except ImportError:
 
 
 TOOL_VERSION = "1.2.0"
+NETWORK_STRUCTURAL_COMPARISON_CONTRACT = "network_share_inventory_v1"
+SMB_CONTENT_COMPARISON_CONTRACT = "smb_tree_inventory_v1"
+SMB_CAPABILITY_COMPARISON_CONTRACT = "smb_nonmutating_capability_v1"
 SENSITIVE_ARGUMENT_FLAGS = {"--password", "--hashes", "--api-token"}
 SMB_PASSWORD_ENV = "SHARE_SENTINEL_SMB_PASSWORD"
 SMB_HASHES_ENV = "SHARE_SENTINEL_SMB_HASHES"
@@ -206,6 +223,102 @@ SMB_ROOT_PATH_FALLBACK_STATUS_CODES = frozenset(
         0xC00000BB,  # STATUS_NOT_SUPPORTED
     }
 )
+SMB_PERMISSION_SEMANTICS = "smb_windows_acl_v1"
+SMB_PERMISSION_SURFACE = "smb_filesystem_dacl"
+SMB_PERMISSION_METHOD = "smb_query_security_info_read_control"
+SMB_PERMISSION_DEFAULT_SAMPLE_LIMIT = 2
+SMB_PERMISSION_MAX_SAMPLE_LIMIT = 10
+SMB_PERMISSION_MAX_DESCRIPTOR_BYTES = 65_535
+SMB_PERMISSION_MAX_ACES_PER_DESCRIPTOR = 64
+SMB_PERMISSION_MAX_ACE_HEADERS = 4_096
+SMB_PERMISSION_MAX_ENTRIES_PER_SHARE = 256
+SMB_PERMISSION_MAX_LIMITATIONS = 8
+SMB_PERMISSION_MAX_ERRORS = 8
+SMB_PERMISSION_REQUESTED_INFORMATION = (
+    OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+)
+SMB_SECURITY_DESCRIPTOR_SELF_RELATIVE = 0x8000
+SMB_SECURITY_DESCRIPTOR_DACL_PRESENT = 0x0004
+SMB_SECURITY_DESCRIPTOR_DACL_DEFAULTED = 0x0008
+SMB_SECURITY_DESCRIPTOR_DACL_AUTO_INHERITED = 0x0400
+SMB_SECURITY_DESCRIPTOR_DACL_PROTECTED = 0x1000
+SMB_SECURITY_DESCRIPTOR_CONTROL_FLAGS = {
+    0x0001: "owner_defaulted",
+    0x0002: "group_defaulted",
+    SMB_SECURITY_DESCRIPTOR_DACL_PRESENT: "dacl_present",
+    SMB_SECURITY_DESCRIPTOR_DACL_DEFAULTED: "dacl_defaulted",
+    0x0100: "dacl_auto_inherit_required",
+    SMB_SECURITY_DESCRIPTOR_DACL_AUTO_INHERITED: "dacl_auto_inherited",
+    SMB_SECURITY_DESCRIPTOR_DACL_PROTECTED: "dacl_protected",
+    SMB_SECURITY_DESCRIPTOR_SELF_RELATIVE: "self_relative",
+}
+SMB_SECURITY_DESCRIPTOR_RETAINED_CONTROL_MASK = sum(SMB_SECURITY_DESCRIPTOR_CONTROL_FLAGS)
+SMB_ACE_FLAG_NAMES = {
+    0x01: "object_inherit",
+    0x02: "container_inherit",
+    0x04: "no_propagate",
+    0x08: "inherit_only",
+    0x10: "inherited",
+    0x40: "successful_access",
+    0x80: "failed_access",
+}
+SMB_ACE_TYPES = {
+    0x00: ("access_allowed", "allow", "simple"),
+    0x01: ("access_denied", "deny", "simple"),
+    0x02: ("system_audit", "audit", "simple"),
+    0x03: ("system_alarm", "unknown", "simple"),
+    0x04: ("access_allowed_compound", "allow", "compound"),
+    0x05: ("access_allowed_object", "allow", "object"),
+    0x06: ("access_denied_object", "deny", "object"),
+    0x07: ("system_audit_object", "audit", "object"),
+    0x08: ("system_alarm_object", "unknown", "object"),
+    0x09: ("access_allowed_callback", "allow", "callback"),
+    0x0A: ("access_denied_callback", "deny", "callback"),
+    0x0B: ("access_allowed_callback_object", "allow", "callback_object"),
+    0x0C: ("access_denied_callback_object", "deny", "callback_object"),
+    0x0D: ("system_audit_callback", "audit", "callback"),
+    0x0E: ("system_alarm_callback", "unknown", "callback"),
+    0x0F: ("system_audit_callback_object", "audit", "callback_object"),
+    0x10: ("system_alarm_callback_object", "unknown", "callback_object"),
+    0x11: ("system_mandatory_label", "label", "simple"),
+    0x12: ("system_resource_attribute", "label", "callback"),
+    0x13: ("system_scoped_policy_id", "label", "simple"),
+    0x14: ("system_process_trust_label", "label", "simple"),
+    0x15: ("system_access_filter", "label", "callback"),
+}
+SMB_FILE_RIGHTS = (
+    (0x00000001, "read_data_or_list_directory"),
+    (0x00000002, "write_data_or_add_file"),
+    (0x00000004, "append_data_or_add_subdirectory"),
+    (0x00000008, "read_extended_attributes"),
+    (0x00000010, "write_extended_attributes"),
+    (0x00000020, "execute_or_traverse"),
+    (0x00000040, "delete_child"),
+    (0x00000080, "read_attributes"),
+    (0x00000100, "write_attributes"),
+    (0x00010000, "delete"),
+    (0x00020000, "read_control"),
+    (0x00040000, "write_dacl"),
+    (0x00080000, "write_owner"),
+    (0x00100000, "synchronize"),
+    (0x01000000, "access_system_security"),
+    (0x02000000, "maximum_allowed"),
+    (0x10000000, "generic_all"),
+    (0x20000000, "generic_execute"),
+    (0x40000000, "generic_write"),
+    (0x80000000, "generic_read"),
+)
+SMB_WELL_KNOWN_SIDS = {
+    "S-1-1-0": "Everyone",
+    "S-1-3-0": "Creator Owner",
+    "S-1-3-1": "Creator Group",
+    "S-1-5-7": "Anonymous Logon",
+    "S-1-5-10": "Self",
+    "S-1-5-11": "Authenticated Users",
+    "S-1-5-18": "Local System",
+    "S-1-5-32-544": "Administrators",
+    "S-1-5-32-545": "Users",
+}
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -226,9 +339,12 @@ class Stats:
     endpoints: int = 0
     resources: int = 0
     items: int = 0
+    permission_assessments: int = 0
+    permission_entries: int = 0
     errors: int = 0
     error_codes: collections.Counter[str] = field(default_factory=collections.Counter)
     error_samples: dict[str, str] = field(default_factory=dict)
+    structural_coverage_gaps: int = 0
 
 
 @dataclass(frozen=True)
@@ -562,7 +678,14 @@ class NDJSONWriter:
                 self._run_end_bytes = serialized_bytes
                 return
             if self._artifact_format == ARTIFACT_FORMAT_NDJSON:
-                if rec_type in {"endpoint", "resource", "item", "error"}:
+                if rec_type in {
+                    "endpoint",
+                    "resource",
+                    "item",
+                    "error",
+                    "permission_assessment",
+                    "permission_entry",
+                }:
                     try:
                         serialized = json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
                         serialized_bytes = len(serialized.encode("utf-8"))
@@ -576,7 +699,13 @@ class NDJSONWriter:
             if rec_type == "error":
                 self._record_issue(record)
                 return
-            if rec_type not in {"endpoint", "resource", "item"}:
+            if rec_type not in {
+                "endpoint",
+                "resource",
+                "item",
+                "permission_assessment",
+                "permission_entry",
+            }:
                 return
 
             endpoint_key = str(record.get("endpoint_key") or "").strip()
@@ -777,6 +906,9 @@ class NDJSONWriter:
                         endpoint["smb"] = record["smb"]
                     if isinstance(record.get("nfs"), dict):
                         endpoint["nfs"] = record["nfs"]
+                    for field_name in ("provider", "provider_endpoint_id", "metadata"):
+                        if record.get(field_name) is not None:
+                            endpoint[field_name] = record[field_name]
                     continue
 
                 if rec_type == "resource":
@@ -796,9 +928,19 @@ class NDJSONWriter:
                         }
                         if isinstance(record.get("access_capabilities"), dict):
                             share_doc["access_capabilities"] = record["access_capabilities"]
+                        for field_name in (
+                            "provider",
+                            "provider_resource_id",
+                            "web_url",
+                            "metadata",
+                            "permission_summary",
+                        ):
+                            if record.get(field_name) is not None:
+                                share_doc[field_name] = record[field_name]
                         share_states[share_key] = {
                             "doc": share_doc,
                             "index": {},
+                            "permission_index": {},
                         }
                         share_order.append(share_key)
                     else:
@@ -808,6 +950,11 @@ class NDJSONWriter:
                             "remark",
                             "access_level",
                             "access_capabilities",
+                            "provider",
+                            "provider_resource_id",
+                            "web_url",
+                            "metadata",
+                            "permission_summary",
                         ):
                             if record.get(field_name) is not None:
                                 share_doc[field_name] = record[field_name]
@@ -832,10 +979,82 @@ class NDJSONWriter:
                         share_state = {
                             "doc": share_doc,
                             "index": {},
+                            "permission_index": {},
                         }
                         share_states[share_key] = share_state
                         share_order.append(share_key)
                     self._insert_item(share_state, record)
+                    continue
+
+                if rec_type == "permission_assessment":
+                    share_name = str(record.get("resource_name") or "").strip()
+                    if not share_name:
+                        continue
+                    share_type = str(record.get("share_type") or record.get("provider") or "smb")
+                    share_key = (share_name, share_type)
+                    share_state = share_states.get(share_key)
+                    if share_state is None:
+                        share_doc = {
+                            "name": share_name,
+                            "share_type": share_type,
+                            "resource_type": record.get("resource_type") or "smb_share",
+                            "remark": None,
+                            "access_level": "unknown",
+                            "entries": [],
+                        }
+                        share_state = {
+                            "doc": share_doc,
+                            "index": {},
+                            "permission_index": {},
+                        }
+                        share_states[share_key] = share_state
+                        share_order.append(share_key)
+                    assessment = {
+                        key: value
+                        for key, value in record.items()
+                        if key
+                        not in {
+                            "type",
+                            "run_id",
+                            "endpoint_key",
+                            "resource_name",
+                            "resource_type",
+                            "share_type",
+                        }
+                    }
+                    assessment["entries"] = []
+                    share_state["doc"].setdefault("permission_assessments", []).append(assessment)
+                    assessment_key = str(record.get("assessment_key") or "")
+                    if assessment_key:
+                        share_state["permission_index"][assessment_key] = assessment
+                    continue
+
+                if rec_type == "permission_entry":
+                    share_name = str(record.get("resource_name") or "").strip()
+                    share_type = str(record.get("share_type") or record.get("provider") or "smb")
+                    share_state = share_states.get((share_name, share_type))
+                    if share_state is None:
+                        continue
+                    assessment_key = str(record.get("assessment_key") or "")
+                    assessment = share_state["permission_index"].get(assessment_key)
+                    if assessment is None:
+                        # The stream contract requires assessment-before-entry.
+                        # Ignore an orphan instead of fabricating assessment state.
+                        continue
+                    entry = {
+                        key: value
+                        for key, value in record.items()
+                        if key
+                        not in {
+                            "type",
+                            "run_id",
+                            "endpoint_key",
+                            "resource_name",
+                            "resource_type",
+                            "share_type",
+                        }
+                    }
+                    assessment["entries"].append(entry)
 
         if endpoint is None:
             return None
@@ -894,6 +1113,13 @@ class NDJSONWriter:
                     "accessed_at",
                     "changed_at",
                     "file_attributes",
+                    "provider",
+                    "provider_item_id",
+                    "web_url",
+                    "mime_type",
+                    "deleted_state",
+                    "metadata",
+                    "permission_summary",
                 ):
                     if record.get(metadata_field) is not None:
                         node[metadata_field] = record[metadata_field]
@@ -907,6 +1133,11 @@ class NDJSONWriter:
         run_end = dict(self._run_end or {})
         summary = dict((run_end.get("stats") or {})) if isinstance(run_end.get("stats"), dict) else {}
         collection = dict(run_meta.get("collection") or {}) if isinstance(run_meta.get("collection"), dict) else {}
+        collection_context = (
+            dict(run_meta.get("collection_context") or {})
+            if isinstance(run_meta.get("collection_context"), dict)
+            else {}
+        )
         meta = {
             "tool": run_meta.get("tool"),
             "tool_version": run_meta.get("tool_version"),
@@ -918,11 +1149,15 @@ class NDJSONWriter:
         }
         target_fp.write("{")
         target_fp.write(f'"schema_version":{json.dumps(run_meta.get("schema_version", 1))}')
+        target_fp.write(',"artifact_features":')
+        json.dump(run_meta.get("artifact_features") or [], target_fp, ensure_ascii=True, separators=(",", ":"))
         target_fp.write(',"format":"share_sentinel_compact_json"')
         target_fp.write(',"meta":')
         json.dump(meta, target_fp, ensure_ascii=True, separators=(",", ":"))
         target_fp.write(',"collection":')
         json.dump(collection, target_fp, ensure_ascii=True, separators=(",", ":"))
+        target_fp.write(',"collection_context":')
+        json.dump(collection_context, target_fp, ensure_ascii=True, separators=(",", ":"))
         target_fp.write(',"summary":')
         json.dump(summary, target_fp, ensure_ascii=True, separators=(",", ":"))
         target_fp.write(',"issue_summary":')
@@ -1094,6 +1329,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum discovered directories and files sampled per SMB share for non-mutating access probes "
             "(0 disables explicit handle probes; directory listing evidence is still recorded)."
+        ),
+    )
+    tuning.add_argument(
+        "--smb-permissions",
+        choices=("none", "root", "sampled"),
+        default="root",
+        help=(
+            "Collect non-mutating SMB owner/group/DACL evidence using READ_CONTROL: "
+            "none disables it, root assesses only the share root (default), and sampled "
+            "also assesses a deterministic bounded set of visible directories and files."
+        ),
+    )
+    tuning.add_argument(
+        "--smb-permission-sample-limit",
+        type=int,
+        default=SMB_PERMISSION_DEFAULT_SAMPLE_LIMIT,
+        help=(
+            "Deterministic directory and file samples per SMB share in sampled mode "
+            f"(default: {SMB_PERMISSION_DEFAULT_SAMPLE_LIMIT}; maximum: {SMB_PERMISSION_MAX_SAMPLE_LIMIT})."
         ),
     )
     tuning.add_argument(
@@ -1382,6 +1636,9 @@ def _access_capability_snapshot(
     probes_aborted: bool = False,
     probe_abort_reason: str | None = None,
     share_presence: str = "unverified",
+    assessed_identity_fingerprint: str | None = None,
+    session_kind: str | None = None,
+    identity_source: str | None = None,
 ) -> dict[str, dict[str, object]]:
     snapshot: dict[str, dict[str, object]] = {}
     for capability, evidence in capabilities.items():
@@ -1418,6 +1675,12 @@ def _access_capability_snapshot(
     }
     if probe_abort_reason:
         snapshot["_metadata"]["probe_abort_reason"] = probe_abort_reason
+    if assessed_identity_fingerprint:
+        snapshot["_metadata"]["assessed_identity_fingerprint"] = assessed_identity_fingerprint
+    if session_kind:
+        snapshot["_metadata"]["session_kind"] = session_kind
+    if identity_source:
+        snapshot["_metadata"]["identity_source"] = identity_source
     return snapshot
 
 
@@ -1499,13 +1762,17 @@ def _smb_access_assessment(
         summary = "not_assessed"
 
     if transport_failed:
-        reason = "partial_transport_failure" if any(
-            (read_observed, list_observed, write_observed, control_observed, tree_observed)
-        ) else "transport_failure"
+        reason = (
+            "partial_transport_failure"
+            if any((read_observed, list_observed, write_observed, control_observed, tree_observed))
+            else "transport_failure"
+        )
     elif interrupted:
-        reason = "cancelled_after_observation" if any(
-            (read_observed, list_observed, write_observed, control_observed, tree_observed)
-        ) else "cancelled"
+        reason = (
+            "cancelled_after_observation"
+            if any((read_observed, list_observed, write_observed, control_observed, tree_observed))
+            else "cancelled"
+        )
     elif workflow_reason and (not workflow_finished or any_inconclusive):
         reason = workflow_reason
     elif listing_truncated:
@@ -1579,9 +1846,9 @@ def _smb_error_identity(exc: BaseException) -> tuple[int | None, tuple[int, int]
             # byte layout of one 32-bit NTSTATUS, not a DOS class/code pair.
             # Impacket exposes both views on the same packet; never publish the
             # split bytes as fabricated legacy evidence.
-            uses_nt_status = bool(
-                packet_flags2 is not None and packet_flags2 & SMB1_FLAGS2_NT_STATUS
-            ) or bool(status_code is not None and status_code > 0xFFFF)
+            uses_nt_status = bool(packet_flags2 is not None and packet_flags2 & SMB1_FLAGS2_NT_STATUS) or bool(
+                status_code is not None and status_code > 0xFFFF
+            )
             if uses_nt_status:
                 return status_code, None
             try:
@@ -1699,6 +1966,898 @@ def _smb_handle_path(path: str) -> str:
     return str(path or "").replace("/", "\\").strip("\\")
 
 
+def _normalized_identity_text(value: object) -> str:
+    return unicodedata.normalize("NFKC", str(value or "").strip()).casefold()
+
+
+def _stable_fingerprint(namespace: str, *parts: object) -> str:
+    payload = "\x00".join(_normalized_identity_text(part) for part in parts)
+    return f"{namespace}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _stable_case_preserving_fingerprint(namespace: str, *parts: object) -> str:
+    payload = "\x00".join(unicodedata.normalize("NFKC", str(part or "").strip()) for part in parts)
+    return f"{namespace}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _smb_server_identity(conn: SMBConnection, target: str) -> dict[str, object]:
+    """Return the strongest stable, non-secret server identity Impacket exposes."""
+
+    low_level = None
+    try:
+        low_level = conn.getSMBServer()
+    except Exception:
+        pass
+
+    server_guid: bytes | None = None
+    connection_state = getattr(low_level, "_Connection", None)
+    if connection_state is not None:
+        try:
+            candidate = connection_state["ServerGuid"]
+        except (IndexError, KeyError, TypeError):
+            candidate = None
+        if isinstance(candidate, (bytes, bytearray, memoryview)) and any(bytes(candidate)):
+            server_guid = bytes(candidate)
+
+    if server_guid is not None:
+        native_id = server_guid.hex()
+        return {
+            "provider_endpoint_id": _stable_fingerprint("smb-server-guid:v1", native_id),
+            "identity_source": "server_guid",
+            "identity_strength": "strong",
+            "server_guid": native_id,
+        }
+
+    advertised_names: list[str] = []
+    for owner in (conn, low_level):
+        if owner is None:
+            continue
+        for method_name in ("getServerName", "getRemoteName"):
+            method = getattr(owner, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                value = str(method() or "").strip()
+            except Exception:
+                continue
+            if value and _normalized_identity_text(value) not in {
+                _normalized_identity_text(candidate) for candidate in advertised_names
+            }:
+                advertised_names.append(value)
+    native_id = advertised_names[0] if advertised_names else target
+    return {
+        "provider_endpoint_id": _stable_fingerprint("smb-server-name:v1", native_id),
+        "identity_source": "advertised_name" if advertised_names else "scan_target",
+        "identity_strength": "moderate" if advertised_names else "weak",
+        "advertised_names": advertised_names[:4],
+    }
+
+
+def _smb_assessed_identity(
+    conn: SMBConnection,
+    args: argparse.Namespace,
+    attempted_auth: str,
+) -> dict[str, str]:
+    session_kind = attempted_auth
+    is_guest = getattr(conn, "isGuestSession", None)
+    if callable(is_guest):
+        try:
+            if bool(is_guest()):
+                session_kind = "guest"
+        except Exception:
+            pass
+    if session_kind in {"anonymous", "guest"}:
+        native_identity = session_kind
+    else:
+        username = str(getattr(args, "username", "") or "")
+        domain = str(getattr(args, "domain", "") or "")
+        native_identity = f"{domain}\\{username}" if domain else username
+    return {
+        "assessed_identity_fingerprint": _stable_fingerprint("smb-session-identity:v1", session_kind, native_identity),
+        "session_kind": session_kind,
+        "identity_source": ("server_session" if session_kind != attempted_auth else "requested_identity"),
+    }
+
+
+@dataclass
+class _SMBPermissionCandidateSelector:
+    resource_id: str
+    limit: int
+    directories: dict[str, tuple[str, str]] = field(default_factory=dict)
+    files: dict[str, tuple[str, str]] = field(default_factory=dict)
+
+    def consider(self, path: str, is_directory: bool) -> None:
+        if self.limit <= 0:
+            return
+        normalized_path = _smb_handle_path(path)
+        if not normalized_path:
+            return
+        # Case-sensitive Samba namespaces can legally expose names that differ
+        # only by case. Preserve case so deterministic sampling never merges
+        # two distinct provider objects.
+        canonical_path = unicodedata.normalize("NFKC", normalized_path.replace("/", "\\"))
+        subject_kind = "directory" if is_directory else "file"
+        score = hashlib.sha256(f"{self.resource_id}\x00{subject_kind}\x00{canonical_path}".encode("utf-8")).hexdigest()
+        candidates = self.directories if is_directory else self.files
+        candidates.setdefault(canonical_path, (score, normalized_path))
+        if len(candidates) > self.limit:
+            worst_key = max(candidates, key=lambda key: (candidates[key][0], key))
+            del candidates[worst_key]
+
+    def selected(self) -> list[tuple[str, bool]]:
+        selected: list[tuple[str, bool, str]] = []
+        selected.extend((path, True, score) for score, path in self.directories.values())
+        selected.extend((path, False, score) for score, path in self.files.values())
+        return [(path, is_directory) for path, is_directory, _ in sorted(selected, key=lambda row: (row[2], row[0]))]
+
+
+def _parse_smb_sid(data: bytes, offset: int, end: int) -> tuple[dict[str, object], int]:
+    if offset < 0 or end > len(data) or offset + 8 > end:
+        raise ValueError("SID header is outside the bounded record")
+    revision = data[offset]
+    subauthority_count = data[offset + 1]
+    if subauthority_count > 15:
+        raise ValueError("SID sub-authority count exceeds the Windows limit")
+    sid_size = 8 + (subauthority_count * 4)
+    if offset + sid_size > end:
+        raise ValueError("SID extends beyond the bounded record")
+    identifier_authority = int.from_bytes(data[offset + 2 : offset + 8], "big")
+    subauthorities = [
+        struct.unpack_from("<L", data, offset + 8 + (index * 4))[0] for index in range(subauthority_count)
+    ]
+    native_id = f"S-{revision}-{identifier_authority}"
+    if subauthorities:
+        native_id += "-" + "-".join(str(value) for value in subauthorities)
+    principal_key = _stable_fingerprint("smb-principal:v1", native_id)
+    known_name = SMB_WELL_KNOWN_SIDS.get(native_id)
+    principal: dict[str, object] = {
+        "provider": "smb",
+        "identifier_namespace": "windows_sid",
+        "principal_key": principal_key,
+        "kind": "well_known" if known_name else "unknown",
+        "native_id": native_id,
+        "authority": "windows_sid",
+        "resolution": "well_known" if known_name else "unresolved_sid",
+    }
+    if known_name:
+        principal["display_name"] = known_name
+        principal["aliases"] = [known_name]
+    return principal, sid_size
+
+
+def _decoded_smb_rights(mask: int) -> list[str]:
+    return [name for bit, name in SMB_FILE_RIGHTS if mask & bit]
+
+
+def _smb_ace_sid_offset(ace: bytes, layout: str) -> tuple[int | None, dict[str, object]]:
+    details: dict[str, object] = {}
+    if layout in {"simple", "callback"}:
+        return 8, details
+    if layout == "compound":
+        if len(ace) < 12:
+            raise ValueError("compound ACE header is truncated")
+        compound_type, reserved = struct.unpack_from("<HH", ace, 8)
+        details.update({"compound_type": compound_type, "compound_reserved": reserved})
+        return 12, details
+    if layout in {"object", "callback_object"}:
+        if len(ace) < 12:
+            raise ValueError("object ACE header is truncated")
+        object_flags = struct.unpack_from("<L", ace, 8)[0]
+        details["object_flags"] = object_flags
+        sid_offset = 12
+        if object_flags & 0x1:
+            if sid_offset + 16 > len(ace):
+                raise ValueError("object ACE object GUID is truncated")
+            details["object_type_guid"] = str(uuid.UUID(bytes_le=ace[sid_offset : sid_offset + 16]))
+            sid_offset += 16
+        if object_flags & 0x2:
+            if sid_offset + 16 > len(ace):
+                raise ValueError("object ACE inherited GUID is truncated")
+            details["inherited_object_type_guid"] = str(uuid.UUID(bytes_le=ace[sid_offset : sid_offset + 16]))
+            sid_offset += 16
+        return sid_offset, details
+    return None, details
+
+
+def _parse_smb_security_descriptor(raw_descriptor: object) -> dict[str, object]:
+    """Parse a bounded self-relative SD without retaining raw or SACL data."""
+
+    try:
+        descriptor = bytes(raw_descriptor)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("security descriptor response is not bytes") from exc
+    if len(descriptor) < 20:
+        raise ValueError("security descriptor header is truncated")
+    if len(descriptor) > SMB_PERMISSION_MAX_DESCRIPTOR_BYTES:
+        raise ValueError("security descriptor exceeds the reviewed byte limit")
+
+    revision, reserved, control, owner_offset, group_offset, _sacl_offset, dacl_offset = struct.unpack_from(
+        "<BBHLLLL", descriptor, 0
+    )
+    if not control & SMB_SECURITY_DESCRIPTOR_SELF_RELATIVE:
+        raise ValueError("security descriptor is not self-relative")
+    details: dict[str, object] = {
+        "descriptor_revision": revision,
+        "descriptor_control_retained": control & SMB_SECURITY_DESCRIPTOR_RETAINED_CONTROL_MASK,
+        "descriptor_control_flags": [
+            label for bit, label in SMB_SECURITY_DESCRIPTOR_CONTROL_FLAGS.items() if control & bit
+        ],
+        "descriptor_size": len(descriptor),
+        "reserved_byte": reserved,
+        "sacl_requested": False,
+        "sacl_retained": False,
+    }
+    limitations: list[str] = [
+        "raw_security_descriptor_not_retained",
+        "sacl_not_requested",
+        "effective_access_not_computed",
+        "sid_names_not_resolved_except_well_known",
+    ]
+    errors: list[dict[str, str]] = []
+    unknown_entries = 0
+    if revision != 1:
+        errors.append({"code": "unsupported_descriptor_revision", "message": f"revision {revision} is unsupported"})
+    if reserved != 0:
+        errors.append({"code": "invalid_descriptor_reserved_byte", "message": "reserved descriptor byte is non-zero"})
+
+    for label, offset in (("owner", owner_offset), ("group", group_offset)):
+        if offset == 0:
+            details[f"{label}_state"] = "not_returned"
+            continue
+        try:
+            principal, _ = _parse_smb_sid(descriptor, offset, len(descriptor))
+        except ValueError as exc:
+            details[f"{label}_state"] = "malformed"
+            errors.append({"code": f"malformed_{label}_sid", "message": str(exc)})
+        else:
+            details[label] = principal
+            details[f"{label}_state"] = "observed"
+
+    dacl_present = bool(control & SMB_SECURITY_DESCRIPTOR_DACL_PRESENT)
+    entries: list[dict[str, object]] = []
+    entry_set_hasher = hashlib.sha256()
+    entries_parsed = 0
+    entries_expected = 0
+    truncated = False
+    if not dacl_present:
+        details["dacl_state"] = "absent"
+    elif dacl_offset == 0:
+        details["dacl_state"] = "null"
+        limitations.append("null_dacl_observed_no_effective_access_conclusion")
+    elif dacl_offset < 20 or dacl_offset + 8 > len(descriptor):
+        details["dacl_state"] = "malformed"
+        errors.append({"code": "malformed_dacl_offset", "message": "DACL offset is outside the descriptor"})
+    else:
+        acl_revision, acl_reserved, acl_size, ace_count, acl_reserved2 = struct.unpack_from(
+            "<BBHHH", descriptor, dacl_offset
+        )
+        details.update(
+            {
+                "dacl_revision": acl_revision,
+                "dacl_reserved_byte": acl_reserved,
+                "dacl_reserved_word": acl_reserved2,
+                "dacl_size": acl_size,
+                "dacl_ace_count": ace_count,
+            }
+        )
+        if acl_revision not in {2, 4}:
+            errors.append(
+                {"code": "unsupported_acl_revision", "message": f"ACL revision {acl_revision} is unsupported"}
+            )
+        entries_expected = ace_count
+        acl_end = dacl_offset + acl_size
+        if acl_size < 8 or acl_end > len(descriptor):
+            details["dacl_state"] = "malformed"
+            unknown_entries = ace_count
+            truncated = ace_count > 0
+            errors.append({"code": "malformed_dacl_size", "message": "DACL size is outside the descriptor"})
+        else:
+            details["dacl_state"] = "empty" if ace_count == 0 else "present"
+            ace_offset = dacl_offset + 8
+            scan_count = min(ace_count, SMB_PERMISSION_MAX_ACE_HEADERS)
+            if ace_count > scan_count:
+                truncated = True
+                unknown_entries += ace_count - scan_count
+                limitations.append("ace_header_scan_limit_reached")
+            for ordinal in range(scan_count):
+                if ace_offset + 4 > acl_end:
+                    errors.append({"code": "truncated_ace_header", "message": f"ACE {ordinal} header is truncated"})
+                    unknown_entries += max(1, scan_count - ordinal)
+                    break
+                ace_type, ace_flags, ace_size = struct.unpack_from("<BBH", descriptor, ace_offset)
+                if ace_size < 4 or ace_offset + ace_size > acl_end:
+                    errors.append({"code": "invalid_ace_size", "message": f"ACE {ordinal} has an invalid size"})
+                    unknown_entries += max(1, scan_count - ordinal)
+                    break
+                ace = descriptor[ace_offset : ace_offset + ace_size]
+                entries_parsed += 1
+                ace_name, effect, layout = SMB_ACE_TYPES.get(ace_type, ("unknown", "unknown", "unknown"))
+                provider_details: dict[str, object] = {
+                    "ace_type": ace_name,
+                    "ace_type_code": ace_type,
+                    "ace_flags": ace_flags,
+                    "ace_flag_names": [label for bit, label in SMB_ACE_FLAG_NAMES.items() if ace_flags & bit],
+                    "ace_size": ace_size,
+                }
+                mask: int | None = None
+                principal: dict[str, object] | None = None
+                application_data_present = False
+                parse_error: str | None = None
+                if ace_size >= 8:
+                    mask = struct.unpack_from("<L", ace, 4)[0]
+                    provider_details["access_mask"] = f"0x{mask:08X}"
+                try:
+                    sid_offset, layout_details = _smb_ace_sid_offset(ace, layout)
+                    provider_details.update(layout_details)
+                    if sid_offset is not None:
+                        principal, sid_size = _parse_smb_sid(ace, sid_offset, len(ace))
+                        application_data_present = sid_offset + sid_size < len(ace)
+                except ValueError as exc:
+                    parse_error = str(exc)
+                if application_data_present:
+                    provider_details["application_data_present"] = True
+                    provider_details["application_data_retained"] = False
+                if application_data_present or parse_error or ace_name == "unknown" or principal is None:
+                    unknown_entries += 1
+                    if parse_error:
+                        provider_details["parse_error"] = parse_error
+                normalized_rights = _decoded_smb_rights(mask) if mask is not None else []
+                evidence_payload = {
+                    "ordinal": ordinal,
+                    "type": ace_type,
+                    "flags": ace_flags,
+                    "mask": mask,
+                    "sid": principal.get("native_id") if principal else None,
+                    "compound_type": provider_details.get("compound_type"),
+                    "object_flags": provider_details.get("object_flags"),
+                    "object_type_guid": provider_details.get("object_type_guid"),
+                    "inherited_object_type_guid": provider_details.get("inherited_object_type_guid"),
+                    "application_data_present": application_data_present,
+                    "parse_error": parse_error,
+                }
+                evidence_hash = hashlib.sha256(
+                    json.dumps(evidence_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                entry_set_hasher.update(evidence_hash.encode("ascii"))
+                entry_set_hasher.update(b"\n")
+                if len(entries) < SMB_PERMISSION_MAX_ACES_PER_DESCRIPTOR:
+                    entries.append(
+                        {
+                            "ordinal": ordinal,
+                            "principal_key": principal.get("principal_key") if principal else None,
+                            "principal": principal,
+                            "entry_kind": "ace",
+                            "effect": effect,
+                            "normalized_rights": normalized_rights,
+                            "inherited_state": "inherited" if ace_flags & 0x10 else "not_inherited",
+                            "expiration_at": None,
+                            "evidence_hash": evidence_hash,
+                            "provider_details": provider_details,
+                        }
+                    )
+                else:
+                    truncated = True
+                ace_offset += ace_size
+
+    if entries_parsed > SMB_PERMISSION_MAX_ACES_PER_DESCRIPTOR:
+        limitations.append("ace_emission_limit_reached")
+    entries_emitted = len(entries)
+    entries_omitted = max(0, entries_expected - entries_emitted)
+    if entries_omitted:
+        truncated = True
+    if unknown_entries:
+        limitations.append("one_or_more_aces_not_fully_interpreted")
+    # A DACL's zero-entry states are not interchangeable: a NULL DACL, an
+    # empty DACL, and a descriptor with no DACL present have materially
+    # different Windows authorization semantics even though all three contain
+    # no ACE bytes.  Bind the ordered ACE digest to the stable descriptor facts
+    # that define the observed permission surface.  Owner/group SIDs are also
+    # included because they were explicitly requested and ownership affects who
+    # can administer the DACL.  No raw descriptor or SACL material is retained.
+    entry_set_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "contract": "smb_windows_acl_v1",
+                "descriptor_revision": details.get("descriptor_revision"),
+                "descriptor_control_retained": details.get("descriptor_control_retained"),
+                "owner_sid": (
+                    details.get("owner", {}).get("native_id") if isinstance(details.get("owner"), dict) else None
+                ),
+                "group_sid": (
+                    details.get("group", {}).get("native_id") if isinstance(details.get("group"), dict) else None
+                ),
+                "dacl_state": details.get("dacl_state", "unknown"),
+                "dacl_revision": details.get("dacl_revision"),
+                "dacl_ace_count": details.get("dacl_ace_count"),
+                "ordered_ace_digest": entry_set_hasher.hexdigest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    descriptor_evidence = {
+        "descriptor_revision": details.get("descriptor_revision"),
+        "descriptor_control_retained": details.get("descriptor_control_retained"),
+        "owner_sid": (details.get("owner", {}).get("native_id") if isinstance(details.get("owner"), dict) else None),
+        "group_sid": (details.get("group", {}).get("native_id") if isinstance(details.get("group"), dict) else None),
+        "dacl_state": details.get("dacl_state", "unknown"),
+        "dacl_ace_count": details.get("dacl_ace_count"),
+        "entry_set_hash": entry_set_hash,
+        "error_codes": [error["code"] for error in errors],
+        "truncated": truncated,
+    }
+    evidence_hash = hashlib.sha256(
+        json.dumps(descriptor_evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "provider_details": details,
+        "permission_summary": {
+            "dacl_state": details.get("dacl_state", "unknown"),
+            "owner_observed": details.get("owner_state") == "observed",
+            "group_observed": details.get("group_state") == "observed",
+            "entries_observed": entries_expected,
+            "entries_parsed": entries_parsed,
+            "entries_emitted": entries_emitted,
+            "entries_omitted": entries_omitted,
+            "unknown_entries": unknown_entries,
+            "truncated": truncated,
+            "entry_set_hash": entry_set_hash,
+            "evidence_hash": evidence_hash,
+        },
+        "entries": entries,
+        "entries_observed": entries_expected,
+        "entries_emitted": entries_emitted,
+        "entries_omitted": entries_omitted,
+        "unknown_entries": unknown_entries,
+        "entry_set_hash": entry_set_hash,
+        "evidence_hash": evidence_hash,
+        "truncated": truncated,
+        "limitations": list(dict.fromkeys(limitations))[:SMB_PERMISSION_MAX_LIMITATIONS],
+        "errors": errors[:SMB_PERMISSION_MAX_ERRORS],
+    }
+
+
+def _smb_permission_assessment_base(
+    *,
+    run_id: str,
+    endpoint_key: str,
+    resource_name: str,
+    provider_resource_id: str,
+    subject_kind: str,
+    subject_path: str,
+    assessed_identity: dict[str, str],
+    selection_scope: str,
+) -> dict[str, object]:
+    subject_id = _stable_case_preserving_fingerprint(
+        "smb-object:v1", provider_resource_id, subject_kind, _smb_handle_path(subject_path)
+    )
+    assessment_key = _stable_fingerprint(
+        "permission-assessment:v1",
+        provider_resource_id,
+        subject_id,
+        assessed_identity["assessed_identity_fingerprint"],
+        SMB_PERMISSION_SEMANTICS,
+        SMB_PERMISSION_METHOD,
+        selection_scope,
+    )
+    record: dict[str, object] = {
+        "type": "permission_assessment",
+        "run_id": run_id,
+        "assessment_key": assessment_key,
+        "provider": "smb",
+        "semantics": SMB_PERMISSION_SEMANTICS,
+        "permission_surface": SMB_PERMISSION_SURFACE,
+        "endpoint_key": endpoint_key,
+        "share_type": "smb",
+        "resource_type": "smb_share",
+        "resource_name": resource_name,
+        "provider_resource_id": provider_resource_id,
+        "subject_id": subject_id,
+        "subject_kind": subject_kind,
+        "subject_path": "\\" if not _smb_handle_path(subject_path) else f"\\{_smb_handle_path(subject_path)}",
+        "assessed_identity_fingerprint": assessed_identity["assessed_identity_fingerprint"],
+        "selection_scope": selection_scope,
+        "selection_coverage": ("exhaustive_for_scope" if selection_scope == "share_root" else "deterministic_sample"),
+        "method": SMB_PERMISSION_METHOD,
+        "non_mutating": True,
+        "effective_access_status": "not_computed",
+        "negative_conclusion_supported": False,
+        "observed_at": datetime.now(tz=UTC).isoformat(),
+        "limitations": [],
+        "errors": [],
+        "provider_details": {
+            "subject_path": "\\" if not _smb_handle_path(subject_path) else f"\\{_smb_handle_path(subject_path)}",
+            "assessed_identity_fingerprint": assessed_identity["assessed_identity_fingerprint"],
+            "session_kind": assessed_identity["session_kind"],
+            "identity_source": assessed_identity["identity_source"],
+            "requested_access": "READ_CONTROL",
+            "requested_security_information": ["owner", "group", "dacl"],
+            "sacl_requested": False,
+        },
+    }
+    return record
+
+
+def _query_smb_security_descriptor(
+    conn: SMBConnection,
+    tree_id: object,
+    path: str,
+    *,
+    is_directory: bool,
+    root_path_hint: str | None,
+    cancel_event: threading.Event | None,
+) -> dict[str, object]:
+    if cancel_event is not None and cancel_event.is_set():
+        return {"error_code": "cancelled", "stage": "before_open"}
+
+    open_file = getattr(conn, "openFile", None)
+    if not callable(open_file):
+        return {"error_code": "probe_method_unavailable", "stage": "open"}
+    normalized_path = _smb_handle_path(path)
+    candidate_paths = [root_path_hint] if not normalized_path and root_path_hint is not None else [normalized_path]
+    if not normalized_path and root_path_hint is None:
+        candidate_paths.append("\\")
+
+    file_id = None
+    used_path = normalized_path
+    result: dict[str, object] = {}
+    try:
+        for candidate_index, candidate_path in enumerate(candidate_paths):
+            used_path = str(candidate_path or "")
+            try:
+                file_id = open_file(
+                    tree_id,
+                    used_path,
+                    desiredAccess=READ_CONTROL,
+                    shareMode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    creationOption=FILE_DIRECTORY_FILE if is_directory else FILE_NON_DIRECTORY_FILE,
+                    creationDisposition=FILE_OPEN,
+                )
+            except (SessionError, NetBIOSError, NetBIOSTimeout, socket.timeout, TimeoutError, OSError) as exc:
+                classification = _classify_smb_probe_failure(exc)
+                if (
+                    candidate_index == 0
+                    and len(candidate_paths) > 1
+                    and classification.root_path_fallback
+                    and not classification.transport_fatal
+                ):
+                    continue
+                return {
+                    "error": exc,
+                    "classification": classification,
+                    "error_code": (
+                        "permission_read_denied" if classification.outcome == "denied" else classification.reason_code
+                    ),
+                    "stage": "open",
+                    "handle_path": used_path,
+                }
+            break
+
+        if file_id is None:
+            return {"error_code": "handle_open_failed", "stage": "open", "handle_path": used_path}
+        if cancel_event is not None and cancel_event.is_set():
+            result.update({"error_code": "cancelled", "stage": "before_query", "handle_path": used_path})
+            return result
+
+        try:
+            low_level = conn.getSMBServer()
+        except Exception as exc:
+            result.update(
+                {
+                    "error": exc,
+                    "classification": _classify_smb_probe_failure(exc),
+                    "error_code": "protocol_adapter_unavailable",
+                    "stage": "query",
+                    "handle_path": used_path,
+                }
+            )
+            return result
+        query_sec_info = getattr(low_level, "query_sec_info", None)
+        query_info = getattr(low_level, "queryInfo", None)
+        try:
+            if callable(query_sec_info):
+                descriptor = query_sec_info(
+                    tree_id,
+                    file_id,
+                    additional_information=SMB_PERMISSION_REQUESTED_INFORMATION,
+                )
+                protocol = "smb1_nt_trans_query_security_desc"
+            elif callable(query_info):
+                descriptor = query_info(
+                    tree_id,
+                    file_id,
+                    inputBlob="",
+                    infoType=SMB2_0_INFO_SECURITY,
+                    fileInfoClass=SMB2_SEC_INFO_00,
+                    additionalInformation=SMB_PERMISSION_REQUESTED_INFORMATION,
+                    flags=0,
+                )
+                protocol = "smb2_query_info_security"
+            else:
+                result.update(
+                    {
+                        "error_code": "security_query_method_unavailable",
+                        "stage": "query",
+                        "handle_path": used_path,
+                    }
+                )
+                return result
+        except (SessionError, NetBIOSError, NetBIOSTimeout, socket.timeout, TimeoutError, OSError) as exc:
+            classification = _classify_smb_probe_failure(exc)
+            result.update(
+                {
+                    "error": exc,
+                    "classification": classification,
+                    "error_code": (
+                        "permission_read_denied" if classification.outcome == "denied" else classification.reason_code
+                    ),
+                    "stage": "query",
+                    "handle_path": used_path,
+                }
+            )
+            return result
+        except Exception as exc:
+            result.update(
+                {
+                    "error": exc,
+                    "classification": _classify_smb_probe_failure(exc),
+                    "error_code": "security_descriptor_response_invalid",
+                    "stage": "query",
+                    "handle_path": used_path,
+                }
+            )
+            return result
+        result.update({"descriptor": descriptor, "protocol": protocol, "handle_path": used_path})
+        return result
+    finally:
+        if file_id is not None:
+            close_file = getattr(conn, "closeFile", None)
+            if callable(close_file):
+                try:
+                    close_file(tree_id, file_id)
+                except Exception as exc:
+                    result["close_error"] = exc
+
+
+def _build_smb_permission_records(
+    conn: SMBConnection,
+    tree_id: object | None,
+    *,
+    run_id: str,
+    endpoint_key: str,
+    resource_name: str,
+    provider_resource_id: str,
+    subject_path: str,
+    is_directory: bool,
+    assessed_identity: dict[str, str],
+    selection_scope: str,
+    entry_budget: int,
+    root_path_hint: str | None,
+    cancel_event: threading.Event | None,
+    unavailable_reason: str | None = None,
+) -> tuple[dict[str, object], list[dict[str, object]], bool]:
+    subject_kind = "share_root" if selection_scope == "share_root" else ("directory" if is_directory else "file")
+    assessment = _smb_permission_assessment_base(
+        run_id=run_id,
+        endpoint_key=endpoint_key,
+        resource_name=resource_name,
+        provider_resource_id=provider_resource_id,
+        subject_kind=subject_kind,
+        subject_path=subject_path,
+        assessed_identity=assessed_identity,
+        selection_scope=selection_scope,
+    )
+    assessment_key = str(assessment["assessment_key"])
+    if tree_id is None:
+        query_result: dict[str, object] = {
+            "error_code": unavailable_reason or "tree_unavailable",
+            "stage": "tree_connect",
+        }
+    else:
+        query_result = _query_smb_security_descriptor(
+            conn,
+            tree_id,
+            subject_path,
+            is_directory=is_directory,
+            root_path_hint=root_path_hint,
+            cancel_event=cancel_event,
+        )
+
+    error_code = str(query_result.get("error_code") or "")
+    if error_code:
+        classification = query_result.get("classification")
+        denied = isinstance(classification, _SMBProbeClassification) and classification.outcome == "denied"
+        transport_fatal = bool(isinstance(classification, _SMBProbeClassification) and classification.transport_fatal)
+        error = query_result.get("error")
+        message = _error_detail(error)[:512] if isinstance(error, BaseException) else error_code.replace("_", " ")
+        error_record: dict[str, object] = {
+            "code": error_code,
+            "stage": str(query_result.get("stage") or "query"),
+            "message": message,
+        }
+        if isinstance(classification, _SMBProbeClassification) and classification.protocol_status:
+            error_record["protocol_status"] = classification.protocol_status
+        errors = [error_record]
+        limitations = ["direct_acl_not_retrieved", "effective_access_not_computed"]
+        close_error = query_result.get("close_error")
+        if isinstance(close_error, BaseException):
+            close_classification = _classify_smb_probe_failure(close_error)
+            transport_fatal = transport_fatal or close_classification.transport_fatal
+            errors.append(
+                {
+                    "code": "handle_close_failed",
+                    "stage": "cleanup",
+                    "message": _error_detail(close_error)[:512],
+                }
+            )
+            limitations.append("handle_cleanup_failed_session_will_be_closed")
+        assessment.update(
+            {
+                "outcome": "denied" if denied else "inconclusive",
+                "assessment_state": "failed",
+                "retrieval_coverage": "failed",
+                "provider_visibility": "denied" if denied else "unknown",
+                "semantic_coverage": "not_observed",
+                "principal_resolution": "not_attempted",
+                "entries_observed": 0,
+                "entries_emitted": 0,
+                "entries_omitted": 0,
+                "unknown_entries": 0,
+                "entry_set_hash": None,
+                "truncated": False,
+                "error_code": error_code,
+                "errors": errors[:SMB_PERMISSION_MAX_ERRORS],
+                "limitations": limitations[:SMB_PERMISSION_MAX_LIMITATIONS],
+                "permission_summary": {
+                    "assessment_state": "failed",
+                    "entries_observed": 0,
+                    "entries_emitted": 0,
+                    "truncated": False,
+                },
+            }
+        )
+        assessment["provider_details"].update(
+            {
+                "failure_stage": str(query_result.get("stage") or "query"),
+                "handle_path_variant": "root_marker" if query_result.get("handle_path") == "\\" else "relative",
+            }
+        )
+        return assessment, [], transport_fatal
+
+    try:
+        parsed = _parse_smb_security_descriptor(query_result.get("descriptor"))
+    except ValueError as exc:
+        errors: list[dict[str, object]] = [
+            {
+                "code": "security_descriptor_parse_failed",
+                "stage": "parse",
+                "message": str(exc)[:512],
+            }
+        ]
+        limitations = ["direct_acl_not_parsed", "effective_access_not_computed"]
+        close_error = query_result.get("close_error")
+        close_transport_fatal = False
+        if isinstance(close_error, BaseException):
+            close_transport_fatal = _classify_smb_probe_failure(close_error).transport_fatal
+            errors.append(
+                {
+                    "code": "handle_close_failed",
+                    "stage": "cleanup",
+                    "message": _error_detail(close_error)[:512],
+                }
+            )
+            limitations.append("handle_cleanup_failed_session_will_be_closed")
+        assessment.update(
+            {
+                "outcome": "inconclusive",
+                "assessment_state": "failed",
+                "retrieval_coverage": "failed",
+                "provider_visibility": "provider_visible",
+                "semantic_coverage": "not_observed",
+                "principal_resolution": "not_attempted",
+                "entries_observed": 0,
+                "entries_emitted": 0,
+                "entries_omitted": 0,
+                "unknown_entries": 0,
+                "entry_set_hash": None,
+                "truncated": False,
+                "error_code": "security_descriptor_parse_failed",
+                "errors": errors[:SMB_PERMISSION_MAX_ERRORS],
+                "limitations": limitations[:SMB_PERMISSION_MAX_LIMITATIONS],
+                "permission_summary": {
+                    "assessment_state": "failed",
+                    "entries_observed": 0,
+                    "entries_emitted": 0,
+                    "truncated": False,
+                },
+            }
+        )
+        return assessment, [], close_transport_fatal
+
+    all_entries = list(parsed["entries"])
+    allowed_entries = all_entries[: max(0, entry_budget)]
+    budget_omitted = len(all_entries) - len(allowed_entries)
+    entries_omitted = int(parsed["entries_omitted"]) + budget_omitted
+    truncated = bool(parsed["truncated"] or budget_omitted)
+    limitations = list(parsed["limitations"])
+    if budget_omitted:
+        limitations.append("share_permission_entry_limit_reached")
+    errors = list(parsed["errors"])
+    close_error = query_result.get("close_error")
+    if isinstance(close_error, BaseException):
+        errors.append(
+            {
+                "code": "handle_close_failed",
+                "stage": "cleanup",
+                "message": _error_detail(close_error)[:512],
+            }
+        )
+        limitations.append("handle_cleanup_failed_session_will_be_closed")
+    assessment_state = "partial" if truncated or errors or int(parsed["unknown_entries"]) > 0 else "complete"
+    assessment.update(
+        {
+            "outcome": "observed",
+            "assessment_state": assessment_state,
+            "retrieval_coverage": "partial" if assessment_state == "partial" else "complete",
+            "provider_visibility": "provider_visible",
+            "semantic_coverage": "acl_structure_only",
+            "principal_resolution": "well_known_only",
+            "negative_conclusion_supported": assessment_state == "complete",
+            "entries_observed": int(parsed["entries_observed"]),
+            "entries_emitted": len(allowed_entries),
+            "entries_omitted": entries_omitted,
+            "unknown_entries": int(parsed["unknown_entries"]),
+            "entry_set_hash": parsed["entry_set_hash"],
+            "evidence_hash": parsed["evidence_hash"],
+            "truncated": truncated,
+            "limitations": list(dict.fromkeys(limitations))[:SMB_PERMISSION_MAX_LIMITATIONS],
+            "errors": errors[:SMB_PERMISSION_MAX_ERRORS],
+            "error_code": errors[0]["code"] if errors else None,
+            "permission_summary": {
+                **parsed["permission_summary"],
+                "assessment_state": assessment_state,
+                "entries_emitted": len(allowed_entries),
+                "entries_omitted": entries_omitted,
+                "truncated": truncated,
+            },
+        }
+    )
+    assessment["provider_details"].update(parsed["provider_details"])
+    assessment["provider_details"].update(
+        {
+            "query_protocol": query_result.get("protocol"),
+            "handle_path_variant": "root_marker" if query_result.get("handle_path") == "\\" else "relative",
+        }
+    )
+
+    entry_records: list[dict[str, object]] = []
+    for entry in allowed_entries:
+        evidence_hash = str(entry["evidence_hash"])
+        entry_key = _stable_fingerprint("permission-entry:v1", assessment_key, entry["ordinal"], evidence_hash)
+        entry_records.append(
+            {
+                "type": "permission_entry",
+                "run_id": run_id,
+                "assessment_key": assessment_key,
+                "entry_key": entry_key,
+                "provider": "smb",
+                "semantics": SMB_PERMISSION_SEMANTICS,
+                "permission_surface": SMB_PERMISSION_SURFACE,
+                "endpoint_key": endpoint_key,
+                "share_type": "smb",
+                "resource_type": "smb_share",
+                "resource_name": resource_name,
+                "provider_resource_id": provider_resource_id,
+                **entry,
+            }
+        )
+    close_error = query_result.get("close_error")
+    close_transport_fatal = bool(
+        isinstance(close_error, BaseException) and _classify_smb_probe_failure(close_error).transport_fatal
+    )
+    return assessment, entry_records, close_transport_fatal
+
+
 def _probe_smb_handle_access(
     conn: SMBConnection,
     tree_id: object,
@@ -1711,9 +2870,7 @@ def _probe_smb_handle_access(
     cancel_event: threading.Event | None,
     probe_circuit: _SMBProbeCircuit | None = None,
 ) -> None:
-    if (cancel_event is not None and cancel_event.is_set()) or (
-        probe_circuit is not None and probe_circuit.blocked
-    ):
+    if (cancel_event is not None and cancel_event.is_set()) or (probe_circuit is not None and probe_circuit.blocked):
         return
     open_file = getattr(conn, "openFile", None)
     if not callable(open_file):
@@ -2363,6 +3520,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     max_depth = int(getattr(args, "max_depth", 1))
     max_entries_per_share = int(getattr(args, "max_entries_per_share", 1))
     access_probe_limit = int(getattr(args, "access_probe_limit", 3))
+    smb_permission_sample_limit = int(getattr(args, "smb_permission_sample_limit", SMB_PERMISSION_DEFAULT_SAMPLE_LIMIT))
     max_targets = int(getattr(args, "max_targets", 65536))
     max_artifact_bytes = int(getattr(args, "max_artifact_bytes", DEFAULT_MAX_ARTIFACT_BYTES))
     progress_interval = float(getattr(args, "progress_interval", 5.0))
@@ -2470,6 +3628,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--max-entries-per-share must be greater than zero")
     if access_probe_limit < 0 or access_probe_limit > 100:
         raise SystemExit("--access-probe-limit must be between 0 and 100")
+    if smb_permission_sample_limit < 0 or smb_permission_sample_limit > SMB_PERMISSION_MAX_SAMPLE_LIMIT:
+        raise SystemExit(f"--smb-permission-sample-limit must be between 0 and {SMB_PERMISSION_MAX_SAMPLE_LIMIT}")
+    if (
+        "smb" in selected_share_types
+        and getattr(args, "smb_permissions", "root") == "sampled"
+        and smb_permission_sample_limit <= 0
+    ):
+        raise SystemExit("--smb-permission-sample-limit must be greater than zero in sampled mode")
     if max_targets < 0:
         raise SystemExit("--max-targets must be zero or greater")
     if max_artifact_bytes < 0:
@@ -2753,6 +3919,8 @@ def scan_host_smb(
         if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
             return False
 
+        server_identity = _smb_server_identity(conn, host)
+        assessed_identity = _smb_assessed_identity(conn, args, attempted_auth)
         endpoint_record = {
             "type": "endpoint",
             "run_id": run_id,
@@ -2760,6 +3928,20 @@ def scan_host_smb(
             "ip": host if _is_ip(host) else None,
             "hostname": host if not _is_ip(host) else None,
             "domain": args.domain or None,
+            "provider": "smb",
+            "provider_endpoint_id": server_identity["provider_endpoint_id"],
+            "metadata": {
+                "identity_source": server_identity["identity_source"],
+                "identity_strength": server_identity["identity_strength"],
+                "assessed_identity_fingerprint": assessed_identity["assessed_identity_fingerprint"],
+                "session_kind": assessed_identity["session_kind"],
+                "session_identity_source": assessed_identity["identity_source"],
+                **(
+                    {"server_guid": server_identity["server_guid"]}
+                    if server_identity.get("server_guid")
+                    else {"advertised_names": server_identity.get("advertised_names", [])}
+                ),
+            },
             "smb": {
                 "dialect": _dialect_label(str(conn.getDialect())),
                 "signing": _signing_label(conn),
@@ -2773,6 +3955,28 @@ def scan_host_smb(
         writer.emit(endpoint_record)
         with lock:
             stats.endpoints += 1
+
+        # Some SMB servers accept invalid or unauthorized credentials by
+        # silently downgrading the connection to a guest session.  Treating
+        # that observation as the requested identity can turn shares hidden
+        # from guest into false, confirmed removals during run comparison.
+        if attempted_auth in {"ntlm", "kerberos"} and assessed_identity["session_kind"] == "guest":
+            message = (
+                f"SMB {attempted_auth} authentication was downgraded to a guest session; "
+                "results do not represent the requested identity."
+            )
+            _emit_error(
+                writer,
+                run_id,
+                severity="warn",
+                code="SMB_AUTH_GUEST_FALLBACK",
+                message=message,
+                endpoint_key=endpoint_key,
+                hint=("Verify the credentials and server guest-fallback policy, then rerun before comparing coverage."),
+            )
+            _record_error(stats, lock, "SMB_AUTH_GUEST_FALLBACK", message)
+            with lock:
+                stats.structural_coverage_gaps += 1
 
         excluded_shares = {s.upper() for s in args.exclude_share}
         include_shares = list(
@@ -2795,11 +3999,7 @@ def scan_host_smb(
                     classification.outcome == "denied"
                     and classification.reason_code in SMB_SHARE_ENUMERATION_DENIAL_REASONS
                 )
-                protocol_suffix = (
-                    f", status={classification.protocol_status}"
-                    if classification.protocol_status
-                    else ""
-                )
+                protocol_suffix = f", status={classification.protocol_status}" if classification.protocol_status else ""
                 message = (
                     "SMB share enumeration denied"
                     if access_denied
@@ -2827,6 +4027,9 @@ def scan_host_smb(
                     hint=hint,
                 )
                 _record_error(stats, lock, code, message)
+                if access_denied:
+                    with lock:
+                        stats.structural_coverage_gaps += 1
                 # A valid authenticated endpoint with explicitly denied share
                 # enumeration is useful partial evidence. Session, transport,
                 # and other protocol failures leave the host scan incomplete.
@@ -2906,8 +4109,41 @@ def scan_host_smb(
             _report_detail(args, f"host {host}: listing SMB share {share_name}")
             capabilities = _new_access_capabilities()
             probe_limit = max(0, int(getattr(args, "access_probe_limit", 3)))
+            # parse_args always supplies the CLI default (root). Treat a
+            # programmatic Namespace created by older integrations as legacy
+            # mode until it explicitly opts into schema-v2 permission records.
+            permission_mode = str(getattr(args, "smb_permissions", "none") or "none")
+            permission_sample_limit = max(
+                0,
+                min(
+                    SMB_PERMISSION_MAX_SAMPLE_LIMIT,
+                    int(
+                        getattr(
+                            args,
+                            "smb_permission_sample_limit",
+                            SMB_PERMISSION_DEFAULT_SAMPLE_LIMIT,
+                        )
+                    ),
+                ),
+            )
             cancel_event = getattr(args, "cancel_event", None)
             share_was_enumerated = not bool(include_shares)
+            provider_resource_id = _stable_fingerprint(
+                "smb-share:v1", server_identity["provider_endpoint_id"], share_name
+            )
+            permission_summary: dict[str, object] | None = None
+            if permission_mode != "none":
+                permission_summary = {
+                    "semantics": SMB_PERMISSION_SEMANTICS,
+                    "permission_surface": SMB_PERMISSION_SURFACE,
+                    "mode": permission_mode,
+                    "assessment_state": "in_progress",
+                    "effective_access_status": "not_computed",
+                    "negative_conclusion_supported": False,
+                    "assessments": 0,
+                    "entries": 0,
+                    "truncated": False,
+                }
             resource_record = {
                 "type": "resource",
                 "run_id": run_id,
@@ -2916,6 +4152,12 @@ def scan_host_smb(
                 "resource_type": "smb_share",
                 "name": share_name,
                 "remark": remark,
+                "provider": "smb",
+                "provider_resource_id": provider_resource_id,
+                "metadata": {
+                    "server_identity": server_identity["provider_endpoint_id"],
+                    "server_identity_strength": server_identity["identity_strength"],
+                },
                 "access_level": "unknown",
                 "access_capabilities": _access_capability_snapshot(
                     capabilities,
@@ -2926,8 +4168,13 @@ def scan_host_smb(
                     assessment_reason="pending",
                     finalized=False,
                     share_presence="advertised" if share_was_enumerated else "unverified",
+                    assessed_identity_fingerprint=assessed_identity["assessed_identity_fingerprint"],
+                    session_kind=assessed_identity["session_kind"],
+                    identity_source=assessed_identity["identity_source"],
                 ),
             }
+            if permission_summary is not None:
+                resource_record["permission_summary"] = permission_summary
             writer.emit(resource_record)
             with lock:
                 stats.resources += 1
@@ -2944,6 +4191,10 @@ def scan_host_smb(
             tree_id = None
             listed_directory_paths: set[str] = set()
             probe_circuit = _SMBProbeCircuit()
+            permission_selector = _SMBPermissionCandidateSelector(
+                provider_resource_id,
+                permission_sample_limit if permission_mode == "sampled" else 0,
+            )
 
             def _handle_list_success(listed_path: str) -> None:
                 listed_directory_paths.add(_smb_handle_path(listed_path).casefold())
@@ -3073,6 +4324,7 @@ def scan_host_smb(
                     on_probe_directory_seed=_capture_probe_directory_seed,
                     cancel_event=cancel_event,
                 ):
+                    permission_selector.consider(entry["path"], bool(entry["is_dir"]))
                     writer.emit(
                         {
                             "type": "item",
@@ -3238,13 +4490,143 @@ def scan_host_smb(
                 )
                 _record_error(stats, lock, "SMB_SHARE_ASSESSMENT_FAILED", message)
             finally:
-                if tree_id is not None:
-                    disconnect_tree = getattr(conn, "disconnectTree", None)
-                    if callable(disconnect_tree):
-                        try:
-                            disconnect_tree(tree_id)
-                        except Exception:
-                            pass
+                try:
+                    if permission_mode != "none" and not bool(getattr(writer, "write_failed", False)):
+                        permission_targets: list[tuple[str, bool, str]] = [("", True, "share_root")]
+                        if permission_mode == "sampled":
+                            permission_targets.extend(
+                                (path, is_directory, "deterministic_sample")
+                                for path, is_directory in permission_selector.selected()
+                            )
+                        selected_count = len(permission_targets)
+                        assessment_records: list[dict[str, object]] = []
+                        permission_entries_emitted = 0
+                        transport_aborted = False
+                        remaining_entry_budget = SMB_PERMISSION_MAX_ENTRIES_PER_SHARE
+                        for subject_path, is_directory, selection_scope in permission_targets:
+                            if transport_aborted:
+                                break
+                            unavailable_reason = None
+                            permission_tree_id = tree_id
+                            if cancel_event is not None and cancel_event.is_set():
+                                permission_tree_id = None
+                                unavailable_reason = "cancelled"
+                            elif probe_circuit.transport_failed:
+                                permission_tree_id = None
+                                unavailable_reason = "transport_aborted"
+                            elif probe_circuit.probes_aborted:
+                                permission_tree_id = None
+                                unavailable_reason = probe_circuit.reason_code or "tree_session_invalid"
+                            assessment, permission_entries, transport_fatal = _build_smb_permission_records(
+                                conn,
+                                permission_tree_id,
+                                run_id=run_id,
+                                endpoint_key=endpoint_key,
+                                resource_name=share_name,
+                                provider_resource_id=provider_resource_id,
+                                subject_path=subject_path,
+                                is_directory=is_directory,
+                                assessed_identity=assessed_identity,
+                                selection_scope=selection_scope,
+                                entry_budget=remaining_entry_budget,
+                                root_path_hint=probe_circuit.root_path,
+                                cancel_event=cancel_event,
+                                unavailable_reason=unavailable_reason,
+                            )
+                            writer.emit(assessment)
+                            for permission_entry in permission_entries:
+                                writer.emit(permission_entry)
+                            assessment_records.append(assessment)
+                            remaining_entry_budget -= len(permission_entries)
+                            permission_entries_emitted += len(permission_entries)
+                            with lock:
+                                stats.permission_assessments += 1
+                                stats.permission_entries += len(permission_entries)
+                            transport_aborted = transport_fatal
+
+                        complete_count = sum(
+                            record.get("assessment_state") == "complete" for record in assessment_records
+                        )
+                        partial_count = sum(
+                            record.get("assessment_state") == "partial" for record in assessment_records
+                        )
+                        failed_count = sum(record.get("assessment_state") == "failed" for record in assessment_records)
+                        if assessment_records and complete_count == len(assessment_records) == selected_count:
+                            permission_state = "complete"
+                        elif assessment_records and (complete_count or partial_count):
+                            permission_state = "partial"
+                        else:
+                            permission_state = "failed"
+                        permission_summary_hash = hashlib.sha256(
+                            "\n".join(
+                                f"{record.get('assessment_key')}:{record.get('evidence_hash') or ''}:"
+                                f"{record.get('assessment_state')}"
+                                for record in assessment_records
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        permission_summary = {
+                            "semantics": SMB_PERMISSION_SEMANTICS,
+                            "permission_surface": SMB_PERMISSION_SURFACE,
+                            "mode": permission_mode,
+                            "assessment_state": permission_state,
+                            "selection_coverage": (
+                                "exhaustive_for_scope" if permission_mode == "root" else "deterministic_sample"
+                            ),
+                            "retrieval_coverage": (
+                                "complete"
+                                if permission_state == "complete"
+                                else ("partial" if complete_count or partial_count else "failed")
+                            ),
+                            "effective_access_status": "not_computed",
+                            "negative_conclusion_supported": (
+                                permission_state == "complete" and permission_mode == "root"
+                            ),
+                            "subjects_selected": selected_count,
+                            "assessments": len(assessment_records),
+                            "complete_assessments": complete_count,
+                            "partial_assessments": partial_count,
+                            "failed_assessments": failed_count,
+                            "entries": permission_entries_emitted,
+                            "truncated": bool(
+                                len(assessment_records) < selected_count
+                                or any(bool(record.get("truncated")) for record in assessment_records)
+                            ),
+                            "evidence_hash": permission_summary_hash,
+                        }
+                        if permission_state != "complete":
+                            permission_message = (
+                                f"SMB direct ACL evidence is {permission_state} for {share_name}: "
+                                f"selected={selected_count}, assessed={len(assessment_records)}, "
+                                f"partial={partial_count}, failed={failed_count}."
+                            )
+                            _emit_error(
+                                writer,
+                                run_id,
+                                severity="warn",
+                                code="SMB_PERMISSION_ASSESSMENT_INCOMPLETE",
+                                message=permission_message,
+                                endpoint_key=endpoint_key,
+                                resource_name=share_name,
+                                path="\\",
+                                hint=(
+                                    "Review permission_assessment errors and coverage; a failed ACL read "
+                                    "does not prove content access is denied."
+                                ),
+                            )
+                            _record_error(
+                                stats,
+                                lock,
+                                "SMB_PERMISSION_ASSESSMENT_INCOMPLETE",
+                                permission_message,
+                            )
+                finally:
+                    if tree_id is not None:
+                        disconnect_tree = getattr(conn, "disconnectTree", None)
+                        if callable(disconnect_tree):
+                            try:
+                                disconnect_tree(tree_id)
+                            except Exception:
+                                pass
 
             interrupted = bool(cancel_event is not None and cancel_event.is_set())
             if int(capabilities["tree_connect"].get("attempted", 0)) <= 0:
@@ -3284,9 +4666,7 @@ def scan_host_smb(
                     reason = workflow_reason
                 elif tree_id is None:
                     reason = "tree_unavailable"
-                elif capability in {"read_file", "modify_file"} or (
-                    capability == "delete" and len(file_samples) <= 0
-                ):
+                elif capability in {"read_file", "modify_file"} or (capability == "delete" and len(file_samples) <= 0):
                     reason = "no_visible_file_candidate"
                 else:
                     reason = "no_directory_candidate"
@@ -3311,6 +4691,7 @@ def scan_host_smb(
                 {
                     **resource_record,
                     "access_level": final_access_level,
+                    **({"permission_summary": permission_summary} if permission_summary is not None else {}),
                     "access_capabilities": _access_capability_snapshot(
                         capabilities,
                         probe_limit=probe_limit,
@@ -3327,10 +4708,11 @@ def scan_host_smb(
                         degraded=assessment_degraded,
                         transport_failed=probe_circuit.transport_failed,
                         probes_aborted=probe_circuit.probes_aborted,
-                        probe_abort_reason=(
-                            probe_circuit.reason_code if probe_circuit.probes_aborted else None
-                        ),
+                        probe_abort_reason=(probe_circuit.reason_code if probe_circuit.probes_aborted else None),
                         share_presence=share_presence,
+                        assessed_identity_fingerprint=assessed_identity["assessed_identity_fingerprint"],
+                        session_kind=assessed_identity["session_kind"],
+                        identity_source=assessed_identity["identity_source"],
                     ),
                 }
             )
@@ -3519,6 +4901,8 @@ def scan_host_nfs(
             hint="Install and verify `showmount`, and ensure rpcbind/mountd access from this host.",
         )
         _record_error(stats, lock, "NFS_EXPORT_ENUM_FAILED", message)
+        with lock:
+            stats.structural_coverage_gaps += 1
 
     if not exports:
         return True
@@ -3559,13 +4943,21 @@ def scan_host(
     if isinstance(reporter, ProgressReporter):
         reporter.target_started(host)
     if "smb" in active_share_types:
-        succeeded = scan_host_smb(host, args, run_id, writer, stats, lock) or succeeded
+        smb_succeeded = scan_host_smb(host, args, run_id, writer, stats, lock)
+        succeeded = smb_succeeded or succeeded
         if cancel_event is not None and cancel_event.is_set():
             return SCAN_CANCELLED
+        if not smb_succeeded:
+            with lock:
+                stats.structural_coverage_gaps += 1
     if "nfs" in active_share_types and not (cancel_event is not None and cancel_event.is_set()):
-        succeeded = scan_host_nfs(host, args, run_id, writer, stats, lock) or succeeded
+        nfs_succeeded = scan_host_nfs(host, args, run_id, writer, stats, lock)
+        succeeded = nfs_succeeded or succeeded
         if cancel_event is not None and cancel_event.is_set():
             return SCAN_CANCELLED
+        if not nfs_succeeded:
+            with lock:
+                stats.structural_coverage_gaps += 1
     return succeeded
 
 
@@ -4245,7 +5637,10 @@ def main() -> int:
                 pass
         print(f"output error: unable to initialize collector buffers: {_error_detail(exc)}", file=sys.stderr)
         return EXIT_FAILURE
-    stats = Stats()
+    # A requested provider that cannot be loaded leaves every target outside
+    # the declared observation plane, even when another provider can still be
+    # collected successfully in a mixed scan.
+    stats = Stats(structural_coverage_gaps=len(disabled_share_types) * target_count)
     lock = threading.Lock()
     reporter = ProgressReporter(
         total_targets=target_count,
@@ -4258,9 +5653,34 @@ def main() -> int:
     args.progress_reporter = reporter
     args.cancel_event = threading.Event()
 
+    provider_scope = "+".join(sorted(selected_share_types))
+    requested_session_kind = smb_auth_method if "smb" in selected_share_types else "not_applicable"
+    if requested_session_kind in {"anonymous", "guest", "not_applicable"}:
+        requested_native_identity = requested_session_kind
+    else:
+        requested_username = str(getattr(args, "username", "") or "")
+        requested_domain = str(getattr(args, "domain", "") or "")
+        requested_native_identity = (
+            f"{requested_domain}\\{requested_username}" if requested_domain else requested_username
+        )
+    requested_identity_fingerprint = _stable_fingerprint(
+        "network-collector-session:v1",
+        requested_session_kind,
+        requested_native_identity,
+    )
+    comparison_contracts = {"structural": NETWORK_STRUCTURAL_COMPARISON_CONTRACT}
+    if "smb" in selected_share_types:
+        comparison_contracts.update(
+            {
+                "content": SMB_CONTENT_COMPARISON_CONTRACT,
+                "capability": SMB_CAPABILITY_COMPARISON_CONTRACT,
+            }
+        )
     run_meta_record = {
         "type": "run_meta",
-        "schema_version": 1,
+        "schema_version": (
+            2 if "smb" in selected_share_types and str(getattr(args, "smb_permissions", "none")) != "none" else 1
+        ),
         "tool": "share-sentinel-collector",
         "tool_version": TOOL_VERSION,
         "run_id": run_id,
@@ -4283,6 +5703,14 @@ def main() -> int:
                 "max_entries_per_share": args.max_entries_per_share,
                 "max_artifact_bytes": int(getattr(args, "max_artifact_bytes", DEFAULT_MAX_ARTIFACT_BYTES)),
                 "access_probe_limit": int(getattr(args, "access_probe_limit", 3)),
+                "smb_permissions": str(getattr(args, "smb_permissions", "none")),
+                "smb_permission_sample_limit": int(
+                    getattr(
+                        args,
+                        "smb_permission_sample_limit",
+                        SMB_PERMISSION_DEFAULT_SAMPLE_LIMIT,
+                    )
+                ),
                 "include_share": list(getattr(args, "include_share", []) or []),
                 "exclude_share": list(getattr(args, "exclude_share", []) or []),
                 "exclude_path_regex": args.exclude_path_regex or None,
@@ -4295,7 +5723,38 @@ def main() -> int:
             "username": (args.username or None) if smb_auth_method in {"ntlm", "kerberos"} else None,
             "method": smb_auth_method,
         },
+        "collection_context": {
+            "source": "network_share_collector",
+            "provider": provider_scope,
+            "collection_mode": "declared_target_inventory",
+            "assessed_identity": requested_identity_fingerprint,
+            "auth_context": {
+                "auth_type": smb_auth_method,
+                "auth_mode": (
+                    ("local" if args.local_auth else "domain") if smb_auth_method in {"ntlm", "kerberos"} else "none"
+                ),
+            },
+            "status": "running",
+            "partial": True,
+            "sync_mode": "full_snapshot",
+            "materialized_snapshot": True,
+            "discovery_completeness": "running",
+            "metadata": {
+                "snapshot_materialized": True,
+                "comparison_contracts": comparison_contracts,
+                # This collector discovers NFS exports but does not mount and
+                # enumerate their file trees. Mixed runs therefore cannot make
+                # a global item/content completeness claim.
+                "files_included": "nfs" not in selected_share_types,
+                "permissions_assessed": str(getattr(args, "smb_permissions", "none")) != "none",
+                "permissions_complete": False,
+                "structural_complete": False,
+                "content_complete": False,
+            },
+        },
     }
+    if int(run_meta_record["schema_version"]) >= 2:
+        run_meta_record["artifact_features"] = ["direct_permissions_v1"]
     try:
         writer.emit(run_meta_record)
     except (OSError, ArtifactSpoolLimitError) as exc:
@@ -4344,6 +5803,46 @@ def main() -> int:
             return _abort_collection_output(writer, temp_artifact=temp_artifact, error=exc)
         _record_error(stats, lock, "SCAN_INTERRUPTED", interruption_message)
 
+    structural_coverage_complete = stats.structural_coverage_gaps == 0
+    structural_complete = bool(
+        not scan_outcome.interrupted
+        and scan_outcome.host_failures == 0
+        and scan_outcome.targets_cancelled == 0
+        and scan_outcome.targets_completed == target_count
+        and structural_coverage_complete
+    )
+    permission_requested = str(getattr(args, "smb_permissions", "none")) != "none"
+    permission_incomplete = int(stats.error_codes.get("SMB_PERMISSION_ASSESSMENT_INCOMPLETE", 0)) > 0
+    collection_partial = bool(scan_outcome.interrupted or scan_outcome.host_failures > 0 or stats.errors > 0)
+    final_context = dict(run_meta_record["collection_context"])
+    final_metadata = dict(final_context.get("metadata") or {})
+    final_metadata.update(
+        {
+            "permissions_assessed": permission_requested and stats.permission_assessments > 0,
+            "permissions_complete": permission_requested
+            and stats.permission_assessments > 0
+            and not permission_incomplete
+            and structural_coverage_complete,
+            "structural_complete": structural_complete,
+            "structural_coverage_gaps": stats.structural_coverage_gaps,
+            "content_complete": not collection_partial and "nfs" not in selected_share_types,
+        }
+    )
+    final_context.update(
+        {
+            "status": "interrupted" if scan_outcome.interrupted else ("partial" if collection_partial else "complete"),
+            "partial": collection_partial,
+            "discovery_completeness": "authoritative" if structural_complete else "partial",
+            "metadata": final_metadata,
+        }
+    )
+    run_meta_record["collection_context"] = final_context
+    try:
+        writer.emit(run_meta_record)
+    except (OSError, ArtifactSpoolLimitError) as exc:
+        reporter.finish(status="failure")
+        return _abort_collection_output(writer, temp_artifact=temp_artifact, error=exc)
+
     try:
         writer.emit(
             {
@@ -4361,6 +5860,9 @@ def main() -> int:
                     "endpoints": stats.endpoints,
                     "resources": stats.resources,
                     "items": stats.items,
+                    "permission_assessments": stats.permission_assessments,
+                    "permission_entries": stats.permission_entries,
+                    "structural_coverage_gaps": stats.structural_coverage_gaps,
                     "errors": stats.errors,
                 },
             }

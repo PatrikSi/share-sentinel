@@ -521,6 +521,95 @@ def test_run_diff_rejects_same_attribution_opaque_token_permissions_as_unverifia
     assert "unknown:baseline.permissions" in result["mismatched_fields"]
 
 
+def _strict_smb_diff_context(
+    *,
+    hosts: list[str] | None = None,
+    include_share: list[str] | None = None,
+    structural_complete: bool = True,
+    structural_contract: str = "network_share_inventory_v1",
+) -> dict:
+    return {
+        "source": "smb",
+        "provider": "smb",
+        "collection_mode": "network_inventory",
+        "auth_mode": "ntlm",
+        "auth_type": "credential",
+        "assessed_identity": "identity-fingerprint",
+        "discovery_completeness": "authoritative",
+        "materialized_snapshot": True,
+        "sync_mode": "full",
+        "partial": False,
+        "metadata": {
+            "discovery_strategy": "declared_network_targets",
+            "discovery_authoritative": True,
+            "files_included": True,
+            "permissions_assessed": False,
+            "structural_complete": structural_complete,
+            "content_complete": True,
+            "comparison_contracts": {
+                "structural": structural_contract,
+                "content": "smb_tree_inventory_v1",
+                "capability": "smb_nonmutating_capability_v1",
+            },
+            "collection": {
+                "target_scope": {
+                    "hosts": hosts or ["files.example.test"],
+                    "cidrs": [],
+                    "share_types": ["smb"],
+                    "disabled_share_types": [],
+                    "target_count": 1,
+                },
+                "enumeration": {
+                    "include_share": include_share or [],
+                    "exclude_share": [],
+                    "max_depth": 8,
+                    "max_entries_per_share": 100000,
+                    "exclude_path_regex": None,
+                    "extensions_only": None,
+                    "access_probe_limit": 32,
+                },
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("baseline_overrides", "expected_reason"),
+    [
+        ({"hosts": ["other.example.test"]}, "target_scope"),
+        ({"include_share": ["Finance"]}, "enumeration.include_share"),
+        ({"structural_complete": False}, "incomplete structural"),
+        ({"structural_contract": "unknown_contract_v9"}, "structural comparison contract"),
+    ],
+)
+def test_legacy_diff_never_promotes_incompatible_smb_absence_claims(
+    baseline_overrides,
+    expected_reason,
+) -> None:
+    current = SimpleNamespace(collection_context=_strict_smb_diff_context())
+    baseline = SimpleNamespace(collection_context=_strict_smb_diff_context(**baseline_overrides))
+
+    result = runs_router._strict_run_diff_compatibility(current, baseline)
+
+    assert result["compatible"] is False
+    assert expected_reason in result["warning"].lower()
+    assert result["dimensions"]["identity_scope_exact"] is False
+
+
+def test_legacy_smb_diff_is_location_bounded_until_worker_identity_preflight() -> None:
+    run = SimpleNamespace(collection_context=_strict_smb_diff_context())
+
+    result = runs_router._strict_run_diff_compatibility(run, run)
+
+    assert result["compatible"] is False
+    assert result["dimensions"] == {
+        "structural_interpretable": True,
+        "content_interpretable": True,
+        "identity_scope_exact": False,
+    }
+    assert "materialized comparison's endpoint identity preflight" in result["warning"]
+
+
 def test_run_diff_preserves_case_sensitive_provider_resource_identity() -> None:
     def record(provider_id: str) -> tuple[tuple[str, str, str], dict]:
         return (

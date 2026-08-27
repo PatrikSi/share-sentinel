@@ -1,0 +1,114 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  canCreateMaterializedComparison,
+  comparisonCompatibilityTone,
+  comparisonRunId,
+  itemChangeCopy,
+  resourceChangeKey,
+  type ProjectComparison,
+  type ResourceComparisonChange,
+} from "@/lib/comparisons";
+
+describe("comparison truthfulness helpers", () => {
+  it("only enables stateful comparison creation after an operator role is confirmed", () => {
+    expect(canCreateMaterializedComparison("operator", "ready")).toBe(true);
+    expect(canCreateMaterializedComparison("admin", "ready")).toBe(true);
+    expect(canCreateMaterializedComparison("viewer", "ready")).toBe(false);
+    expect(canCreateMaterializedComparison("operator", "loading")).toBe(false);
+    expect(canCreateMaterializedComparison(null, "error")).toBe(false);
+  });
+
+  it("never presents an uncomputed item delta as zero", () => {
+    expect(itemChangeCopy({ state: "not_computed", added: null, removed: null, moved: null })).toContain("not computed");
+    expect(itemChangeCopy({ state: "not_computed", added: null, removed: null, moved: null })).not.toContain("0 added");
+  });
+
+  it("treats dimension compatibility independently", () => {
+    expect(comparisonCompatibilityTone({
+      status: "partial",
+      structural_interpretable: true,
+      content_interpretable: false,
+      access_interpretable: false,
+      reasons: ["Collection methods differ"],
+    })).toBe("warning");
+    expect(comparisonCompatibilityTone({
+      status: "incompatible",
+      structural_interpretable: false,
+      content_interpretable: false,
+      access_interpretable: false,
+      reasons: [],
+    })).toBe("error");
+    expect(comparisonCompatibilityTone({
+      status: "partial",
+      structural_interpretable: true,
+      content_interpretable: true,
+      access_interpretable: true,
+      direct_permissions_interpretable: false,
+      reasons: ["Provider permission evidence is incomplete"],
+    })).toBe("warning");
+    expect(comparisonCompatibilityTone({
+      status: "compatible",
+      structural_interpretable: true,
+      content_interpretable: true,
+      access_interpretable: true,
+      capability_interpretable: false,
+      direct_permissions_interpretable: true,
+      reasons: ["Capability assessment scopes differ"],
+    })).toBe("warning");
+    expect(comparisonCompatibilityTone({
+      status: "compatible",
+      structural_interpretable: true,
+      content_interpretable: true,
+      access_interpretable: true,
+      identity_applicable: true,
+      identity_scope_exact: false,
+      capability_interpretable: true,
+      direct_permissions_interpretable: true,
+      reasons: ["Only location-bound identity is available"],
+    })).toBe("warning");
+    expect(comparisonCompatibilityTone({
+      status: "compatible",
+      structural_interpretable: true,
+      content_interpretable: true,
+      access_interpretable: true,
+      identity_applicable: false,
+      identity_scope_exact: false,
+      capability_applicable: false,
+      capability_interpretable: false,
+      direct_permissions_interpretable: true,
+      reasons: [],
+    })).toBe("success");
+    expect(comparisonCompatibilityTone({
+      status: "compatible",
+      structural_interpretable: true,
+      content_interpretable: true,
+      access_interpretable: true,
+      capability_interpretable: true,
+      direct_permissions_interpretable: true,
+      reasons: [],
+    })).toBe("success");
+  });
+
+  it("accepts nested and compatibility run identifiers", () => {
+    const nested = { id: "comparison", state: "complete", current_run: { id: "current" } } as ProjectComparison;
+    const flat = { id: "comparison", state: "complete", current_run_id: "current" } as ProjectComparison;
+    expect(comparisonRunId(nested, "current")).toBe("current");
+    expect(comparisonRunId(flat, "current")).toBe("current");
+  });
+
+  it("builds a deterministic row key when the API does not expose an id", () => {
+    const change = {
+      change_type: "changed",
+      provider: "smb",
+      change_categories: ["access"],
+      structural_state: "unchanged",
+      access_state: "changed",
+      content_state: "not_computed",
+      before: { endpoint_key: "server", provider_resource_id: "share-id", name: "Finance" },
+      after: { endpoint_key: "server", provider_resource_id: "share-id", name: "Finance" },
+    } satisfies ResourceComparisonChange;
+    expect(resourceChangeKey(change, 0)).toBe(resourceChangeKey(change, 0));
+    expect(resourceChangeKey(change, 0)).toContain("share-id");
+  });
+});

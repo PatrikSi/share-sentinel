@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     api_database_statement_timeout_ms: int = 30_000
     api_database_lock_timeout_ms: int = 5_000
     api_run_diff_max_items: int = 250_000
+    api_comparison_max_active_per_project: int = 3
+    api_comparison_rate_limit: int = 12
+    api_comparison_rate_window_seconds: int = 60
     api_inventory_export_max_concurrent: int = 4
     api_inventory_export_rate_limit: int = 12
     api_inventory_export_rate_window_seconds: int = 60
@@ -93,7 +96,9 @@ class Settings(BaseSettings):
         normalized = str(value).strip().lower() or "development"
         allowed = {"development", "dev", "testing", "test", "staging", "stage", "production", "prod"}
         if normalized not in allowed:
-            raise ValueError("app_env must be one of: development, dev, testing, test, staging, stage, production, prod")
+            raise ValueError(
+                "app_env must be one of: development, dev, testing, test, staging, stage, production, prod"
+            )
         return normalized
 
     @field_validator("log_level", mode="before")
@@ -184,6 +189,9 @@ class Settings(BaseSettings):
         "api_database_statement_timeout_ms",
         "api_database_lock_timeout_ms",
         "api_run_diff_max_items",
+        "api_comparison_max_active_per_project",
+        "api_comparison_rate_limit",
+        "api_comparison_rate_window_seconds",
         "api_inventory_export_max_concurrent",
         "api_inventory_export_rate_limit",
         "api_inventory_export_rate_window_seconds",
@@ -246,6 +254,20 @@ class Settings(BaseSettings):
     def _validate_api_run_diff_max_items(cls, value: int) -> int:
         if value > 5_000_000:
             raise ValueError("api_run_diff_max_items must be 5000000 or less")
+        return value
+
+    @field_validator("api_comparison_max_active_per_project")
+    @classmethod
+    def _validate_comparison_concurrency(cls, value: int) -> int:
+        if value > 100:
+            raise ValueError("api_comparison_max_active_per_project must be 100 or less")
+        return value
+
+    @field_validator("api_comparison_rate_limit", "api_comparison_rate_window_seconds")
+    @classmethod
+    def _validate_comparison_rate_settings(cls, value: int, info) -> int:
+        if value > 86_400:
+            raise ValueError(f"{info.field_name} must be 86400 or less")
         return value
 
     @field_validator("api_inventory_export_max_concurrent")

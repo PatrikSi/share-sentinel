@@ -175,10 +175,12 @@ def test_scan_host_dispatch_runs_only_selected_share_scanners(monkeypatch) -> No
     )
 
     args = SimpleNamespace(share_types="both")
-    ok = collector.scan_host("10.0.0.5", args, "run-1", SimpleNamespace(emit=lambda *_: None), collector.Stats(), object())
+    stats = collector.Stats()
+    ok = collector.scan_host("10.0.0.5", args, "run-1", SimpleNamespace(emit=lambda *_: None), stats, threading.Lock())
 
     assert ok is True
     assert calls == ["smb", "nfs"]
+    assert stats.structural_coverage_gaps == 1
 
 
 def test_validate_args_allows_anonymous_smb_without_username() -> None:
@@ -246,9 +248,7 @@ def test_normalize_smb_identity_allows_matching_explicit_domain() -> None:
         ("@contoso.example", "", False, "components must be non-empty"),
     ],
 )
-def test_normalize_smb_identity_rejects_ambiguous_or_conflicting_forms(
-    username, domain, local_auth, message
-) -> None:
+def test_normalize_smb_identity_rejects_ambiguous_or_conflicting_forms(username, domain, local_auth, message) -> None:
     collector = _load_collector_module()
     args = SimpleNamespace(username=username, domain=domain, local_auth=local_auth)
 
@@ -423,9 +423,7 @@ def test_validate_args_rejects_output_path_with_missing_parent(tmp_path) -> None
         ("scan.json.gz", False, "requires --gzip"),
     ],
 )
-def test_validate_args_rejects_ambiguous_artifact_suffixes(
-    tmp_path, filename, gzip_output, message
-) -> None:
+def test_validate_args_rejects_ambiguous_artifact_suffixes(tmp_path, filename, gzip_output, message) -> None:
     collector = _load_collector_module()
     args = collector.parse_args(
         [
@@ -498,7 +496,15 @@ def test_redact_cli_arguments_hides_sensitive_values() -> None:
         ]
     )
 
-    assert redacted == ["--username", "svc", "--password", "<redacted>", "--hashes=<redacted>", "--api-token", "<redacted>"]
+    assert redacted == [
+        "--username",
+        "svc",
+        "--password",
+        "<redacted>",
+        "--hashes=<redacted>",
+        "--api-token",
+        "<redacted>",
+    ]
 
 
 @pytest.mark.parametrize("abbreviated_flag", ["--pass", "--hash", "--api-t"])
@@ -651,12 +657,67 @@ def test_scan_host_smb_passes_normalized_domain_identity_to_impacket(monkeypatch
     )
     collector._normalize_smb_identity(args)
 
-    ok = collector.scan_host_smb(
-        "10.0.0.5", args, "run-domain-1", _Writer(), collector.Stats(), threading.Lock()
-    )
+    ok = collector.scan_host_smb("10.0.0.5", args, "run-domain-1", _Writer(), collector.Stats(), threading.Lock())
 
     assert ok is True
     assert fake_conn.login_args == ("svc_scan", "secret", "CONTOSO", "", "")
+
+
+def test_scan_host_smb_reports_authenticated_guest_fallback(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _Conn:
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def isGuestSession(self):
+            return True
+
+        def getDialect(self):
+            return "768"
+
+        def isSigningRequired(self):
+            return False
+
+        def listShares(self):
+            return []
+
+        def logoff(self):
+            return None
+
+    fake_conn = _Conn()
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: fake_conn)
+    records = []
+    writer = SimpleNamespace(records=records, emit=records.append, write_failed=False)
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=False,
+        username="svc_scan",
+        password="secret",
+        domain="CONTOSO",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=[],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=1,
+    )
+    stats = collector.Stats()
+
+    ok = collector.scan_host_smb("10.0.0.5", args, "run-guest-1", writer, stats, threading.Lock())
+
+    assert ok is True
+    assert stats.structural_coverage_gaps == 1
+    assert stats.error_codes["SMB_AUTH_GUEST_FALLBACK"] == 1
+    assert any(record.get("code") == "SMB_AUTH_GUEST_FALLBACK" for record in records)
+    endpoint = next(record for record in records if record.get("type") == "endpoint")
+    assert endpoint["metadata"]["session_kind"] == "guest"
+    assert endpoint["metadata"]["session_identity_source"] == "server_session"
 
 
 def test_scan_host_smb_kerberos_does_not_mutate_ccache_env_per_call(monkeypatch) -> None:
@@ -800,6 +861,7 @@ def test_scan_host_smb_reports_share_enumeration_denied_with_anonymous_hint(monk
     assert stats.endpoints == 1
     assert stats.resources == 0
     assert stats.errors == 1
+    assert stats.structural_coverage_gaps == 1
     endpoint_record = next(row for row in writer.records if row.get("type") == "endpoint")
     assert endpoint_record["endpoint_key"] == "10.0.0.6:445"
     error_record = next(row for row in writer.records if row.get("type") == "error")
@@ -1129,6 +1191,41 @@ def test_scan_host_nfs_preserves_empty_endpoint_when_no_exports_found(monkeypatc
     assert stats.endpoints == 1
     assert stats.resources == 0
     assert [row["type"] for row in writer.records] == ["endpoint"]
+
+
+def test_scan_host_nfs_marks_export_enumeration_failure_as_structural_gap(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _SocketConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    records = []
+    writer = SimpleNamespace(records=records, emit=records.append)
+    monkeypatch.setattr(collector.socket, "create_connection", lambda *_args, **_kwargs: _SocketConn())
+    monkeypatch.setattr(
+        collector,
+        "_discover_nfs_exports",
+        lambda *_args, **_kwargs: ([], "rpc mount service denied the request"),
+    )
+    stats = collector.Stats()
+
+    ok = collector.scan_host_nfs(
+        "10.0.0.10",
+        SimpleNamespace(timeout=1.0, domain=""),
+        "run-nfs-denied",
+        writer,
+        stats,
+        threading.Lock(),
+    )
+
+    assert ok is True
+    assert stats.structural_coverage_gaps == 1
+    assert stats.error_codes["NFS_EXPORT_ENUM_FAILED"] == 1
+    assert any(record.get("code") == "NFS_EXPORT_ENUM_FAILED" for record in records)
 
 
 def test_scan_host_smb_auth_failure_includes_actionable_hint(monkeypatch) -> None:

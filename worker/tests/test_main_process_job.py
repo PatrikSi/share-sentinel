@@ -2,6 +2,7 @@ import gzip
 import io
 import json
 import sys
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,21 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from worker import main
+
+
+@pytest.fixture(autouse=True)
+def _bypass_integrity_for_legacy_stream_fakes(monkeypatch):
+    """Keep legacy process tests focused; integrity has dedicated real-byte tests."""
+
+    monkeypatch.setattr(main, "_require_artifact_integrity", lambda *_args: (0, "0" * 64))
+
+    @contextmanager
+    def _open_unverified(key, _expected, **_kwargs):
+        with main.open_artifact_stream(key) as body:
+            yield body
+
+    monkeypatch.setattr(main, "open_verified_artifact_stream", _open_unverified)
+    monkeypatch.setattr(main, "verify_artifact_integrity", lambda *_args, **_kwargs: None)
 
 
 def test_process_job_returns_early_for_invalid_run_id(monkeypatch) -> None:
@@ -46,6 +62,7 @@ class _FakeConn:
     def __init__(self, run_row):
         self._run_row = run_row
         self._unlocked = False
+        self.collection_context_updates: list[tuple[object, ...] | None] = []
         self.rollback_calls = 0
         self.commit_calls = 0
 
@@ -58,10 +75,20 @@ class _FakeConn:
     def execute(self, query, _params=None):
         if "pg_try_advisory_lock" in query:
             return _FakeResult((True,))
+        if "structural_rejected_records" in query:
+            context = (
+                self._run_row[7]
+                if self._run_row is not None and len(self._run_row) > 7 and isinstance(self._run_row[7], dict)
+                else {}
+            )
+            return _FakeResult((context, 0, 0, 0))
         if "FROM scan_runs" in query:
             return _FakeResult(self._run_row)
         if "SELECT COUNT(*) FROM endpoints" in query:
             return _FakeResult((0, 0, 0, 0))
+        if "UPDATE scan_runs" in query and "collection_context" in query:
+            self.collection_context_updates.append(_params)
+            return _FakeResult(None)
         if "pg_advisory_unlock" in query:
             self._unlocked = True
             return _FakeResult((True,))
@@ -805,7 +832,7 @@ def test_process_job_records_non_object_ndjson_and_continues(monkeypatch) -> Non
     assert result == "complete"
     assert len(endpoint_records) == 1
     assert len(captured_errors) == 1
-    assert captured_errors[0][2] == "SCHEMA_INVALID"
+    assert captured_errors[0][2] == main.CONSUMER_UNCLASSIFIED_RECORD_ERROR
     assert captured_errors[0][3] == "record must be a JSON object"
 
 

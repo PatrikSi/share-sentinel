@@ -2,6 +2,8 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 
 import { AccessCapabilityCell, type AccessCapabilities } from "@/components/access-capability-cell";
+import { AccessEvidencePanel } from "@/components/access-evidence-panel";
+import { AccessEvidenceSummaryCell } from "@/components/access-evidence-summary";
 import { ColumnPicker } from "@/components/column-picker";
 import { Dialog } from "@/components/dialog";
 import { ExposureBadge, ProviderBadge } from "@/components/provider-context";
@@ -9,6 +11,7 @@ import { SharePointAssessmentCell } from "@/components/sharepoint-assessment-cel
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch } from "@/lib/api";
+import type { AccessEvidenceSummary } from "@/lib/access-evidence";
 import { copyText } from "@/lib/clipboard";
 import {
   deriveSharePointAssessment,
@@ -90,6 +93,7 @@ type InventoryResource = {
   remark: string | null;
   access_level: string;
   access_capabilities: AccessCapabilities | null;
+  access_evidence_summary?: AccessEvidenceSummary | null;
   share_type: string;
   resource_type?: string | null;
   provider?: string | null;
@@ -244,6 +248,11 @@ type SelectedSharePointAssessment = {
   canonicalUrl: string | null;
   resource: InventoryResource | null;
 };
+type SelectedAccessEvidence = {
+  runId: string;
+  resourceId: number;
+  resourceName: string;
+};
 
 const DEFAULT_ITEM_COLUMNS: ItemColumnKey[] = ["path", "name", "is_dir", "connection", "provider", "resource_name", "access_level", "exposure", "size_bytes", "mtime", "run_name"];
 const DEFAULT_RESOURCE_COLUMNS: ResourceColumnKey[] = ["name", "connection", "assessment", "provider", "resource_type", "exposure", "access_level", "hostname", "item_count", "run_name"];
@@ -300,7 +309,7 @@ const RESOURCE_COLUMN_OPTIONS: Array<{ key: ResourceColumnKey; label: string }> 
   { key: "assessment_scope", label: "Assessment Scope" },
   { key: "resource_type", label: "Resource Type" },
   { key: "exposure", label: "Exposure" },
-  { key: "access_level", label: "Observed Access" },
+  { key: "access_level", label: "Access Evidence" },
   { key: "endpoint_key", label: "Endpoint Key" },
   { key: "hostname", label: "Site / Host" },
   { key: "item_count", label: "Items" },
@@ -508,6 +517,13 @@ function readInitialRunSelection(): { ids: string[]; truncated: boolean } {
 
 function readInitialRuns(): string[] {
   return readInitialRunSelection().ids;
+}
+
+function readInitialAccessEvidence(): SelectedAccessEvidence | null {
+  const runId = readInitialSearchParam("evidenceRun").trim();
+  const resourceId = Number(readInitialSearchParam("evidenceResource"));
+  if (!runId || !Number.isSafeInteger(resourceId) || resourceId <= 0) return null;
+  return { runId, resourceId, resourceName: `Resource ${resourceId}` };
 }
 
 function readStoredColumns<T extends string>(
@@ -859,6 +875,7 @@ export function ProjectInventoryPage() {
   );
   const [showViewsDialog, setShowViewsDialog] = useState(false);
   const [selectedSharePointAssessment, setSelectedSharePointAssessment] = useState<SelectedSharePointAssessment | null>(null);
+  const [selectedAccessEvidence, setSelectedAccessEvidence] = useState<SelectedAccessEvidence | null>(readInitialAccessEvidence);
   const [density, setDensity] = useState<Density>(readStoredDensity);
   const [preferenceWarning, setPreferenceWarning] = useState<string | null>(null);
   const [copiedNotice, setCopiedNotice] = useState<string | null>(null);
@@ -1369,8 +1386,12 @@ export function ProjectInventoryPage() {
       if (exposureFilter.trim()) next.set("exposure", exposureFilter.trim());
     }
     if (includeDeleted) next.set("includeDeleted", "1");
+    if (selectedAccessEvidence) {
+      next.set("evidenceRun", selectedAccessEvidence.runId);
+      next.set("evidenceResource", String(selectedAccessEvidence.resourceId));
+    }
     setSearchParams(next, { replace: true });
-  }, [activeTab, appliedInventoryQuery, endpointFilter, exposureFilter, extFilter, includeDeleted, itemTypeFilter, pathPrefix, providerFilter, query, queryModeActive, resourceAccess, resourceTypeFilter, selectedRunIds, setSearchParams, shareFilter]);
+  }, [activeTab, appliedInventoryQuery, endpointFilter, exposureFilter, extFilter, includeDeleted, itemTypeFilter, pathPrefix, providerFilter, query, queryModeActive, resourceAccess, resourceTypeFilter, selectedAccessEvidence, selectedRunIds, setSearchParams, shareFilter]);
 
   useEffect(() => {
     const persistenceError = persistInventoryPreference("share_sentinel_inventory_item_columns_v2", JSON.stringify(itemColumns));
@@ -1457,6 +1478,7 @@ export function ProjectInventoryPage() {
     setSavingInvestigation(false);
     setDeletingInvestigationId(null);
     setShowViewsDialog(false);
+    setSelectedAccessEvidence(readInitialAccessEvidence());
     setItems([]);
     setResources([]);
     setEndpoints([]);
@@ -1940,13 +1962,16 @@ export function ProjectInventoryPage() {
     if (column === "exposure") return exposure ? <InventoryCell content={<ExposureBadge evidence={row.exposure_evidence} exposure={exposure} />} text={exposureLabel(exposure)} filterField="exposure" filterValue={exposure} label={label} onFilter={applyCellFilter} onCopy={copyExactValue} /> : <InventoryCell text="—" label={label} onFilter={applyCellFilter} onCopy={copyExactValue} />;
     if (column === "access_level") {
       return (
-        <AccessCapabilityCell
-          accessLevel={row.access_level}
-          capabilities={row.access_capabilities}
-          evidenceScope={provider === "smb" ? "Bounded share sample" : provider === "sharepoint" ? "Library scope" : undefined}
-          label={label}
-          onCopy={copyExactValue}
-          onFilter={(value, negated) => applyCellFilter("access", value, negated)}
+        <AccessEvidenceSummaryCell
+          compatibilityAccess={row.access_level}
+          onFilterCompatibility={(value, negated) => applyCellFilter("access", value, negated)}
+          onOpen={() => setSelectedAccessEvidence({
+            runId: row.run_id,
+            resourceId: row.id,
+            resourceName: row.name,
+          })}
+          resourceName={row.name}
+          summary={row.access_evidence_summary}
         />
       );
     }
@@ -2547,7 +2572,7 @@ export function ProjectInventoryPage() {
               <table className="inventory-table">
                 <caption className="sr-only">Shares, exports, and document libraries in the selected inventory scope</caption>
                 <thead><tr>{resourceColumns.map((column) => <th key={column} scope="col"><span>{RESOURCE_COLUMN_OPTIONS.find((entry) => entry.key === column)?.label || column}</span>{resourceColumns.length > 1 ? <button aria-label={`Hide ${column} column`} onClick={() => toggleResourceColumn(column)} title="Hide column" type="button">×</button> : null}</th>)}</tr></thead>
-                <tbody>{resources.map((row) => <tr key={`${row.run_id}-${row.id}`}>{resourceColumns.map((column) => <td key={`${row.id}-${column}`}>{resourceCell(row, column)}</td>)}</tr>)}</tbody>
+                <tbody>{resources.map((row) => <tr className={selectedAccessEvidence?.runId === row.run_id && selectedAccessEvidence.resourceId === row.id ? "is-selected" : undefined} key={`${row.run_id}-${row.id}`}>{resourceColumns.map((column) => <td key={`${row.id}-${column}`}>{resourceCell(row, column)}</td>)}</tr>)}</tbody>
               </table>
             ) : null}
             {activeTab === "endpoints" ? (
@@ -2649,6 +2674,16 @@ export function ProjectInventoryPage() {
           </div>
         ) : null}
       </Dialog>
+
+      {projectId && selectedAccessEvidence ? (
+        <AccessEvidencePanel
+          onClose={() => setSelectedAccessEvidence(null)}
+          projectId={projectId}
+          resourceId={selectedAccessEvidence.resourceId}
+          resourceName={selectedAccessEvidence.resourceName}
+          runId={selectedAccessEvidence.runId}
+        />
+      ) : null}
 
       <Dialog
         description="Open a team view or save the current tab, run scope, and filters."

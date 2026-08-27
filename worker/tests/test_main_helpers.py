@@ -198,6 +198,9 @@ def test_clear_persisted_ingest_inventory_removes_all_resumable_rows() -> None:
     main.clear_persisted_ingest_inventory(_Conn(), "run-1")
 
     assert [statement for statement, _params in statements] == [
+        "DELETE FROM permission_entries WHERE run_id = %s",
+        "DELETE FROM permission_assessments WHERE run_id = %s",
+        "DELETE FROM permission_principals WHERE run_id = %s",
         "DELETE FROM items WHERE run_id = %s",
         "DELETE FROM resources WHERE run_id = %s",
         "DELETE FROM endpoints WHERE run_id = %s",
@@ -417,6 +420,115 @@ def test_validate_record_rejects_database_poison_fields() -> None:
     assert reason == "field auth must be an object"
 
 
+def test_endpoint_provider_identity_is_preserved_and_conflicts_are_rejected() -> None:
+    endpoint = {
+        "type": "endpoint",
+        "run_id": "11111111-1111-1111-1111-111111111111",
+        "endpoint_key": "files:445",
+        "provider": "smb",
+        "provider_endpoint_id": "smb-server-guid:v1:abc",
+        "metadata": {
+            "identity_source": "server_guid",
+            "identity_strength": "strong",
+        },
+    }
+
+    valid, reason = main.validate_record(endpoint)
+
+    assert valid is True
+    assert reason is None
+    assert endpoint["provider_metadata"]["provider_endpoint_id"] == "smb-server-guid:v1:abc"
+
+    conflicting = {
+        **endpoint,
+        "provider_endpoint_id": "smb-server-guid:v1:def",
+        "provider_metadata": {
+            **endpoint["provider_metadata"],
+            "provider_endpoint_id": "smb-server-guid:v1:abc",
+        },
+    }
+    valid, reason = main.validate_record(conflicting)
+    assert valid is False
+    assert reason == "field provider_endpoint_id conflicts with metadata.provider_endpoint_id"
+
+
+def test_endpoint_upsert_neutralizes_identity_metadata_without_provider_id() -> None:
+    class _Result:
+        @staticmethod
+        def fetchone():
+            return (17,)
+
+    class _Conn:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, query, params):
+            self.calls.append((query, params))
+            return _Result()
+
+    conn = _Conn()
+    endpoint_id = main.upsert_endpoint(
+        conn,
+        "11111111-1111-1111-1111-111111111111",
+        {
+            "endpoint_key": "files:445",
+            "provider": "smb",
+            "provider_metadata": {
+                "identity_source": "scan_target",
+                "identity_strength": "weak",
+                "server_guid": "f" * 32,
+                "advertised_names": ["replacement"],
+                "session_kind": "ntlm",
+            },
+        },
+    )
+
+    persisted_metadata = json.loads(conn.calls[0][1][-1])
+    assert endpoint_id == 17
+    assert persisted_metadata == {"session_kind": "ntlm"}
+
+
+def test_endpoint_upsert_keeps_identity_metadata_for_identified_enrichment() -> None:
+    class _Result:
+        @staticmethod
+        def fetchone():
+            return (17,)
+
+    class _Conn:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, query, params):
+            self.calls.append((query, params))
+            return _Result()
+
+    provider_id = "smb-server-guid:v1:" + ("a" * 64)
+    conn = _Conn()
+    endpoint_id = main.upsert_endpoint(
+        conn,
+        "11111111-1111-1111-1111-111111111111",
+        {
+            "endpoint_key": "files:445",
+            "provider": "smb",
+            "provider_endpoint_id": provider_id,
+            "provider_metadata": {
+                "identity_source": "server_guid",
+                "identity_strength": "strong",
+                "server_guid": "b" * 32,
+            },
+        },
+    )
+
+    persisted_metadata = json.loads(conn.calls[0][1][-1])
+    assert endpoint_id == 17
+    assert persisted_metadata == {
+        "provider_endpoint_id": provider_id,
+        "identity_source": "server_guid",
+        "identity_strength": "strong",
+        "server_guid": "b" * 32,
+    }
+
+
 def test_bounded_identity_cache_evicts_least_recently_used_entry() -> None:
     cache = main._BoundedLRUCache[str](2)
     cache["a"] = 1
@@ -512,7 +624,7 @@ def test_validate_record_requires_numeric_schema_version_for_run_meta() -> None:
     unsupported, unsupported_reason = main.validate_record(
         {
             "type": "run_meta",
-            "schema_version": 2,
+            "schema_version": 3,
             "tool": "collector",
             "tool_version": "1.0",
             "run_id": "run-1",
@@ -662,6 +774,35 @@ def test_validate_record_rejects_explicit_unknown_resource_types_instead_of_smb_
 
 
 @pytest.mark.parametrize(
+    "record",
+    [
+        {
+            "type": "resource",
+            "run_id": "run-1",
+            "endpoint_key": "files:445",
+            "name": "Finance",
+            "share_type": "smb",
+            "provider": "nfs",
+        },
+        {
+            "type": "item",
+            "run_id": "run-1",
+            "endpoint_key": "files:445",
+            "resource_name": "Finance",
+            "path": "\\report.txt",
+            "share_type": "smb",
+            "provider": "nfs",
+        },
+    ],
+)
+def test_validate_record_rejects_provider_resource_type_conflicts(record) -> None:
+    valid, reason = main.validate_record(record)
+
+    assert valid is False
+    assert reason == "field provider conflicts with the provider implied by share_type/resource_type"
+
+
+@pytest.mark.parametrize(
     "web_url",
     [
         "javascript:alert(1)",
@@ -688,7 +829,27 @@ def test_validate_record_rejects_unsafe_sharepoint_urls(web_url: str) -> None:
 
 @pytest.mark.parametrize(
     "secret_key",
-    ["accessToken", "clientSecret", "authorization_header", "refresh-token", "privateKey"],
+    [
+        "accessToken",
+        "api_token_v2",
+        "authorization_header",
+        "authorizationHeaderV3",
+        "authtoken",
+        "backup-private-key",
+        "clientSecret",
+        "client_secret_backup",
+        "credentialsv2",
+        "dbpasswordbackup",
+        "mysecretvalue",
+        "password_v2",
+        "refresh-token",
+        "secret_copy",
+        "sessioncredential",
+        "token_backup",
+        "userpasswordcopy",
+        "xauthorizationdata",
+        "x-api-key-v2",
+    ],
 )
 def test_validate_record_rejects_secret_key_variants(secret_key: str) -> None:
     record = {
@@ -703,6 +864,209 @@ def test_validate_record_rejects_secret_key_variants(secret_key: str) -> None:
 
     assert valid is False
     assert "secret or sensitive operational state" in str(reason)
+
+
+def test_validate_record_preserves_narrow_nonsecret_telemetry_key_allowlist() -> None:
+    record = {
+        "type": "endpoint",
+        "run_id": "run-1",
+        "endpoint_key": "sharepoint:site-1",
+        "provider": "sharepoint",
+        "metadata": {
+            "token_expiration": "2026-08-27T18:00:00Z",
+            "has_password": True,
+            "collection_strategy": "path_terms",
+        },
+    }
+
+    assert main.validate_record(record) == (True, None)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Bearer eyJhbGciOiJub25lIn0.SECRET",
+        "2026-08-27 18:00:00Z",
+        "2026-08-27T18:00:00",
+        "2026-02-30T18:00:00Z",
+        "https://tenant.example/bearer",
+        1_788_000_000,
+        {"value": "2026-08-27T18:00:00Z"},
+        ["2026-08-27T18:00:00Z"],
+    ],
+)
+def test_validate_record_rejects_non_timestamp_token_expiration_telemetry(value: object) -> None:
+    record = {
+        "type": "resource",
+        "run_id": "run-1",
+        "endpoint_key": "sharepoint:site-1",
+        "name": "Documents",
+        "share_type": "sharepoint",
+        "provider_resource_id": "drive-1",
+        "metadata": {"token_expiration": value},
+    }
+
+    valid, reason = main.validate_record(record)
+
+    assert valid is False
+    assert "RFC3339 timestamp or null" in str(reason)
+
+
+@pytest.mark.parametrize("value", [None, "2026-08-27T18:00:00Z", "2026-08-27T20:00:00+02:00"])
+def test_provider_metadata_accepts_bounded_token_expiration_timestamp(value: str | None) -> None:
+    assert main._normalize_provider_metadata({"token_expiration": value}) == {"token_expiration": value}
+
+
+def test_run_meta_auth_context_rejects_non_timestamp_token_expiration() -> None:
+    record = {
+        "type": "run_meta",
+        "schema_version": 1,
+        "tool": "share-sentinel-sharepoint-collector",
+        "tool_version": "1.2.0",
+        "run_id": "00000000-0000-4000-8000-000000000101",
+        "started_at": "2026-08-27T18:00:00Z",
+        "auth_context": {"token_expiration": "Bearer SECRET"},
+    }
+
+    valid, reason = main.validate_record(record)
+
+    assert valid is False
+    assert "auth_context.token_expiration" in str(reason)
+
+
+@pytest.mark.parametrize(
+    ("container_field", "sensitive_key"),
+    [
+        ("exposure_evidence", "sharing_url_v2"),
+        ("permission_summary", "link_href_backup"),
+        ("descendant_permission_summary", "raw_descriptor_v2"),
+    ],
+)
+def test_validate_record_rejects_sensitive_permission_material_in_adjacent_metadata(
+    container_field: str,
+    sensitive_key: str,
+) -> None:
+    record = {
+        "type": "resource",
+        "run_id": "run-1",
+        "endpoint_key": "sharepoint:site-1",
+        "name": "Documents",
+        "share_type": "sharepoint",
+        "provider_resource_id": "drive-1",
+        "metadata": {},
+    }
+    if container_field == "exposure_evidence":
+        record[container_field] = {sensitive_key: "must-not-survive"}
+    else:
+        record["metadata"] = {container_field: {sensitive_key: "must-not-survive"}}
+
+    valid, reason = main.validate_record(record)
+
+    assert valid is False
+    assert "sensitive permission material" in str(reason)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"security_descriptor_copy": "must-not-survive"},
+        {"acl_evidence": {"raw_bytes": "must-not-survive"}},
+        {"permission_payload": {"sharing_url_v2": "https://tenant.example/bearer"}},
+        {"access_evidence": {"invitation_url_v2": "https://tenant.example/invite"}},
+    ],
+)
+def test_validate_record_rejects_permission_material_smuggled_through_arbitrary_metadata(
+    metadata: dict[str, object],
+) -> None:
+    record = {
+        "type": "resource",
+        "run_id": "run-1",
+        "endpoint_key": "sharepoint:site-1",
+        "name": "Documents",
+        "share_type": "sharepoint",
+        "provider_resource_id": "drive-1",
+        "metadata": metadata,
+    }
+
+    valid, reason = main.validate_record(record)
+
+    assert valid is False
+    assert "sensitive permission material" in str(reason)
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["sample-sharepoint-baseline.ndjson", "sample-sharepoint-current.ndjson"],
+)
+def test_validate_record_accepts_builtin_sharepoint_endpoint_resource_and_item_metadata(fixture_name: str) -> None:
+    fixture_path = Path(__file__).resolve().parents[2] / "examples" / fixture_name
+    records = [json.loads(line) for line in fixture_path.read_text(encoding="utf-8").splitlines()]
+    inventory_records = [record for record in records if record.get("type") in {"endpoint", "resource", "item"}]
+
+    assert {record["type"] for record in inventory_records} == {"endpoint", "resource", "item"}
+    for record in inventory_records:
+        assert main.validate_record(record) == (True, None)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["max_artifact_bytes", "size_bytes", "allocation_size_bytes", "total_size_bytes"],
+)
+@pytest.mark.parametrize("value", [None, 0, 2**63 - 1])
+def test_provider_metadata_accepts_reviewed_bounded_byte_count_telemetry(key: str, value: int | None) -> None:
+    assert main._normalize_provider_metadata({key: value}) == {key: value}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, 1.0, "1", -1, 2**63, [], {}],
+)
+def test_provider_metadata_rejects_invalid_reviewed_byte_count_telemetry(value: object) -> None:
+    with pytest.raises(ValueError, match="invalid permission telemetry"):
+        main._normalize_provider_metadata({"size_bytes": value})
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["raw_bytes", "descriptor_bytes", "size_bytes_backup", "total_size_bytes_raw"],
+)
+def test_provider_metadata_byte_count_allowlist_does_not_allow_raw_byte_aliases(key: str) -> None:
+    with pytest.raises(ValueError, match="sensitive permission material"):
+        main._normalize_provider_metadata({key: 123})
+
+
+def test_endpoint_navigation_web_url_exception_does_not_allow_nested_permission_link() -> None:
+    record = {
+        "type": "endpoint",
+        "run_id": "run-1",
+        "endpoint_key": "sharepoint:site-1",
+        "provider": "sharepoint",
+        "metadata": {
+            "web_url": "https://tenant.sharepoint.com/sites/a",
+            "permission_payload": {"web_url": "https://tenant.example/bearer"},
+        },
+    }
+
+    valid, reason = main.validate_record(record)
+
+    assert valid is False
+    assert "sensitive permission material" in str(reason)
+
+
+@pytest.mark.parametrize("alias", ["web-url", "WEBURL"])
+def test_endpoint_navigation_web_url_exception_rejects_unvalidated_aliases(alias: str) -> None:
+    record = {
+        "type": "endpoint",
+        "run_id": "run-1",
+        "endpoint_key": "sharepoint:site-1",
+        "provider": "sharepoint",
+        "metadata": {alias: "https://tenant.example/bearer"},
+    }
+
+    valid, reason = main.validate_record(record)
+
+    assert valid is False
+    assert "sensitive permission material" in str(reason)
 
 
 def test_validate_record_bounds_unicode_sharepoint_names_and_paths_without_truncation() -> None:
@@ -767,6 +1131,48 @@ def test_validate_record_normalizes_canonical_collection_context() -> None:
     assert context["scopes"] == ["Sites.Read.All"]
     assert context["materialized_snapshot"] is True
     assert context["discovery_completeness"] == "non_authoritative"
+
+
+def test_validate_record_accepts_network_collector_run_meta_byte_limit() -> None:
+    record = {
+        "type": "run_meta",
+        "schema_version": 1,
+        "tool": "share-sentinel-collector",
+        "tool_version": "1.2.0",
+        "run_id": "11111111-1111-4111-8111-111111111111",
+        "started_at": "2026-08-27T00:00:00+00:00",
+        "collection": {
+            "command": "share_sentinel_collector.py",
+            "arguments": ["--hosts", "files.example.test", "--max-artifact-bytes", "10737418240"],
+            "target_scope": {
+                "hosts": ["files.example.test"],
+                "target_count": 1,
+                "share_types": ["smb"],
+            },
+            "enumeration": {
+                "workers": 16,
+                "timeout_seconds": 5.0,
+                "max_depth": 10,
+                "max_entries_per_share": 1000000,
+                "max_artifact_bytes": 10 * 1024**3,
+                "access_probe_limit": 3,
+                "smb_permissions": "share-root",
+            },
+        },
+        "collection_context": {
+            "source": "network_share_collector",
+            "provider": "smb",
+            "collection_mode": "declared_target_inventory",
+            "status": "running",
+            "partial": True,
+            "sync_mode": "full_snapshot",
+            "materialized_snapshot": True,
+            "discovery_completeness": "running",
+        },
+    }
+
+    assert main.validate_record(record) == (True, None)
+    assert record["collection_context"]["metadata"]["collection"]["enumeration"]["max_artifact_bytes"] == (10 * 1024**3)
 
 
 def test_validate_record_normalizes_access_level_aliases() -> None:
@@ -1326,7 +1732,7 @@ def test_flush_item_batch_upserts_optional_metadata() -> None:
     assert "DO UPDATE SET" in str(captured["query"])
     assert "allocation_size_bytes" in str(captured["query"])
     assert "file_attributes" in str(captured["query"])
-    assert len(captured["params"][0]) == 21
+    assert len(captured["params"][0]) == 22
     assert rows == []
 
 

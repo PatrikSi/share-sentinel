@@ -35,6 +35,49 @@ def test_sharepoint_cli_requires_no_host_or_cidr_target() -> None:
     assert args.site == []
     assert not hasattr(args, "hosts")
     assert args.output == "-"
+    assert args.permissions == "none"
+    assert args.max_permission_objects == 10_000
+    assert args.max_permission_http_attempts == 25_000
+    assert args.max_permission_entries == 100_000
+    assert args.permission_concurrency == 2
+
+
+def test_permission_cli_modes_and_hard_bounds_are_explicit() -> None:
+    args = cli.parse_args(
+        [
+            "--auth",
+            "token",
+            "--permissions",
+            "library_roots",
+            "--max-permission-objects",
+            "25",
+            "--max-permission-http-attempts",
+            "75",
+            "--max-permission-entries",
+            "100",
+            "--permission-concurrency",
+            "3",
+        ]
+    )
+    assert args.permissions == "library_roots"
+    assert args.max_permission_objects == 25
+    assert args.max_permission_http_attempts == 75
+    assert args.max_permission_entries == 100
+    assert args.permission_concurrency == 3
+
+    with pytest.raises(TokenAcquisitionError, match="cannot be combined"):
+        cli.parse_args(["--auth", "token", "--no-files", "--permissions", "all_items"])
+    with pytest.raises(TokenAcquisitionError, match="permission-concurrency cannot exceed 8"):
+        cli.parse_args(["--auth", "token", "--permission-concurrency", "9"])
+    with pytest.raises(TokenAcquisitionError, match="max-permission-objects cannot exceed"):
+        cli.parse_args(
+            [
+                "--auth",
+                "token",
+                "--max-permission-objects",
+                str(cli.MAX_PERMISSION_OBJECTS_HARD_LIMIT + 1),
+            ]
+        )
 
 
 @pytest.mark.parametrize("path", ["scan.json", "scan.json.gz", "scan.txt"])
@@ -229,6 +272,33 @@ class SuccessfulCollector:
         return [], "success"
 
 
+class SuccessfulPermissionCollector(SuccessfulCollector):
+    permission_run_summary = {
+        "contract_version": 1,
+        "requested": True,
+        "mode": "library_roots",
+        "permission_surface": "sharepoint_graph_permissions",
+        "semantics": "sharepoint_graph_permission_v1",
+        "classification_policy": "positive_evidence_only_v1",
+        "response_scope": "effective_sharing_permissions",
+        "provider_visibility": "caller_dependent_unverified",
+        "request_coverage": "complete",
+        "candidate_objects": 1,
+        "attempted_objects": 1,
+        "completed_objects": 1,
+        "failed_objects": 0,
+        "skipped_objects": 0,
+        "http_attempts": 2,
+        "entries_observed": 1,
+        "entries_emitted": 1,
+        "entries_omitted": 0,
+        "unknown_entries": 0,
+        "anonymous_objects": 1,
+        "broad_internal_objects": 0,
+        "partial_reasons": [],
+    }
+
+
 def _patch_run_dependencies(monkeypatch, *, state=None, collector=SuccessfulCollector) -> FakeState:
     fake_state = state or FakeState()
     FakeWriter.instances.clear()
@@ -387,6 +457,38 @@ def test_successful_temporary_upload_removes_spool(monkeypatch, tmp_path, capsys
     assert "artifact preserved" not in capsys.readouterr().err
 
 
+def test_upload_scope_records_sharepoint_permission_mode(monkeypatch, tmp_path) -> None:
+    _patch_run_dependencies(monkeypatch, collector=SuccessfulPermissionCollector)
+    monkeypatch.setenv("SHARE_SENTINEL_API_TOKEN", "api-token")
+    captured_scope: dict[str, object] = {}
+
+    def upload(args, _run_id, _path, hosts):  # noqa: ARG001
+        captured_scope.update(args.target_scope_override)
+        return "accepted"
+
+    monkeypatch.setattr(cli, "upload_artifact", upload)
+    args = cli.parse_args(
+        [
+            "--auth",
+            "token",
+            "--permissions",
+            "library_roots",
+            "--upload",
+            "--api-base",
+            "https://sentinel.example/api",
+            "--project-id",
+            "project-1",
+            "--state-path",
+            str(tmp_path / "sharepoint-state.sqlite3"),
+            "--quiet",
+        ]
+    )
+
+    assert cli.run(args) == cli.EXIT_SUCCESS
+    assert captured_scope["provider"] == "sharepoint"
+    assert captured_scope["permissions"] == "library_roots"
+
+
 def test_real_writer_artifact_has_one_run_meta_and_final_context(monkeypatch, tmp_path) -> None:
     _patch_run_dependencies(monkeypatch)
     monkeypatch.setattr(cli, "NDJSONWriter", RealNDJSONWriter)
@@ -419,5 +521,65 @@ def test_real_writer_artifact_has_one_run_meta_and_final_context(monkeypatch, tm
     assert records[0]["type"] == "run_meta"
     assert records[0]["status"] == "success"
     assert records[0]["materialized_snapshot"] is True
+    assert "permissions" not in records[0]["collection"]
     assert records[-1]["type"] == "run_end"
     assert "collection_context" not in records[-1]
+
+
+def test_permission_mode_declares_schema_v2_and_feature_from_initial_header(monkeypatch, tmp_path) -> None:
+    _patch_run_dependencies(monkeypatch, collector=SuccessfulPermissionCollector)
+    args = cli.parse_args(
+        [
+            "--auth",
+            "token",
+            "--permissions",
+            "library_roots",
+            "--output",
+            str(tmp_path / "permissions.ndjson"),
+            "--state-path",
+            str(tmp_path / "sharepoint-state.sqlite3"),
+            "--quiet",
+        ]
+    )
+
+    assert cli.run(args) == cli.EXIT_SUCCESS
+
+    records = FakeWriter.instances[-1].records
+    run_meta = [record for record in records if record["type"] == "run_meta"]
+    assert len(run_meta) == 2
+    assert all(record["schema_version"] == 2 for record in run_meta)
+    assert all(record["artifact_features"] == ["direct_permissions_v1"] for record in run_meta)
+    assert run_meta[0]["metadata"]["permission_assessment"]["request_coverage"] == "running"
+    assert run_meta[-1]["metadata"]["permission_assessment"]["request_coverage"] == "complete"
+    assert run_meta[-1]["metadata"]["permissions_assessed"] is True
+    assert run_meta[-1]["metadata"]["permissions_complete"] is True
+    run_end = next(record for record in records if record["type"] == "run_end")
+    assert run_end["stats"]["permission_http_attempts"] == 2
+    assert run_end["stats"]["permission_partial"] is False
+
+
+def test_real_writer_permission_artifact_starts_with_schema_v2_feature(monkeypatch, tmp_path) -> None:
+    _patch_run_dependencies(monkeypatch, collector=SuccessfulPermissionCollector)
+    monkeypatch.setattr(cli, "NDJSONWriter", RealNDJSONWriter)
+    output_path = tmp_path / "sharepoint-permissions.ndjson"
+    args = cli.parse_args(
+        [
+            "--auth",
+            "token",
+            "--permissions",
+            "library_roots",
+            "--output",
+            str(output_path),
+            "--state-path",
+            str(tmp_path / "sharepoint-state.sqlite3"),
+            "--quiet",
+        ]
+    )
+
+    assert cli.run(args) == cli.EXIT_SUCCESS
+
+    records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert records[0]["type"] == "run_meta"
+    assert records[0]["schema_version"] == 2
+    assert records[0]["artifact_features"] == ["direct_permissions_v1"]
+    assert records[0]["collection"]["permissions"]["mode"] == "library_roots"

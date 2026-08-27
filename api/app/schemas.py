@@ -243,6 +243,66 @@ class RunActivityEventOut(BaseModel):
     metadata: dict[str, Any]
 
 
+class ComparisonCreateIn(BaseModel):
+    baseline_run_id: uuid.UUID
+    current_run_id: uuid.UUID
+
+    @field_validator("current_run_id")
+    @classmethod
+    def validate_distinct_runs(cls, value: uuid.UUID, info) -> uuid.UUID:
+        baseline = info.data.get("baseline_run_id")
+        if baseline is not None and value == baseline:
+            raise ValueError("baseline_run_id and current_run_id must be different")
+        return value
+
+
+class ComparisonOut(BaseModel):
+    id: uuid.UUID
+    project_id: uuid.UUID
+    baseline_run_id: uuid.UUID
+    current_run_id: uuid.UUID
+    baseline_run: dict[str, Any] | None = None
+    current_run: dict[str, Any] | None = None
+    algorithm_version: str
+    state: str
+    compatibility: dict[str, Any] = Field(default_factory=dict)
+    progress: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    error: dict[str, str] | None = None
+    attempt_count: int
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+    heartbeat_at: datetime | None
+    next_retry_at: datetime | None
+
+
+class ComparisonResourceChangeOut(BaseModel):
+    id: int
+    identity_key: str
+    change_type: str
+    provider: str
+    resource_type: str
+    provider_resource_id: str | None
+    before: dict[str, Any] | None
+    after: dict[str, Any] | None
+    change_categories: list[str]
+    structural_state: str
+    access_state: str
+    content_state: str
+    access_interpretation: str
+    match: dict[str, str]
+    item_changes: dict[str, Any]
+    impact_rank: int
+
+
+class AccessEvidenceOut(BaseModel):
+    resource: dict[str, Any]
+    overall: dict[str, Any]
+    assessments: list[dict[str, Any]]
+    provenance: dict[str, Any]
+
+
 class ThemeUpdateIn(BaseModel):
     ui_theme: UITheme
 
