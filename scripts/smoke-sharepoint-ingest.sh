@@ -200,7 +200,10 @@ if [[ "$comparison_state" != "complete" ]]; then
   exit 1
 fi
 if ! jq -e '
-  .summary.exact == false
+  .algorithm_version == "resource-evidence-v3"
+  and .algorithm_current == true
+  and .algorithm_warning == null
+  and .summary.exact == false
   and .summary.resource_summary_exact == false
   and .summary.item_churn_computed == true
   and .summary.item_summary_exact == true

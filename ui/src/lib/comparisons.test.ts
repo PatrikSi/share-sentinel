@@ -172,6 +172,7 @@ describe("comparison truthfulness helpers", () => {
     const comparison = {
       id: "comparison-a",
       state: "complete",
+      algorithm_current: true,
       summary: { findings_evaluation: { state: "degraded", attempt_count: 3 } },
     } as ProjectComparison;
     expect(canRetryComparisonFindings(comparison, "operator")).toBe(true);
@@ -182,11 +183,12 @@ describe("comparison truthfulness helpers", () => {
   });
 
   it("exposes materialized comparison retry only for failed comparisons and write roles", () => {
-    const failed = { id: "comparison-a", state: "failed" } as ProjectComparison;
+    const failed = { id: "comparison-a", state: "failed", algorithm_current: true } as ProjectComparison;
     expect(canRetryMaterializedComparison(failed, "operator")).toBe(true);
     expect(canRetryMaterializedComparison(failed, "admin")).toBe(true);
     expect(canRetryMaterializedComparison(failed, "viewer")).toBe(false);
     expect(canRetryMaterializedComparison({ ...failed, state: "queued" }, "admin")).toBe(false);
+    expect(canRetryMaterializedComparison({ ...failed, algorithm_current: false }, "admin")).toBe(false);
     expect(canRetryMaterializedComparison(null, "admin")).toBe(false);
   });
 });

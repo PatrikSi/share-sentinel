@@ -1,9 +1,12 @@
+import inspect
 import uuid
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 from app.deps import AuthContext
 from app.enums import ProjectRole
+from app.routers import comparisons
 from app.routers.comparisons import build_comparison_compatibility
 from app.routers.comparisons import router as comparison_router
 from app.routers.runs import router as runs_router
@@ -174,6 +177,46 @@ def test_comparison_creation_requires_inventory_read_scope_for_tokens() -> None:
     assert exc.value.status_code == 403
     assert scope_dependency(allowed_token) is allowed_token
     assert scope_dependency(default_operator) is default_operator
+
+
+def test_comparison_algorithm_version_advances_for_durable_item_history() -> None:
+    assert comparisons.ALGORITHM_VERSION == "resource-evidence-v3"
+    create_source = inspect.getsource(comparisons.create_comparison)
+    assert "RunComparison.algorithm_version == ALGORITHM_VERSION" in create_source
+    assert "RunComparison.options_hash == DEFAULT_OPTIONS_HASH" in create_source
+
+
+def test_legacy_comparison_is_explicitly_non_authoritative_and_not_retryable() -> None:
+    legacy = SimpleNamespace(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        source_id=None,
+        baseline_run_id=uuid.uuid4(),
+        current_run_id=uuid.uuid4(),
+        algorithm_version="resource-evidence-v2",
+        trigger="manual",
+        state="complete",
+        compatibility={},
+        progress={"phase": "complete"},
+        summary={"total": 0},
+        error_code=None,
+        error_message=None,
+        attempt_count=1,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        started_at=None,
+        completed_at=None,
+        heartbeat_at=None,
+        next_retry_at=None,
+    )
+
+    payload = comparisons._comparison_out(legacy)
+
+    assert payload.algorithm_current is False
+    assert "may be incomplete" in (payload.algorithm_warning or "")
+    with pytest.raises(HTTPException) as exc:
+        comparisons._require_current_comparison_algorithm(legacy)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "COMPARISON_ALGORITHM_OBSOLETE"
 
 
 def test_comparison_compatibility_accepts_same_complete_observation_plane() -> None:

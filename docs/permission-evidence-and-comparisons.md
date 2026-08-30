@@ -89,6 +89,8 @@ The bounded `GET .../runs/{run_id}/diff` endpoint remains useful for exact item-
 
 Comparison creation requires project `operator` or `admin` access plus `write:runs` and `read:inventory`; project viewers need both `read:runs` and `read:inventory` to read an existing result. Repeating the same baseline/current/algorithm/options request is idempotent. A failed comparison can be explicitly submitted again, which resets its terminal error and requeues it. Redis handoff is an optimization: database recovery can claim a committed queued comparison if enqueueing fails.
 
+The item-history implementation uses comparison algorithm `resource-evidence-v3`. Earlier `resource-evidence-v2` rows remain immutable for audit history, but their result is potentially incomplete and must not be treated as authoritative. The API and UI identify legacy rows explicitly and do not present them as a current result. Queued or running v2 work and legacy finding-evaluation retries fail with `COMPARISON_ALGORITHM_OBSOLETE` instead of running v3 logic under an old label. Automatic-baseline source coverage records the algorithm version; missing or obsolete versions degrade source health rather than failing open. Recreating the same baseline/current pair produces a separate v3 result, so existing deployments can backfill corrected item history without deleting the earlier record.
+
 ### Identity and match quality
 
 Stable provider resource IDs are preferred and scoped to provider and SharePoint tenant. Fallback identity uses provider, endpoint, resource type, and a provider-appropriate normalized name. SMB and SharePoint fallback names are case-insensitive; NFS export names preserve case. Ambiguous duplicate identities fail the job rather than pairing arbitrary resources.

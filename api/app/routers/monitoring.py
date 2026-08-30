@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.orm import Session, aliased
 
+from app.comparison_contract import COMPARISON_ALGORITHM_VERSION, comparison_algorithm_is_current
 from app.config import get_settings
 from app.db import escape_like, get_db
 from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
@@ -107,6 +108,23 @@ FINDING_ACTIVITY_PUBLIC_METADATA_FIELDS = frozenset(
         "reason",
     }
 )
+
+
+def _require_current_comparison_algorithm(comparison: RunComparison) -> None:
+    if comparison_algorithm_is_current(comparison.algorithm_version):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "COMPARISON_ALGORITHM_OBSOLETE",
+            "message": (
+                f"Comparison algorithm {comparison.algorithm_version} cannot be retried in place. "
+                "Create the same baseline/current comparison again to use the current algorithm."
+            ),
+        },
+    )
+
+
 SOURCE_PROVIDER_COMPONENT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 
@@ -190,6 +208,11 @@ def _source_health_filter(value: str):
             func.coalesce(CollectionSource.coverage["monitoring_findings"]["state"].astext, "unknown")
         )
         != "complete",
+        func.coalesce(
+            CollectionSource.coverage["automatic_baseline"]["algorithm_version"].astext,
+            "",
+        )
+        != COMPARISON_ALGORITHM_VERSION,
         func.lower(
             func.coalesce(CollectionSource.coverage["automatic_baseline"]["state"].astext, "unknown")
         )
@@ -548,6 +571,7 @@ def retry_comparison_finding_evaluation(
     ).scalar_one_or_none()
     if candidate is None:
         raise HTTPException(status_code=404, detail="comparison not found")
+    _require_current_comparison_algorithm(candidate)
     candidate_summary = dict(candidate.summary or {})
     candidate_evaluation = (
         dict(candidate_summary.get("findings_evaluation"))
@@ -589,6 +613,7 @@ def retry_comparison_finding_evaluation(
     ).scalar_one_or_none()
     if comparison is None:
         raise HTTPException(status_code=404, detail="comparison not found")
+    _require_current_comparison_algorithm(comparison)
     summary = dict(comparison.summary or {})
     evaluation = (
         dict(summary.get("findings_evaluation"))

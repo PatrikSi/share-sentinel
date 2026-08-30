@@ -92,6 +92,10 @@ function runTimestamp(run: ProjectComparison["current_run"]): string | null {
 }
 
 function comparisonStateCopy(comparison: ProjectComparison): string {
+  if (comparison.algorithm_current !== true) {
+    return comparison.algorithm_warning
+      || "This legacy comparison is retained for history but is not authoritative. Recreate the same run pair with the current algorithm.";
+  }
   if (comparison.state === "queued") {
     if (comparison.next_retry_at) {
       const retryAt = new Date(comparison.next_retry_at);
@@ -333,6 +337,7 @@ export function ComparisonPage() {
     const evaluation = comparisonFindingsEvaluation(comparison);
     if (
       !projectId
+      || comparison?.algorithm_current !== true
       || (comparison?.state !== "failed" && monitoringEvaluationState(evaluation) !== "degraded")
     ) {
       setRole(null);
@@ -355,7 +360,7 @@ export function ComparisonPage() {
       })
       .finally(() => !controller.signal.aborted && setRoleReady(true));
     return () => controller.abort();
-  }, [comparison?.id, comparison?.state, comparison?.summary?.findings_evaluation?.state, projectId]);
+  }, [comparison?.algorithm_current, comparison?.id, comparison?.state, comparison?.summary?.findings_evaluation?.state, projectId]);
 
   useEffect(() => {
     if (
@@ -384,7 +389,7 @@ export function ComparisonPage() {
   }, [category, changeType, debouncedQuery, provider]);
 
   useEffect(() => {
-    if (!projectId || !comparisonId || comparison?.state !== "complete" || resultLevel !== "resources") {
+    if (!projectId || !comparisonId || comparison?.state !== "complete" || comparison.algorithm_current !== true || resultLevel !== "resources") {
       setChanges([]);
       setNextCursor(null);
       setChangesLoading(false);
@@ -437,7 +442,7 @@ export function ComparisonPage() {
         if (!controller.signal.aborted) setChangesLoading(false);
       });
     return () => controller.abort();
-  }, [category, changeType, changesReloadNonce, comparison?.state, comparisonId, cursor, debouncedQuery, projectId, provider, resultLevel]);
+  }, [category, changeType, changesReloadNonce, comparison?.algorithm_current, comparison?.state, comparisonId, cursor, debouncedQuery, projectId, provider, resultLevel]);
 
   const selectedChange = useMemo(
     () => changes.find((change, index) => resourceChangeKey(change, index) === selectedChangeKey) || null,
@@ -466,6 +471,7 @@ export function ComparisonPage() {
   const identitySatisfied = compatibility?.identity_applicable === false
     || compatibility?.identity_scope_exact !== false;
   const comparisonActive = comparison?.state === "queued" || comparison?.state === "running";
+  const comparisonAlgorithmCurrent = comparison?.algorithm_current === true;
   const findingsEvaluation = comparisonFindingsEvaluation(comparison);
   const findingsState = monitoringEvaluationState(findingsEvaluation);
   const findingsEvaluationActive = monitoringEvaluationIsActive(findingsEvaluation);
@@ -604,19 +610,27 @@ export function ComparisonPage() {
         <StatusBanner tone="warning" title="Live comparison state may be stale"><p>{pollWarning}</p><button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={() => setPollNonce((value) => value + 1)} type="button">Retry status</button></StatusBanner>
       ) : null}
 
+      {!comparisonAlgorithmCurrent ? (
+        <StatusBanner tone="error" title="Legacy comparison is not authoritative">
+          <p>{comparison.algorithm_warning || "This comparison was produced by an obsolete algorithm and may be incomplete."}</p>
+          <p className="mt-1">Algorithm: {comparison.algorithm_version || "Not recorded"}. Recreate the same baseline/current pair to generate a current v3 result before acting on change or absence evidence.</p>
+          {boundedPreviewLink ? <Link className="inline-flex rounded-md border border-current px-3 py-2 text-xs font-semibold mt-2" to={boundedPreviewLink}>Open run diff and recreate</Link> : null}
+        </StatusBanner>
+      ) : null}
+
       {comparisonRetryError ? <StatusBanner tone="error" title="Comparison recovery request failed"><p>{comparisonRetryError} The authoritative comparison state is being reloaded before another attempt.</p></StatusBanner> : null}
       {comparisonRetryInfo ? <StatusBanner tone="success" title="Comparison recovery requested"><p>{comparisonRetryInfo}</p></StatusBanner> : null}
 
       {findingsRetryError ? <StatusBanner tone="error" title="Finding recovery request failed"><p>{findingsRetryError} Comparison state is being reloaded before another attempt.</p></StatusBanner> : null}
       {findingsRetryInfo ? <StatusBanner tone="success" title="Finding recovery requested"><p>{findingsRetryInfo}</p></StatusBanner> : null}
 
-      {comparison.state === "complete" && !findingsEvaluation ? (
+      {comparisonAlgorithmCurrent && comparison.state === "complete" && !findingsEvaluation ? (
         <StatusBanner tone="warning" title="Finding evaluation state is not recorded">
           <p>This comparison may predate continuous finding evaluation. Change evidence remains available, but do not infer that policies were evaluated.</p>
         </StatusBanner>
       ) : null}
 
-      {comparison.state === "complete" && findingsEvaluation ? (
+      {comparisonAlgorithmCurrent && comparison.state === "complete" && findingsEvaluation ? (
         <StatusBanner
           tone={findingsState === "complete" ? "success" : findingsState === "degraded" ? "error" : "warning"}
           title={findingsState === "complete" ? "Finding evaluation complete" : findingsState === "degraded" ? "Finding evaluation is degraded" : findingsEvaluationActive ? "Finding evaluation is in progress" : "Finding evaluation state is indeterminate"}
@@ -640,6 +654,7 @@ export function ComparisonPage() {
       <section className="comparison-run-context">
         <div><span>Baseline</span><strong>{comparisonRunLabel(comparison, "baseline")}</strong><small>{runTimestamp(comparison.baseline_run) || baselineRunId || "Timestamp not recorded"}</small></div>
         <div><span>Current</span><strong>{comparisonRunLabel(comparison, "current")}</strong><small>{runTimestamp(comparison.current_run) || currentRunId || "Timestamp not recorded"}</small></div>
+        <div><span>Algorithm</span><strong>{comparison.algorithm_version || "Not recorded"}</strong><small>{comparisonAlgorithmCurrent ? "Current evidence contract" : "Legacy, recreate required"}</small></div>
         <div><span>State</span><strong>{humanizeEvidenceValue(comparison.state)}</strong><small>{comparisonStateCopy(comparison)}</small></div>
         <div><span>Freshness</span><strong>{lastUpdatedAt ? lastUpdatedAt.toLocaleTimeString() : "Not loaded"}</strong><small>{comparisonActive || findingsEvaluationActive ? "Polling every few seconds" : "Terminal state"}</small></div>
       </section>
@@ -651,18 +666,18 @@ export function ComparisonPage() {
       {comparison.state === "failed" ? (
         <StatusBanner tone="error" title="Comparison failed">
           <p>{comparisonStateCopy(comparison)}</p>
-          <p className="mt-1">No partial result rows are published as final. After correcting the recorded failure, retry this comparison so its durable identity and audit history are preserved.</p>
+          <p className="mt-1">{comparisonAlgorithmCurrent ? "No partial result rows are published as final. After correcting the recorded failure, retry this comparison so its durable identity and audit history are preserved." : "Obsolete comparisons cannot be retried in place. Create the same baseline/current pair again to produce a new v3 comparison while preserving this row for audit history."}</p>
           <div className="mt-2 flex flex-wrap gap-2">
             {canRetryMaterializedComparison(comparison, role) ? <button className="inventory-button-primary" disabled={comparisonRetryBusy} onClick={() => void retryMaterializedComparison()} type="button">{comparisonRetryBusy ? "Requesting retry…" : "Retry comparison"}</button> : null}
             {boundedPreviewLink ? <Link className="inline-flex rounded-md border border-current px-3 py-2 text-xs font-semibold" to={boundedPreviewLink}>Return to run diff</Link> : null}
           </div>
-          {roleError ? <p className="mt-2">{roleError} Recovery remains disabled until access can be verified.</p> : null}
-          {!roleReady && !roleError ? <p className="mt-2">Checking recovery permission…</p> : null}
-          {roleReady && !canRetryMaterializedComparison(comparison, role) && !roleError ? <p className="mt-2">An operator or project administrator must retry this comparison.</p> : null}
+          {comparisonAlgorithmCurrent && roleError ? <p className="mt-2">{roleError} Recovery remains disabled until access can be verified.</p> : null}
+          {comparisonAlgorithmCurrent && !roleReady && !roleError ? <p className="mt-2">Checking recovery permission…</p> : null}
+          {comparisonAlgorithmCurrent && roleReady && !canRetryMaterializedComparison(comparison, role) && !roleError ? <p className="mt-2">An operator or project administrator must retry this comparison.</p> : null}
         </StatusBanner>
       ) : null}
 
-      {comparison.state === "complete" ? (
+      {comparisonAlgorithmCurrent && comparison.state === "complete" ? (
         <>
           <StatusBanner tone={comparisonCompatibilityTone(compatibility)} title={compatibility?.structural_interpretable ? (compatibility.content_interpretable && compatibility.access_interpretable && identitySatisfied && capabilitySatisfied && compatibility.direct_permissions_interpretable ? "Comparison dimensions are interpretable" : "Some comparison dimensions are limited") : "Structural changes are not fully interpretable"}>
             <div className="comparison-compatibility-grid">

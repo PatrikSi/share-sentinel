@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.comparison_contract import COMPARISON_ALGORITHM_VERSION, comparison_algorithm_is_current
 from app.locking import lock_monitoring_source
 from app.models import CollectionSource, Finding, RunComparison
 
@@ -127,10 +128,12 @@ def source_health(source: CollectionSource, *, now: datetime | None = None) -> d
     findings_state = str(findings_coverage.get("state") or "unknown").lower()
     baseline_state = str(baseline_coverage.get("state") or "unknown").lower()
     baseline_findings_state = str(baseline_coverage.get("findings_evaluation_state") or "unknown").lower()
+    baseline_algorithm_current = comparison_algorithm_is_current(baseline_coverage.get("algorithm_version"))
     monitoring_complete = (
         findings_state == "complete"
         and baseline_state == "established"
         and baseline_findings_state == "complete"
+        and baseline_algorithm_current
     )
     reasons: list[str] = []
     if not source.enabled:
@@ -153,6 +156,8 @@ def source_health(source: CollectionSource, *, now: datetime | None = None) -> d
         health_status = "degraded"
         freshness_state = "fresh"
         reasons.extend(coverage_reasons or ["The latest collection reported partial or unknown coverage."])
+        if baseline_state == "established" and not baseline_algorithm_current:
+            reasons.append("Automatic comparison coverage uses an obsolete or unknown algorithm.")
     else:
         health_status = "healthy"
         freshness_state = "fresh"
@@ -162,6 +167,10 @@ def source_health(source: CollectionSource, *, now: datetime | None = None) -> d
         "health_reasons": list(dict.fromkeys(reasons)),
         "coverage": {
             **coverage,
+            "automatic_baseline": {
+                **baseline_coverage,
+                "algorithm_current": baseline_algorithm_current,
+            },
             "state": coverage_state if coverage_state in {"complete", "partial", "unknown"} else "unknown",
             "reasons": coverage_reasons,
         },
@@ -206,7 +215,11 @@ def publish_automatic_baseline_recovery(
 ) -> bool:
     """Publish recovery only while this comparison is the source's current baseline."""
 
-    if comparison.trigger != "automatic" or comparison.source_id is None:
+    if (
+        comparison.trigger != "automatic"
+        or comparison.source_id is None
+        or not comparison_algorithm_is_current(comparison.algorithm_version)
+    ):
         return False
     candidate = db.get(CollectionSource, comparison.source_id)
     if candidate is None:
@@ -237,6 +250,7 @@ def publish_automatic_baseline_recovery(
         baseline.update(
             {
                 "state": "established",
+                "algorithm_version": COMPARISON_ALGORITHM_VERSION,
                 "findings_evaluation_state": "queued",
                 "findings_next_retry_at": None,
             }
@@ -245,6 +259,7 @@ def publish_automatic_baseline_recovery(
         baseline.update(
             {
                 "state": "queued",
+                "algorithm_version": COMPARISON_ALGORITHM_VERSION,
                 "findings_evaluation_state": "queued",
                 "findings_next_retry_at": None,
                 "next_retry_at": None,

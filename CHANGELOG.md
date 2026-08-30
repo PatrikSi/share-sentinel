@@ -41,6 +41,7 @@ The project follows a simple release-first workflow:
 - Findings and effective-access output are evidence, not a directory-service entitlement simulation. Group expansion and inherited-permission resolution remain unknown unless a future collector supplies complete, ordered, and provenance-backed membership/inheritance snapshots.
 - Recurring comparisons are time-sliced and recovered from Postgres. Size worker replicas, database capacity, retention, and collection cadence from representative tenant skew; a schedule must not create an unbounded backlog.
 - Raw artifacts, item history, permission evidence, findings, and audit records can contain sensitive infrastructure and identity metadata. Define deployment-specific access, backup, retention, and deletion policies.
+- Materialized item history uses comparison algorithm `resource-evidence-v3`. Existing v2 rows are retained for audit history but are potentially incomplete and non-authoritative; the API and UI mark them as legacy. Queued or running v2 work and legacy finding-evaluation retries fail with recreate guidance instead of being mislabeled. Cached automatic-baseline coverage now includes the algorithm version and fails closed in source health, so important baseline/current pairs must be recreated after upgrade to materialize the corrected v3 result.
 
 ## [1.3.0] - 2026-08-27
 

@@ -323,6 +323,8 @@ class ComparisonOut(BaseModel):
     baseline_run: dict[str, Any] | None = None
     current_run: dict[str, Any] | None = None
     algorithm_version: str
+    algorithm_current: bool
+    algorithm_warning: str | None = None
     trigger: str = "manual"
     state: str
     compatibility: dict[str, Any] = Field(default_factory=dict)

@@ -462,6 +462,8 @@ def test_source_health_filter_normalizes_coverage_like_payload_health():
     source = inspect.getsource(monitoring._source_health_filter)
     assert "func.lower(func.coalesce" in source
     assert '"findings_evaluation_state"' in source
+    assert '"algorithm_version"' in source
+    assert "COMPARISON_ALGORITHM_VERSION" in source
     assert '"unknown"' in source
 
 
@@ -482,6 +484,46 @@ def test_source_health_fails_closed_when_baseline_finding_state_is_missing():
     health = monitoring_service.source_health(source, now=now)
 
     assert health["health_status"] == "degraded"
+
+
+def test_source_health_fails_closed_for_legacy_comparison_coverage():
+    now = datetime.now(tz=UTC)
+    coverage = {
+        "state": "complete",
+        "monitoring_findings": {"state": "complete"},
+        "automatic_baseline": {
+            "state": "established",
+            "findings_evaluation_state": "complete",
+            "algorithm_version": "resource-evidence-v2",
+        },
+    }
+    source = SimpleNamespace(
+        enabled=True,
+        last_success_at=now,
+        last_failure_at=None,
+        expected_interval_seconds=3600,
+        coverage=coverage,
+    )
+
+    legacy = monitoring_service.source_health(source, now=now)
+    coverage["automatic_baseline"]["algorithm_version"] = comparisons.ALGORITHM_VERSION
+    current = monitoring_service.source_health(source, now=now)
+
+    assert legacy["health_status"] == "degraded"
+    assert legacy["coverage"]["automatic_baseline"]["algorithm_current"] is False
+    assert any("obsolete or unknown algorithm" in reason for reason in legacy["health_reasons"])
+    assert current["health_status"] == "healthy"
+    assert current["coverage"]["automatic_baseline"]["algorithm_current"] is True
+
+
+def test_comparison_finding_retry_rejects_legacy_algorithm():
+    with pytest.raises(HTTPException) as raised:
+        monitoring._require_current_comparison_algorithm(
+            SimpleNamespace(algorithm_version="resource-evidence-v2")
+        )
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail["code"] == "COMPARISON_ALGORITHM_OBSOLETE"
 
 
 def test_finding_history_cursor_and_search_match_new_indexes():

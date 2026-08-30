@@ -435,7 +435,7 @@ CONSUMER_UNCLASSIFIED_INVENTORY_ERROR_CODES = {
     "JSON_DECODE_ERROR",
 }
 
-COMPARISON_ALGORITHM_VERSION = "resource-evidence-v2"
+COMPARISON_ALGORITHM_VERSION = "resource-evidence-v3"
 COMPARISON_DEFAULT_OPTIONS_HASH = hashlib.sha256(b"{}").hexdigest()
 COMPARISON_ITEM_BATCH_SIZE = 5000
 COMPARISON_WORK_QUANTUM_SECONDS = _read_int_env(
@@ -3095,6 +3095,12 @@ def _recompute_source_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
     findings_state = str(findings.get("state") or "unknown").casefold()
     baseline_state = str(baseline.get("state") or "unknown").casefold()
     baseline_findings_state = str(baseline.get("findings_evaluation_state") or "unknown").casefold()
+    baseline_algorithm_current = (
+        str(baseline.get("algorithm_version") or "") == COMPARISON_ALGORITHM_VERSION
+    )
+    if baseline.get("comparison_id"):
+        baseline["algorithm_current"] = baseline_algorithm_current
+        coverage["automatic_baseline"] = baseline
     reasons = list(inventory_reasons)
     if findings_state != "complete":
         reasons.append(
@@ -3104,6 +3110,8 @@ def _recompute_source_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
         )
     if baseline_state != "established":
         reasons.append("Automatic comparison coverage has not established a usable baseline.")
+    elif not baseline_algorithm_current:
+        reasons.append("Automatic comparison coverage uses an obsolete or unknown algorithm.")
     elif baseline_findings_state != "complete":
         reasons.append("Automatic comparison finding evaluation is incomplete.")
     if inventory_state not in {"complete", "partial", "unknown"}:
@@ -3112,6 +3120,7 @@ def _recompute_source_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
         inventory_state
         if findings_state == "complete"
         and baseline_state == "established"
+        and baseline_algorithm_current
         and baseline_findings_state == "complete"
         else ("unknown" if inventory_state == "unknown" else "partial")
     )
@@ -3166,7 +3175,10 @@ def update_collection_source_monitoring_coverage(
             "retryable": str(findings.get("state") or "") == "degraded",
         }
     if baseline is not None:
-        coverage["automatic_baseline"] = baseline
+        normalized_baseline = dict(baseline)
+        if normalized_baseline.get("comparison_id"):
+            normalized_baseline.setdefault("algorithm_version", COMPARISON_ALGORITHM_VERSION)
+        coverage["automatic_baseline"] = normalized_baseline
     coverage = _recompute_source_coverage(coverage)
     conn.execute(
         "UPDATE collection_sources SET coverage = %s::jsonb, updated_at = NOW() WHERE id = %s",
@@ -3463,6 +3475,7 @@ def _existing_comparison_baseline_coverage(
         "state": baseline_state,
         "comparison_id": comparison_id,
         "baseline_run_id": baseline_run_id,
+        "algorithm_version": COMPARISON_ALGORITHM_VERSION,
         "findings_evaluation_state": str(evaluation.get("state") or "unknown").casefold(),
     }
     if len(row) > 3 and row[3]:
@@ -3671,6 +3684,7 @@ def create_automatic_comparison(
             "state": "queued",
             "comparison_id": comparison_id,
             "baseline_run_id": baseline_run_id,
+            "algorithm_version": COMPARISON_ALGORITHM_VERSION,
             "findings_evaluation_state": "queued",
         }
     )
@@ -6907,16 +6921,84 @@ def discover_recoverable_comparisons(limit: int = 8) -> list[dict[str, str]]:
     ]
 
 
+def _degrade_obsolete_comparison_finding_evaluations(
+    conn: psycopg.Connection,
+    *,
+    limit: int,
+) -> int:
+    """Terminally quarantine legacy finding retries without evaluating their evidence."""
+
+    rows = conn.execute(
+        """
+        WITH candidates AS (
+            SELECT id
+            FROM run_comparisons
+            WHERE state = 'complete'
+              AND algorithm_version IS DISTINCT FROM %s
+              AND COALESCE(summary #>> '{findings_evaluation,state}', '')
+                  IN ('queued', 'retrying', 'evaluating', 'degraded')
+              AND COALESCE(summary #>> '{findings_evaluation,error_code}', '')
+                  <> 'COMPARISON_ALGORITHM_OBSOLETE'
+            ORDER BY completed_at, id
+            FOR UPDATE SKIP LOCKED
+            LIMIT %s
+        )
+        UPDATE run_comparisons AS comparison
+        SET heartbeat_at = NOW(),
+            progress = COALESCE(comparison.progress, '{}'::jsonb) || jsonb_build_object(
+                'findings_evaluation_state', 'degraded'
+            ),
+            summary = jsonb_set(
+                COALESCE(comparison.summary, '{}'::jsonb),
+                '{findings_evaluation}',
+                COALESCE(comparison.summary->'findings_evaluation', '{}'::jsonb)
+                    || jsonb_build_object(
+                        'state', 'degraded',
+                        'next_retry_at', NULL,
+                        'retryable', FALSE,
+                        'error_code', 'COMPARISON_ALGORITHM_OBSOLETE',
+                        'algorithm_version', comparison.algorithm_version,
+                        'current_algorithm_version', %s::text
+                    ),
+                TRUE
+            )
+        FROM candidates
+        WHERE comparison.id = candidates.id
+        RETURNING comparison.id::text, comparison.project_id::text,
+                  comparison.algorithm_version
+        """,
+        (COMPARISON_ALGORITHM_VERSION, max(1, min(int(limit), 100)), COMPARISON_ALGORITHM_VERSION),
+    ).fetchall()
+    for comparison_id, project_id, algorithm_version in rows:
+        write_audit(
+            conn,
+            str(project_id),
+            "COMPARISON_FINDINGS_EVALUATION_FAILED",
+            "run_comparison",
+            str(comparison_id),
+            {
+                "worker": CONSUMER_NAME,
+                "error_code": "COMPARISON_ALGORITHM_OBSOLETE",
+                "reason": "algorithm_obsolete",
+                "algorithm_version": str(algorithm_version or "unknown")[:128],
+                "current_algorithm_version": COMPARISON_ALGORITHM_VERSION,
+            },
+        )
+    return len(rows)
+
+
 def discover_recoverable_comparison_finding_evaluations(limit: int = 8) -> list[dict[str, str]]:
     """Claim derived finding retries while keeping a valid comparison visible."""
 
     with connect_database() as conn:
+        _degrade_obsolete_comparison_finding_evaluations(conn, limit=limit)
         rows = conn.execute(
             """
             WITH candidates AS (
                 SELECT id
                 FROM run_comparisons
                 WHERE state = 'complete'
+                  AND algorithm_version = %s
                   AND (
                       (
                           COALESCE(summary #>> '{findings_evaluation,state}', '') IN ('queued', 'retrying')
@@ -6960,7 +7042,12 @@ def discover_recoverable_comparison_finding_evaluations(limit: int = 8) -> list[
             WHERE comparison.id = candidates.id
             RETURNING comparison.id::text, comparison.project_id::text
             """,
-            (STALE_INGESTING_SECONDS, max(1, min(int(limit), 100)), CONSUMER_NAME),
+            (
+                COMPARISON_ALGORITHM_VERSION,
+                STALE_INGESTING_SECONDS,
+                max(1, min(int(limit), 100)),
+                CONSUMER_NAME,
+            ),
         ).fetchall()
     return [
         {
@@ -6997,6 +7084,32 @@ def _comparison_batch_keys(
             (baseline_run_id, current_run_id, after_key, after_key, max(1, limit)),
         ).fetchall()
     ]
+
+
+def _comparison_resource_resume_state(
+    progress: dict[str, Any],
+    *,
+    resource_phase_complete: bool,
+) -> tuple[str | None, int, int]:
+    """Normalize the durable resource cursor without inventing a key.
+
+    A missing JSON value must remain ``None``. Converting it with ``str``
+    produces the literal cursor ``"None"`` and can make every hexadecimal
+    identity key sort before the cursor, publishing a false empty comparison.
+    """
+
+    raw_cursor = progress.get("last_identity_key")
+    if raw_cursor is None or raw_cursor == "":
+        cursor = None
+    elif isinstance(raw_cursor, str) and re.fullmatch(r"[0-9a-f]{64}", raw_cursor):
+        cursor = raw_cursor
+    else:
+        raise ValueError("comparison resource cursor must be a lowercase SHA-256 identity key")
+
+    resume_counts = resource_phase_complete or cursor is not None
+    processed = int(progress.get("processed") or 0) if resume_counts else 0
+    emitted = int(progress.get("changes_emitted") or 0) if resume_counts else 0
+    return cursor, processed, emitted
 
 
 def _materialize_comparison_batch(
@@ -8974,7 +9087,8 @@ def process_comparison_job(fields: dict[str, str]) -> str:
             row = conn.execute(
                 """
                 SELECT project_id::text, source_id::text, baseline_run_id::text, current_run_id::text,
-                       state, compatibility, attempt_count, next_retry_at, progress, trigger
+                       state, compatibility, attempt_count, next_retry_at, progress, trigger,
+                       algorithm_version
                 FROM run_comparisons
                 WHERE id = %s
                 FOR UPDATE
@@ -8994,6 +9108,7 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                 next_retry_at,
                 raw_progress,
                 comparison_trigger,
+                comparison_algorithm_version,
             ) = row
             if state in {"complete", "failed"}:
                 return "ignored"
@@ -9008,6 +9123,62 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                 source_lock_key = monitoring_source_advisory_lock_key_from_id(conn, source_id)
                 if source_lock_key is not None:
                     conn.execute("SELECT pg_advisory_lock(%s)", (source_lock_key,))
+            if str(comparison_algorithm_version or "") != COMPARISON_ALGORITHM_VERSION:
+                conn.execute(
+                    """
+                    UPDATE run_comparisons
+                    SET state = 'failed', completed_at = NOW(), heartbeat_at = NOW(),
+                        next_retry_at = NULL,
+                        error_code = 'COMPARISON_ALGORITHM_OBSOLETE',
+                        error_message =
+                            'This comparison uses an obsolete algorithm; create a new comparison for the same runs.',
+                        progress = COALESCE(progress, '{}'::jsonb) || jsonb_build_object(
+                            'phase', 'failed',
+                            'reason', 'algorithm_obsolete',
+                            'algorithm_version', algorithm_version,
+                            'current_algorithm_version', %s::text
+                        )
+                    WHERE id = %s
+                    """,
+                    (COMPARISON_ALGORITHM_VERSION, comparison_id),
+                )
+                if source_id and str(comparison_trigger) == "automatic":
+                    baseline_row = conn.execute(
+                        "SELECT coverage #>> '{automatic_baseline,comparison_id}' "
+                        "FROM collection_sources WHERE id = %s FOR UPDATE",
+                        (source_id,),
+                    ).fetchone()
+                    if baseline_row and str(baseline_row[0] or "") == comparison_id:
+                        update_collection_source_monitoring_coverage(
+                            conn,
+                            source_id=source_id,
+                            run_id=current_run_id,
+                            baseline={
+                                "state": "failed",
+                                "comparison_id": comparison_id,
+                                "baseline_run_id": baseline_run_id,
+                                "error_code": "COMPARISON_ALGORITHM_OBSOLETE",
+                                "reason": "algorithm_obsolete",
+                                "algorithm_version": str(comparison_algorithm_version or "unknown"),
+                                "current_algorithm_version": COMPARISON_ALGORITHM_VERSION,
+                            },
+                        )
+                write_audit(
+                    conn,
+                    project_id,
+                    "COMPARISON_FAILED",
+                    "run_comparison",
+                    comparison_id,
+                    {
+                        "worker": CONSUMER_NAME,
+                        "error_code": "COMPARISON_ALGORITHM_OBSOLETE",
+                        "reason": "algorithm_obsolete",
+                        "algorithm_version": str(comparison_algorithm_version or "unknown")[:128],
+                        "current_algorithm_version": COMPARISON_ALGORITHM_VERSION,
+                    },
+                )
+                conn.commit()
+                return "failed"
             if (
                 str(comparison_trigger) == "automatic"
                 and source_id
@@ -9298,13 +9469,13 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                 "finalizing",
                 "evaluating_findings",
             }
-            after_key: str | None = (
-                str(progress.get("last_identity_key"))
-                if resource_phase_complete or resume_phase in {"materializing", "materializing_resources"}
-                else None
-            )
-            processed = int(progress.get("processed") or 0) if after_key else 0
-            emitted = int(progress.get("changes_emitted") or 0) if after_key else 0
+            if resource_phase_complete or resume_phase in {"materializing", "materializing_resources"}:
+                after_key, processed, emitted = _comparison_resource_resume_state(
+                    progress,
+                    resource_phase_complete=resource_phase_complete,
+                )
+            else:
+                after_key, processed, emitted = None, 0, 0
             if not resource_phase_complete:
                 while not _shutdown_event.is_set():
                     keys = _comparison_batch_keys(
@@ -10137,7 +10308,8 @@ def process_comparison_finding_evaluation_job(fields: dict[str, str]) -> str:
             row = conn.execute(
                 """
                 SELECT project_id::text, source_id::text, baseline_run_id::text,
-                       current_run_id::text, state, progress, summary, trigger
+                       current_run_id::text, state, progress, summary, trigger,
+                       algorithm_version
                 FROM run_comparisons
                 WHERE id = %s
                 FOR UPDATE
@@ -10146,7 +10318,17 @@ def process_comparison_finding_evaluation_job(fields: dict[str, str]) -> str:
             ).fetchone()
             if row is None:
                 return "ignored"
-            project_id, source_id, baseline_run_id, current_run_id, state, raw_progress, raw_summary, trigger = row
+            (
+                project_id,
+                source_id,
+                baseline_run_id,
+                current_run_id,
+                state,
+                raw_progress,
+                raw_summary,
+                trigger,
+                comparison_algorithm_version,
+            ) = row
             summary = dict(raw_summary) if isinstance(raw_summary, dict) else {}
             evaluation = (
                 dict(summary.get("findings_evaluation"))
@@ -10164,6 +10346,62 @@ def process_comparison_finding_evaluation_job(fields: dict[str, str]) -> str:
                 source_lock_key = monitoring_source_advisory_lock_key_from_id(conn, source_id)
                 if source_lock_key is not None:
                     conn.execute("SELECT pg_advisory_lock(%s)", (source_lock_key,))
+            if str(comparison_algorithm_version or "") != COMPARISON_ALGORITHM_VERSION:
+                evaluation = {
+                    **evaluation,
+                    "state": "degraded",
+                    "next_retry_at": None,
+                    "retryable": False,
+                    "error_code": "COMPARISON_ALGORITHM_OBSOLETE",
+                    "algorithm_version": str(comparison_algorithm_version or "unknown")[:128],
+                    "current_algorithm_version": COMPARISON_ALGORITHM_VERSION,
+                }
+                summary["findings_evaluation"] = evaluation
+                progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
+                progress = {**progress, "findings_evaluation_state": "degraded"}
+                conn.execute(
+                    "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb, "
+                    "summary = %s::jsonb WHERE id = %s",
+                    (json.dumps(progress), json.dumps(summary), comparison_id),
+                )
+                if source_id and str(trigger) == "automatic":
+                    baseline_row = conn.execute(
+                        "SELECT coverage #>> '{automatic_baseline,comparison_id}' "
+                        "FROM collection_sources WHERE id = %s FOR UPDATE",
+                        (source_id,),
+                    ).fetchone()
+                    if baseline_row and str(baseline_row[0] or "") == comparison_id:
+                        update_collection_source_monitoring_coverage(
+                            conn,
+                            source_id=source_id,
+                            run_id=current_run_id,
+                            baseline={
+                                "state": "failed",
+                                "comparison_id": comparison_id,
+                                "baseline_run_id": baseline_run_id,
+                                "findings_evaluation_state": "degraded",
+                                "error_code": "COMPARISON_ALGORITHM_OBSOLETE",
+                                "reason": "algorithm_obsolete",
+                                "algorithm_version": str(comparison_algorithm_version or "unknown"),
+                                "current_algorithm_version": COMPARISON_ALGORITHM_VERSION,
+                            },
+                        )
+                write_audit(
+                    conn,
+                    project_id,
+                    "COMPARISON_FINDINGS_EVALUATION_FAILED",
+                    "run_comparison",
+                    comparison_id,
+                    {
+                        "worker": CONSUMER_NAME,
+                        "error_code": "COMPARISON_ALGORITHM_OBSOLETE",
+                        "reason": "algorithm_obsolete",
+                        "algorithm_version": str(comparison_algorithm_version or "unknown")[:128],
+                        "current_algorithm_version": COMPARISON_ALGORITHM_VERSION,
+                    },
+                )
+                conn.commit()
+                return "degraded"
             authoritative = bool(
                 not source_id
                 or comparison_is_latest_complete_candidate(

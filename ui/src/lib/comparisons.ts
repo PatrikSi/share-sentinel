@@ -59,6 +59,9 @@ export type ProjectComparison = {
   id: string;
   project_id?: string | null;
   state: ComparisonState;
+  algorithm_version?: string | null;
+  algorithm_current?: boolean;
+  algorithm_warning?: string | null;
   current_run?: ComparisonRun | null;
   baseline_run?: ComparisonRun | null;
   current_run_id?: string | null;
@@ -132,6 +135,9 @@ export type ResourceComparisonChange = {
 export type ResourceChangePage = {
   items: ResourceComparisonChange[];
   next_cursor: string | null;
+  algorithm_version?: string | null;
+  algorithm_current?: boolean;
+  algorithm_warning?: string | null;
 };
 
 export type ItemComparisonSnapshot = {
@@ -168,6 +174,9 @@ export type ItemChangePage = {
   items: ItemComparisonChange[];
   next_cursor: string | null;
   comparison_state: ComparisonState;
+  algorithm_version?: string | null;
+  algorithm_current?: boolean;
+  algorithm_warning?: string | null;
   interpretation?: {
     state?: string | null;
     exact?: boolean;
@@ -232,6 +241,7 @@ export function canRetryComparisonFindings(
   role: string | null | undefined,
 ): boolean {
   return canManageFindings(role)
+    && comparison?.algorithm_current === true
     && comparison?.state === "complete"
     && monitoringEvaluationState(comparisonFindingsEvaluation(comparison)) === "degraded";
 }
@@ -241,7 +251,9 @@ export function canRetryMaterializedComparison(
   role: string | null | undefined,
 ): boolean {
   const normalizedRole = role?.trim().toLowerCase();
-  return comparison?.state === "failed" && (normalizedRole === "operator" || normalizedRole === "admin");
+  return comparison?.algorithm_current === true
+    && comparison.state === "failed"
+    && (normalizedRole === "operator" || normalizedRole === "admin");
 }
 
 export function comparisonRunId(comparison: ProjectComparison, side: "current" | "baseline"): string | null {

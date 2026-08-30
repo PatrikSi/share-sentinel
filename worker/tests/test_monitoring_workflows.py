@@ -460,6 +460,197 @@ def test_comparison_recovery_keeps_phase_and_worker_has_durable_yield_contract()
     assert delete_position > operator_position
 
 
+@pytest.mark.parametrize(
+    "progress",
+    [
+        {"phase": "materializing_resources", "processed": 17, "changes_emitted": 4},
+        {
+            "phase": "materializing_resources",
+            "last_identity_key": None,
+            "processed": 17,
+            "changes_emitted": 4,
+        },
+        {
+            "phase": "materializing_resources",
+            "last_identity_key": "",
+            "processed": 17,
+            "changes_emitted": 4,
+        },
+    ],
+)
+def test_comparison_resource_resume_never_invents_a_cursor(progress):
+    assert main._comparison_resource_resume_state(
+        progress,
+        resource_phase_complete=False,
+    ) == (None, 0, 0)
+
+
+def test_comparison_resource_resume_preserves_real_cursor_and_completed_counts():
+    identity_key = "a" * 64
+    assert main._comparison_resource_resume_state(
+        {
+            "last_identity_key": identity_key,
+            "processed": 17,
+            "changes_emitted": 4,
+        },
+        resource_phase_complete=False,
+    ) == (identity_key, 17, 4)
+    assert main._comparison_resource_resume_state(
+        {"processed": 17, "changes_emitted": 4},
+        resource_phase_complete=True,
+    ) == (None, 17, 4)
+
+
+@pytest.mark.parametrize("cursor", [123, "None", "abc", [], {}])
+def test_comparison_resource_resume_rejects_corrupt_cursor(cursor):
+    with pytest.raises(ValueError, match="lowercase SHA-256 identity key"):
+        main._comparison_resource_resume_state(
+            {"last_identity_key": cursor},
+            resource_phase_complete=False,
+        )
+
+
+def test_comparison_algorithm_version_requires_corrected_item_history_output():
+    assert main.COMPARISON_ALGORITHM_VERSION == "resource-evidence-v3"
+    api_root = Path(__file__).resolve().parents[2] / "api/app"
+    api_contract = (api_root / "comparison_contract.py").read_text()
+    api_router = (api_root / "routers/comparisons.py").read_text()
+    assert 'COMPARISON_ALGORITHM_VERSION = "resource-evidence-v3"' in api_contract
+    assert "ALGORITHM_VERSION = COMPARISON_ALGORITHM_VERSION" in api_router
+
+
+def test_obsolete_queued_comparison_fails_with_recreate_guidance(monkeypatch):
+    comparison_id = str(uuid.uuid4())
+    project_id = str(uuid.uuid4())
+    baseline_run_id = str(uuid.uuid4())
+    current_run_id = str(uuid.uuid4())
+
+    class Conn:
+        def __init__(self):
+            self.failure_update = None
+            self.commits = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            normalized = " ".join(query.split())
+            if "SELECT pg_try_advisory_lock" in normalized:
+                return Result((True,))
+            if "SELECT project_id::text, source_id::text" in normalized:
+                assert "algorithm_version" in normalized
+                return Result(
+                    (
+                        project_id,
+                        None,
+                        baseline_run_id,
+                        current_run_id,
+                        "queued",
+                        {},
+                        0,
+                        None,
+                        {"phase": "queued"},
+                        "manual",
+                        "resource-evidence-v2",
+                    )
+                )
+            if "COMPARISON_ALGORITHM_OBSOLETE" in normalized:
+                self.failure_update = params
+                return Result()
+            if "SELECT pg_advisory_unlock" in normalized:
+                return Result((True,))
+            raise AssertionError(normalized)
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            return None
+
+    conn = Conn()
+    audits = []
+    monkeypatch.setattr(main, "connect_database", lambda: conn)
+    monkeypatch.setattr(main, "write_audit", lambda *args, **_kwargs: audits.append(args))
+
+    assert main.process_comparison_job({"comparison_id": comparison_id}) == "failed"
+    assert conn.failure_update == (main.COMPARISON_ALGORITHM_VERSION, comparison_id)
+    assert conn.commits == 1
+    assert audits[0][2] == "COMPARISON_FAILED"
+    assert audits[0][5]["error_code"] == "COMPARISON_ALGORITHM_OBSOLETE"
+    assert audits[0][5]["algorithm_version"] == "resource-evidence-v2"
+
+
+def test_obsolete_comparison_findings_are_degraded_without_evaluation(monkeypatch):
+    comparison_id = str(uuid.uuid4())
+    project_id = str(uuid.uuid4())
+    baseline_run_id = str(uuid.uuid4())
+    current_run_id = str(uuid.uuid4())
+
+    class Conn:
+        def __init__(self):
+            self.update = None
+            self.commits = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            normalized = " ".join(query.split())
+            if "SELECT pg_try_advisory_lock" in normalized:
+                return Result((True,))
+            if "SELECT project_id::text, source_id::text" in normalized:
+                assert "algorithm_version" in normalized
+                return Result(
+                    (
+                        project_id,
+                        None,
+                        baseline_run_id,
+                        current_run_id,
+                        "complete",
+                        {"phase": "complete"},
+                        {"findings_evaluation": {"state": "queued"}},
+                        "manual",
+                        "resource-evidence-v2",
+                    )
+                )
+            if "UPDATE run_comparisons SET heartbeat_at" in normalized:
+                self.update = params
+                return Result()
+            if "SELECT pg_advisory_unlock" in normalized:
+                return Result((True,))
+            raise AssertionError(normalized)
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            return None
+
+    conn = Conn()
+    audits = []
+    monkeypatch.setattr(main, "connect_database", lambda: conn)
+    monkeypatch.setattr(main, "write_audit", lambda *args, **_kwargs: audits.append(args))
+    monkeypatch.setattr(
+        main,
+        "evaluate_comparison_findings",
+        lambda *_args, **_kwargs: pytest.fail("legacy findings must not be evaluated"),
+    )
+
+    assert main.process_comparison_finding_evaluation_job({"comparison_id": comparison_id}) == "degraded"
+    assert conn.commits == 1
+    assert conn.update is not None
+    assert json.loads(conn.update[1])["findings_evaluation"]["error_code"] == (
+        "COMPARISON_ALGORITHM_OBSOLETE"
+    )
+    assert audits[0][2] == "COMPARISON_FINDINGS_EVALUATION_FAILED"
+
+
 def test_comparison_finding_does_not_treat_indeterminate_access_as_changed():
     source = inspect.getsource(main.evaluate_comparison_findings)
     assert 'change_type != "indeterminate"' in source
@@ -766,6 +957,7 @@ def test_monitoring_recovery_is_durable_bounded_and_operator_replayable():
     discovery = inspect.getsource(main.discover_recoverable_monitoring_evaluations)
     processor = inspect.getsource(main.process_monitoring_evaluation_job)
     comparison_discovery = inspect.getsource(main.discover_recoverable_comparison_finding_evaluations)
+    obsolete_reconciliation = inspect.getsource(main._degrade_obsolete_comparison_finding_evaluations)
     comparison_processor = inspect.getsource(main.process_comparison_finding_evaluation_job)
     assert "FOR UPDATE SKIP LOCKED" in discovery and "LIMIT %s" in discovery
     assert "monitoring_findings,next_retry_at" in discovery
@@ -777,12 +969,41 @@ def test_monitoring_recovery_is_durable_bounded_and_operator_replayable():
     assert "FOR UPDATE SKIP LOCKED" in comparison_discovery
     assert "= 'evaluating'" in comparison_discovery
     assert "STALE_INGESTING_SECONDS" in comparison_discovery
+    assert "algorithm_version = %s" in comparison_discovery
+    assert "_degrade_obsolete_comparison_finding_evaluations" in comparison_discovery
+    assert "COMPARISON_ALGORITHM_OBSOLETE" in obsolete_reconciliation
+    assert "FOR UPDATE SKIP LOCKED" in obsolete_reconciliation
     assert "without hiding or rebuilding" in comparison_processor
+    assert "comparison_algorithm_version" in comparison_processor
+    assert "COMPARISON_ALGORITHM_OBSOLETE" in comparison_processor
     assert "evaluation_complete = False" in comparison_processor
     assert "COMPARISON_FINDINGS_EVALUATION_PAUSED" in comparison_processor
     assert comparison_processor.index("if not evaluation_complete") < comparison_processor.index(
         '"state": "complete"'
     )
+
+
+def test_source_coverage_requires_current_comparison_algorithm():
+    base = {
+        "inventory": {"state": "complete", "reasons": []},
+        "monitoring_findings": {"state": "complete"},
+        "automatic_baseline": {
+            "state": "established",
+            "comparison_id": "comparison",
+            "findings_evaluation_state": "complete",
+            "algorithm_version": main.COMPARISON_ALGORITHM_VERSION,
+        },
+    }
+    current = main._recompute_source_coverage(json.loads(json.dumps(base)))
+    legacy_input = json.loads(json.dumps(base))
+    legacy_input["automatic_baseline"]["algorithm_version"] = "resource-evidence-v2"
+    legacy = main._recompute_source_coverage(legacy_input)
+
+    assert current["state"] == "complete"
+    assert current["automatic_baseline"]["algorithm_current"] is True
+    assert legacy["state"] == "partial"
+    assert legacy["automatic_baseline"]["algorithm_current"] is False
+    assert any("obsolete or unknown algorithm" in reason for reason in legacy["reasons"])
 
 
 def test_source_target_scope_summary_is_bounded_but_full_scope_hash_is_stable():

@@ -246,21 +246,21 @@ Lists comparison history in stable keyset order. Optional `state`, `source_id`, 
 
 ### `GET /projects/{project_id}/comparisons/{comparison_id}`
 
-Returns queued/running progress, delayed retry time, dimension-specific compatibility, terminal summary, or a bounded public error. Requires project viewer access plus both `read:runs` and `read:inventory`.
+Returns queued/running progress, delayed retry time, dimension-specific compatibility, terminal summary, or a bounded public error. `algorithm_version`, `algorithm_current`, and `algorithm_warning` distinguish current v3 evidence from potentially incomplete legacy output. Requires project viewer access plus both `read:runs` and `read:inventory`.
 
 ### `POST /projects/{project_id}/comparisons/{comparison_id}/retry`
 
-Explicitly resets a failed comparison for a fresh operator-authorized attempt. Active work is returned idempotently before mutation admission. A failed retry consumes the same rate-limit budget and per-project active-comparison capacity as creation; capacity exhaustion returns structured `429` detail with `Retry-After`. Mutation is serialized with the worker, source automation, project admission lane, and comparison row so concurrent retries cannot create duplicate work; a completed result returns `409`. Worker crash recovery, by contrast, preserves durable phase/cursor progress and does not erase already materialized rows.
+Explicitly resets a failed comparison for a fresh operator-authorized attempt. Active work is returned idempotently before mutation admission. A failed retry consumes the same rate-limit budget and per-project active-comparison capacity as creation; capacity exhaustion returns structured `429` detail with `Retry-After`. Mutation is serialized with the worker, source automation, project admission lane, and comparison row so concurrent retries cannot create duplicate work; a completed result returns `409`. Legacy algorithms also return `409 COMPARISON_ALGORITHM_OBSOLETE` and must be recreated as a new current-algorithm comparison. Worker crash recovery, by contrast, preserves durable phase/cursor progress and does not erase already materialized rows.
 
 ### `GET /projects/{project_id}/comparisons/{comparison_id}/resource-changes`
 
-Returns a complete comparison's materialized resource changes using stable keyset pagination. Filters include `change_type`, `provider`, `category`, and `q`. Rows separate structural, access, and content states and include match provenance plus before/after snapshots. `appeared`, `disappeared`, `changed`, and `indeterminate` are distinct; a missing resource is definitive only when structural collection scope is comparable. The endpoint returns `409` until work completes. It requires project viewer access plus both `read:runs` and `read:inventory`.
+Returns a complete comparison's materialized resource changes using stable keyset pagination. Filters include `change_type`, `provider`, `category`, and `q`. Rows separate structural, access, and content states and include match provenance plus before/after snapshots. `appeared`, `disappeared`, `changed`, and `indeterminate` are distinct; a missing resource is definitive only when structural collection scope is comparable. The response repeats algorithm version/current/warning fields so direct API consumers cannot mistake legacy rows for current evidence. The endpoint returns `409` until work completes. It requires project viewer access plus both `read:runs` and `read:inventory`.
 
 The summary's `resource_summary_exact` applies to the published resource-level evidence scope. Item counts on each resource state whether history was computed and exact; null means not computed, never zero.
 
 ### `GET /projects/{project_id}/comparisons/{comparison_id}/item-changes`
 
-Returns durable item-level changes after a comparison completes. Filters include `change_type`, `resource_change_id`, and `q`; `limit`/`cursor` use stable keyset pagination. Change types distinguish additions, removals, moves/renames, metadata changes, permission-evidence changes, and indeterminate correlations. Each row contains bounded before/after snapshots (including collected URL and file-attribute metadata), match basis/quality, evidence state, limitations, and impact rank. A definitive permission change requires comparable non-null permission-quality hashes; evidence-shape drift without that contract is indeterminate. The endpoint returns `409` until the complete result is published and writes a bounded read-audit event.
+Returns durable item-level changes after a comparison completes. Filters include `change_type`, `resource_change_id`, and `q`; `limit`/`cursor` use stable keyset pagination. Change types distinguish additions, removals, moves/renames, metadata changes, permission-evidence changes, and indeterminate correlations. Each row contains bounded before/after snapshots (including collected URL and file-attribute metadata), match basis/quality, evidence state, limitations, and impact rank. A definitive permission change requires comparable non-null permission-quality hashes; evidence-shape drift without that contract is indeterminate. Algorithm version/current/warning fields are returned and a legacy warning is included in interpretation limitations. The endpoint returns `409` until the complete result is published and writes a bounded read-audit event.
 
 ## Continuous monitoring and findings
 
@@ -268,7 +268,7 @@ Collection sources are registered from normalized, non-secret run context. A sou
 
 ### `GET /projects/{project_id}/sources`
 
-Lists sources with `provider`, `health_status`, `q`, `limit`, and `cursor` filters. A single provider component such as `smb` or `nfs` includes mixed sources such as `nfs+smb`; pass the full compound value to match only that collector scope. Health combines enabled state, last success/failure, expected interval, current age, and collection coverage. Staleness begins only after the larger of 15 minutes or twice the configured interval.
+Lists sources with `provider`, `health_status`, `q`, `limit`, and `cursor` filters. A single provider component such as `smb` or `nfs` includes mixed sources such as `nfs+smb`; pass the full compound value to match only that collector scope. Health combines enabled state, last success/failure, expected interval, current age, and collection coverage. An established automatic baseline is healthy only when its recorded comparison algorithm is current; missing or legacy versions fail closed as degraded. Staleness begins only after the larger of 15 minutes or twice the configured interval.
 
 ### `GET /projects/{project_id}/sources/{source_id}`
 
@@ -284,7 +284,7 @@ Operator/admin recovery for the newest complete monitored run when its built-in 
 
 ### `POST /projects/{project_id}/comparisons/{comparison_id}/findings/retry`
 
-Operator/admin recovery for finding evaluation attached to a complete comparison when the nested `findings_evaluation.state` is terminal `degraded`. This does not reset or recompute the comparison itself. Active/queued evaluation is returned idempotently; non-retryable state returns structured `409`, and rate limiting returns structured `429` with `Retry-After`. It requires `write:findings`.
+Operator/admin recovery for finding evaluation attached to a complete comparison when the nested `findings_evaluation.state` is terminal `degraded`. This does not reset or recompute the comparison itself. Active/queued evaluation is returned idempotently; non-retryable state returns structured `409`, and a legacy comparison returns `409 COMPARISON_ALGORITHM_OBSOLETE` before any evidence is evaluated or republished. Rate limiting returns structured `429` with `Retry-After`. It requires `write:findings`.
 
 ### `GET /projects/{project_id}/finding-policies`
 

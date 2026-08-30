@@ -10,6 +10,11 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.comparison_contract import (
+    COMPARISON_ALGORITHM_VERSION,
+    LEGACY_COMPARISON_ALGORITHM_WARNING,
+    comparison_algorithm_is_current,
+)
 from app.config import get_settings
 from app.db import escape_like, get_db
 from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
@@ -35,8 +40,9 @@ from app.token_scopes import SCOPE_READ_INVENTORY, SCOPE_READ_RUNS, SCOPE_WRITE_
 router = APIRouter(prefix="/projects/{project_id}/comparisons", tags=["comparisons"])
 logger = logging.getLogger("share_sentinel.comparisons")
 rate_limiter = RateLimiter()
-ALGORITHM_VERSION = "resource-evidence-v2"
+ALGORITHM_VERSION = COMPARISON_ALGORITHM_VERSION
 DEFAULT_OPTIONS_HASH = hashlib.sha256(b"{}").hexdigest()
+LEGACY_ALGORITHM_WARNING = LEGACY_COMPARISON_ALGORITHM_WARNING
 CHANGE_CURSOR = (
     KeysetColumn("impact_rank", ComparisonResourceChange.impact_rank, direction="desc", parser=parse_int_cursor_value),
     KeysetColumn("id", ComparisonResourceChange.id, direction="desc", parser=parse_int_cursor_value),
@@ -741,6 +747,10 @@ def _comparison_out(
         baseline_run=_run_label(baseline),
         current_run=_run_label(current),
         algorithm_version=comparison.algorithm_version,
+        algorithm_current=comparison_algorithm_is_current(comparison.algorithm_version),
+        algorithm_warning=(
+            None if comparison_algorithm_is_current(comparison.algorithm_version) else LEGACY_ALGORITHM_WARNING
+        ),
         trigger=getattr(comparison, "trigger", "manual"),
         state=comparison.state,
         compatibility=comparison.compatibility or {},
@@ -753,6 +763,21 @@ def _comparison_out(
         completed_at=comparison.completed_at,
         heartbeat_at=comparison.heartbeat_at,
         next_retry_at=comparison.next_retry_at,
+    )
+
+
+def _require_current_comparison_algorithm(comparison: RunComparison) -> None:
+    if comparison_algorithm_is_current(comparison.algorithm_version):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "COMPARISON_ALGORITHM_OBSOLETE",
+            "message": (
+                f"Comparison algorithm {comparison.algorithm_version} cannot be retried in place. "
+                "Create the same baseline/current comparison again to use the current algorithm."
+            ),
+        },
     )
 
 
@@ -995,6 +1020,7 @@ def retry_comparison(
     ).scalar_one_or_none()
     if comparison is None:
         raise HTTPException(status_code=404, detail="comparison not found")
+    _require_current_comparison_algorithm(comparison)
     baseline = _get_complete_run(db, project_id, comparison.baseline_run_id, "baseline")
     current = _get_complete_run(db, project_id, comparison.current_run_id, "current")
     if comparison.state in {"queued", "running"}:
@@ -1031,6 +1057,7 @@ def retry_comparison(
     ).scalar_one_or_none()
     if comparison is None:
         raise HTTPException(status_code=404, detail="comparison not found")
+    _require_current_comparison_algorithm(comparison)
     baseline = _get_complete_run(db, project_id, comparison.baseline_run_id, "baseline")
     current = _get_complete_run(db, project_id, comparison.current_run_id, "current")
     if comparison.state in {"queued", "running"}:
@@ -1273,7 +1300,15 @@ def list_resource_changes(
         },
     )
     db.commit()
-    return {"items": items, "next_cursor": next_cursor, "comparison_state": comparison.state}
+    algorithm_current = comparison_algorithm_is_current(comparison.algorithm_version)
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "comparison_state": comparison.state,
+        "algorithm_version": comparison.algorithm_version,
+        "algorithm_current": algorithm_current,
+        "algorithm_warning": None if algorithm_current else LEGACY_ALGORITHM_WARNING,
+    }
 
 
 @router.get("/{comparison_id}/item-changes", response_model=dict)
@@ -1351,13 +1386,20 @@ def list_item_changes(
         },
     )
     db.commit()
+    algorithm_current = comparison_algorithm_is_current(comparison.algorithm_version)
+    item_limitations = list((comparison.summary or {}).get("item_limitations") or [])
+    if not algorithm_current:
+        item_limitations.append(LEGACY_ALGORITHM_WARNING)
     return {
         "items": items,
         "next_cursor": next_cursor,
         "comparison_state": comparison.state,
+        "algorithm_version": comparison.algorithm_version,
+        "algorithm_current": algorithm_current,
+        "algorithm_warning": None if algorithm_current else LEGACY_ALGORITHM_WARNING,
         "interpretation": {
             "state": "computed" if (comparison.summary or {}).get("item_churn_computed") else "not_computed",
             "exact": bool((comparison.summary or {}).get("item_summary_exact")),
-            "limitations": list((comparison.summary or {}).get("item_limitations") or []),
+            "limitations": item_limitations,
         },
     }
