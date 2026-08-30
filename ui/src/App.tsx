@@ -2,11 +2,14 @@ import { lazy, Suspense, useEffect, useRef } from "react";
 import { Navigate, Route, Routes, useLocation, useParams } from "react-router-dom";
 
 import { AppFooter } from "@/components/app-footer";
+import { ProjectNav } from "@/components/project-nav";
 import { StatePanel } from "@/components/state-panel";
 import { TopNav } from "@/components/top-nav";
 import { bootstrapSession, resetSession, useSession } from "@/lib/auth";
 import { DashboardWorkspaceProvider } from "@/lib/dashboard-workspace";
 import { AccountPage } from "@/pages/account-page";
+import { ChangesPage } from "@/pages/changes-page";
+import { FindingsPage } from "@/pages/findings-page";
 import { LoginPage } from "@/pages/login-page";
 import { ProjectImportPage } from "@/pages/project-import-page";
 import { ProjectInventoryPage } from "@/pages/project-inventory-page";
@@ -20,6 +23,7 @@ import { SettingsLayout } from "@/pages/settings-layout";
 import { SettingsOverviewPage } from "@/pages/settings-overview-page";
 import { SettingsProjectDetailPage } from "@/pages/settings-project-detail-page";
 import { SettingsProjectsPage } from "@/pages/settings-projects-page";
+import { SourcesPage } from "@/pages/sources-page";
 
 const ComparisonPage = lazy(() =>
   import("@/pages/comparison-page").then((module) => ({ default: module.ComparisonPage })),
@@ -69,6 +73,26 @@ function RunDetailRoute() {
 function ProjectInventoryRoute() {
   const { projectId } = useParams<{ projectId: string }>();
   return <ProjectInventoryPage key={projectId || ""} />;
+}
+
+function ProjectOverviewRoute() {
+  const { projectId } = useParams<{ projectId: string }>();
+  return <ProjectsPage key={projectId || ""} />;
+}
+
+function ProjectFindingsRoute() {
+  const { projectId } = useParams<{ projectId: string }>();
+  return <FindingsPage key={projectId || ""} />;
+}
+
+function ProjectChangesRoute() {
+  const { projectId } = useParams<{ projectId: string }>();
+  return <ChangesPage key={projectId || ""} />;
+}
+
+function ProjectSourcesRoute() {
+  const { projectId } = useParams<{ projectId: string }>();
+  return <SourcesPage key={projectId || ""} />;
 }
 
 function ComparisonRoute() {
@@ -121,6 +145,12 @@ export function App() {
   useEffect(() => {
     const section = location.pathname.startsWith("/settings")
       ? "Settings"
+      : location.pathname.includes("/findings")
+        ? "Findings"
+        : location.pathname.includes("/sources")
+          ? "Sources"
+          : location.pathname.includes("/changes")
+            ? "Changes"
       : location.pathname.includes("/inventory")
         ? "Inventory"
         : location.pathname.includes("/comparisons/")
@@ -144,6 +174,7 @@ export function App() {
         Skip to main content
       </a>
       {showNav ? <TopNav /> : null}
+      {showNav ? <ProjectNav /> : null}
       <main
         className={showNav ? "app-main" : "app-login-main"}
         id="main-content"
@@ -162,6 +193,22 @@ export function App() {
               }
             />
             <Route
+              path="/projects/:projectId/overview"
+              element={
+                <RequireAuth>
+                  <ProjectOverviewRoute />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/projects/:projectId/findings"
+              element={
+                <RequireAuth>
+                  <ProjectFindingsRoute />
+                </RequireAuth>
+              }
+            />
+            <Route
               path="/projects/:projectId/runs/:runId"
               element={
                 <RequireAuth>
@@ -174,6 +221,22 @@ export function App() {
               element={
                 <RequireAuth>
                   <ProjectInventoryRoute />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/projects/:projectId/changes"
+              element={
+                <RequireAuth>
+                  <ProjectChangesRoute />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/projects/:projectId/sources"
+              element={
+                <RequireAuth>
+                  <ProjectSourcesRoute />
                 </RequireAuth>
               }
             />

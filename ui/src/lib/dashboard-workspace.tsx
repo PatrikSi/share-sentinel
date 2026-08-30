@@ -44,10 +44,29 @@ export function DashboardWorkspaceProvider({ children }: { children: ReactNode }
   const inventoryMatch = matchPath("/projects/:projectId/inventory", location.pathname);
   const importMatch = matchPath("/projects/:projectId/import", location.pathname);
   const runMatch = matchPath("/projects/:projectId/runs/:runId", location.pathname);
-  const routeProjectId = inventoryMatch?.params.projectId || importMatch?.params.projectId || runMatch?.params.projectId || "";
+  const overviewMatch = matchPath("/projects/:projectId/overview", location.pathname);
+  const findingsMatch = matchPath("/projects/:projectId/findings", location.pathname);
+  const changesMatch = matchPath("/projects/:projectId/changes", location.pathname);
+  const sourcesMatch = matchPath("/projects/:projectId/sources", location.pathname);
+  const comparisonMatch = matchPath("/projects/:projectId/comparisons/:comparisonId", location.pathname);
+  const routeProjectId = inventoryMatch?.params.projectId
+    || importMatch?.params.projectId
+    || runMatch?.params.projectId
+    || overviewMatch?.params.projectId
+    || findingsMatch?.params.projectId
+    || changesMatch?.params.projectId
+    || sourcesMatch?.params.projectId
+    || comparisonMatch?.params.projectId
+    || "";
   const inProjectArea = location.pathname.startsWith("/projects");
   const projectSectionLabel = inventoryMatch
     ? "Inventory"
+    : findingsMatch
+      ? "Findings"
+      : changesMatch || comparisonMatch
+        ? "Changes"
+        : sourcesMatch
+          ? "Sources"
     : importMatch
       ? "Import Scan"
       : runMatch
@@ -94,6 +113,22 @@ export function DashboardWorkspaceProvider({ children }: { children: ReactNode }
       portableParams.delete("runs");
       const portableQuery = portableParams.toString();
       navigate(`/projects/${projectId}/inventory${portableQuery ? `?${portableQuery}` : ""}`);
+      return;
+    }
+    if (findingsMatch) {
+      navigate(`/projects/${projectId}/findings`);
+      return;
+    }
+    if (changesMatch || comparisonMatch) {
+      navigate(`/projects/${projectId}/changes`);
+      return;
+    }
+    if (sourcesMatch) {
+      navigate(`/projects/${projectId}/sources`);
+      return;
+    }
+    if (overviewMatch) {
+      navigate(`/projects/${projectId}/overview`);
       return;
     }
     if (importMatch) {
