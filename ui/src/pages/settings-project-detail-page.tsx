@@ -5,6 +5,7 @@ import { Dialog } from "@/components/dialog";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiFetchAllPages } from "@/lib/api";
+import { formatAuditActor } from "@/lib/audit";
 import { Membership } from "@/lib/iam";
 
 type ProjectDetail = {
@@ -45,6 +46,8 @@ type ActivityRow = {
   ts: string;
   actor_email: string | null;
   actor_user_id: string | null;
+  actor_token_id: string | null;
+  actor_token_name: string | null;
   action: string;
   object_type: string;
   object_id: string;
@@ -478,7 +481,7 @@ export function SettingsProjectDetailPage() {
                 {activity.map((event) => (
                   <tr key={event.id}>
                     <td>{formatDateTime(event.ts)}</td>
-                    <td>{event.actor_email || event.actor_user_id || "system"}</td>
+                    <td>{formatAuditActor(event)}</td>
                     <td>{event.action}</td>
                     <td>
                       <div>{event.object_type}</div>

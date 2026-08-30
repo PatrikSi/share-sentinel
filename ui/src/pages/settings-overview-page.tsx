@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 
 import { StatePanel } from "@/components/state-panel";
 import { apiFetch } from "@/lib/api";
+import { formatAuditActor } from "@/lib/audit";
 
 type SecuritySettings = {
   allow_self_registration: boolean;
@@ -23,7 +24,10 @@ type SecuritySettings = {
 type AuditEventRow = {
   id: number;
   ts: string;
+  actor_user_id: string | null;
   actor_email: string | null;
+  actor_token_id: string | null;
+  actor_token_name: string | null;
   action: string;
   object_type: string;
   object_id: string;
@@ -333,7 +337,7 @@ export function SettingsOverviewPage() {
                       <div>{event.object_type}</div>
                       <div className="settings-meta">{event.object_id}</div>
                     </td>
-                    <td>{event.actor_email || "system"}</td>
+                    <td>{formatAuditActor(event)}</td>
                     <td>{event.project_name || "Global"}</td>
                   </tr>
                 ))}

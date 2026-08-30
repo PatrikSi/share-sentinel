@@ -7,12 +7,13 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.models import AuditEvent
+from app.models import ApiToken, AuditEvent, Project, User
 
 MAX_AUDIT_METADATA_BYTES = 64 * 1024
 MAX_AUDIT_STRING_CHARS = 4096
 MAX_AUDIT_COLLECTION_ITEMS = 100
 MAX_AUDIT_DEPTH = 6
+MAX_AUDIT_FALLBACK_STRING_CHARS = 512
 AUDIT_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
 SENSITIVE_METADATA_KEYS = frozenset(
     {
@@ -90,6 +91,22 @@ SENSITIVE_METADATA_FINGERPRINT_SUFFIXES = (
     "token",
     "tokenhash",
 )
+SENSITIVE_METADATA_WRAPPER_SUFFIXES = (
+    "blob",
+    "bytes",
+    "content",
+    "contents",
+    "data",
+    "key",
+    "material",
+    "text",
+    "value",
+)
+SENSITIVE_METADATA_WRAPPED_FINGERPRINT_SUFFIXES = tuple(
+    f"{stem}{wrapper}"
+    for stem in SENSITIVE_METADATA_FINGERPRINT_SUFFIXES
+    for wrapper in SENSITIVE_METADATA_WRAPPER_SUFFIXES
+)
 
 
 def _normalized_key(value: object) -> str:
@@ -103,6 +120,7 @@ def _is_sensitive_key(value: object) -> bool:
         normalized in SENSITIVE_METADATA_KEYS
         or normalized.endswith(SENSITIVE_METADATA_SUFFIXES)
         or fingerprint.endswith(SENSITIVE_METADATA_FINGERPRINT_SUFFIXES)
+        or fingerprint.endswith(SENSITIVE_METADATA_WRAPPED_FINGERPRINT_SUFFIXES)
     )
 
 
@@ -158,16 +176,30 @@ def sanitize_audit_metadata(metadata: dict | None) -> dict[str, Any]:
     if len(encoded) <= MAX_AUDIT_METADATA_BYTES:
         return sanitized
 
-    preserved = {
-        key: value
-        for key, value in sanitized.items()
-        if key in {"request_id", "ip", "user_agent", "reason", "status"}
-    }
-    return {
+    preserved: dict[str, Any] = {}
+    for key in ("request_id", "ip", "user_agent", "reason", "status"):
+        if key not in sanitized:
+            continue
+        value = sanitized.get(key)
+        if value is None or isinstance(value, (bool, int, float)):
+            preserved[key] = value
+        elif isinstance(value, str):
+            preserved[key] = value[:MAX_AUDIT_FALLBACK_STRING_CHARS]
+        else:
+            preserved[key] = "[omitted: oversized audit metadata]"
+    fallback = {
         **preserved,
         "_metadata_truncated": True,
         "_encoded_bytes_before_truncation": len(encoded),
-        "_top_level_keys": list(sanitized)[:MAX_AUDIT_COLLECTION_ITEMS],
+        "_top_level_key_count": len(sanitized),
+    }
+    fallback_encoded = json.dumps(fallback, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(fallback_encoded) <= MAX_AUDIT_METADATA_BYTES:
+        return fallback
+    return {
+        "_metadata_truncated": True,
+        "_encoded_bytes_before_truncation": len(encoded),
+        "_top_level_key_count": len(sanitized),
     }
 
 
@@ -185,6 +217,29 @@ def _validate_object_id(value: str) -> str:
     return normalized
 
 
+def _snapshot_label(
+    db: Session,
+    model: type[ApiToken] | type[Project] | type[User],
+    object_id: uuid.UUID | None,
+    attribute: str,
+    supplied: str | None,
+    *,
+    max_length: int,
+) -> str | None:
+    value = supplied
+    if value is None and object_id is not None:
+        getter = getattr(db, "get", None)
+        if callable(getter):
+            entity = getter(model, object_id)
+            value = getattr(entity, attribute, None) if entity is not None else None
+    if value is None:
+        return None
+    normalized = str(value)
+    if not normalized or len(normalized) > max_length:
+        raise ValueError(f"{attribute} snapshot must be between 1 and {max_length} characters")
+    return normalized
+
+
 def write_audit_event(
     db: Session,
     action: str,
@@ -193,15 +248,58 @@ def write_audit_event(
     actor_user_id: uuid.UUID | None = None,
     actor_token_id: uuid.UUID | None = None,
     project_id: uuid.UUID | None = None,
+    actor_user_ref: uuid.UUID | None = None,
+    actor_email_snapshot: str | None = None,
+    actor_token_ref: uuid.UUID | None = None,
+    actor_token_name_snapshot: str | None = None,
+    project_ref: uuid.UUID | None = None,
+    project_name_snapshot: str | None = None,
     metadata: dict | None = None,
 ) -> None:
+    if actor_user_id is not None and actor_user_ref not in (None, actor_user_id):
+        raise ValueError("actor_user_ref must match actor_user_id when both are provided")
+    if actor_token_id is not None and actor_token_ref not in (None, actor_token_id):
+        raise ValueError("actor_token_ref must match actor_token_id when both are provided")
+    if project_id is not None and project_ref not in (None, project_id):
+        raise ValueError("project_ref must match project_id when both are provided")
+
+    effective_actor_user_ref = actor_user_id or actor_user_ref
+    effective_actor_token_ref = actor_token_id or actor_token_ref
+    effective_project_ref = project_id or project_ref
     event = AuditEvent(
         action=_validate_audit_label(action, name="action", max_length=120),
         object_type=_validate_audit_label(object_type, name="object_type", max_length=80),
         object_id=_validate_object_id(object_id),
         actor_user_id=actor_user_id,
+        actor_user_ref=effective_actor_user_ref,
+        actor_email_snapshot=_snapshot_label(
+            db,
+            User,
+            effective_actor_user_ref,
+            "email",
+            actor_email_snapshot,
+            max_length=320,
+        ),
         actor_token_id=actor_token_id,
+        actor_token_ref=effective_actor_token_ref,
+        actor_token_name_snapshot=_snapshot_label(
+            db,
+            ApiToken,
+            effective_actor_token_ref,
+            "name",
+            actor_token_name_snapshot,
+            max_length=120,
+        ),
         project_id=project_id,
+        project_ref=effective_project_ref,
+        project_name_snapshot=_snapshot_label(
+            db,
+            Project,
+            effective_project_ref,
+            "name",
+            project_name_snapshot,
+            max_length=255,
+        ),
         metadata_json=sanitize_audit_metadata(metadata),
     )
     db.add(event)

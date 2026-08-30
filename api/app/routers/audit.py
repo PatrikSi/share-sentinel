@@ -1,7 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -37,7 +37,12 @@ def list_audit_events(
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
 
-    stmt = select(AuditEvent).where(AuditEvent.project_id == project_id)
+    stmt = select(AuditEvent).where(
+        or_(
+            AuditEvent.project_ref == project_id,
+            (AuditEvent.project_ref.is_(None) & (AuditEvent.project_id == project_id)),
+        )
+    )
     stmt = apply_keyset_pagination(stmt, PROJECT_AUDIT_CURSOR, cursor, limit)
     events, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), PROJECT_AUDIT_CURSOR, limit)
     write_audit_event(
@@ -56,8 +61,14 @@ def list_audit_events(
             {
                 "id": e.id,
                 "ts": e.ts.isoformat(),
-                "actor_user_id": str(e.actor_user_id) if e.actor_user_id else None,
-                "actor_token_id": str(e.actor_token_id) if e.actor_token_id else None,
+                "actor_user_id": str(e.actor_user_ref or e.actor_user_id)
+                if (e.actor_user_ref or e.actor_user_id)
+                else None,
+                "actor_email": e.actor_email_snapshot,
+                "actor_token_id": str(e.actor_token_ref or e.actor_token_id)
+                if (e.actor_token_ref or e.actor_token_id)
+                else None,
+                "actor_token_name": e.actor_token_name_snapshot,
                 "action": e.action,
                 "object_type": e.object_type,
                 "object_id": e.object_id,

@@ -38,11 +38,47 @@ jobs:
       - name: Verify SharePoint command
         run: python collector/share_sentinel_sharepoint.py --help
 
+  audit-attribution-postgres:
+    name: Audit attribution migrations on PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16.14
+        env:
+          POSTGRES_DB: share_sentinel_test
+          POSTGRES_USER: share_sentinel
+          POSTGRES_PASSWORD: ReleaseAuditDatabasePassword123
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U share_sentinel -d share_sentinel_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AUDIT_ATTRIBUTION_TEST_DATABASE_URL: postgresql+psycopg://share_sentinel:ReleaseAuditDatabasePassword123@127.0.0.1:5432/share_sentinel_test
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: api/requirements-dev.txt
+      - name: Install API dependencies
+        working-directory: api
+        run: pip install -r requirements-dev.txt
+      - name: Exercise audit attribution DDL, triggers, and bounded backfill
+        working-directory: api
+        run: pytest -q -p no:cacheprovider tests/test_audit_attribution_migration.py
+
   verify:
     name: Verify release
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    needs: sharepoint-windows
+    needs: [sharepoint-windows, audit-attribution-postgres]
     env:
       POSTGRES_PASSWORD: ReleaseDatabasePassword123
       JWT_SECRET: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc

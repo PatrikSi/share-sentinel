@@ -1,13 +1,11 @@
 import asyncio
 import csv
 import io
-import json
 import logging
 import threading
 import time
 import uuid
 from collections.abc import Iterator
-from datetime import date, datetime
 from enum import Enum
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -18,6 +16,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.types import Receive, Scope, Send
 
 from app.config import get_settings
+from app.csv_utils import spreadsheet_safe_csv_value
 from app.db import SessionLocal, escape_like, get_db
 from app.deps import (
     AuthContext,
@@ -28,7 +27,7 @@ from app.deps import (
     require_token_scopes,
 )
 from app.enums import ProjectRole, RunStatus
-from app.models import Endpoint, Item, Resource, SavedInvestigation, ScanRun, User
+from app.models import ApiToken, Endpoint, Item, Project, Resource, SavedInvestigation, ScanRun, User
 from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_int_cursor_value
 from app.rate_limit import RateLimiter
 from app.schemas import SavedInvestigationIn, SavedInvestigationOut, SavedInvestigationUpdateIn
@@ -936,28 +935,6 @@ def _inventory_export_record(tab: str, row) -> dict[str, object]:
     }
 
 
-def _spreadsheet_safe_csv_value(value: object) -> str:
-    value = _enum_value(value)
-    if value is None:
-        text = ""
-    elif isinstance(value, bool):
-        text = "true" if value else "false"
-    elif isinstance(value, (datetime, date)):
-        text = value.isoformat()
-    elif isinstance(value, (dict, list, tuple)):
-        text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-    else:
-        text = str(value)
-
-    formula_candidate = text.lstrip(" \t\r\n")
-    leading_characters = text[: len(text) - len(formula_candidate)]
-    if any(character in "\t\r\n" for character in leading_characters) or formula_candidate.startswith(
-        ("=", "+", "-", "@")
-    ):
-        return f"'{text}"
-    return text
-
-
 def _csv_record_bytes(values: tuple | list) -> bytes:
     output = io.StringIO(newline="")
     csv.writer(output, lineterminator="\r\n").writerow(values)
@@ -982,7 +959,7 @@ def _inventory_csv_chunks(
             yield _csv_record_bytes(columns)
         for row in rows:
             record = _inventory_export_record(tab, row)
-            yield _csv_record_bytes([_spreadsheet_safe_csv_value(record.get(column)) for column in columns])
+            yield _csv_record_bytes([spreadsheet_safe_csv_value(record.get(column)) for column in columns])
 
     records = encoded_records()
     buffer = bytearray()
@@ -1079,19 +1056,23 @@ def _record_inventory_export_terminal_audit(
     action: str,
     project_id: uuid.UUID,
     auth: AuthContext,
+    audit_attribution: dict | None = None,
     request_metadata: dict,
     metadata: dict,
 ) -> None:
     audit_db = SessionLocal()
     try:
+        durable_attribution = audit_attribution or {
+            "actor_user_ref": auth.user_id,
+            "actor_token_ref": auth.token_id,
+            "project_ref": project_id,
+        }
         write_audit_event(
             audit_db,
             action=action,
             object_type="project_inventory",
             object_id=str(project_id),
-            actor_user_id=auth.user_id,
-            actor_token_id=auth.token_id,
-            project_id=project_id,
+            **durable_attribution,
             metadata={**request_metadata, **metadata},
         )
         audit_db.commit()
@@ -1161,6 +1142,7 @@ def _inventory_csv_stream(
     first_batch: list,
     export_id: str,
     auth: AuthContext,
+    audit_attribution: dict | None = None,
     request_metadata: dict,
     scope_metadata: dict,
 ) -> Iterator[bytes]:
@@ -1215,6 +1197,7 @@ def _inventory_csv_stream(
             action=f"PROJECT_INVENTORY_CSV_EXPORT_{outcome.upper()}",
             project_id=project_id,
             auth=auth,
+            audit_attribution=audit_attribution,
             request_metadata=request_metadata,
             metadata=terminal_metadata,
         )
@@ -1641,6 +1624,17 @@ def export_inventory_csv(
         )
 
     export_id = str(uuid.uuid4())
+    actor_user = db.get(User, auth.user_id) if auth.user_id is not None else None
+    actor_token = db.get(ApiToken, auth.token_id) if auth.token_id is not None else None
+    project = db.get(Project, project_id)
+    audit_attribution = {
+        "actor_user_ref": auth.user_id,
+        "actor_email_snapshot": getattr(actor_user, "email", None),
+        "actor_token_ref": auth.token_id,
+        "actor_token_name_snapshot": getattr(actor_token, "name", None),
+        "project_ref": project_id,
+        "project_name_snapshot": getattr(project, "name", None),
+    }
     scope_metadata = {
         "tab": tab,
         "query_dsl": query_dsl,
@@ -1706,6 +1700,7 @@ def export_inventory_csv(
             first_batch=first_batch,
             export_id=export_id,
             auth=auth,
+            audit_attribution=audit_attribution,
             request_metadata=request_meta(request),
             scope_metadata=scope_metadata,
         )

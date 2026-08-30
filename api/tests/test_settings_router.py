@@ -1,14 +1,19 @@
+import asyncio
+import csv
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from io import StringIO
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from app.db import get_db
 from app.deps import AuthContext, get_auth_context, require_sysadmin
 from app.enums import ProjectRole, RunStatus
 from app.main import app
 from app.models import ApiToken, AuditEvent, Project, ProjectMember, User
+from app.routers import settings as settings_router
 from fastapi.testclient import TestClient
 
 
@@ -82,6 +87,9 @@ class _FakeDb:
                     pass
 
     def refresh(self, _obj):
+        return None
+
+    def close(self):
         return None
 
 
@@ -276,6 +284,9 @@ def test_settings_project_delete_reports_artifact_failures(monkeypatch) -> None:
     assert "pg_advisory_xact_lock" in str(fake_db.executed_statements[0][0])
     audit_event = next(obj for obj in fake_db.added if isinstance(obj, AuditEvent))
     assert audit_event.action == "SETTINGS_PROJECT_DELETED"
+    assert audit_event.project_id is None
+    assert audit_event.project_ref == project_id
+    assert audit_event.project_name_snapshot == "Core"
     assert audit_event.metadata_json["deleted_run_count"] == 2
 
 
@@ -497,26 +508,88 @@ def test_settings_audit_supports_exact_project_filter() -> None:
         _clear_overrides()
 
     assert response.status_code == 200
-    assert "audit_events.project_id" in str(fake_db.executed_statements[0][0])
+    statement = str(fake_db.executed_statements[0][0])
+    assert "audit_events.project_id" in statement
+    assert "audit_events.project_ref" in statement
     audit_event = next(obj for obj in fake_db.added if isinstance(obj, AuditEvent))
     assert audit_event.metadata_json["project_id"] == str(project_id)
 
 
-def test_settings_audit_export_returns_csv_attachment() -> None:
+def test_settings_audit_retains_snapshot_attribution_after_parent_deletion() -> None:
+    actor_user_ref = uuid.uuid4()
+    actor_token_ref = uuid.uuid4()
+    project_ref = uuid.uuid4()
+    event = SimpleNamespace(
+        id=45,
+        ts=datetime.now(tz=UTC),
+        actor_user_id=None,
+        actor_user_ref=actor_user_ref,
+        actor_email_snapshot="retired@example.com",
+        actor_token_id=None,
+        actor_token_ref=actor_token_ref,
+        actor_token_name_snapshot="retired-collector",
+        project_id=None,
+        project_ref=project_ref,
+        project_name_snapshot="Retired project",
+        action="RUN_CREATED",
+        object_type="scan_run",
+        object_id="run-retained",
+        metadata_json={},
+    )
+    row = SimpleNamespace(
+        AuditEvent=event,
+        actor_user_ref=actor_user_ref,
+        actor_email="retired@example.com",
+        actor_token_ref=actor_token_ref,
+        actor_token_name="retired-collector",
+        project_ref=project_ref,
+        project_name="Retired project",
+    )
+    fake_db = _FakeDb(execute_queue=[_ExecuteResult([row])])
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get(f"/settings/audit?project_id={project_ref}&q=retired")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["actor_user_id"] == str(actor_user_ref)
+    assert item["actor_email"] == "retired@example.com"
+    assert item["actor_token_id"] == str(actor_token_ref)
+    assert item["actor_token_name"] == "retired-collector"
+    assert item["project_id"] == str(project_ref)
+    assert item["project_name"] == "Retired project"
+    statement = str(fake_db.executed_statements[0][0])
+    assert "actor_email_snapshot" in statement
+    assert "actor_token_name_snapshot" in statement
+    assert "project_name_snapshot" in statement
+
+
+def test_settings_audit_export_streams_formula_safe_csv_attachment(monkeypatch) -> None:
     fake_db = _FakeDb()
     event = SimpleNamespace(
         id=43,
         ts=datetime.now(tz=UTC),
         actor_user_id=uuid.uuid4(),
-        actor_token_id=None,
+        actor_token_id=uuid.uuid4(),
         project_id=uuid.uuid4(),
         action="RUN_CREATED",
         object_type="scan_run",
-        object_id="run-1",
-        metadata_json={"ip": "127.0.0.1", "source": "ui"},
+        object_id="=HYPERLINK(\"https://malicious.invalid\")",
+        metadata_json={"ip": "127.0.0.1", "source": "+external"},
     )
-    row = SimpleNamespace(AuditEvent=event, actor_email="auditor@example.com", project_name="Core")
-    fake_db.execute_queue.append(_ExecuteResult([row]))
+    row = SimpleNamespace(
+        AuditEvent=event,
+        actor_email=" +auditor@example.com",
+        actor_token_name="-nightly-collector",
+        project_name="@SUM(1,1)",
+    )
+    fake_db.execute_queue.extend(
+        [_ExecuteResult([43]), _ExecuteResult([1]), _ExecuteResult([row])]
+    )
+    monkeypatch.setattr(settings_router, "SessionLocal", lambda: fake_db)
 
     client = _client_for_db(fake_db)
     try:
@@ -527,10 +600,241 @@ def test_settings_audit_export_returns_csv_attachment() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/csv")
     assert "attachment; filename=" in response.headers["content-disposition"]
+    assert response.headers["x-export-row-count"] == "1"
+    assert response.headers["x-export-truncated"] == "false"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
     assert "RUN_CREATED" in response.text
-    assert "auditor@example.com" in response.text
     assert '"source"' in response.text
-    assert '"ui"' in response.text
+    values = next(csv.DictReader(StringIO(response.text)))
+    assert values["object_id"].startswith("'=")
+    assert values["actor_email"].startswith("' +")
+    assert values["actor_token_name"].startswith("'-")
+    assert values["project_name"].startswith("'@")
+    assert values["metadata"].startswith("{")
+    assert any(event.action == "SETTINGS_AUDIT_EXPORT_REQUESTED" for event in fake_db.added)
+    assert any(event.action == "SETTINGS_AUDIT_EXPORTED" for event in fake_db.added)
+
+
+def test_settings_audit_export_streams_bounded_json_across_batches(monkeypatch) -> None:
+    fake_db = _FakeDb()
+    now = datetime.now(tz=UTC)
+    rows = []
+    for event_id in (44, 43):
+        event = SimpleNamespace(
+            id=event_id,
+            ts=now,
+            actor_user_id=None,
+            actor_token_id=None,
+            project_id=None,
+            action=f"EVENT_{event_id}",
+            object_type="system",
+            object_id=str(event_id),
+            metadata_json={"sequence": event_id},
+        )
+        rows.append(
+            SimpleNamespace(
+                AuditEvent=event,
+                actor_email=None,
+                actor_token_name=None,
+                project_name=None,
+            )
+        )
+    fake_db.execute_queue.extend(
+        [
+            _ExecuteResult([44]),
+            _ExecuteResult([3]),
+            _ExecuteResult([rows[0]]),
+            _ExecuteResult([rows[1]]),
+        ]
+    )
+    monkeypatch.setattr(settings_router, "AUDIT_EXPORT_BATCH_SIZE", 1)
+    monkeypatch.setattr(settings_router, "SessionLocal", lambda: fake_db)
+
+    client = _client_for_db(fake_db)
+    try:
+        response = client.get("/settings/audit/export?format=json&max_rows=2")
+    finally:
+        _clear_overrides()
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "id": 44,
+            "ts": now.isoformat().replace("+00:00", "Z"),
+            "actor_user_id": None,
+            "actor_email": None,
+            "actor_token_id": None,
+            "actor_token_name": None,
+            "project_id": None,
+            "project_name": None,
+            "action": "EVENT_44",
+            "object_type": "system",
+            "object_id": "44",
+            "metadata": {"sequence": 44},
+        },
+        {
+            "id": 43,
+            "ts": now.isoformat().replace("+00:00", "Z"),
+            "actor_user_id": None,
+            "actor_email": None,
+            "actor_token_id": None,
+            "actor_token_name": None,
+            "project_id": None,
+            "project_name": None,
+            "action": "EVENT_43",
+            "object_type": "system",
+            "object_id": "43",
+            "metadata": {"sequence": 43},
+        },
+    ]
+    assert response.headers["x-export-row-count"] == "2"
+    assert response.headers["x-export-row-limit"] == "2"
+    assert response.headers["x-export-truncated"] == "true"
+    assert response.headers["x-export-snapshot-id"] == "44"
+    assert sum("LIMIT" in str(statement).upper() for statement, _ in fake_db.executed_statements) >= 3
+    assert any(event.action == "SETTINGS_AUDIT_EXPORTED" for event in fake_db.added)
+
+
+def test_audit_export_generator_records_batch_failure(monkeypatch) -> None:
+    terminal_events: list[tuple[str, dict]] = []
+
+    def _fail_batch(**_kwargs):
+        raise RuntimeError("database connection lost")
+
+    def _capture_terminal(*, action, metadata, **_kwargs):
+        terminal_events.append((action, metadata))
+
+    monkeypatch.setattr(settings_router, "_load_audit_export_batch", _fail_batch)
+    monkeypatch.setattr(settings_router, "_record_audit_export_terminal", _capture_terminal)
+    chunks = settings_router._audit_export_chunks(
+        q=None,
+        project_id=None,
+        export_format="json",
+        max_rows=10,
+        expected_rows=1,
+        truncated=False,
+        snapshot_id=9,
+        auth=AuthContext(
+            user_id=uuid.uuid4(),
+            token_id=None,
+            token_project_id=None,
+            token_role=None,
+            token_scopes=None,
+        ),
+        actor_email_snapshot="admin@example.com",
+        request_metadata={"request_id": "request-1"},
+    )
+
+    assert next(chunks) == b"[\n"
+    with pytest.raises(RuntimeError, match="database connection lost"):
+        next(chunks)
+
+    assert terminal_events == [
+        (
+            "SETTINGS_AUDIT_EXPORT_FAILED",
+            {
+                "format": "json",
+                "max_rows": 10,
+                "snapshot_id": 9,
+                "exported_count": 0,
+                "truncated": False,
+                "error_type": "RuntimeError",
+            },
+        )
+    ]
+
+
+def test_audit_export_generator_records_client_interruption(monkeypatch) -> None:
+    terminal_events: list[tuple[str, dict]] = []
+
+    def _capture_terminal(*, action, metadata, **_kwargs):
+        terminal_events.append((action, metadata))
+
+    monkeypatch.setattr(settings_router, "_record_audit_export_terminal", _capture_terminal)
+    chunks = settings_router._audit_export_chunks(
+        q=None,
+        project_id=None,
+        export_format="csv",
+        max_rows=10,
+        expected_rows=1,
+        truncated=False,
+        snapshot_id=9,
+        auth=AuthContext(
+            user_id=uuid.uuid4(),
+            token_id=None,
+            token_project_id=None,
+            token_role=None,
+            token_scopes=None,
+        ),
+        actor_email_snapshot="admin@example.com",
+        request_metadata={"request_id": "request-2"},
+    )
+
+    assert next(chunks).startswith(b"id,ts,action")
+    chunks.close()
+
+    assert terminal_events == [
+        (
+            "SETTINGS_AUDIT_EXPORT_INTERRUPTED",
+            {
+                "format": "csv",
+                "max_rows": 10,
+                "snapshot_id": 9,
+                "exported_count": 0,
+                "truncated": False,
+            },
+        )
+    ]
+
+
+def test_audit_export_asgi_disconnect_closes_generator_and_records_interruption(monkeypatch) -> None:
+    terminal_events: list[tuple[str, dict]] = []
+
+    def _capture_terminal(*, action, metadata, **_kwargs):
+        terminal_events.append((action, metadata))
+
+    monkeypatch.setattr(settings_router, "_record_audit_export_terminal", _capture_terminal)
+    stream = settings_router._audit_export_chunks(
+        q=None,
+        project_id=None,
+        export_format="json",
+        max_rows=10,
+        expected_rows=1,
+        truncated=False,
+        snapshot_id=9,
+        auth=AuthContext(uuid.uuid4(), None, None, None, None),
+        actor_email_snapshot="admin@example.com",
+        request_metadata={"request_id": "request-disconnect"},
+    )
+    response = settings_router._AuditStreamingResponse(
+        stream,
+        media_type="application/json",
+    )
+
+    async def disconnect_after_first_body() -> None:
+        first_body = asyncio.Event()
+
+        async def send(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.body" and message.get("body"):
+                first_body.set()
+                await asyncio.Event().wait()
+
+        async def receive() -> dict[str, str]:
+            await first_body.wait()
+            return {"type": "http.disconnect"}
+
+        await response(
+            {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}},
+            receive,
+            send,
+        )
+
+    asyncio.run(disconnect_after_first_body())
+
+    assert terminal_events[0][0] == "SETTINGS_AUDIT_EXPORT_INTERRUPTED"
+    assert terminal_events[0][1]["exported_count"] == 0
 
 
 def test_settings_rbac_upsert_and_remove_membership() -> None:

@@ -2,7 +2,9 @@ import { FormEvent, useEffect, useState } from "react";
 
 import { Dialog } from "@/components/dialog";
 import { StatePanel } from "@/components/state-panel";
+import { StatusBanner } from "@/components/status-banner";
 import { apiFetch, apiFetchBlob } from "@/lib/api";
+import { formatAuditActor, formatAuditExportTruncationWarning } from "@/lib/audit";
 
 type AuditEventRow = {
   id: number;
@@ -10,6 +12,7 @@ type AuditEventRow = {
   actor_user_id: string | null;
   actor_email: string | null;
   actor_token_id: string | null;
+  actor_token_name: string | null;
   project_id: string | null;
   project_name: string | null;
   action: string;
@@ -45,6 +48,7 @@ export function SettingsAuditLogsPage() {
   const [nextCursor, setNextCursor] = useState<string | null>(null);
 
   const [error, setError] = useState<string | null>(null);
+  const [exportWarning, setExportWarning] = useState<string | null>(null);
   const [exporting, setExporting] = useState<"csv" | "json" | null>(null);
 
   async function loadProjects() {
@@ -109,12 +113,19 @@ export function SettingsAuditLogsPage() {
 
   async function exportAuditLogs(format: "csv" | "json") {
     setError(null);
+    setExportWarning(null);
     setExporting(format);
     try {
       const query = new URLSearchParams({ format, max_rows: "5000" });
       if (search.trim()) query.set("q", search.trim());
       if (projectFilter !== "all") query.set("project_id", projectFilter);
-      const { blob, filename } = await apiFetchBlob(`/settings/audit/export?${query.toString()}`);
+      const {
+        blob,
+        filename,
+        exportTruncated,
+        exportRowCount,
+        exportRowLimit,
+      } = await apiFetchBlob(`/settings/audit/export?${query.toString()}`);
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -123,6 +134,9 @@ export function SettingsAuditLogsPage() {
       link.click();
       link.remove();
       window.URL.revokeObjectURL(url);
+      setExportWarning(
+        formatAuditExportTruncationWarning(exportTruncated, exportRowCount, exportRowLimit),
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to export audit logs");
     } finally {
@@ -151,6 +165,12 @@ export function SettingsAuditLogsPage() {
         <div className="settings-panel">
           <p className="text-sm text-rose-700 dark:text-rose-200">{error}</p>
         </div>
+      ) : null}
+
+      {exportWarning ? (
+        <StatusBanner tone="warning" title="Export reached its row limit">
+          <p>{exportWarning}</p>
+        </StatusBanner>
       ) : null}
 
       <section className="settings-panel">
@@ -234,7 +254,7 @@ export function SettingsAuditLogsPage() {
                       <div>{event.object_type}</div>
                       <div className="settings-meta">{event.object_id}</div>
                     </td>
-                    <td>{event.actor_email || event.actor_user_id || "system"}</td>
+                    <td>{formatAuditActor(event)}</td>
                     <td>{event.project_name || event.project_id || "Global"}</td>
                     <td className="text-right">
                       <button className="settings-button" onClick={() => setSelectedEvent(event)} type="button">
@@ -278,7 +298,7 @@ export function SettingsAuditLogsPage() {
               </div>
               <div className="flex items-start justify-between gap-3">
                 <span className="text-slate-500 dark:text-slate-400">Actor</span>
-                <span>{selectedEvent.actor_email || selectedEvent.actor_user_id || "system"}</span>
+                <span>{formatAuditActor(selectedEvent)}</span>
               </div>
               <div className="flex items-start justify-between gap-3">
                 <span className="text-slate-500 dark:text-slate-400">Project</span>

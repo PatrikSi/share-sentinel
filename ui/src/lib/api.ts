@@ -97,7 +97,14 @@ export async function apiFetchBlob(
   path: string,
   init: RequestInit = {},
   allowRefresh = true,
-): Promise<{ blob: Blob; filename: string | null; contentType: string }> {
+): Promise<{
+  blob: Blob;
+  filename: string | null;
+  contentType: string;
+  exportTruncated: boolean;
+  exportRowCount: number | null;
+  exportRowLimit: number | null;
+}> {
   const headers = new Headers(init.headers || {});
   const method = (init.method || "GET").toUpperCase();
 
@@ -132,7 +139,17 @@ export async function apiFetchBlob(
     blob: await response.blob(),
     filename: contentDispositionFilename(response),
     contentType: response.headers.get("content-type") || "application/octet-stream",
+    exportTruncated: response.headers.get("x-export-truncated")?.toLowerCase() === "true",
+    exportRowCount: nonNegativeIntegerHeader(response, "x-export-row-count"),
+    exportRowLimit: nonNegativeIntegerHeader(response, "x-export-row-limit"),
   };
+}
+
+function nonNegativeIntegerHeader(response: Response, name: string): number | null {
+  const value = response.headers.get(name);
+  if (!value || !/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 export type PaginatedFetchLimitReason = "page_limit" | "item_limit" | "time_limit";

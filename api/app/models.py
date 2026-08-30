@@ -852,6 +852,17 @@ class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (
         Index("ix_audit_events_project_ts_id", "project_id", "ts", "id"),
+        Index("ix_audit_events_project_ref_ts_id", "project_ref", "ts", "id"),
+        Index(
+            "ix_audit_events_actor_user_id",
+            "actor_user_id",
+            postgresql_where=sa.text("actor_user_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_audit_events_actor_token_id",
+            "actor_token_id",
+            postgresql_where=sa.text("actor_token_id IS NOT NULL"),
+        ),
         Index(
             "ix_audit_events_project_object_ts_id",
             "project_id",
@@ -867,12 +878,18 @@ class AuditEvent(Base):
     actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    actor_user_ref: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
+    actor_email_snapshot: Mapped[str | None] = mapped_column(sa.String(320), nullable=True)
     actor_token_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid, ForeignKey("api_tokens.id", ondelete="SET NULL"), nullable=True
     )
+    actor_token_ref: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
+    actor_token_name_snapshot: Mapped[str | None] = mapped_column(sa.String(120), nullable=True)
     project_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True
     )
+    project_ref: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
+    project_name_snapshot: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
     action: Mapped[str] = mapped_column(sa.String(120), nullable=False)
     object_type: Mapped[str] = mapped_column(sa.String(80), nullable=False)
     object_id: Mapped[str] = mapped_column(sa.String(255), nullable=False)

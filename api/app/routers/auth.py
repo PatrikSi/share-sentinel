@@ -511,6 +511,7 @@ def create_api_token(
         object_type="api_token",
         object_id=str(token.id),
         actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
         project_id=payload.project_id,
         metadata={**request_meta(request), "scopes": scopes, "expires_at": expires_at.isoformat() if expires_at else None},
     )
@@ -580,6 +581,7 @@ def revoke_api_token(
         object_type="api_token",
         object_id=str(token.id),
         actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
         project_id=token.project_id,
         metadata=request_meta(request),
     )

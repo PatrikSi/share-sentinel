@@ -781,6 +781,48 @@ def test_inventory_csv_terminal_audit_failure_is_best_effort_and_closes_session(
     assert audit_session.close_count == 1
 
 
+def test_inventory_csv_terminal_audit_uses_retained_attribution_without_live_foreign_keys(
+    monkeypatch,
+) -> None:
+    actor_ref = uuid.uuid4()
+    token_ref = uuid.uuid4()
+    project_ref = uuid.uuid4()
+    added = []
+    audit_session = SimpleNamespace(
+        get=lambda *_args: None,
+        add=added.append,
+        commit=lambda: None,
+        rollback=lambda: None,
+        close=lambda: None,
+    )
+    monkeypatch.setattr(inventory_router, "SessionLocal", lambda: audit_session)
+
+    inventory_router._record_inventory_export_terminal_audit(
+        action="PROJECT_INVENTORY_CSV_EXPORT_COMPLETED",
+        project_id=project_ref,
+        auth=AuthContext(actor_ref, token_ref, project_ref, None, None),
+        audit_attribution={
+            "actor_user_ref": actor_ref,
+            "actor_email_snapshot": "deleted-user@example.test",
+            "actor_token_ref": token_ref,
+            "actor_token_name_snapshot": "retired-collector",
+            "project_ref": project_ref,
+            "project_name_snapshot": "Deleted project",
+        },
+        request_metadata={},
+        metadata={"result_count": 1},
+    )
+
+    assert len(added) == 1
+    event = added[0]
+    assert event.actor_user_id is None and event.actor_user_ref == actor_ref
+    assert event.actor_token_id is None and event.actor_token_ref == token_ref
+    assert event.project_id is None and event.project_ref == project_ref
+    assert event.actor_email_snapshot == "deleted-user@example.test"
+    assert event.actor_token_name_snapshot == "retired-collector"
+    assert event.project_name_snapshot == "Deleted project"
+
+
 def test_inventory_csv_asgi_disconnect_closes_generator_audits_and_releases_slot(monkeypatch) -> None:
     terminal_audits: list[dict[str, Any]] = []
     releases: list[bool] = []

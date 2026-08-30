@@ -1,17 +1,23 @@
+import asyncio
 import csv
 import json
 import logging
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import String, case, cast, func, or_, select, text
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy import String, and_, case, cast, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
+from starlette.types import Receive, Scope, Send
 
 from app.config import get_settings
-from app.db import escape_like, get_db
+from app.csv_utils import spreadsheet_safe_csv_value
+from app.db import SessionLocal, escape_like, get_db
 from app.deps import AuthContext, get_auth_context, request_meta, require_sysadmin, require_token_scopes
 from app.enums import ProjectRole, RunStatus
 from app.locking import lock_project_admin_guard
@@ -62,6 +68,59 @@ from app.token_scopes import (
 router = APIRouter(prefix="/settings", tags=["settings"])
 logger = logging.getLogger("share_sentinel.settings")
 MAX_SETTINGS_SEARCH_CHARS = 512
+AUDIT_EXPORT_BATCH_SIZE = 200
+AUDIT_EXPORT_FIELDS = (
+    "id",
+    "ts",
+    "action",
+    "object_type",
+    "object_id",
+    "actor_email",
+    "actor_user_id",
+    "actor_token_name",
+    "actor_token_id",
+    "project_name",
+    "project_id",
+    "metadata",
+)
+
+
+async def _close_audit_export_stream(stream: Iterator[bytes]) -> None:
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+    close_task = asyncio.create_task(run_in_threadpool(close))
+    pending_cancellation: asyncio.CancelledError | None = None
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError as exc:
+            pending_cancellation = pending_cancellation or exc
+            continue
+        except Exception:
+            logger.exception("audit_export_stream_close_failed")
+            break
+    if close_task.done() and not close_task.cancelled():
+        try:
+            close_task.result()
+        except Exception:
+            logger.exception("audit_export_stream_close_failed")
+    if pending_cancellation is not None:
+        raise pending_cancellation
+
+
+class _AuditStreamingResponse(StreamingResponse):
+    """Close the sync generator on disconnect so its terminal audit is durable."""
+
+    def __init__(self, stream: Iterator[bytes], **kwargs) -> None:
+        self._sync_stream = stream
+        super().__init__(stream, **kwargs)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await _close_audit_export_stream(self._sync_stream)
 SETTINGS_API_TOKEN_CURSOR = (
     KeysetColumn(
         "created_at",
@@ -130,14 +189,24 @@ def _global_audit_stmt(q: str | None, project_id: uuid.UUID | None = None):
     stmt = (
         select(
             AuditEvent,
-            User.email.label("actor_email"),
-            Project.name.label("project_name"),
+            func.coalesce(AuditEvent.actor_user_ref, AuditEvent.actor_user_id).label("actor_user_ref"),
+            func.coalesce(AuditEvent.actor_email_snapshot, User.email).label("actor_email"),
+            func.coalesce(AuditEvent.actor_token_ref, AuditEvent.actor_token_id).label("actor_token_ref"),
+            func.coalesce(AuditEvent.actor_token_name_snapshot, ApiToken.name).label("actor_token_name"),
+            func.coalesce(AuditEvent.project_ref, AuditEvent.project_id).label("project_ref"),
+            func.coalesce(AuditEvent.project_name_snapshot, Project.name).label("project_name"),
         )
         .outerjoin(User, User.id == AuditEvent.actor_user_id)
+        .outerjoin(ApiToken, ApiToken.id == AuditEvent.actor_token_id)
         .outerjoin(Project, Project.id == AuditEvent.project_id)
     )
     if project_id is not None:
-        stmt = stmt.where(AuditEvent.project_id == project_id)
+        stmt = stmt.where(
+            or_(
+                AuditEvent.project_ref == project_id,
+                (AuditEvent.project_ref.is_(None) & (AuditEvent.project_id == project_id)),
+            )
+        )
     if q:
         escaped = escape_like(q.strip())
         pattern = f"%{escaped}%"
@@ -147,29 +216,267 @@ def _global_audit_stmt(q: str | None, project_id: uuid.UUID | None = None):
                 AuditEvent.object_type.ilike(pattern, escape="\\"),
                 AuditEvent.object_id.ilike(pattern, escape="\\"),
                 User.email.ilike(pattern, escape="\\"),
+                AuditEvent.actor_email_snapshot.ilike(pattern, escape="\\"),
+                ApiToken.name.ilike(pattern, escape="\\"),
+                AuditEvent.actor_token_name_snapshot.ilike(pattern, escape="\\"),
                 Project.name.ilike(pattern, escape="\\"),
+                AuditEvent.project_name_snapshot.ilike(pattern, escape="\\"),
+                cast(AuditEvent.actor_user_ref, String).ilike(pattern, escape="\\"),
+                cast(AuditEvent.actor_token_ref, String).ilike(pattern, escape="\\"),
+                cast(AuditEvent.project_ref, String).ilike(pattern, escape="\\"),
             )
         )
     return stmt
 
 
 def _serialize_audit_rows(rows) -> list[dict]:
-    return [
-        AuditEventOut(
-            id=row.AuditEvent.id,
-            ts=row.AuditEvent.ts,
-            actor_user_id=row.AuditEvent.actor_user_id,
-            actor_email=row.actor_email,
-            actor_token_id=row.AuditEvent.actor_token_id,
-            project_id=row.AuditEvent.project_id,
-            project_name=row.project_name,
-            action=row.AuditEvent.action,
-            object_type=row.AuditEvent.object_type,
-            object_id=row.AuditEvent.object_id,
-            metadata=row.AuditEvent.metadata_json,
-        ).model_dump(mode="json")
-        for row in rows
-    ]
+    items: list[dict] = []
+    for row in rows:
+        event = row.AuditEvent
+        items.append(
+            AuditEventOut(
+                id=event.id,
+                ts=event.ts,
+                actor_user_id=getattr(row, "actor_user_ref", None)
+                or getattr(event, "actor_user_ref", None)
+                or event.actor_user_id,
+                actor_email=getattr(row, "actor_email", None)
+                or getattr(event, "actor_email_snapshot", None),
+                actor_token_id=getattr(row, "actor_token_ref", None)
+                or getattr(event, "actor_token_ref", None)
+                or event.actor_token_id,
+                actor_token_name=getattr(row, "actor_token_name", None)
+                or getattr(event, "actor_token_name_snapshot", None),
+                project_id=getattr(row, "project_ref", None)
+                or getattr(event, "project_ref", None)
+                or event.project_id,
+                project_name=getattr(row, "project_name", None)
+                or getattr(event, "project_name_snapshot", None),
+                action=event.action,
+                object_type=event.object_type,
+                object_id=event.object_id,
+                metadata=event.metadata_json,
+            ).model_dump(mode="json")
+        )
+    return items
+
+
+def _audit_export_csv_row(item: dict) -> bytes:
+    values = {
+        "id": item["id"],
+        "ts": item["ts"],
+        "action": item["action"],
+        "object_type": item["object_type"],
+        "object_id": item["object_id"],
+        "actor_email": item["actor_email"] or "",
+        "actor_user_id": item["actor_user_id"] or "",
+        "actor_token_name": item["actor_token_name"] or "",
+        "actor_token_id": item["actor_token_id"] or "",
+        "project_name": item["project_name"] or "",
+        "project_id": item["project_id"] or "",
+        "metadata": json.dumps(item["metadata"] or {}, ensure_ascii=True, sort_keys=True),
+    }
+    output = StringIO(newline="")
+    csv.writer(output, lineterminator="\r\n").writerow(
+        [spreadsheet_safe_csv_value(values[field]) for field in AUDIT_EXPORT_FIELDS]
+    )
+    return output.getvalue().encode("utf-8")
+
+
+def _record_audit_export_terminal(
+    *,
+    action: str,
+    auth: AuthContext,
+    actor_email_snapshot: str | None,
+    actor_token_name_snapshot: str | None = None,
+    project_id: uuid.UUID | None,
+    project_name_snapshot: str | None = None,
+    request_metadata: dict,
+    metadata: dict,
+) -> None:
+    db = SessionLocal()
+    try:
+        write_audit_event(
+            db,
+            action=action,
+            object_type="system",
+            object_id="audit",
+            actor_user_ref=auth.user_id,
+            actor_email_snapshot=actor_email_snapshot,
+            actor_token_ref=auth.token_id,
+            actor_token_name_snapshot=actor_token_name_snapshot,
+            project_ref=project_id,
+            project_name_snapshot=project_name_snapshot,
+            metadata={**request_metadata, **metadata},
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            logger.exception("audit_export_terminal_rollback_failed action=%s", action)
+        logger.exception("audit_export_terminal_audit_failed action=%s", action)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.exception("audit_export_terminal_session_close_failed action=%s", action)
+
+
+def _load_audit_export_batch(
+    *,
+    q: str | None,
+    project_id: uuid.UUID | None,
+    snapshot_id: int,
+    before_ts: datetime | None,
+    before_id: int | None,
+    limit: int,
+) -> tuple[list[dict], datetime | None, int | None]:
+    db = SessionLocal()
+    try:
+        stmt = _global_audit_stmt(q, project_id=project_id).where(AuditEvent.id <= snapshot_id)
+        if before_ts is not None and before_id is not None:
+            stmt = stmt.where(
+                or_(
+                    AuditEvent.ts < before_ts,
+                    and_(AuditEvent.ts == before_ts, AuditEvent.id < before_id),
+                )
+            )
+        rows = db.execute(
+            stmt.order_by(AuditEvent.ts.desc(), AuditEvent.id.desc()).limit(limit)
+        ).all()
+        items = _serialize_audit_rows(rows)
+        if not rows:
+            return items, None, None
+        last_event = rows[-1].AuditEvent
+        return items, last_event.ts, int(last_event.id)
+    finally:
+        try:
+            db.rollback()
+        except Exception:
+            logger.exception("audit_export_batch_rollback_failed")
+        try:
+            db.close()
+        except Exception:
+            logger.exception("audit_export_batch_session_close_failed")
+
+
+def _audit_export_chunks(
+    *,
+    q: str | None,
+    project_id: uuid.UUID | None,
+    export_format: str,
+    max_rows: int,
+    expected_rows: int,
+    truncated: bool,
+    snapshot_id: int,
+    auth: AuthContext,
+    actor_email_snapshot: str | None,
+    actor_token_name_snapshot: str | None = None,
+    project_name_snapshot: str | None = None,
+    request_metadata: dict,
+) -> Iterator[bytes]:
+    exported_count = 0
+    before_ts: datetime | None = None
+    before_id: int | None = None
+    completed = False
+    terminal_recorded = False
+    try:
+        if export_format == "csv":
+            output = StringIO(newline="")
+            csv.writer(output, lineterminator="\r\n").writerow(AUDIT_EXPORT_FIELDS)
+            yield output.getvalue().encode("utf-8")
+        else:
+            yield b"[\n"
+
+        first_json_item = True
+        while exported_count < expected_rows:
+            batch_limit = min(AUDIT_EXPORT_BATCH_SIZE, expected_rows - exported_count)
+            items, next_before_ts, next_before_id = _load_audit_export_batch(
+                q=q,
+                project_id=project_id,
+                snapshot_id=snapshot_id,
+                before_ts=before_ts,
+                before_id=before_id,
+                limit=batch_limit,
+            )
+            if not items:
+                break
+
+            for item in items:
+                if export_format == "csv":
+                    yield _audit_export_csv_row(item)
+                else:
+                    prefix = b"" if first_json_item else b",\n"
+                    yield prefix + json.dumps(item, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+                    first_json_item = False
+                exported_count += 1
+
+            before_ts = next_before_ts
+            before_id = next_before_id
+            if len(items) < batch_limit:
+                break
+
+        if export_format == "json":
+            yield b"\n]\n"
+        _record_audit_export_terminal(
+            action="SETTINGS_AUDIT_EXPORTED",
+            auth=auth,
+            actor_email_snapshot=actor_email_snapshot,
+            actor_token_name_snapshot=actor_token_name_snapshot,
+            project_id=project_id,
+            project_name_snapshot=project_name_snapshot,
+            request_metadata=request_metadata,
+            metadata={
+                "format": export_format,
+                "max_rows": max_rows,
+                "snapshot_id": snapshot_id,
+                "exported_count": exported_count,
+                "truncated": truncated,
+            },
+        )
+        terminal_recorded = True
+        completed = True
+    except GeneratorExit:
+        raise
+    except BaseException as exc:
+        _record_audit_export_terminal(
+            action="SETTINGS_AUDIT_EXPORT_FAILED",
+            auth=auth,
+            actor_email_snapshot=actor_email_snapshot,
+            actor_token_name_snapshot=actor_token_name_snapshot,
+            project_id=project_id,
+            project_name_snapshot=project_name_snapshot,
+            request_metadata=request_metadata,
+            metadata={
+                "format": export_format,
+                "max_rows": max_rows,
+                "snapshot_id": snapshot_id,
+                "exported_count": exported_count,
+                "truncated": truncated,
+                "error_type": type(exc).__name__[:120],
+            },
+        )
+        terminal_recorded = True
+        raise
+    finally:
+        if not completed and not terminal_recorded:
+            _record_audit_export_terminal(
+                action="SETTINGS_AUDIT_EXPORT_INTERRUPTED",
+                auth=auth,
+                actor_email_snapshot=actor_email_snapshot,
+                actor_token_name_snapshot=actor_token_name_snapshot,
+                project_id=project_id,
+                project_name_snapshot=project_name_snapshot,
+                request_metadata=request_metadata,
+                metadata={
+                    "format": export_format,
+                    "max_rows": max_rows,
+                    "snapshot_id": snapshot_id,
+                    "exported_count": exported_count,
+                    "truncated": truncated,
+                },
+            )
 
 
 def _project_catalog_stmt(q: str | None = None, project_id: uuid.UUID | None = None):
@@ -375,7 +682,7 @@ def rename_project(
         object_type="project",
         object_id=str(project_id),
         actor_user_id=auth.user_id,
-        project_id=project_id,
+        project_ref=project_id,
         metadata={**request_meta(request), "previous_name": previous_name, "name": project.name},
     )
     db.commit()
@@ -426,6 +733,8 @@ def delete_project(
         object_type="project",
         object_id=str(project_id),
         actor_user_id=auth.user_id,
+        project_ref=project_id,
+        project_name_snapshot=project.name,
         metadata={
             **request_meta(request),
             "project_id": str(project_id),
@@ -884,76 +1193,77 @@ def export_global_audit(
     __: User = Depends(require_sysadmin),
 ):
     _ = __
-    rows = db.execute(
-        _global_audit_stmt(q, project_id=project_id).order_by(AuditEvent.ts.desc(), AuditEvent.id.desc()).limit(max_rows)
-    ).all()
-    items = _serialize_audit_rows(rows)
+    actor_email_snapshot = str(__.email) if getattr(__, "email", None) else None
+    actor_token = db.get(ApiToken, auth.token_id) if auth.token_id is not None else None
+    project = db.get(Project, project_id) if project_id is not None else None
+    actor_token_name_snapshot = getattr(actor_token, "name", None)
+    project_name_snapshot = getattr(project, "name", None)
+    snapshot_id = int(db.execute(select(func.max(AuditEvent.id))).scalar() or 0)
+    candidate_ids = (
+        _global_audit_stmt(q, project_id=project_id)
+        .where(AuditEvent.id <= snapshot_id)
+        .with_only_columns(AuditEvent.id)
+        .limit(max_rows + 1)
+        .subquery()
+    )
+    available_count = int(
+        db.execute(select(func.count()).select_from(candidate_ids)).scalar() or 0
+    )
+    exported_count = min(max_rows, available_count)
+    truncated = available_count > max_rows
+    request_metadata = request_meta(request)
 
     write_audit_event(
         db,
-        action="SETTINGS_AUDIT_EXPORTED",
+        action="SETTINGS_AUDIT_EXPORT_REQUESTED",
         object_type="system",
         object_id="audit",
         actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_ref=project_id,
         metadata={
-            **request_meta(request),
+            **request_metadata,
             "q": q,
             "project_id": str(project_id) if project_id else None,
             "format": format,
             "max_rows": max_rows,
-            "exported_count": len(items),
+            "snapshot_id": snapshot_id,
+            "expected_exported_count": exported_count,
+            "truncated": truncated,
         },
     )
     db.commit()
 
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
-    if format == "json":
-        filename = f"share-sentinel-audit-{timestamp}.json"
-        return Response(
-            content=json.dumps(items, ensure_ascii=True, indent=2),
-            media_type="application/json",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-
-    output = StringIO()
-    writer = csv.DictWriter(
-        output,
-        fieldnames=[
-            "id",
-            "ts",
-            "action",
-            "object_type",
-            "object_id",
-            "actor_email",
-            "actor_user_id",
-            "actor_token_id",
-            "project_name",
-            "project_id",
-            "metadata",
-        ],
-    )
-    writer.writeheader()
-    for item in items:
-        writer.writerow(
-            {
-                "id": item["id"],
-                "ts": item["ts"],
-                "action": item["action"],
-                "object_type": item["object_type"],
-                "object_id": item["object_id"],
-                "actor_email": item["actor_email"] or "",
-                "actor_user_id": item["actor_user_id"] or "",
-                "actor_token_id": item["actor_token_id"] or "",
-                "project_name": item["project_name"] or "",
-                "project_id": item["project_id"] or "",
-                "metadata": json.dumps(item["metadata"] or {}, ensure_ascii=True, sort_keys=True),
-            }
-        )
-    filename = f"share-sentinel-audit-{timestamp}.csv"
-    return Response(
-        content=output.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    extension = "json" if format == "json" else "csv"
+    filename = f"share-sentinel-audit-{timestamp}.{extension}"
+    return _AuditStreamingResponse(
+        _audit_export_chunks(
+            q=q,
+            project_id=project_id,
+            export_format=format,
+            max_rows=max_rows,
+            expected_rows=exported_count,
+            truncated=truncated,
+            snapshot_id=snapshot_id,
+            auth=auth,
+            actor_email_snapshot=actor_email_snapshot,
+            actor_token_name_snapshot=actor_token_name_snapshot,
+            project_name_snapshot=project_name_snapshot,
+            request_metadata=request_metadata,
+        ),
+        media_type="application/json" if format == "json" else "text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Export-Row-Count": str(exported_count),
+            "X-Export-Row-Limit": str(max_rows),
+            "X-Export-Truncated": str(truncated).lower(),
+            "X-Export-Snapshot-ID": str(snapshot_id),
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
