@@ -562,6 +562,11 @@ treated as an empty server. A confirmed NFSv4 endpoint is also partial because
 `showmount` cannot enumerate an NFSv4-only pseudo-filesystem. The collector does
 not mount exports or traverse their contents. Discovered exports remain `unknown`;
 an advertised export name does not prove that the scanner can mount or list it.
+`showmount` retention is bounded to 4 MiB of stdout, 64 KiB of stderr, 10,000
+exports, and 4,096 bytes per path. Output truncation, a pipe-drain failure, or an
+exceeded export/path bound is reported as a structural coverage gap. Unless NFSv4
+is authoritatively excluded, the v4 pseudo-filesystem remains unassessed even when
+legacy export enumeration succeeds.
 
 ## Exit codes
 
