@@ -5,11 +5,22 @@ import os
 import shutil
 import stat
 import tempfile
+import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from app.config import get_settings
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the supported container runtime is POSIX.
+    fcntl = None  # type: ignore[assignment]
+
+
+ARTIFACT_CAPACITY_LOCK_FILE = ".share-sentinel-capacity.lock"
+ARTIFACT_CAPACITY_LOCK_TIMEOUT_SECONDS = 10.0
 
 
 class ArtifactStorageUnavailableError(OSError):
@@ -223,6 +234,41 @@ def _open_storage_regular(parts: tuple[str, ...], flags: int, *, mode: int = 0o6
         raise
 
 
+@contextmanager
+def _artifact_capacity_lock():
+    """Serialize capacity admission and writes across API replicas.
+
+    POSIX advisory locks are released by the kernel if a process exits. The
+    shared filesystem used by multiple replicas must therefore support flock
+    semantics in addition to the link/fsync contract checked by deep health.
+    """
+
+    if fcntl is None:
+        raise ArtifactStorageUnavailableError("capacity_lock_unsupported")
+    with _open_storage_regular(
+        (ARTIFACT_CAPACITY_LOCK_FILE,),
+        os.O_CREAT | os.O_RDWR,
+    ) as lock_file:
+        deadline = time.monotonic() + ARTIFACT_CAPACITY_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise ArtifactStorageUnavailableError("capacity_lock_timeout") from exc
+                time.sleep(0.05)
+            except OSError as exc:
+                raise ArtifactStorageUnavailableError("capacity_lock_unavailable") from exc
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
 def _remove_empty_storage_parents(parts: tuple[str, ...], *, preserve: int = 0) -> None:
     for depth in range(len(parts), preserve, -1):
         try:
@@ -264,9 +310,13 @@ def create_multipart_upload(key: str, content_type: str | None = None) -> str:
 def upload_part(key: str, upload_id: str, part_number: int, body: bytes) -> str:
     if part_number < 1:
         raise ValueError("part_number must be greater than zero")
-    require_artifact_upload_capacity(additional_bytes=len(body))
-    with _open_storage_regular(_multipart_parts(key, upload_id), os.O_APPEND | os.O_WRONLY) as fp:
-        fp.write(body)
+    # Keep the projected-capacity check and allocation in one shared critical
+    # section. Without this, every replica can admit a full part from the same
+    # stale free-space observation and collectively cross the configured floor.
+    with _artifact_capacity_lock():
+        require_artifact_upload_capacity(additional_bytes=len(body))
+        with _open_storage_regular(_multipart_parts(key, upload_id), os.O_APPEND | os.O_WRONLY) as fp:
+            fp.write(body)
     return hashlib.sha256(body).hexdigest()
 
 

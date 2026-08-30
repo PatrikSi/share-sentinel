@@ -1,3 +1,5 @@
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -155,6 +157,63 @@ def test_known_upload_size_must_leave_configured_headroom(monkeypatch) -> None:
         storage.require_artifact_upload_capacity(additional_bytes=801)
 
     assert exc_info.value.reason == "insufficient_capacity_for_upload"
+
+
+@pytest.mark.skipif(storage.fcntl is None, reason="requires POSIX advisory locks")
+def test_upload_parts_serialize_capacity_check_and_allocation(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+    key = "projects/p/artifact.ndjson"
+    upload_id = storage.create_multipart_upload(key)
+    active = 0
+    maximum_active = 0
+    counter_lock = threading.Lock()
+    start = threading.Barrier(3)
+    errors: list[BaseException] = []
+
+    def checked_capacity(*, additional_bytes: int = 0) -> None:
+        nonlocal active, maximum_active
+        assert additional_bytes == 7
+        with counter_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.05)
+        with counter_lock:
+            active -= 1
+
+    monkeypatch.setattr(storage, "require_artifact_upload_capacity", checked_capacity)
+
+    def write_part(part_number: int) -> None:
+        try:
+            start.wait()
+            storage.upload_part(key, upload_id, part_number, b"payload")
+        except BaseException as exc:  # pragma: no cover - asserted through errors.
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write_part, args=(part_number,)) for part_number in (1, 2)]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert maximum_active == 1
+    assert storage._multipart_path(key, upload_id).stat().st_size == 14
+
+
+@pytest.mark.skipif(storage.fcntl is None, reason="requires POSIX advisory locks")
+def test_capacity_lock_does_not_follow_symlink(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"unchanged")
+    (tmp_path / storage.ARTIFACT_CAPACITY_LOCK_FILE).symlink_to(victim)
+
+    with pytest.raises(OSError):
+        with storage._artifact_capacity_lock():
+            pass
+
+    assert victim.read_bytes() == b"unchanged"
 
 
 def test_upload_part_does_not_follow_replaced_multipart_symlink(tmp_path, monkeypatch) -> None:
