@@ -14,7 +14,8 @@ from app.config import get_settings
 from app.db import escape_like, get_db
 from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
 from app.enums import ProjectRole, RunStatus
-from app.models import ComparisonItemChange, ComparisonResourceChange, RunComparison, ScanRun
+from app.locking import lock_monitoring_source, lock_worker_job
+from app.models import CollectionSource, ComparisonItemChange, ComparisonResourceChange, RunComparison, ScanRun
 from app.pagination import (
     KeysetColumn,
     apply_keyset_pagination,
@@ -27,6 +28,7 @@ from app.rate_limit import RateLimiter
 from app.routers.runs import _run_diff_compatibility
 from app.schemas import ComparisonCreateIn, ComparisonItemChangeOut, ComparisonOut, ComparisonResourceChangeOut
 from app.services.audit import write_audit_event
+from app.services.monitoring import AutomaticSourceDisabledError, publish_automatic_baseline_recovery
 from app.services.queue import enqueue_worker_job
 from app.token_scopes import SCOPE_READ_INVENTORY, SCOPE_READ_RUNS, SCOPE_WRITE_RUNS
 
@@ -984,10 +986,12 @@ def retry_comparison(
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
+    # Keep the idempotent and terminal-state reads cheap. A failed comparison
+    # is re-read under the project admission lock below before any state is
+    # reset, so this optimistic read never authorizes a mutation by itself.
     comparison = db.execute(
         select(RunComparison)
         .where(RunComparison.id == comparison_id, RunComparison.project_id == project_id)
-        .with_for_update()
     ).scalar_one_or_none()
     if comparison is None:
         raise HTTPException(status_code=404, detail="comparison not found")
@@ -1005,6 +1009,84 @@ def retry_comparison(
         )
     if comparison.state != "failed":
         raise HTTPException(status_code=409, detail="comparison is not in a retryable state")
+
+    settings = get_settings()
+    # Creation and retry consume the same admission budget so alternating the
+    # two endpoints cannot bypass the project comparison rate limit.
+    rate_limiter.check(
+        request,
+        "comparison_create",
+        limit=settings.api_comparison_rate_limit,
+        window_seconds=settings.api_comparison_rate_window_seconds,
+        actor_key=f"{auth.user_id or auth.token_id}:{project_id}",
+    )
+    # Match worker lock order: job -> source -> project admission. Ingest owns
+    # source -> project, so taking project first here would invert that order.
+    lock_worker_job(db, comparison_id)
+    comparison = db.execute(
+        select(RunComparison)
+        .where(RunComparison.id == comparison_id, RunComparison.project_id == project_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if comparison is None:
+        raise HTTPException(status_code=404, detail="comparison not found")
+    baseline = _get_complete_run(db, project_id, comparison.baseline_run_id, "baseline")
+    current = _get_complete_run(db, project_id, comparison.current_run_id, "current")
+    if comparison.state in {"queued", "running"}:
+        return _comparison_out(comparison, baseline, current)
+    if comparison.state == "complete":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "COMPARISON_ALREADY_COMPLETE",
+                "message": "A completed comparison cannot be retried; create a comparison with different runs instead.",
+            },
+        )
+    if comparison.state != "failed":
+        raise HTTPException(status_code=409, detail="comparison is not in a retryable state")
+
+    if comparison.trigger == "automatic" and comparison.source_id is not None:
+        source_candidate = db.get(CollectionSource, comparison.source_id)
+        if source_candidate is not None:
+            lock_monitoring_source(db, source_candidate.source_key)
+    comparison_lock_key = project_id.int % (2**63 - 1)
+    db.execute(select(func.pg_advisory_xact_lock(comparison_lock_key)))
+
+    active_count = int(
+        db.execute(
+            select(func.count(RunComparison.id)).where(
+                RunComparison.project_id == project_id,
+                RunComparison.state.in_(("queued", "running")),
+            )
+        ).scalar()
+        or 0
+    )
+    if active_count >= settings.api_comparison_max_active_per_project:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "code": "COMPARISON_CAPACITY_REACHED",
+                "message": "This project already has the maximum number of active comparisons. Retry shortly.",
+            },
+            headers={"Retry-After": "5"},
+        )
+
+    try:
+        source_coverage_updated = publish_automatic_baseline_recovery(
+            db,
+            comparison,
+            findings_only=False,
+            require_enabled=True,
+        )
+    except AutomaticSourceDisabledError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "COMPARISON_SOURCE_DISABLED",
+                "message": "Enable this comparison's collection source before retrying automatic recovery.",
+            },
+        ) from exc
     previous_attempt_count = comparison.attempt_count
     previous_error_code = comparison.error_code
     comparison.state = "queued"
@@ -1040,6 +1122,7 @@ def retry_comparison(
             "previous_error_code": previous_error_code,
             "baseline_run_id": str(comparison.baseline_run_id),
             "current_run_id": str(comparison.current_run_id),
+            "source_coverage_updated": source_coverage_updated,
         },
     )
     db.commit()
@@ -1261,6 +1344,10 @@ def list_item_changes(
             "result_count": len(rows),
             "change_type": normalized_type,
             "resource_change_id": resource_change_id,
+            "query_applied": bool(q and q.strip()),
+            "cursor_applied": cursor is not None,
+            "limit": limit,
+            "has_next_page": next_cursor is not None,
         },
     )
     db.commit()

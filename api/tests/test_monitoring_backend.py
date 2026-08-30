@@ -6,9 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from app.deps import AuthContext
 from app.models import CollectionSource, ComparisonItemChange, Finding, FindingOccurrence, RunComparison, ScanRun
 from app.routers import comparisons, monitoring, runs
-from app.schemas import FindingBulkUpdateIn, RunCreateIn
+from app.schemas import CollectionSourceUpdateIn, FindingBulkUpdateIn, RunCreateIn
+from app.services import monitoring as monitoring_service
 from fastapi import HTTPException
 
 
@@ -189,6 +191,8 @@ def test_bulk_lifecycle_writes_indexed_per_finding_audits():
     assert 'object_type="finding"' in source
     assert 'action="FINDING_BULK_UPDATED"' in source
     assert '"batch_action_id": batch_action_id' in source
+    assert '"old_accepted_risk_expires_at"' in source
+    assert '"new_accepted_risk_expires_at"' in source
     assert "_finding_update_would_change" in source
     assert "if not any(state_changes.values()) and not has_note" in source
     assert 'mutable_fields == {"note"}' in source
@@ -250,6 +254,11 @@ def test_provider_computed_effective_access_requires_complete_unambiguous_eviden
     assert runs._provider_computed_effective_decision(
         [complete], assessments_truncated=False, principal_filtered=False
     ) == ("allow", complete)
+    for retrieval_coverage in ("full", "all_returned"):
+        alias = SimpleNamespace(**{**vars(complete), "retrieval_coverage": retrieval_coverage})
+        assert runs._provider_computed_effective_decision(
+            [alias], assessments_truncated=False, principal_filtered=False
+        ) == ("allow", alias)
     denied_without_negative_support = SimpleNamespace(**{**vars(complete), "effective_access_status": "denied"})
     assert runs._provider_computed_effective_decision(
         [denied_without_negative_support], assessments_truncated=False, principal_filtered=False
@@ -281,11 +290,147 @@ def test_retry_is_operator_authorized_idempotent_and_resets_only_failed_work():
     source = inspect.getsource(comparisons.retry_comparison)
     assert "ProjectRole.OPERATOR" in source
     assert '.with_for_update()' in source
+    assert '"comparison_create"' in source
+    assert "pg_advisory_xact_lock" in source
+    assert "api_comparison_max_active_per_project" in source
+    assert '"COMPARISON_CAPACITY_REACHED"' in source
+    assert 'headers={"Retry-After": "5"}' in source
     assert 'if comparison.state in {"queued", "running"}' in source
     assert 'if comparison.state == "complete"' in source
     assert 'if comparison.state != "failed"' in source
     assert '"operator_retry": True' in source
     assert 'action="COMPARISON_RETRY_REQUESTED"' in source
+    assert source.index("pg_advisory_xact_lock") < source.index('comparison.state = "queued"')
+    assert source.index("active_count") < source.index('comparison.state = "queued"')
+    assert source.index("lock_worker_job") < source.index("lock_monitoring_source") < source.index(
+        "pg_advisory_xact_lock"
+    )
+
+
+def test_source_provider_filter_matches_single_components_and_exact_compounds():
+    single = str(monitoring._source_provider_filter(" SMB "))
+    assert "collection_sources.provider =" in single
+    assert single.count("collection_sources.provider LIKE") == 3
+
+    compound = str(monitoring._source_provider_filter("nfs+smb"))
+    assert "collection_sources.provider =" in compound
+    assert "LIKE" not in compound
+
+    with pytest.raises(HTTPException) as caught:
+        monitoring._source_provider_filter("smb%")
+    assert caught.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("current_interval", "requested_interval"),
+    ((3600, 7200), (3600, None), (None, 3600)),
+)
+def test_source_update_applies_set_change_and_clear_cadence(
+    monkeypatch, current_interval, requested_interval
+):
+    project_id = uuid.uuid4()
+    source = SimpleNamespace(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        display_name="Finance",
+        enabled=True,
+        expected_interval_seconds=current_interval,
+        updated_at=datetime.now(tz=UTC),
+    )
+    db = SimpleNamespace(commit=lambda: None, refresh=lambda _row: None)
+    monkeypatch.setattr(monitoring, "require_project_role", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(monitoring, "_get_source", lambda *_args, **_kwargs: source)
+    monkeypatch.setattr(monitoring, "request_meta", lambda _request: {})
+    monkeypatch.setattr(monitoring, "write_audit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        monitoring,
+        "source_payload",
+        lambda row: {"expected_interval_seconds": row.expected_interval_seconds},
+    )
+
+    result = monitoring.update_source(
+        project_id,
+        source.id,
+        CollectionSourceUpdateIn(
+            expected_display_name="Finance",
+            expected_enabled=True,
+            expected_current_interval_seconds=current_interval,
+            expected_interval_seconds=requested_interval,
+        ),
+        SimpleNamespace(),
+        db,
+        AuthContext(None, None, None, None, None),
+        AuthContext(uuid.uuid4(), None, None, None, None),
+    )
+
+    assert result["expected_interval_seconds"] == requested_interval
+
+
+def test_source_update_combines_fields_and_rejects_stale_configuration(monkeypatch):
+    project_id = uuid.uuid4()
+    source = SimpleNamespace(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        display_name="Finance",
+        enabled=True,
+        expected_interval_seconds=3600,
+        updated_at=datetime.now(tz=UTC),
+    )
+    db = SimpleNamespace(commit=lambda: None, refresh=lambda _row: None)
+    monkeypatch.setattr(monitoring, "require_project_role", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(monitoring, "_get_source", lambda *_args, **_kwargs: source)
+    monkeypatch.setattr(monitoring, "request_meta", lambda _request: {})
+    monkeypatch.setattr(monitoring, "write_audit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        monitoring,
+        "source_payload",
+        lambda row: {
+            "display_name": row.display_name,
+            "enabled": row.enabled,
+            "expected_interval_seconds": row.expected_interval_seconds,
+        },
+    )
+    auth = AuthContext(uuid.uuid4(), None, None, None, None)
+
+    updated = monitoring.update_source(
+        project_id,
+        source.id,
+        CollectionSourceUpdateIn(
+            expected_display_name="Finance",
+            expected_enabled=True,
+            expected_current_interval_seconds=3600,
+            display_name="Finance production",
+            enabled=False,
+            expected_interval_seconds=7200,
+        ),
+        SimpleNamespace(),
+        db,
+        auth,
+        auth,
+    )
+    assert updated == {
+        "display_name": "Finance production",
+        "enabled": False,
+        "expected_interval_seconds": 7200,
+    }
+
+    with pytest.raises(HTTPException) as caught:
+        monitoring.update_source(
+            project_id,
+            source.id,
+            CollectionSourceUpdateIn(
+                expected_display_name="Finance",
+                expected_enabled=True,
+                expected_current_interval_seconds=3600,
+                display_name="Stale write",
+            ),
+            SimpleNamespace(),
+            db,
+            auth,
+            auth,
+        )
+    assert caught.value.status_code == 409
+    assert caught.value.detail["code"] == "SOURCE_REVISION_CONFLICT"
 
 
 def test_resource_change_contract_uses_materialized_item_history_counts():
@@ -295,6 +440,10 @@ def test_resource_change_contract_uses_materialized_item_history_counts():
     assert '"state": "not_computed"' in source
     assert "item_churn_computed" in source
     assert 'action="COMPARISON_RESOURCE_CHANGES_LISTED"' in source
+    item_source = inspect.getsource(comparisons.list_item_changes)
+    assert '"query_applied"' in item_source
+    assert '"cursor_applied"' in item_source
+    assert '"has_next_page"' in item_source
 
 
 def test_monitoring_routes_are_bounded_and_expose_assignee_candidates():
@@ -312,6 +461,27 @@ def test_monitoring_routes_are_bounded_and_expose_assignee_candidates():
 def test_source_health_filter_normalizes_coverage_like_payload_health():
     source = inspect.getsource(monitoring._source_health_filter)
     assert "func.lower(func.coalesce" in source
+    assert '"findings_evaluation_state"' in source
+    assert '"unknown"' in source
+
+
+def test_source_health_fails_closed_when_baseline_finding_state_is_missing():
+    now = datetime.now(tz=UTC)
+    source = SimpleNamespace(
+        enabled=True,
+        last_success_at=now,
+        last_failure_at=None,
+        expected_interval_seconds=3600,
+        coverage={
+            "state": "complete",
+            "monitoring_findings": {"state": "complete"},
+            "automatic_baseline": {"state": "established"},
+        },
+    )
+
+    health = monitoring_service.source_health(source, now=now)
+
+    assert health["health_status"] == "degraded"
 
 
 def test_finding_history_cursor_and_search_match_new_indexes():
@@ -329,6 +499,84 @@ def test_finding_evidence_reads_are_audited_without_auditing_list_polls():
     assert "FINDING_ACTIVITY_ACTIONS" in activity_source
     assert "FINDING_ACTIVITY_LISTED" not in monitoring.FINDING_ACTIVITY_ACTIONS
     assert "write_audit_event" not in inspect.getsource(monitoring.list_findings)
+
+
+def test_finding_queue_payload_withholds_detail_until_audited_read():
+    now = datetime.now(tz=UTC)
+    finding = SimpleNamespace(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        source_id=None,
+        policy_id="policy-a",
+        policy_version=1,
+        title="Finding",
+        description="Description",
+        severity="high",
+        status="open",
+        resource_identity_key="resource-a",
+        resource_type="smb_share",
+        provider="smb",
+        resource_name="Finance",
+        first_seen_at=now,
+        last_seen_at=now,
+        resolved_at=None,
+        accepted_risk_expires_at=None,
+        assignee_user_id=None,
+        latest_run_id=None,
+        latest_comparison_id=None,
+        evidence={"state": "exact", "summary": {"sensitive_path": "/finance/private"}},
+        occurrence_count=1,
+        revision=1,
+        created_at=now,
+        updated_at=now,
+    )
+
+    queue_payload = monitoring_service.finding_payload(finding, include_evidence=False)
+    detail_payload = monitoring_service.finding_payload(finding)
+
+    assert queue_payload["evidence"] == {"state": "exact"}
+    assert detail_payload["evidence"]["summary"]["sensitive_path"] == "/finance/private"
+
+
+def test_finding_activity_projection_withholds_audit_only_request_context():
+    assert "FINDING_AUTO_REOPENED" in monitoring.FINDING_ACTIVITY_ACTIONS
+    projected = monitoring._public_finding_activity_metadata(
+        {
+            "old_status": "open",
+            "new_status": "acknowledged",
+            "note": "Reviewed with the owner",
+            "reason": "authoritative_recurrence",
+            "ip": "192.0.2.10",
+            "user_agent": "sensitive workstation fingerprint",
+            "request_id": "internal-correlation-id",
+            "future_internal_field": {"secret": "must not escape"},
+        }
+    )
+
+    assert projected == {
+        "old_status": "open",
+        "new_status": "acknowledged",
+        "note": "Reviewed with the owner",
+        "reason": "authoritative_recurrence",
+    }
+
+
+def test_finding_activity_labels_api_token_without_exposing_token_or_owner_ids():
+    actor = monitoring._public_finding_activity_actor(
+        SimpleNamespace(actor_user_id=uuid.uuid4(), actor_token_id=uuid.uuid4())
+    )
+
+    assert actor == {"actor_user_id": None, "actor_token_id": None, "actor_kind": "api_token"}
+
+    retained_actor = monitoring._public_finding_activity_actor(
+        SimpleNamespace(
+            actor_user_id=None,
+            actor_user_ref=uuid.uuid4(),
+            actor_token_id=None,
+            actor_token_ref=uuid.uuid4(),
+        )
+    )
+    assert retained_actor == {"actor_user_id": None, "actor_token_id": None, "actor_kind": "api_token"}
 
 
 def test_finding_occurrence_retains_snapshot_when_run_is_deleted():

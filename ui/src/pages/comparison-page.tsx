@@ -12,8 +12,10 @@ import {
   changeTypeLabel,
   changeTypeTone,
   canRetryComparisonFindings,
+  canRetryMaterializedComparison,
   comparisonCompatibilityTone,
   comparisonErrorText,
+  emptyResourceChangesDescription,
   comparisonFindingsEvaluation,
   comparisonRunId,
   comparisonRunLabel,
@@ -215,9 +217,10 @@ function ComparisonChangePanel({
             <SnapshotCard label="Current" projectId={projectId} snapshot={change.after} />
           </div>
 
-          <StatusBanner tone={change.item_changes?.state === "exact_bounded" ? "success" : "info"} title="Item-level comparison">
+          <StatusBanner tone={change.item_changes?.state === "computed" ? (change.item_changes.exact ? "success" : "warning") : "info"} title={change.item_changes?.state === "computed" ? (change.item_changes.exact ? "Item-level comparison computed" : "Item-level comparison is bounded") : "Item-level comparison not computed"}>
             <p>{itemChangeCopy(change.item_changes)}</p>
-            {change.item_changes?.state !== "exact_bounded" ? <p className="mt-1">Null item counts mean not computed, never zero.</p> : null}
+            {change.item_changes?.state === "not_computed" ? <p className="mt-1">Null item counts mean not computed, never zero.</p> : null}
+            {change.item_changes?.state === "computed" && !change.item_changes.exact ? <p className="mt-1">Counts describe materialized rows, but coverage or identity limitations prevent an exact absence/correlation conclusion.</p> : null}
           </StatusBanner>
 
           <section aria-labelledby="comparison-match-title" className="access-evidence-section">
@@ -248,6 +251,9 @@ export function ComparisonPage() {
   const [role, setRole] = useState<string | null>(null);
   const [roleReady, setRoleReady] = useState(false);
   const [roleError, setRoleError] = useState<string | null>(null);
+  const [comparisonRetryBusy, setComparisonRetryBusy] = useState(false);
+  const [comparisonRetryError, setComparisonRetryError] = useState<string | null>(null);
+  const [comparisonRetryInfo, setComparisonRetryInfo] = useState<string | null>(null);
   const [findingsRetryBusy, setFindingsRetryBusy] = useState(false);
   const [findingsRetryError, setFindingsRetryError] = useState<string | null>(null);
   const [findingsRetryInfo, setFindingsRetryInfo] = useState<string | null>(null);
@@ -304,6 +310,7 @@ export function ComparisonPage() {
           return;
         }
         setComparison(payload);
+        if (payload.state !== "failed") setComparisonRetryError(null);
         setPollWarning(null);
         setLastUpdatedAt(new Date());
       })
@@ -324,7 +331,10 @@ export function ComparisonPage() {
 
   useEffect(() => {
     const evaluation = comparisonFindingsEvaluation(comparison);
-    if (!projectId || monitoringEvaluationState(evaluation) !== "degraded") {
+    if (
+      !projectId
+      || (comparison?.state !== "failed" && monitoringEvaluationState(evaluation) !== "degraded")
+    ) {
       setRole(null);
       setRoleReady(false);
       setRoleError(null);
@@ -345,7 +355,7 @@ export function ComparisonPage() {
       })
       .finally(() => !controller.signal.aborted && setRoleReady(true));
     return () => controller.abort();
-  }, [comparison?.id, comparison?.summary?.findings_evaluation?.state, projectId]);
+  }, [comparison?.id, comparison?.state, comparison?.summary?.findings_evaluation?.state, projectId]);
 
   useEffect(() => {
     if (
@@ -488,6 +498,30 @@ export function ComparisonPage() {
     }
   }
 
+  async function retryMaterializedComparison() {
+    if (!projectId || !comparisonId || !canRetryMaterializedComparison(comparison, role)) return;
+    setComparisonRetryBusy(true);
+    setComparisonRetryError(null);
+    setComparisonRetryInfo(null);
+    try {
+      const response = await apiFetch(
+        `/projects/${encodeURIComponent(projectId)}/comparisons/${encodeURIComponent(comparisonId)}/retry`,
+        { method: "POST" },
+      );
+      const payload = response as ProjectComparison;
+      if (!payload?.id || payload.id.toLowerCase() !== comparisonId.toLowerCase()) {
+        throw new Error("The retry response did not match this comparison. Reload before trying again.");
+      }
+      setComparison(payload);
+      setComparisonRetryInfo("Comparison recovery was queued. This page will refresh as materialization resumes from a clean retry state.");
+    } catch (caught) {
+      setComparisonRetryError(caught instanceof Error ? caught.message : "Comparison recovery could not be requested.");
+    } finally {
+      setComparisonRetryBusy(false);
+      setPollNonce((value) => value + 1);
+    }
+  }
+
   function changeFilter(next: ResourceChangeType | "all") {
     setChangeTypeState(next);
     setSelectedChangeKey("");
@@ -558,7 +592,7 @@ export function ComparisonPage() {
             </div>
             <span className={`comparison-state is-${comparisonStateTone(comparison.state)}`}>{humanizeEvidenceValue(comparison.state)}</span>
           </div>
-          <p className="comparison-page-subtitle">Server-materialized resource changes with dimension-specific comparability. Item paths remain in the bounded legacy preview.</p>
+          <p className="comparison-page-subtitle">Server-materialized resource and item history with dimension-specific comparability. The bounded run preview remains available for legacy comparisons.</p>
         </div>
         <div className="comparison-header-actions">
           {boundedPreviewLink ? <Link className="inventory-button-primary" to={boundedPreviewLink}>Open bounded item preview</Link> : null}
@@ -569,6 +603,9 @@ export function ComparisonPage() {
       {pollWarning ? (
         <StatusBanner tone="warning" title="Live comparison state may be stale"><p>{pollWarning}</p><button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={() => setPollNonce((value) => value + 1)} type="button">Retry status</button></StatusBanner>
       ) : null}
+
+      {comparisonRetryError ? <StatusBanner tone="error" title="Comparison recovery request failed"><p>{comparisonRetryError} The authoritative comparison state is being reloaded before another attempt.</p></StatusBanner> : null}
+      {comparisonRetryInfo ? <StatusBanner tone="success" title="Comparison recovery requested"><p>{comparisonRetryInfo}</p></StatusBanner> : null}
 
       {findingsRetryError ? <StatusBanner tone="error" title="Finding recovery request failed"><p>{findingsRetryError} Comparison state is being reloaded before another attempt.</p></StatusBanner> : null}
       {findingsRetryInfo ? <StatusBanner tone="success" title="Finding recovery requested"><p>{findingsRetryInfo}</p></StatusBanner> : null}
@@ -612,7 +649,17 @@ export function ComparisonPage() {
       ) : null}
 
       {comparison.state === "failed" ? (
-        <StatusBanner tone="error" title="Comparison failed"><p>{comparisonStateCopy(comparison)}</p><p className="mt-1">No partial result rows are published as final. Start a new comparison from the current run after correcting the recorded failure.</p>{boundedPreviewLink ? <Link className="mt-2 inline-flex rounded-md border border-current px-3 py-2 text-xs font-semibold" to={boundedPreviewLink}>Return to run diff</Link> : null}</StatusBanner>
+        <StatusBanner tone="error" title="Comparison failed">
+          <p>{comparisonStateCopy(comparison)}</p>
+          <p className="mt-1">No partial result rows are published as final. After correcting the recorded failure, retry this comparison so its durable identity and audit history are preserved.</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {canRetryMaterializedComparison(comparison, role) ? <button className="inventory-button-primary" disabled={comparisonRetryBusy} onClick={() => void retryMaterializedComparison()} type="button">{comparisonRetryBusy ? "Requesting retry…" : "Retry comparison"}</button> : null}
+            {boundedPreviewLink ? <Link className="inline-flex rounded-md border border-current px-3 py-2 text-xs font-semibold" to={boundedPreviewLink}>Return to run diff</Link> : null}
+          </div>
+          {roleError ? <p className="mt-2">{roleError} Recovery remains disabled until access can be verified.</p> : null}
+          {!roleReady && !roleError ? <p className="mt-2">Checking recovery permission…</p> : null}
+          {roleReady && !canRetryMaterializedComparison(comparison, role) && !roleError ? <p className="mt-2">An operator or project administrator must retry this comparison.</p> : null}
+        </StatusBanner>
       ) : null}
 
       {comparison.state === "complete" ? (
@@ -666,7 +713,7 @@ export function ComparisonPage() {
             ) : null}
             {changesLoading ? <div className="inventory-skeleton" aria-label="Loading resource changes" role="status">{Array.from({ length: 8 }, (_, index) => <span key={index} />)}</div> : null}
             {!changesLoading && !changesError && changes.length === 0 ? (
-              <StatePanel description={changeType === "all" && !provider && !category && !debouncedQuery ? "No resource-level changes were detected within comparable collected scope. Item-level comparison was not computed." : "No resource changes match the current server-side filters."} title="No resource changes" />
+              <StatePanel description={emptyResourceChangesDescription(summary, changeType !== "all" || Boolean(provider || category || debouncedQuery))} title="No resource changes" />
             ) : null}
             {!changesLoading && changes.length > 0 ? (
               <div className="comparison-table-scroll">

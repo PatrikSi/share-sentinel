@@ -12,7 +12,7 @@ import {
   type ComparisonState,
   type ProjectComparison,
 } from "@/lib/comparisons";
-import { formatMonitoringTimestamp, humanizeMonitoringValue, monitoringEvaluationState } from "@/lib/monitoring";
+import { formatMonitoringTimestamp, humanizeMonitoringValue, monitoringEvaluationIsActive, monitoringEvaluationState } from "@/lib/monitoring";
 
 const PAGE_LIMIT = 50;
 const COMPARISON_STATES: ComparisonState[] = ["queued", "running", "complete", "failed"];
@@ -99,6 +99,20 @@ export function ChangesPage() {
     return () => controller.abort();
   }, [cursor, projectId, reloadNonce, sourceId, sourceIdInvalid, state]);
 
+  const activeWorkflowVisible = comparisons.some((comparison) => (
+    comparison.state === "queued"
+    || comparison.state === "running"
+    || monitoringEvaluationIsActive(comparison.summary?.findings_evaluation)
+  ));
+  useEffect(() => {
+    if (!activeWorkflowVisible || loading || sourceIdInvalid) return;
+    const timer = window.setTimeout(
+      () => setReloadNonce((value) => value + 1),
+      error ? 15_000 : 5_000,
+    );
+    return () => window.clearTimeout(timer);
+  }, [activeWorkflowVisible, error, loading, sourceIdInvalid]);
+
   function resetPage() {
     setCursor(null);
     setCursorHistory([]);
@@ -115,12 +129,13 @@ export function ChangesPage() {
         <label>State<select onChange={(event) => { setState(normalizeState(event.target.value)); resetPage(); }} value={state}><option value="">All states</option>{COMPARISON_STATES.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label>
         <label>Source ID<input onChange={(event) => { setSourceId(event.target.value.trim()); resetPage(); }} placeholder="Optional stable source ID" value={sourceId} /></label>
         {(state || sourceId) ? <button className="inventory-button-secondary" onClick={() => { setState(""); setSourceId(""); resetPage(); }} type="button">Clear filters</button> : null}
+        <button className="inventory-button-secondary" disabled={loading} onClick={() => setReloadNonce((value) => value + 1)} type="button">{loading ? "Refreshing…" : "Refresh"}</button>
       </section>
 
       {sourceIdInvalid ? <StatusBanner tone="warning" title="Source filter is incomplete"><p>Enter a complete source UUID or clear the filter. No server request is sent for an invalid identifier.</p></StatusBanner> : sourceId ? <StatusBanner title="Source-scoped history"><p>Showing comparisons registered to source <code>{sourceId}</code>. Open Sources to inspect its coverage and freshness.</p></StatusBanner> : null}
 
       <section aria-busy={loading} aria-labelledby="comparison-history-title" className="monitoring-queue">
-        <header className="monitoring-queue-header"><div><h2 id="comparison-history-title">Comparison history</h2><p>Each row is a materialized, immutable comparison attempt with explicit interpretation limits.</p></div><span>Page {cursorHistory.length + 1}</span></header>
+        <header className="monitoring-queue-header"><div><h2 id="comparison-history-title">Comparison history</h2><p>Each row is a durable comparison identity; completed evidence is immutable, while a failed identity can be explicitly retried and rebuilt.</p></div><span>Page {cursorHistory.length + 1}</span></header>
         {error ? <StatePanel actions={<button className="inventory-button-primary" onClick={() => setReloadNonce((value) => value + 1)} type="button">Retry history</button>} description={`${error} Previously opened comparisons remain addressable by URL.`} title="Comparison history unavailable" tone="error" /> : null}
         {loading ? <div aria-label="Loading comparisons" className="inventory-skeleton" role="status">{Array.from({ length: 8 }, (_, index) => <span key={index} />)}</div> : null}
         {!sourceIdInvalid && !loading && !error && comparisons.length === 0 ? <StatePanel description={state || sourceId ? "No comparisons match the current server-side filters." : "No materialized comparisons exist yet. A comparable successful run can be evaluated against its previous source baseline."} title="No comparisons in view" /> : null}

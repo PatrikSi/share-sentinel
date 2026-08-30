@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from app.models import CollectionSource, Finding
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.locking import lock_monitoring_source
+from app.models import CollectionSource, Finding, RunComparison
 
 BUILT_IN_FINDING_POLICIES: tuple[dict[str, Any], ...] = (
     {
@@ -85,6 +89,10 @@ BUILT_IN_FINDING_POLICIES: tuple[dict[str, Any], ...] = (
     },
 )
 
+
+class AutomaticSourceDisabledError(RuntimeError):
+    pass
+
 POLICY_BY_ID = {policy["id"]: policy for policy in BUILT_IN_FINDING_POLICIES}
 FINDING_STATUSES = frozenset({"open", "acknowledged", "accepted_risk", "resolved"})
 FINDING_SEVERITIES = frozenset({"critical", "high", "medium", "low", "info"})
@@ -118,7 +126,7 @@ def source_health(source: CollectionSource, *, now: datetime | None = None) -> d
     )
     findings_state = str(findings_coverage.get("state") or "unknown").lower()
     baseline_state = str(baseline_coverage.get("state") or "unknown").lower()
-    baseline_findings_state = str(baseline_coverage.get("findings_evaluation_state") or "complete").lower()
+    baseline_findings_state = str(baseline_coverage.get("findings_evaluation_state") or "unknown").lower()
     monitoring_complete = (
         findings_state == "complete"
         and baseline_state == "established"
@@ -189,7 +197,78 @@ def source_payload(source: CollectionSource, *, now: datetime | None = None) -> 
     }
 
 
-def finding_payload(finding: Finding) -> dict[str, Any]:
+def publish_automatic_baseline_recovery(
+    db: Session,
+    comparison: RunComparison,
+    *,
+    findings_only: bool,
+    require_enabled: bool = False,
+) -> bool:
+    """Publish recovery only while this comparison is the source's current baseline."""
+
+    if comparison.trigger != "automatic" or comparison.source_id is None:
+        return False
+    candidate = db.get(CollectionSource, comparison.source_id)
+    if candidate is None:
+        return False
+    lock_monitoring_source(db, candidate.source_key)
+    source = db.execute(
+        select(CollectionSource)
+        .where(
+            CollectionSource.id == comparison.source_id,
+            CollectionSource.project_id == comparison.project_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if source is None:
+        return False
+    if require_enabled and not source.enabled:
+        raise AutomaticSourceDisabledError("automatic comparison source is disabled")
+    coverage = dict(source.coverage or {})
+    baseline = (
+        dict(coverage.get("automatic_baseline"))
+        if isinstance(coverage.get("automatic_baseline"), dict)
+        else {}
+    )
+    if str(baseline.get("comparison_id") or "") != str(comparison.id):
+        return False
+    if findings_only:
+        baseline.update(
+            {
+                "state": "established",
+                "findings_evaluation_state": "queued",
+                "findings_next_retry_at": None,
+            }
+        )
+    else:
+        baseline.update(
+            {
+                "state": "queued",
+                "findings_evaluation_state": "queued",
+                "findings_next_retry_at": None,
+                "next_retry_at": None,
+            }
+        )
+    baseline.pop("error_code", None)
+    baseline.pop("reason", None)
+    coverage["automatic_baseline"] = baseline
+    coverage["state"] = "partial"
+    reasons = [str(reason) for reason in coverage.get("reasons", []) if str(reason).strip()]
+    reasons.append(
+        "Automatic comparison finding evaluation is pending or retrying."
+        if findings_only
+        else "Automatic comparison recovery is queued."
+    )
+    coverage["reasons"] = list(dict.fromkeys(reasons))
+    source.coverage = coverage
+    source.updated_at = datetime.now(tz=UTC)
+    return True
+
+
+def finding_payload(finding: Finding, *, include_evidence: bool = True) -> dict[str, Any]:
+    evidence = finding.evidence or {}
+    public_evidence = evidence if include_evidence else {"state": str(evidence.get("state") or "indeterminate")}
     return {
         "id": str(finding.id),
         "project_id": str(finding.project_id),
@@ -213,7 +292,7 @@ def finding_payload(finding: Finding) -> dict[str, Any]:
         "assignee_user_id": str(finding.assignee_user_id) if finding.assignee_user_id else None,
         "latest_run_id": str(finding.latest_run_id) if finding.latest_run_id else None,
         "latest_comparison_id": str(finding.latest_comparison_id) if finding.latest_comparison_id else None,
-        "evidence": finding.evidence or {},
+        "evidence": public_evidence,
         "occurrence_count": finding.occurrence_count,
         "revision": finding.revision,
         "created_at": finding.created_at.isoformat() if finding.created_at else None,

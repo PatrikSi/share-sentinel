@@ -7,11 +7,13 @@ import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch } from "@/lib/api";
 import {
+  buildFindingUpdatePayload,
   canManageFindings,
   evidenceTrustCopy,
   findingEvidenceFacts,
   findingExpectedRevisions,
   findingOccurrenceRunReference,
+  findingUpdateHasChanges,
   findingTone,
   formatMonitoringTimestamp,
   humanizeMonitoringValue,
@@ -179,7 +181,7 @@ function FindingHistory({ finding }: { finding: Finding }) {
           {activity.length > 0 ? <ol className="finding-history-list">{activity.map((event) => {
             const metadata = event.metadata || {};
             const transition = [metadata.old_status, metadata.new_status].filter((value) => typeof value === "string").map((value) => humanizeMonitoringValue(String(value))).join(" → ");
-            const actor = event.actor_user_id ? `User ${event.actor_user_id}` : event.actor_token_id ? `Token ${event.actor_token_id}` : "System";
+            const actor = event.actor_kind === "api_token" ? "API token" : event.actor_user_id ? `User ${event.actor_user_id}` : "System";
             return <li key={event.id}><span className="finding-activity-mark" aria-hidden="true" /><div><strong>{humanizeMonitoringValue(event.action)}</strong><small>{formatMonitoringTimestamp(event.ts)} · {actor}</small>{transition ? <p>{transition}</p> : null}{typeof metadata.note === "string" && metadata.note ? <p>{metadata.note}</p> : null}</div></li>;
           })}</ol> : null}
           {activityCursor ? <button className="inventory-button-secondary mt-2" disabled={activityLoading} onClick={() => void loadMoreActivity()} type="button">{activityLoading ? "Loading…" : "Load more activity"}</button> : null}
@@ -206,7 +208,6 @@ function FindingDetail({ canManage, permissionsReady, permissionError, finding, 
   const [expiry, setExpiry] = useState("");
   const [note, setNote] = useState("");
   const [assignee, setAssignee] = useState("");
-  const [assigneeChanged, setAssigneeChanged] = useState(false);
 
   useEffect(() => {
     if (!finding) return;
@@ -214,19 +215,24 @@ function FindingDetail({ canManage, permissionsReady, permissionError, finding, 
     setExpiry(localDateTimeValue(finding.accepted_risk_expires_at));
     setNote("");
     setAssignee(finding.assignee_user_id || "");
-    setAssigneeChanged(false);
   }, [finding?.id, finding?.revision]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!finding) return;
-    const payload: Record<string, unknown> = { status, note: note.trim() || undefined, revision: finding.revision };
-    if (assigneeChanged) payload.assignee_user_id = assignee || null;
+    let acceptedRiskExpiresAt: string | null = null;
     if (status === "accepted_risk") {
       const parsed = new Date(expiry);
       if (!expiry || Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) return;
-      payload.accepted_risk_expires_at = parsed.toISOString();
+      acceptedRiskExpiresAt = parsed.toISOString();
     }
+    const payload = buildFindingUpdatePayload(finding, {
+      status,
+      assigneeUserId: assignee || null,
+      acceptedRiskExpiresAt,
+      note,
+    });
+    if (!findingUpdateHasChanges(payload)) return;
     await onUpdate(payload);
   }
 
@@ -238,6 +244,15 @@ function FindingDetail({ canManage, permissionsReady, permissionError, finding, 
 
   const expiryTimestamp = new Date(expiry).getTime();
   const acceptedRiskInvalid = status === "accepted_risk" && (!expiry || Number.isNaN(expiryTimestamp) || expiryTimestamp <= Date.now());
+  const pendingPayload = buildFindingUpdatePayload(finding, {
+    status,
+    assigneeUserId: assignee || null,
+    acceptedRiskExpiresAt: status === "accepted_risk" && !acceptedRiskInvalid
+      ? new Date(expiryTimestamp).toISOString()
+      : null,
+    note,
+  });
+  const updateDirty = findingUpdateHasChanges(pendingPayload);
   return (
     <article className="monitoring-detail-card">
       <header className="monitoring-detail-header">
@@ -284,10 +299,10 @@ function FindingDetail({ canManage, permissionsReady, permissionError, finding, 
           <form className="monitoring-action-form" onSubmit={(event) => void submit(event)}>
             <label>Status<select disabled={busy} onChange={(event) => setStatus(event.target.value as FindingStatus)} value={status}>{FINDING_STATUSES.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label>
             {status === "accepted_risk" ? <label>Risk acceptance expires<input aria-describedby={acceptedRiskInvalid ? "accepted-risk-validation" : undefined} aria-invalid={acceptedRiskInvalid} disabled={busy} min={localDateTimeValue(new Date(Date.now() + 60_000).toISOString())} onChange={(event) => setExpiry(event.target.value)} required type="datetime-local" value={expiry} /></label> : null}
-            <FindingAssigneePicker disabled={busy} onChange={(value) => { setAssignee(value); setAssigneeChanged(true); }} projectId={finding.project_id} value={assignee} />
+            <FindingAssigneePicker disabled={busy} onChange={setAssignee} projectId={finding.project_id} value={assignee} />
             <label className="monitoring-action-note">Analyst note<textarea disabled={busy} maxLength={4000} onChange={(event) => setNote(event.target.value)} placeholder="Explain the decision or handoff context" rows={3} value={note} /></label>
             {acceptedRiskInvalid ? <p className="monitoring-validation" id="accepted-risk-validation" role="alert">Accepted risk requires an expiry time in the future.</p> : null}
-            <div className="monitoring-action-row"><button className="inventory-button-primary" disabled={busy || acceptedRiskInvalid} type="submit">{busy ? "Updating…" : "Save finding update"}</button></div>
+            <div className="monitoring-action-row"><button className="inventory-button-primary" disabled={busy || acceptedRiskInvalid || !updateDirty} type="submit">{busy ? "Updating…" : updateDirty ? "Save finding update" : "No changes to save"}</button></div>
           </form>
         ) : permissionError ? <StatusBanner tone="warning" title="Action permissions unavailable"><p>{permissionError} No lifecycle or assignment action is enabled until the project role can be verified.</p></StatusBanner> : permissionsReady ? <StatusBanner title="Read-only project role"><p>Operator or project admin access is required to change finding status or assignment. Evidence and current state remain available.</p></StatusBanner> : <StatePanel description="Checking whether this project role can update finding lifecycle and ownership." title="Loading action permissions" />}
       </section>

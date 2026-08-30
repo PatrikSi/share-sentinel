@@ -6,6 +6,8 @@ import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
 import { apiFetch } from "@/lib/api";
 import {
+  automaticBaselineIsActive,
+  buildSourceUpdatePayload,
   canManageSources,
   canRetrySourceMonitoring,
   formatDuration,
@@ -15,13 +17,19 @@ import {
   monitoringEvaluationState,
   safeMonitoringCount,
   safeMonitoringDiagnostic,
+  sourceUpdateHasChanges,
   type MonitoringSource,
   type SourceHealth,
 } from "@/lib/monitoring";
 
 const PAGE_LIMIT = 50;
 const SOURCE_HEALTH: SourceHealth[] = ["healthy", "stale", "degraded", "never_collected", "disabled"];
-const PROVIDERS = ["smb", "sharepoint", "nfs"];
+const PROVIDERS = [
+  { value: "smb", label: "SMB (including mixed network scans)" },
+  { value: "sharepoint", label: "SharePoint" },
+  { value: "nfs", label: "NFS (including mixed network scans)" },
+  { value: "nfs+smb", label: "NFS + SMB only" },
+];
 
 function readParam(name: string): string {
   if (typeof window === "undefined") return "";
@@ -47,25 +55,63 @@ function SourceDetail({ source, loading, error, canManage, canRetryFindings, per
   busy: boolean;
   onReload: () => void;
   onRetryFindings: () => Promise<void>;
-  onUpdate: (payload: Record<string, unknown>) => Promise<void>;
+  onUpdate: (payload: Record<string, unknown>) => Promise<MonitoringSource | null>;
 }) {
   const [displayName, setDisplayName] = useState("");
   const [enabled, setEnabled] = useState(true);
   const [interval, setInterval] = useState("");
+  const [draftBase, setDraftBase] = useState<MonitoringSource | null>(null);
+  const [serverConfigurationChanged, setServerConfigurationChanged] = useState(false);
+
+  function loadSourceDraft(value: MonitoringSource) {
+    setDisplayName(value.display_name || "");
+    setEnabled(value.enabled);
+    setInterval(value.expected_interval_seconds == null ? "" : String(value.expected_interval_seconds));
+    setDraftBase(value);
+    setServerConfigurationChanged(false);
+  }
 
   useEffect(() => {
     if (!source) return;
-    setDisplayName(source.display_name || "");
-    setEnabled(source.enabled);
-    setInterval(source.expected_interval_seconds == null ? "" : String(source.expected_interval_seconds));
+    if (!draftBase || draftBase.id !== source.id) {
+      loadSourceDraft(source);
+      return;
+    }
+    const draftInterval = interval.trim() === "" ? null : Number(interval);
+    const draftDirty = sourceUpdateHasChanges(buildSourceUpdatePayload(draftBase, {
+      displayName,
+      enabled,
+      expectedIntervalSeconds: draftInterval === null || Number.isSafeInteger(draftInterval)
+        ? draftInterval
+        : draftBase.expected_interval_seconds ?? null,
+    }));
+    const configurationChanged = source.display_name !== draftBase.display_name
+      || source.enabled !== draftBase.enabled
+      || (source.expected_interval_seconds ?? null) !== (draftBase.expected_interval_seconds ?? null);
+    if (!draftDirty) {
+      loadSourceDraft(source);
+    } else if (configurationChanged) {
+      setServerConfigurationChanged(true);
+    } else if (source.updated_at !== draftBase.updated_at) {
+      // Monitoring progress also advances updated_at. Preserve the operator's
+      // draft while refreshing its unchanged configuration baseline.
+      setDraftBase({ ...draftBase, updated_at: source.updated_at });
+    }
   }, [source?.id, source?.updated_at]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!source) return;
+    if (!source || serverConfigurationChanged) return;
     const parsedInterval = interval.trim() === "" ? null : Number(interval);
     if (!displayName.trim() || (parsedInterval !== null && (!Number.isSafeInteger(parsedInterval) || parsedInterval < 300 || parsedInterval > 31_536_000))) return;
-    await onUpdate({ display_name: displayName.trim(), enabled, expected_interval_seconds: parsedInterval });
+    const payload = buildSourceUpdatePayload(draftBase || source, {
+      displayName,
+      enabled,
+      expectedIntervalSeconds: parsedInterval,
+    });
+    if (!sourceUpdateHasChanges(payload)) return;
+    const updated = await onUpdate(payload);
+    if (updated) loadSourceDraft(updated);
   }
 
   if (loading) return <StatePanel description="Loading source scope, cadence, and collection health." title="Loading source" />;
@@ -88,6 +134,13 @@ function SourceDetail({ source, loading, error, canManage, canRetryFindings, per
   const baselineErrorCode = safeMonitoringDiagnostic(baseline?.error_code);
   const nameInvalid = !displayName.trim();
   const intervalInvalid = interval.trim() !== "" && (!Number.isSafeInteger(Number(interval)) || Number(interval) < 300 || Number(interval) > 31_536_000);
+  const parsedInterval = interval.trim() === "" ? null : Number(interval);
+  const pendingPayload = buildSourceUpdatePayload(draftBase || source, {
+    displayName,
+    enabled,
+    expectedIntervalSeconds: intervalInvalid ? source.expected_interval_seconds ?? null : parsedInterval,
+  });
+  const updateDirty = sourceUpdateHasChanges(pendingPayload);
   return (
     <article className="monitoring-detail-card">
       <header className="monitoring-detail-header">
@@ -152,7 +205,7 @@ function SourceDetail({ source, loading, error, canManage, canRetryFindings, per
 
       <section aria-labelledby="source-config-title" className="monitoring-detail-section">
         <div className="monitoring-detail-heading"><div><h3 id="source-config-title">Monitoring configuration</h3><p>Automatic monitoring controls freshness, automatic comparisons, and finding policy evaluation. Disabling it does not block manual ingestion or comparison. Cadence never remotely schedules a collector.</p></div></div>
-        {canManage ? <form className="monitoring-action-form" onSubmit={(event) => void submit(event)}><label>Display name<input aria-invalid={nameInvalid} disabled={busy} maxLength={255} onChange={(event) => setDisplayName(event.target.value)} required value={displayName} /></label><label>Expected interval (seconds)<input aria-invalid={intervalInvalid} disabled={busy} inputMode="numeric" max="31536000" min="300" onChange={(event) => setInterval(event.target.value)} placeholder="Unset" type="number" value={interval} /></label><label className="monitoring-checkbox"><input checked={enabled} disabled={busy} onChange={(event) => setEnabled(event.target.checked)} type="checkbox" />Enable automatic monitoring</label>{!enabled ? <p className="monitoring-validation monitoring-disabled-note">Automatic comparison and policy evaluation will be skipped for future ingested runs. Manual ingest and comparison remain available.</p> : null}{nameInvalid ? <p className="monitoring-validation" role="alert">Display name cannot be blank.</p> : null}{intervalInvalid ? <p className="monitoring-validation" role="alert">Expected interval must be a whole number from 300 to 31,536,000 seconds, or left unset.</p> : null}<div className="monitoring-action-row"><button className="inventory-button-primary" disabled={busy || intervalInvalid || nameInvalid} type="submit">{busy ? "Working…" : "Save source settings"}</button></div></form> : permissionError ? <StatusBanner tone="warning" title="Action permissions unavailable"><p>{permissionError} Source configuration remains disabled until the project role can be verified.</p></StatusBanner> : permissionsReady ? <StatusBanner title="Admin permission required"><p>Project admins can rename sources, enable automatic monitoring, and set the expected collection interval. No credentials are managed here.</p></StatusBanner> : <StatePanel description="Checking whether this project role can configure collection monitoring." title="Loading action permissions" />}
+        {canManage ? <form className="monitoring-action-form" onSubmit={(event) => void submit(event)}>{serverConfigurationChanged ? <StatusBanner tone="warning" title="Source settings changed in another session"><p>Your unsaved draft is preserved. Load the latest settings before editing again so a newer administrator change is not overwritten.</p><button className="inventory-button-secondary mt-2" onClick={() => loadSourceDraft(source)} type="button">Discard draft and load latest</button></StatusBanner> : null}<label>Display name<input aria-invalid={nameInvalid} disabled={busy || serverConfigurationChanged} maxLength={255} onChange={(event) => setDisplayName(event.target.value)} required value={displayName} /></label><label>Expected interval (seconds)<input aria-invalid={intervalInvalid} disabled={busy || serverConfigurationChanged} inputMode="numeric" max="31536000" min="300" onChange={(event) => setInterval(event.target.value)} placeholder="Unset" type="number" value={interval} /></label><label className="monitoring-checkbox"><input checked={enabled} disabled={busy || serverConfigurationChanged} onChange={(event) => setEnabled(event.target.checked)} type="checkbox" />Enable automatic monitoring</label>{!enabled ? <p className="monitoring-validation monitoring-disabled-note">Automatic comparison and policy evaluation will be skipped for future ingested runs. Manual ingest and comparison remain available.</p> : null}{nameInvalid ? <p className="monitoring-validation" role="alert">Display name cannot be blank.</p> : null}{intervalInvalid ? <p className="monitoring-validation" role="alert">Expected interval must be a whole number from 300 to 31,536,000 seconds, or left unset.</p> : null}<div className="monitoring-action-row"><button className="inventory-button-primary" disabled={busy || intervalInvalid || nameInvalid || !updateDirty || serverConfigurationChanged} type="submit">{busy ? "Working…" : updateDirty ? "Save source settings" : "No changes to save"}</button></div></form> : permissionError ? <StatusBanner tone="warning" title="Action permissions unavailable"><p>{permissionError} Source configuration remains disabled until the project role can be verified.</p></StatusBanner> : permissionsReady ? <StatusBanner title="Admin permission required"><p>Project admins can rename sources, enable automatic monitoring, and set the expected collection interval. No credentials are managed here.</p></StatusBanner> : <StatePanel description="Checking whether this project role can configure collection monitoring." title="Loading action permissions" />}
       </section>
     </article>
   );
@@ -230,23 +283,35 @@ export function SourcesPage() {
     const controller = new AbortController();
     setDetailLoading(true);
     setDetailError(null);
-    apiFetch(`/projects/${encodeURIComponent(projectId)}/sources/${encodeURIComponent(selectedId)}`, { signal: controller.signal }).then((data) => !controller.signal.aborted && setDetail(data as MonitoringSource)).catch((caught) => { if (!controller.signal.aborted && !isAbortError(caught)) { setDetail(null); setDetailError(caught instanceof Error ? caught.message : "Source detail could not be loaded."); } }).finally(() => !controller.signal.aborted && setDetailLoading(false));
+    apiFetch(`/projects/${encodeURIComponent(projectId)}/sources/${encodeURIComponent(selectedId)}`, { signal: controller.signal }).then((data) => !controller.signal.aborted && setDetail(data as MonitoringSource)).catch((caught) => { if (!controller.signal.aborted && !isAbortError(caught)) { setDetailError(caught instanceof Error ? caught.message : "Source detail could not be loaded."); } }).finally(() => !controller.signal.aborted && setDetailLoading(false));
     return () => controller.abort();
   }, [detailNonce, projectId, selectedId]);
 
   useEffect(() => {
-    if (!monitoringEvaluationIsActive(detail?.coverage?.monitoring_findings)) return;
-    const timer = window.setInterval(() => {
+    const monitoringActive = monitoringEvaluationIsActive(detail?.coverage?.monitoring_findings)
+      || automaticBaselineIsActive(detail?.coverage?.automatic_baseline);
+    if (!monitoringActive || detailLoading || loading) return;
+    // Schedule only after the previous detail request has settled. A fixed
+    // interval could repeatedly abort a slow but otherwise healthy request.
+    const timer = window.setTimeout(() => {
       setDetailNonce((value) => value + 1);
       setReloadNonce((value) => value + 1);
-    }, 5_000);
-    return () => window.clearInterval(timer);
-  }, [detail?.id, detail?.coverage?.monitoring_findings?.state]);
+    }, detailError ? 15_000 : 5_000);
+    return () => window.clearTimeout(timer);
+  }, [
+    detail?.id,
+    detail?.coverage?.automatic_baseline?.findings_evaluation_state,
+    detail?.coverage?.automatic_baseline?.state,
+    detail?.coverage?.monitoring_findings?.state,
+    detailError,
+    detailLoading,
+    loading,
+  ]);
 
   function resetPage() { setCursor(null); setCursorHistory([]); }
 
-  async function updateSource(payload: Record<string, unknown>) {
-    if (!projectId || !detail) return;
+  async function updateSource(payload: Record<string, unknown>): Promise<MonitoringSource | null> {
+    if (!projectId || !detail) return null;
     setMutationBusy(true); setMutationError(null); setMutationInfo(null);
     try {
       const updated = await apiFetch(`/projects/${encodeURIComponent(projectId)}/sources/${encodeURIComponent(detail.id)}`, { method: "PATCH", body: JSON.stringify(payload) }) as MonitoringSource;
@@ -254,9 +319,11 @@ export function SourcesPage() {
       setSources((rows) => rows.map((row) => row.id === updated.id ? updated : row));
       setMutationInfo("Source monitoring settings saved. Automatic monitoring behavior was updated without changing collector scheduling or credentials.");
       setReloadNonce((value) => value + 1);
+      return updated;
     } catch (caught) {
       setMutationError(caught instanceof Error ? caught.message : "Source settings could not be saved.");
       setDetailNonce((value) => value + 1);
+      return null;
     } finally { setMutationBusy(false); }
   }
 
@@ -284,7 +351,7 @@ export function SourcesPage() {
     <section className="monitoring-workspace">
       <header className="monitoring-page-header"><div><p>Collection operations</p><h1>Sources</h1><span>Verify which scopes are monitored, whether their evidence is fresh, and why collection confidence is degraded.</span></div><div className="monitoring-freshness"><strong>{lastLoadedAt ? `Updated ${lastLoadedAt.toLocaleTimeString()}` : "Not loaded"}</strong><span>Metadata only · no credentials stored</span></div></header>
 
-      <section aria-label="Source filters" className="monitoring-filter-bar"><label>Search<input onChange={(event) => { setQuery(event.target.value); resetPage(); }} placeholder="Name, provider, identity, or scope" type="search" value={query} /></label><label>Provider<select onChange={(event) => { setProvider(event.target.value); resetPage(); }} value={provider}><option value="">All providers</option>{PROVIDERS.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label><label>Health<select onChange={(event) => { setHealth(normalizeHealth(event.target.value)); resetPage(); }} value={health}><option value="">All health states</option>{SOURCE_HEALTH.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label>{(provider || health || query) ? <button className="inventory-button-secondary" onClick={() => { setProvider(""); setHealth(""); setQuery(""); resetPage(); }} type="button">Clear filters</button> : null}</section>
+      <section aria-label="Source filters" className="monitoring-filter-bar"><label>Search<input onChange={(event) => { setQuery(event.target.value); resetPage(); }} placeholder="Name, provider, identity, or scope" type="search" value={query} /></label><label>Provider<select onChange={(event) => { setProvider(event.target.value); resetPage(); }} value={provider}><option value="">All providers</option>{PROVIDERS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label><label>Health<select onChange={(event) => { setHealth(normalizeHealth(event.target.value)); resetPage(); }} value={health}><option value="">All health states</option>{SOURCE_HEALTH.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label>{(provider || health || query) ? <button className="inventory-button-secondary" onClick={() => { setProvider(""); setHealth(""); setQuery(""); resetPage(); }} type="button">Clear filters</button> : null}</section>
 
       {mutationError ? <StatusBanner tone="error" title="Source action failed"><p>{mutationError} Current source state is being reloaded before another action is attempted.</p></StatusBanner> : null}
       {mutationInfo ? <StatusBanner tone="success" title="Source monitoring updated"><p>{mutationInfo}</p></StatusBanner> : null}

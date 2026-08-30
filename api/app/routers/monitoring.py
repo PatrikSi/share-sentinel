@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -11,6 +12,7 @@ from app.config import get_settings
 from app.db import escape_like, get_db
 from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
 from app.enums import ProjectRole
+from app.locking import lock_monitoring_source, lock_worker_job
 from app.models import (
     AuditEvent,
     CollectionSource,
@@ -39,6 +41,7 @@ from app.services.monitoring import (
     POLICY_BY_ID,
     SOURCE_HEALTH_STATES,
     finding_payload,
+    publish_automatic_baseline_recovery,
     source_payload,
     utc_datetime,
 )
@@ -77,10 +80,71 @@ FINDING_ACTIVITY_ACTIONS = frozenset(
         "FINDING_UPDATED",
         "FINDING_BULK_UPDATED",
         "FINDING_OBSERVED",
+        "FINDING_AUTO_REOPENED",
         "FINDING_AUTO_RESOLVED",
         "FINDING_ACCEPTED_RISK_EXPIRED",
     }
 )
+FINDING_ACTIVITY_PUBLIC_METADATA_FIELDS = frozenset(
+    {
+        "policy_id",
+        "policy_version",
+        "source_id",
+        "run_id",
+        "comparison_id",
+        "evidence_state",
+        "status",
+        "authoritative_state",
+        "old_status",
+        "new_status",
+        "old_assignee_user_id",
+        "new_assignee_user_id",
+        "old_accepted_risk_expires_at",
+        "new_accepted_risk_expires_at",
+        "note",
+        "revision",
+        "batch_action_id",
+        "reason",
+    }
+)
+SOURCE_PROVIDER_COMPONENT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def _source_provider_filter(value: str):
+    normalized = value.strip().lower()
+    components = normalized.split("+")
+    if not normalized or any(not SOURCE_PROVIDER_COMPONENT_PATTERN.fullmatch(component) for component in components):
+        raise HTTPException(status_code=400, detail="unsupported provider filter")
+    if len(components) > 1:
+        return CollectionSource.provider == normalized
+    escaped = escape_like(normalized)
+    return or_(
+        CollectionSource.provider == normalized,
+        CollectionSource.provider.like(f"{escaped}+%", escape="\\"),
+        CollectionSource.provider.like(f"%+{escaped}", escape="\\"),
+        CollectionSource.provider.like(f"%+{escaped}+%", escape="\\"),
+    )
+
+
+def _public_finding_activity_metadata(metadata: dict | None) -> dict:
+    if not isinstance(metadata, dict):
+        return {}
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key in FINDING_ACTIVITY_PUBLIC_METADATA_FIELDS
+        and (value is None or isinstance(value, (str, int, float, bool)))
+    }
+
+
+def _public_finding_activity_actor(event: AuditEvent) -> dict[str, str | None]:
+    actor_token_ref = getattr(event, "actor_token_ref", None) or event.actor_token_id
+    actor_user_ref = getattr(event, "actor_user_ref", None) or event.actor_user_id
+    if actor_token_ref:
+        return {"actor_user_id": None, "actor_token_id": None, "actor_kind": "api_token"}
+    if actor_user_ref:
+        return {"actor_user_id": str(actor_user_ref), "actor_token_id": None, "actor_kind": "user"}
+    return {"actor_user_id": None, "actor_token_id": None, "actor_kind": "system"}
 
 
 def _get_source(db: Session, project_id: uuid.UUID, source_id: uuid.UUID, *, lock: bool = False) -> CollectionSource:
@@ -133,7 +197,7 @@ def _source_health_filter(value: str):
         func.lower(
             func.coalesce(
                 CollectionSource.coverage["automatic_baseline"]["findings_evaluation_state"].astext,
-                "complete",
+                "unknown",
             )
         )
         != "complete",
@@ -175,7 +239,7 @@ def list_sources(
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
     stmt = select(CollectionSource).where(CollectionSource.project_id == project_id)
     if provider:
-        stmt = stmt.where(CollectionSource.provider == provider.strip().lower())
+        stmt = stmt.where(_source_provider_filter(provider))
     if health_status:
         normalized_health = health_status.strip().lower()
         if normalized_health not in SOURCE_HEALTH_STATES:
@@ -220,24 +284,56 @@ def update_source(
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.ADMIN, auth, db)
-    if not payload.model_fields_set:
+    expected_fields = {
+        "expected_display_name",
+        "expected_enabled",
+        "expected_current_interval_seconds",
+    }
+    mutable_fields = payload.model_fields_set - expected_fields
+    if not mutable_fields:
         raise HTTPException(status_code=400, detail="at least one source field is required")
     source = _get_source(db, project_id, source_id, lock=True)
+    current_configuration = {
+        "display_name": source.display_name,
+        "enabled": source.enabled,
+        "expected_interval_seconds": source.expected_interval_seconds,
+    }
+    expected_configuration = {
+        "display_name": payload.expected_display_name,
+        "enabled": payload.expected_enabled,
+        "expected_interval_seconds": payload.expected_current_interval_seconds,
+    }
+    if current_configuration != expected_configuration:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "SOURCE_REVISION_CONFLICT",
+                "message": "The source changed after it was loaded; reload and retry.",
+                "current_updated_at": source.updated_at.isoformat(),
+            },
+        )
     before = {
         "display_name": source.display_name,
         "enabled": source.enabled,
         "expected_interval_seconds": source.expected_interval_seconds,
     }
-    if "display_name" in payload.model_fields_set:
+    if "display_name" in mutable_fields:
         if payload.display_name is None:
             raise HTTPException(status_code=400, detail="display_name cannot be null")
         source.display_name = payload.display_name
-    if "enabled" in payload.model_fields_set:
+    if "enabled" in mutable_fields:
         if payload.enabled is None:
             raise HTTPException(status_code=400, detail="enabled cannot be null")
         source.enabled = payload.enabled
-    if "expected_interval_seconds" in payload.model_fields_set:
+    if "expected_interval_seconds" in mutable_fields:
         source.expected_interval_seconds = payload.expected_interval_seconds
+    after = {
+        "display_name": source.display_name,
+        "enabled": source.enabled,
+        "expected_interval_seconds": source.expected_interval_seconds,
+    }
+    if after == before:
+        raise HTTPException(status_code=400, detail="source update would not change state")
     source.updated_at = datetime.now(tz=UTC)
     write_audit_event(
         db,
@@ -250,11 +346,7 @@ def update_source(
         metadata={
             **request_meta(request),
             "before": before,
-            "after": {
-                "display_name": source.display_name,
-                "enabled": source.enabled,
-                "expected_interval_seconds": source.expected_interval_seconds,
-            },
+            "after": after,
         },
     )
     db.commit()
@@ -272,6 +364,29 @@ def retry_run_monitoring_evaluation(
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
+    candidate = db.execute(
+        select(ScanRun).where(ScanRun.id == run_id, ScanRun.project_id == project_id)
+    ).scalar_one_or_none()
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    candidate_progress = dict(candidate.ingest_progress or {})
+    candidate_findings = (
+        dict(candidate_progress.get("monitoring_findings"))
+        if isinstance(candidate_progress.get("monitoring_findings"), dict)
+        else {}
+    )
+    candidate_state = str(candidate_findings.get("state") or "unknown")
+    candidate_status = candidate.status.value if hasattr(candidate.status, "value") else str(candidate.status)
+    if candidate_status == "COMPLETE" and candidate.source_id is not None and candidate_state in {
+        "queued",
+        "retrying",
+        "evaluating",
+    }:
+        return {
+            "run_id": str(candidate.id),
+            "state": candidate_state,
+            "monitoring_findings": candidate_findings,
+        }
     settings = get_settings()
     try:
         rate_limiter.check(
@@ -288,10 +403,12 @@ def retry_run_monitoring_evaluation(
                 "message": "Too many monitoring retries were requested; wait before retrying again.",
             }
         raise
+    lock_worker_job(db, run_id)
     run = db.execute(
         select(ScanRun)
         .where(ScanRun.id == run_id, ScanRun.project_id == project_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
@@ -311,7 +428,24 @@ def retry_run_monitoring_evaluation(
                 "message": "Only a monitored COMPLETE run can retry finding evaluation.",
             },
         )
-    source = db.get(CollectionSource, run.source_id)
+    source_candidate = db.get(CollectionSource, run.source_id)
+    if source_candidate is None:
+        raise HTTPException(status_code=404, detail="collection source not found")
+    lock_monitoring_source(db, source_candidate.source_key)
+    run = db.execute(
+        select(ScanRun)
+        .where(ScanRun.id == run_id, ScanRun.project_id == project_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if run is None or run.source_id != source_candidate.id:
+        raise HTTPException(status_code=409, detail="run source changed while recovery was being locked")
+    source = db.execute(
+        select(CollectionSource)
+        .where(CollectionSource.id == run.source_id, CollectionSource.project_id == project_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
     if source is None or not source.enabled:
         raise HTTPException(
             status_code=409,
@@ -406,6 +540,30 @@ def retry_comparison_finding_evaluation(
     auth: AuthContext = Depends(get_auth_context),
 ):
     require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
+    candidate = db.execute(
+        select(RunComparison).where(
+            RunComparison.id == comparison_id,
+            RunComparison.project_id == project_id,
+        )
+    ).scalar_one_or_none()
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="comparison not found")
+    candidate_summary = dict(candidate.summary or {})
+    candidate_evaluation = (
+        dict(candidate_summary.get("findings_evaluation"))
+        if isinstance(candidate_summary.get("findings_evaluation"), dict)
+        else {}
+    )
+    if candidate.state == "complete" and str(candidate_evaluation.get("state") or "") in {
+        "queued",
+        "retrying",
+        "evaluating",
+    }:
+        return {
+            "comparison_id": str(candidate.id),
+            "state": candidate.state,
+            "findings_evaluation": candidate_evaluation,
+        }
     settings = get_settings()
     try:
         rate_limiter.check(
@@ -422,10 +580,12 @@ def retry_comparison_finding_evaluation(
                 "message": "Too many monitoring retries were requested; wait before retrying again.",
             }
         raise
+    lock_worker_job(db, comparison_id)
     comparison = db.execute(
         select(RunComparison)
         .where(RunComparison.id == comparison_id, RunComparison.project_id == project_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if comparison is None:
         raise HTTPException(status_code=404, detail="comparison not found")
@@ -437,6 +597,8 @@ def retry_comparison_finding_evaluation(
     )
     evaluation_state = str(evaluation.get("state") or "unknown")
     if comparison.state == "complete" and evaluation_state in {"queued", "retrying", "evaluating"}:
+        publish_automatic_baseline_recovery(db, comparison, findings_only=True)
+        db.commit()
         return {"comparison_id": str(comparison.id), "state": comparison.state, "findings_evaluation": evaluation}
     if comparison.state != "complete" or evaluation_state != "degraded":
         raise HTTPException(
@@ -462,6 +624,11 @@ def retry_comparison_finding_evaluation(
         "findings_retry_requested": True,
     }
     comparison.summary = summary
+    source_coverage_updated = publish_automatic_baseline_recovery(
+        db,
+        comparison,
+        findings_only=True,
+    )
     write_audit_event(
         db,
         action="COMPARISON_FINDINGS_RETRY_REQUESTED",
@@ -470,7 +637,11 @@ def retry_comparison_finding_evaluation(
         actor_user_id=auth.user_id,
         actor_token_id=auth.token_id,
         project_id=project_id,
-        metadata={**request_meta(request), "previous_state": evaluation_state},
+        metadata={
+            **request_meta(request),
+            "previous_state": evaluation_state,
+            "source_coverage_updated": source_coverage_updated,
+        },
     )
     db.commit()
     return {"comparison_id": str(comparison.id), "state": "complete", "findings_evaluation": queued_evaluation}
@@ -581,7 +752,7 @@ def list_findings(
         if row_status in counts:
             counts[row_status] = int(count)
     return {
-        "items": [finding_payload(row) for row in rows],
+        "items": [finding_payload(row, include_evidence=False) for row in rows],
         "next_cursor": next_cursor,
         "summary": {**counts, "total": sum(counts.values())},
     }
@@ -836,7 +1007,7 @@ def bulk_update_findings(
     for finding in rows:
         if not state_changes[finding.id] and not has_note:
             continue
-        old_status, old_assignee, _old_expiry = _apply_finding_update(
+        old_status, old_assignee, old_expiry = _apply_finding_update(
             finding,
             fields_set=mutable_fields,
             new_status=payload.status,
@@ -850,6 +1021,10 @@ def bulk_update_findings(
                 "new_status": finding.status,
                 "old_assignee_user_id": str(old_assignee) if old_assignee else None,
                 "new_assignee_user_id": str(finding.assignee_user_id) if finding.assignee_user_id else None,
+                "old_accepted_risk_expires_at": old_expiry.isoformat() if old_expiry else None,
+                "new_accepted_risk_expires_at": (
+                    finding.accepted_risk_expires_at.isoformat() if finding.accepted_risk_expires_at else None
+                ),
                 "revision": finding.revision,
             }
         )
@@ -985,9 +1160,8 @@ def list_finding_activity(
                 "id": row.id,
                 "ts": row.ts.isoformat(),
                 "action": row.action,
-                "actor_user_id": str(row.actor_user_id) if row.actor_user_id else None,
-                "actor_token_id": str(row.actor_token_id) if row.actor_token_id else None,
-                "metadata": row.metadata_json or {},
+                **_public_finding_activity_actor(row),
+                "metadata": _public_finding_activity_metadata(row.metadata_json),
             }
             for row in rows
         ],

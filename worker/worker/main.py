@@ -444,6 +444,13 @@ COMPARISON_WORK_QUANTUM_SECONDS = _read_int_env(
 COMPARISON_WORK_QUANTUM_BATCHES = _read_int_env(
     "COMPARISON_WORK_QUANTUM_BATCHES", 20, min_value=1, max_value=1000
 )
+AUTOMATIC_COMPARISON_MAX_ACTIVE_PER_PROJECT = _read_int_env(
+    "AUTOMATIC_COMPARISON_MAX_ACTIVE_PER_PROJECT",
+    3,
+    min_value=1,
+    max_value=100,
+    strict=True,
+)
 FINDING_EVALUATION_BATCH_SIZE = _read_int_env(
     "FINDING_EVALUATION_BATCH_SIZE", 500, min_value=50, max_value=5000
 )
@@ -891,6 +898,57 @@ MAX_AUDIT_COLLECTION_ITEMS = 100
 MAX_AUDIT_DEPTH = 6
 MAX_AUDIT_FALLBACK_STRING_CHARS = 512
 AUDIT_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
+SENSITIVE_AUDIT_KEYS = frozenset(
+    {
+        "access_key",
+        "access_token",
+        "api_key",
+        "authorization",
+        "client_assertion",
+        "client_secret",
+        "connection_string",
+        "cookie",
+        "credential",
+        "credential_hash",
+        "credentials",
+        "database_url",
+        "hashes",
+        "jwt",
+        "lm_hash",
+        "nt_hash",
+        "passphrase",
+        "password",
+        "password_hash",
+        "pem",
+        "private_key",
+        "refresh_token",
+        "secret",
+        "set_cookie",
+        "token_hash",
+    }
+)
+SENSITIVE_AUDIT_KEY_SUFFIXES = (
+    "_access_key",
+    "_access_token",
+    "_api_key",
+    "_authorization",
+    "_client_assertion",
+    "_connection_string",
+    "_cookie",
+    "_credential",
+    "_credential_hash",
+    "_database_url",
+    "_hashes",
+    "_jwt",
+    "_passphrase",
+    "_password",
+    "_password_hash",
+    "_pem",
+    "_private_key",
+    "_refresh_token",
+    "_secret",
+    "_token_hash",
+)
 SENSITIVE_AUDIT_KEY_FINGERPRINT_SUFFIXES = (
     "accesskey",
     "accesstoken",
@@ -916,11 +974,33 @@ SENSITIVE_AUDIT_KEY_FINGERPRINT_SUFFIXES = (
     "token",
     "tokenhash",
 )
+SENSITIVE_AUDIT_KEY_WRAPPER_SUFFIXES = (
+    "blob",
+    "bytes",
+    "content",
+    "contents",
+    "data",
+    "key",
+    "material",
+    "text",
+    "value",
+)
+SENSITIVE_AUDIT_KEY_WRAPPED_FINGERPRINT_SUFFIXES = tuple(
+    f"{stem}{wrapper}"
+    for stem in SENSITIVE_AUDIT_KEY_FINGERPRINT_SUFFIXES
+    for wrapper in SENSITIVE_AUDIT_KEY_WRAPPER_SUFFIXES
+)
 
 
 def _audit_key_is_sensitive(value: object) -> bool:
-    fingerprint = "".join(character for character in str(value).strip().casefold() if character.isalnum())
-    return fingerprint.endswith(SENSITIVE_AUDIT_KEY_FINGERPRINT_SUFFIXES)
+    normalized = str(value).strip().casefold().replace("-", "_")
+    fingerprint = "".join(character for character in normalized if character.isalnum())
+    return (
+        normalized in SENSITIVE_AUDIT_KEYS
+        or normalized.endswith(SENSITIVE_AUDIT_KEY_SUFFIXES)
+        or fingerprint.endswith(SENSITIVE_AUDIT_KEY_FINGERPRINT_SUFFIXES)
+        or fingerprint.endswith(SENSITIVE_AUDIT_KEY_WRAPPED_FINGERPRINT_SUFFIXES)
+    )
 
 
 def _bounded_audit_string(value: object) -> str:
@@ -3014,7 +3094,7 @@ def _recompute_source_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
     )
     findings_state = str(findings.get("state") or "unknown").casefold()
     baseline_state = str(baseline.get("state") or "unknown").casefold()
-    baseline_findings_state = str(baseline.get("findings_evaluation_state") or "complete").casefold()
+    baseline_findings_state = str(baseline.get("findings_evaluation_state") or "unknown").casefold()
     reasons = list(inventory_reasons)
     if findings_state != "complete":
         reasons.append(
@@ -3054,7 +3134,9 @@ def update_collection_source_monitoring_coverage(
         SELECT source.coverage, run.collection_context
         FROM collection_sources AS source
         JOIN scan_runs AS run ON run.id = %s
-        WHERE source.id = %s AND run.source_id = source.id
+        WHERE source.id = %s
+          AND run.source_id = source.id
+          AND source.last_run_id = run.id
         FOR UPDATE OF source
         """,
         (run_id, source_id),
@@ -3356,6 +3438,40 @@ def _automatic_comparison_compatibility(
     }
 
 
+def _existing_comparison_baseline_coverage(
+    row: tuple[Any, ...],
+    *,
+    baseline_run_id: str,
+) -> dict[str, Any]:
+    """Describe an existing comparison without inventing runnable/healthy state."""
+
+    comparison_id = str(row[0])
+    comparison_state = str(row[1] or "unknown").casefold()
+    summary = dict(row[2]) if len(row) > 2 and isinstance(row[2], dict) else {}
+    evaluation = (
+        dict(summary.get("findings_evaluation"))
+        if isinstance(summary.get("findings_evaluation"), dict)
+        else {}
+    )
+    baseline_state = {
+        "complete": "established",
+        "queued": "queued",
+        "running": "running",
+        "failed": "failed",
+    }.get(comparison_state, "unknown")
+    coverage: dict[str, Any] = {
+        "state": baseline_state,
+        "comparison_id": comparison_id,
+        "baseline_run_id": baseline_run_id,
+        "findings_evaluation_state": str(evaluation.get("state") or "unknown").casefold(),
+    }
+    if len(row) > 3 and row[3]:
+        coverage["error_code"] = str(row[3])[:128]
+    if comparison_state == "failed":
+        coverage["reason"] = "comparison_failed_requires_operator_retry"
+    return coverage
+
+
 def create_automatic_comparison(
     conn: psycopg.Connection,
     *,
@@ -3439,6 +3555,69 @@ def create_automatic_comparison(
             )
         return None
 
+    existing = conn.execute(
+        """
+        SELECT id::text, state, summary, error_code
+        FROM run_comparisons
+        WHERE project_id = %s AND baseline_run_id = %s AND current_run_id = %s
+          AND algorithm_version = %s AND options_hash = %s
+        """,
+        (
+            project_id,
+            baseline_run_id,
+            current_run_id,
+            COMPARISON_ALGORITHM_VERSION,
+            COMPARISON_DEFAULT_OPTIONS_HASH,
+        ),
+    ).fetchone()
+    if existing is not None:
+        comparison_id = str(existing[0])
+        update_collection_source_monitoring_coverage(
+            conn,
+            source_id=source_id,
+            run_id=current_run_id,
+            baseline=_existing_comparison_baseline_coverage(
+                existing,
+                baseline_run_id=baseline_run_id,
+            ),
+        )
+        return comparison_id
+
+    # Share the API's per-project admission lane so concurrent source workers
+    # cannot each observe a free slot and create an unbounded comparison queue.
+    project_lock_key = uuid.UUID(project_id).int % (2**63 - 1)
+    conn.execute("SELECT pg_advisory_xact_lock(%s)", (project_lock_key,))
+    active_count = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM run_comparisons "
+            "WHERE project_id = %s AND state IN ('queued', 'running')",
+            (project_id,),
+        ).fetchone()[0]
+    )
+    if active_count >= AUTOMATIC_COMPARISON_MAX_ACTIVE_PER_PROJECT:
+        deferred = {
+            "state": "deferred",
+            "reason": "project_comparison_capacity",
+            "active_count": active_count,
+            "active_limit": AUTOMATIC_COMPARISON_MAX_ACTIVE_PER_PROJECT,
+            "baseline_run_id": baseline_run_id,
+        }
+        update_collection_source_monitoring_coverage(
+            conn,
+            source_id=source_id,
+            run_id=current_run_id,
+            baseline=deferred,
+        )
+        write_audit(
+            conn,
+            project_id,
+            "AUTOMATIC_COMPARISON_DEFERRED",
+            "scan_run",
+            current_run_id,
+            {"worker": CONSUMER_NAME, "source_id": source_id, **deferred},
+        )
+        return None
+
     comparison_id = str(uuid.uuid4())
     inserted = conn.execute(
         """
@@ -3471,7 +3650,7 @@ def create_automatic_comparison(
     if inserted is None:
         existing = conn.execute(
             """
-            SELECT id::text, state
+            SELECT id::text, state, summary, error_code
             FROM run_comparisons
             WHERE project_id = %s AND baseline_run_id = %s AND current_run_id = %s
               AND algorithm_version = %s AND options_hash = %s
@@ -3485,16 +3664,21 @@ def create_automatic_comparison(
             ),
         ).fetchone()
         comparison_id = str(existing[0]) if existing else comparison_id
-    baseline_state = "established" if inserted is None and existing and str(existing[1]) == "complete" else "queued"
+    baseline_coverage = (
+        _existing_comparison_baseline_coverage(existing, baseline_run_id=baseline_run_id)
+        if inserted is None and existing is not None
+        else {
+            "state": "queued",
+            "comparison_id": comparison_id,
+            "baseline_run_id": baseline_run_id,
+            "findings_evaluation_state": "queued",
+        }
+    )
     update_collection_source_monitoring_coverage(
         conn,
         source_id=source_id,
         run_id=current_run_id,
-        baseline={
-            "state": baseline_state,
-            "comparison_id": comparison_id,
-            "baseline_run_id": baseline_run_id,
-        },
+        baseline=baseline_coverage,
     )
     if inserted is None:
         return comparison_id if existing else None
@@ -6733,19 +6917,28 @@ def discover_recoverable_comparison_finding_evaluations(limit: int = 8) -> list[
                 SELECT id
                 FROM run_comparisons
                 WHERE state = 'complete'
-                  AND COALESCE(summary #>> '{findings_evaluation,state}', '') IN ('queued', 'retrying')
-                  AND COALESCE(
-                      CASE
-                          WHEN pg_input_is_valid(
-                              NULLIF(summary #>> '{findings_evaluation,next_retry_at}', ''),
-                              'timestamp with time zone'
-                          )
-                          THEN NULLIF(
-                              summary #>> '{findings_evaluation,next_retry_at}', ''
-                          )::timestamptz
-                      END,
-                      TO_TIMESTAMP(0)
-                  ) <= NOW()
+                  AND (
+                      (
+                          COALESCE(summary #>> '{findings_evaluation,state}', '') IN ('queued', 'retrying')
+                          AND COALESCE(
+                              CASE
+                                  WHEN pg_input_is_valid(
+                                      NULLIF(summary #>> '{findings_evaluation,next_retry_at}', ''),
+                                      'timestamp with time zone'
+                                  )
+                                  THEN NULLIF(
+                                      summary #>> '{findings_evaluation,next_retry_at}', ''
+                                  )::timestamptz
+                              END,
+                              TO_TIMESTAMP(0)
+                          ) <= NOW()
+                      )
+                      OR (
+                          COALESCE(summary #>> '{findings_evaluation,state}', '') = 'evaluating'
+                          AND COALESCE(heartbeat_at, completed_at, created_at)
+                              <= NOW() - (%s * INTERVAL '1 second')
+                      )
+                  )
                 ORDER BY completed_at, id
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s
@@ -6767,7 +6960,7 @@ def discover_recoverable_comparison_finding_evaluations(limit: int = 8) -> list[
             WHERE comparison.id = candidates.id
             RETURNING comparison.id::text, comparison.project_id::text
             """,
-            (max(1, min(int(limit), 100)), CONSUMER_NAME),
+            (STALE_INGESTING_SECONDS, max(1, min(int(limit), 100)), CONSUMER_NAME),
         ).fetchall()
     return [
         {
@@ -8517,19 +8710,9 @@ def evaluate_run_findings(
             conn.commit()
             if not has_more:
                 break
-    _persist_finding_evaluation_progress(
-        conn,
-        run_id,
-        {
-            "state": "complete",
-            "phase": "complete",
-            "after_resource_id": after_resource_id,
-            "completed_policy_index": len(resolution_policies),
-            "observed": observed_count,
-            "resolved": resolved_count,
-        },
-    )
-    conn.commit()
+    # The caller owns the terminal transition. Keeping the last checkpoint in
+    # ``evaluating`` lets stale-work discovery recover a process kill until run
+    # progress, source coverage, and the terminal audit commit together.
     return {"observed": observed_count, "resolved": resolved_count}
 
 
@@ -8841,6 +9024,24 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                     """,
                     (comparison_id,),
                 )
+                baseline_row = conn.execute(
+                    "SELECT coverage #>> '{automatic_baseline,comparison_id}' "
+                    "FROM collection_sources WHERE id = %s FOR UPDATE",
+                    (source_id,),
+                ).fetchone()
+                if baseline_row and str(baseline_row[0] or "") == comparison_id:
+                    update_collection_source_monitoring_coverage(
+                        conn,
+                        source_id=source_id,
+                        run_id=current_run_id,
+                        baseline={
+                            "state": "failed",
+                            "comparison_id": comparison_id,
+                            "baseline_run_id": baseline_run_id,
+                            "error_code": "SOURCE_DISABLED",
+                            "reason": "source_disabled",
+                        },
+                    )
                 write_audit(
                     conn,
                     project_id,
@@ -9147,6 +9348,8 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                     quantum_batches += 1
                     if quantum_exhausted():
                         return yield_comparison(progress, "work_quantum_exhausted")
+                if _shutdown_event.is_set():
+                    return yield_comparison(progress, "worker_shutdown")
                 progress = {
                     "phase": "materializing_items",
                     "processed": processed,
@@ -9284,6 +9487,8 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                         quantum_batches += 1
                         if quantum_exhausted():
                             return yield_comparison(progress, "work_quantum_exhausted")
+                    if _shutdown_event.is_set():
+                        return yield_comparison(progress, "worker_shutdown")
                     completed_resource_change_id = resource_change_id
                     current_resource_change_id = 0
                     resume_item_key = None
@@ -9422,7 +9627,10 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                     finding_count += inserted
                     progress = {
                         **progress,
-                        "phase": "complete",
+                        # This is a durable resume phase, not a terminal state.
+                        # A yielded comparison must continue from this cursor
+                        # without rematerializing resource and item history.
+                        "phase": "evaluating_findings",
                         "findings_cursor": finding_cursor,
                         "findings_observed": finding_count,
                     }
@@ -9774,6 +9982,19 @@ def process_monitoring_evaluation_job(fields: dict[str, str]) -> str:
             source_lock_key = monitoring_source_advisory_lock_key_from_id(conn, source_id)
             if source_lock_key is not None:
                 conn.execute("SELECT pg_advisory_lock(%s)", (source_lock_key,))
+            if not collection_source_run_is_latest_complete_candidate(conn, source_id, run_id):
+                skipped = {**findings_progress, "state": "skipped", "phase": "skipped", "reason": "superseded"}
+                _persist_finding_evaluation_progress(conn, run_id, skipped)
+                write_audit(
+                    conn,
+                    project_id,
+                    "MONITORING_EVALUATION_SKIPPED",
+                    "scan_run",
+                    run_id,
+                    {"worker": CONSUMER_NAME, "source_id": source_id, "reason": "superseded"},
+                )
+                conn.commit()
+                return "complete"
             if not collection_source_automation_enabled(conn, source_id):
                 skipped = {**findings_progress, "state": "skipped", "phase": "skipped", "reason": "source_disabled"}
                 _persist_finding_evaluation_progress(conn, run_id, skipped)
@@ -9790,19 +10011,6 @@ def process_monitoring_evaluation_job(fields: dict[str, str]) -> str:
                     "scan_run",
                     run_id,
                     {"worker": CONSUMER_NAME, "source_id": source_id, "reason": "source_disabled"},
-                )
-                conn.commit()
-                return "complete"
-            if not collection_source_run_is_latest_complete_candidate(conn, source_id, run_id):
-                skipped = {**findings_progress, "state": "skipped", "phase": "skipped", "reason": "superseded"}
-                _persist_finding_evaluation_progress(conn, run_id, skipped)
-                write_audit(
-                    conn,
-                    project_id,
-                    "MONITORING_EVALUATION_SKIPPED",
-                    "scan_run",
-                    run_id,
-                    {"worker": CONSUMER_NAME, "source_id": source_id, "reason": "superseded"},
                 )
                 conn.commit()
                 return "complete"
@@ -9972,6 +10180,7 @@ def process_comparison_finding_evaluation_job(fields: dict[str, str]) -> str:
             batches = 0
             started = time.monotonic()
             try:
+                evaluation_complete = False
                 while not _shutdown_event.is_set():
                     inserted, cursor, has_more = evaluate_comparison_findings(
                         conn,
@@ -10003,9 +10212,22 @@ def process_comparison_finding_evaluation_job(fields: dict[str, str]) -> str:
                         "summary = %s::jsonb WHERE id = %s",
                         (json.dumps(progress), json.dumps(summary), comparison_id),
                     )
+                    if source_id and authoritative and str(trigger) == "automatic":
+                        update_collection_source_monitoring_coverage(
+                            conn,
+                            source_id=source_id,
+                            run_id=current_run_id,
+                            baseline={
+                                "state": "established",
+                                "comparison_id": comparison_id,
+                                "baseline_run_id": baseline_run_id,
+                                "findings_evaluation_state": "evaluating",
+                            },
+                        )
                     conn.commit()
                     batches += 1
                     if not has_more:
+                        evaluation_complete = True
                         break
                     if (
                         batches >= COMPARISON_WORK_QUANTUM_BATCHES
@@ -10017,8 +10239,69 @@ def process_comparison_finding_evaluation_job(fields: dict[str, str]) -> str:
                             "UPDATE run_comparisons SET summary = %s::jsonb, heartbeat_at = NOW() WHERE id = %s",
                             (json.dumps(summary), comparison_id),
                         )
+                        if source_id and authoritative and str(trigger) == "automatic":
+                            update_collection_source_monitoring_coverage(
+                                conn,
+                                source_id=source_id,
+                                run_id=current_run_id,
+                                baseline={
+                                    "state": "established",
+                                    "comparison_id": comparison_id,
+                                    "baseline_run_id": baseline_run_id,
+                                    "findings_evaluation_state": "retrying",
+                                    "findings_next_retry_at": evaluation["next_retry_at"],
+                                },
+                            )
                         conn.commit()
                         return "yielded"
+                if not evaluation_complete:
+                    evaluation = {
+                        **evaluation,
+                        "state": "queued",
+                        "next_retry_at": now_iso(),
+                    }
+                    summary["findings_evaluation"] = evaluation
+                    progress = {
+                        **progress,
+                        "phase": "complete",
+                        "findings_cursor": cursor,
+                        "findings_observed": observed,
+                        "findings_attempt_count": attempt_count,
+                        "findings_evaluation_state": "queued",
+                    }
+                    conn.execute(
+                        "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb, "
+                        "summary = %s::jsonb WHERE id = %s",
+                        (json.dumps(progress), json.dumps(summary), comparison_id),
+                    )
+                    if source_id and authoritative and str(trigger) == "automatic":
+                        update_collection_source_monitoring_coverage(
+                            conn,
+                            source_id=source_id,
+                            run_id=current_run_id,
+                            baseline={
+                                "state": "established",
+                                "comparison_id": comparison_id,
+                                "baseline_run_id": baseline_run_id,
+                                "findings_evaluation_state": "queued",
+                                "findings_next_retry_at": evaluation["next_retry_at"],
+                            },
+                        )
+                    write_audit(
+                        conn,
+                        project_id,
+                        "COMPARISON_FINDINGS_EVALUATION_PAUSED",
+                        "run_comparison",
+                        comparison_id,
+                        {
+                            "worker": CONSUMER_NAME,
+                            "reason": "worker_shutdown",
+                            "findings_observed": observed,
+                            "findings_cursor": cursor,
+                        },
+                    )
+                    conn.commit()
+                    return "shutdown"
             except Exception as exc:
                 logger.exception("comparison finding-only recovery failed comparison_id=%s", comparison_id)
                 conn.rollback()

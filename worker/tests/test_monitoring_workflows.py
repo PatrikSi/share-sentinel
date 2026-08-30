@@ -2,8 +2,11 @@ import inspect
 import json
 import os
 import sys
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -231,6 +234,7 @@ def test_expired_risk_sweep_reopens_and_audits_atomically(monkeypatch):
 
 def test_automatic_baseline_insert_is_idempotent(monkeypatch):
     context = complete_context()
+    project_id = str(uuid.uuid4())
 
     class Conn:
         def __init__(self):
@@ -253,17 +257,21 @@ def test_automatic_baseline_insert_is_idempotent(monkeypatch):
                 return Result(({}, context))
             if query.startswith("UPDATE collection_sources SET coverage"):
                 return Result()
+            if "pg_advisory_xact_lock" in query:
+                return Result()
+            if "SELECT COUNT(*) FROM run_comparisons" in query:
+                return Result((0,))
             if "SELECT id::text, state" in query:
-                return Result((first, "queued"))
+                return Result(None if not self.inserted else (first, "queued", {}, None))
             raise AssertionError(query)
 
     conn = Conn()
     monkeypatch.setattr(main, "write_audit", lambda *_args, **_kwargs: None)
     first = main.create_automatic_comparison(
-        conn, project_id="project", source_id="source", current_run_id="current"
+        conn, project_id=project_id, source_id="source", current_run_id="current"
     )
     second = main.create_automatic_comparison(
-        conn, project_id="project", source_id="source", current_run_id="current"
+        conn, project_id=project_id, source_id="source", current_run_id="current"
     )
     assert first is not None
     assert second == first
@@ -435,6 +443,16 @@ def test_comparison_recovery_keeps_phase_and_worker_has_durable_yield_contract()
     assert '"completed_resource_change_id"' in worker_source
     assert '"last_item_identity_key"' in worker_source
     assert "work_quantum_exhausted" in worker_source
+    findings_loop = worker_source[
+        worker_source.index('findings_evaluation_state = "complete"'):
+        worker_source.index("except Exception as findings_exc")
+    ]
+    assert '"phase": "evaluating_findings"' in findings_loop
+    assert '"phase": "complete"' not in findings_loop
+    assert '"evaluating_findings"' in worker_source[
+        worker_source.index("durable_resume = resume_phase in"):
+        worker_source.index("if operator_retry")
+    ]
     assert "if operator_retry" in worker_source
     # Committed results are reset only for an explicit operator retry.
     delete_position = worker_source.index("DELETE FROM comparison_resource_changes")
@@ -559,6 +577,29 @@ def test_worker_audit_metadata_is_bounded_redacted_and_labels_are_validated():
             raise AssertionError(f"invalid audit label was accepted: {invalid!r}")
 
 
+@pytest.mark.parametrize(
+    "sensitive_key",
+    [
+        "credentials",
+        "credential_hash",
+        "backup_credential_hash",
+        "password_hash",
+        "legacy_password_hash",
+        "client-secret",
+        "nested.token_hash",
+        "secretKey",
+        "passwordValue",
+        "clientSecretValue",
+        "apiKeyValue",
+        "privateKeyData",
+        "bearerTokenValue",
+    ],
+)
+def test_worker_audit_sanitizer_matches_api_sensitive_key_contract(sensitive_key: str):
+    sanitized = main.sanitize_audit_metadata({sensitive_key: "must-not-survive"})
+    assert sanitized[sensitive_key] == "[redacted]"
+
+
 def test_findings_evaluators_use_durable_bounded_batches():
     run_source = inspect.getsource(main.evaluate_run_findings)
     comparison_source = inspect.getsource(main.process_comparison_job)
@@ -570,6 +611,91 @@ def test_findings_evaluators_use_durable_bounded_batches():
     checkpoint_source = inspect.getsource(main._persist_finding_evaluation_progress)
     assert "'heartbeat_at', NOW()" in checkpoint_source
     assert "'monitoring_worker'" in checkpoint_source
+
+
+def test_run_finding_evaluation_leaves_terminal_transition_atomic_for_caller(monkeypatch):
+    committed_progress = []
+
+    class Conn:
+        def __init__(self):
+            self.pending_progress = None
+
+        def execute(self, query, params=None):
+            if "SELECT collection_context, ingest_progress FROM scan_runs" in query:
+                return Result((complete_context("smb"), {}))
+            if "SELECT resource.id" in query:
+                return Result(rows=[])
+            if "SELECT COUNT(*), COALESCE" in query:
+                return Result((0, True))
+            if "UPDATE scan_runs" in query:
+                self.pending_progress = json.loads(params[1])
+                return Result()
+            raise AssertionError(query)
+
+        def commit(self):
+            committed_progress.append(dict(self.pending_progress or {}))
+
+    monkeypatch.setattr(main, "_resolve_absent_state_findings", lambda *_args, **_kwargs: (0, False))
+    assert main.evaluate_run_findings(
+        Conn(), project_id="project", source_id="source", run_id="run"
+    ) == {"observed": 0, "resolved": 0}
+    assert committed_progress
+    assert committed_progress[-1]["state"] == "evaluating"
+
+    processor = inspect.getsource(main.process_monitoring_evaluation_job)
+    terminal_start = processor.index("complete_progress = {")
+    terminal = processor[terminal_start : processor.index('return "complete"', terminal_start)]
+    assert terminal.index("_persist_finding_evaluation_progress") < terminal.index(
+        "update_collection_source_monitoring_coverage"
+    ) < terminal.index("write_audit") < terminal.index("conn.commit()")
+
+
+def test_source_coverage_publisher_rejects_non_current_runs():
+    class Conn:
+        def __init__(self):
+            self.queries = []
+
+        def execute(self, query, params=None):
+            self.queries.append(query)
+            if "SELECT source.coverage" in query:
+                return Result()
+            raise AssertionError("stale source coverage attempted a write")
+
+    conn = Conn()
+    main.update_collection_source_monitoring_coverage(
+        conn,
+        source_id="source",
+        run_id="superseded-run",
+        findings={"state": "skipped"},
+    )
+    assert "source.last_run_id = run.id" in conn.queries[0]
+    processor = inspect.getsource(main.process_monitoring_evaluation_job)
+    assert processor.index("collection_source_run_is_latest_complete_candidate") < processor.index(
+        "collection_source_automation_enabled"
+    )
+
+
+def test_existing_comparison_coverage_is_fail_closed_and_terminally_truthful():
+    complete_without_findings = main._existing_comparison_baseline_coverage(
+        ("comparison", "complete", {}, None),
+        baseline_run_id="baseline",
+    )
+    assert complete_without_findings["state"] == "established"
+    assert complete_without_findings["findings_evaluation_state"] == "unknown"
+
+    complete = main._existing_comparison_baseline_coverage(
+        ("comparison", "complete", {"findings_evaluation": {"state": "degraded"}}, None),
+        baseline_run_id="baseline",
+    )
+    assert complete["findings_evaluation_state"] == "degraded"
+
+    failed = main._existing_comparison_baseline_coverage(
+        ("comparison", "failed", {"findings_evaluation": {"state": "degraded"}}, "WORKER_FAILED"),
+        baseline_run_id="baseline",
+    )
+    assert failed["state"] == "failed"
+    assert failed["error_code"] == "WORKER_FAILED"
+    assert failed["reason"] == "comparison_failed_requires_operator_retry"
 
 
 def test_artifact_open_refuses_symlinks_and_non_regular_files(tmp_path, monkeypatch):
@@ -649,7 +775,14 @@ def test_monitoring_recovery_is_durable_bounded_and_operator_replayable():
     assert "update_collection_source_monitoring_coverage" in processor
     assert "state = 'complete'" in comparison_discovery
     assert "FOR UPDATE SKIP LOCKED" in comparison_discovery
+    assert "= 'evaluating'" in comparison_discovery
+    assert "STALE_INGESTING_SECONDS" in comparison_discovery
     assert "without hiding or rebuilding" in comparison_processor
+    assert "evaluation_complete = False" in comparison_processor
+    assert "COMPARISON_FINDINGS_EVALUATION_PAUSED" in comparison_processor
+    assert comparison_processor.index("if not evaluation_complete") < comparison_processor.index(
+        '"state": "complete"'
+    )
 
 
 def test_source_target_scope_summary_is_bounded_but_full_scope_hash_is_stable():

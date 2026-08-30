@@ -160,6 +160,7 @@ def test_list_run_errors_returns_issue_rows(monkeypatch) -> None:
 
 
 def test_list_run_activity_returns_timeline_rows(monkeypatch) -> None:
+    assert "AUTOMATIC_BASELINE_UNAVAILABLE" in runs_router.RUN_ACTIVITY_ACTIONS
     project_id = uuid.uuid4()
     run_id = uuid.uuid4()
     fake_run = SimpleNamespace(id=run_id, project_id=project_id)
@@ -170,7 +171,14 @@ def test_list_run_activity_returns_timeline_rows(monkeypatch) -> None:
         action="INGEST_COMPLETED",
         object_type="scan_run",
         object_id=str(run_id),
-        metadata_json={"line_offset": 26, "counts": {"errors": 1}},
+        metadata_json={
+            "line_offset": 26,
+            "counts": {"errors": 1},
+            "ip": "192.0.2.10",
+            "user_agent": "sensitive workstation fingerprint",
+            "request_id": "internal-correlation-id",
+            "future_internal_field": {"secret": "must not escape"},
+        },
     )
     fake_db = _FakeDb(execute_queue=[_ExecuteResult([fake_run]), _ExecuteResult([fake_event])])
     monkeypatch.setattr(runs_router, "require_project_role", lambda *_args, **_kwargs: None)

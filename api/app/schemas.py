@@ -372,11 +372,14 @@ class ComparisonItemChangeOut(BaseModel):
 
 
 class CollectionSourceUpdateIn(BaseModel):
+    expected_display_name: str = Field(min_length=1, max_length=255)
+    expected_enabled: bool
+    expected_current_interval_seconds: int | None = Field(ge=300, le=31_536_000)
     display_name: str | None = Field(default=None, min_length=1, max_length=255)
     enabled: bool | None = None
     expected_interval_seconds: int | None = Field(default=None, ge=300, le=31_536_000)
 
-    @field_validator("display_name")
+    @field_validator("display_name", "expected_display_name")
     @classmethod
     def normalize_display_name(cls, value: str | None) -> str | None:
         if value is None:
@@ -540,6 +543,7 @@ class AuditEventOut(BaseModel):
     actor_user_id: uuid.UUID | None
     actor_email: str | None
     actor_token_id: uuid.UUID | None
+    actor_token_name: str | None
     project_id: uuid.UUID | None
     project_name: str | None
     action: str

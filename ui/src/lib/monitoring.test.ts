@@ -1,23 +1,37 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  automaticBaselineIsActive,
+  buildFindingUpdatePayload,
+  buildSourceUpdatePayload,
   canManageFindings,
   canManageSources,
   canRetrySourceMonitoring,
+  effectiveAccessDecisionIsConclusive,
   evidenceTrustCopy,
   findingEvidenceFacts,
   findingExpectedRevisions,
   findingOccurrenceRunReference,
   findingSeverityRank,
+  findingUpdateHasChanges,
   formatDuration,
   humanizeMonitoringValue,
   monitoringEvaluationIsActive,
   monitoringEvaluationState,
   safeMonitoringDiagnostic,
+  sourceUpdateHasChanges,
   type MonitoringSource,
 } from "@/lib/monitoring";
 
 describe("monitoring presentation", () => {
+  it("uses the backend effective-access decision vocabulary", () => {
+    expect(effectiveAccessDecisionIsConclusive("allow")).toBe(true);
+    expect(effectiveAccessDecisionIsConclusive("deny")).toBe(true);
+    expect(effectiveAccessDecisionIsConclusive("mixed")).toBe(true);
+    expect(effectiveAccessDecisionIsConclusive("unknown")).toBe(false);
+    expect(effectiveAccessDecisionIsConclusive("allowed")).toBe(false);
+  });
+
   it("keeps finding severity ordering stable", () => {
     expect(findingSeverityRank("critical")).toBeGreaterThan(findingSeverityRank("high"));
     expect(findingSeverityRank("high")).toBeGreaterThan(findingSeverityRank("medium"));
@@ -140,5 +154,92 @@ describe("monitoring presentation", () => {
     expect(monitoringEvaluationState({ state: "unexpected-worker-state" })).toBe("unknown");
     expect(safeMonitoringDiagnostic("FINDING_EVALUATION_FAILED")).toBe("FINDING_EVALUATION_FAILED");
     expect(safeMonitoringDiagnostic("Bearer must-never-render")).toBeNull();
+  });
+
+  it("keeps source refresh active through automatic comparison and finding phases", () => {
+    expect(automaticBaselineIsActive({ state: "queued" })).toBe(true);
+    expect(automaticBaselineIsActive({ state: "established", findings_evaluation_state: "retrying" })).toBe(true);
+    expect(automaticBaselineIsActive({ state: "established", findings_evaluation_state: "complete" })).toBe(false);
+    expect(automaticBaselineIsActive({ state: "failed", findings_evaluation_state: "degraded" })).toBe(false);
+  });
+
+  it("omits unchanged finding fields and permits a nonblank note-only update", () => {
+    const finding = {
+      status: "open",
+      assignee_user_id: null,
+      accepted_risk_expires_at: null,
+      revision: 7,
+    } as const;
+    const unchanged = buildFindingUpdatePayload(finding, {
+      status: "open",
+      assigneeUserId: null,
+      acceptedRiskExpiresAt: null,
+      note: "   ",
+    });
+    expect(unchanged).toEqual({ revision: 7 });
+    expect(findingUpdateHasChanges(unchanged)).toBe(false);
+
+    const noteOnly = buildFindingUpdatePayload(finding, {
+      status: "open",
+      assigneeUserId: null,
+      acceptedRiskExpiresAt: null,
+      note: "  Investigated with the owner.  ",
+    });
+    expect(noteOnly).toEqual({ revision: 7, note: "Investigated with the owner." });
+    expect(findingUpdateHasChanges(noteOnly)).toBe(true);
+  });
+
+  it("sends only dirty source settings with an optimistic concurrency token", () => {
+    const source = {
+      display_name: "Finance",
+      enabled: true,
+      expected_interval_seconds: 3600,
+      updated_at: "2026-08-30T12:00:00Z",
+    };
+    const unchanged = buildSourceUpdatePayload(source, {
+      displayName: "Finance",
+      enabled: true,
+      expectedIntervalSeconds: 3600,
+    });
+    expect(unchanged).toEqual({
+      expected_display_name: "Finance",
+      expected_enabled: true,
+      expected_current_interval_seconds: 3600,
+    });
+    expect(sourceUpdateHasChanges(unchanged)).toBe(false);
+
+    const changed = buildSourceUpdatePayload(source, {
+      displayName: "Finance",
+      enabled: false,
+      expectedIntervalSeconds: 3600,
+    });
+    expect(changed).toEqual({
+      expected_display_name: "Finance",
+      expected_enabled: true,
+      expected_current_interval_seconds: 3600,
+      enabled: false,
+    });
+    expect(sourceUpdateHasChanges(changed)).toBe(true);
+
+    const cadenceChanged = buildSourceUpdatePayload(source, {
+      displayName: "Finance",
+      enabled: true,
+      expectedIntervalSeconds: 7200,
+    });
+    expect(cadenceChanged).toEqual({
+      expected_display_name: "Finance",
+      expected_enabled: true,
+      expected_current_interval_seconds: 3600,
+      expected_interval_seconds: 7200,
+    });
+    expect(sourceUpdateHasChanges(cadenceChanged)).toBe(true);
+
+    const cadenceCleared = buildSourceUpdatePayload(source, {
+      displayName: "Finance",
+      enabled: true,
+      expectedIntervalSeconds: null,
+    });
+    expect(cadenceCleared.expected_interval_seconds).toBeNull();
+    expect(sourceUpdateHasChanges(cadenceCleared)).toBe(true);
   });
 });

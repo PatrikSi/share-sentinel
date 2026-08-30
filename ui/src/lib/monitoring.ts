@@ -90,6 +90,7 @@ export type FindingActivity = {
   action: string;
   actor_user_id?: string | null;
   actor_token_id?: string | null;
+  actor_kind?: "user" | "api_token" | "system" | null;
   metadata?: Record<string, unknown> | null;
 };
 
@@ -172,6 +173,8 @@ export type MonitoringSource = {
   updated_at: string;
 };
 
+export type EffectiveAccessDecision = "allow" | "deny" | "mixed" | "unknown";
+
 export type EffectiveAccessPrincipal = {
   id?: string | number | null;
   display_name?: string | null;
@@ -183,7 +186,7 @@ export type EffectiveAccessPrincipal = {
   email?: string | null;
   resolution?: string | null;
   direct_decision?: string | null;
-  effective_decision?: string | null;
+  effective_decision?: EffectiveAccessDecision | null;
   decision?: string | null;
   capabilities?: string[] | Record<string, unknown> | null;
   allow_rights?: string[] | null;
@@ -197,13 +200,19 @@ export type EffectiveAccessPrincipal = {
 export type EffectiveAccessAnalysis = {
   resource?: Record<string, unknown> | null;
   analysis_state: "computed" | "bounded" | "indeterminate";
-  decision: "allowed" | "denied" | "mixed" | "unknown";
+  decision: EffectiveAccessDecision;
   capabilities?: string[] | Record<string, unknown> | null;
   principals: { items: EffectiveAccessPrincipal[]; next_cursor?: string | null };
   evidence_planes?: Record<string, unknown> | null;
   limitations?: string[] | null;
   provenance?: Record<string, unknown> | null;
 };
+
+export function effectiveAccessDecisionIsConclusive(
+  value: string | null | undefined,
+): value is Exclude<EffectiveAccessDecision, "unknown"> {
+  return value === "allow" || value === "deny" || value === "mixed";
+}
 
 export function humanizeMonitoringValue(value: string | null | undefined): string {
   if (!value) return "Not recorded";
@@ -232,7 +241,71 @@ export function canManageSources(role: string | null | undefined): boolean {
   return role === "admin";
 }
 
+export function buildSourceUpdatePayload(
+  source: Pick<MonitoringSource, "display_name" | "enabled" | "expected_interval_seconds" | "updated_at">,
+  draft: { displayName: string; enabled: boolean; expectedIntervalSeconds: number | null },
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    expected_display_name: source.display_name,
+    expected_enabled: source.enabled,
+    expected_current_interval_seconds: source.expected_interval_seconds ?? null,
+  };
+  const displayName = draft.displayName.trim();
+  if (displayName !== source.display_name) payload.display_name = displayName;
+  if (draft.enabled !== source.enabled) payload.enabled = draft.enabled;
+  if (draft.expectedIntervalSeconds !== (source.expected_interval_seconds ?? null)) {
+    payload.expected_interval_seconds = draft.expectedIntervalSeconds;
+  }
+  return payload;
+}
+
+export function sourceUpdateHasChanges(payload: Record<string, unknown>): boolean {
+  const preconditions = new Set([
+    "expected_display_name",
+    "expected_enabled",
+    "expected_current_interval_seconds",
+  ]);
+  return Object.keys(payload).some((field) => !preconditions.has(field));
+}
+
+export function buildFindingUpdatePayload(
+  finding: Pick<Finding, "status" | "assignee_user_id" | "accepted_risk_expires_at" | "revision">,
+  draft: {
+    status: FindingStatus;
+    assigneeUserId: string | null;
+    acceptedRiskExpiresAt: string | null;
+    note: string;
+  },
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = { revision: finding.revision };
+  if (draft.status !== finding.status) payload.status = draft.status;
+
+  const currentAssignee = finding.assignee_user_id || null;
+  if (draft.assigneeUserId !== currentAssignee) {
+    payload.assignee_user_id = draft.assigneeUserId;
+  }
+
+  if (draft.status === "accepted_risk" && draft.acceptedRiskExpiresAt) {
+    const currentExpiry = finding.accepted_risk_expires_at
+      ? new Date(finding.accepted_risk_expires_at).getTime()
+      : Number.NaN;
+    const nextExpiry = new Date(draft.acceptedRiskExpiresAt).getTime();
+    if (draft.status !== finding.status || currentExpiry !== nextExpiry) {
+      payload.accepted_risk_expires_at = draft.acceptedRiskExpiresAt;
+    }
+  }
+
+  const note = draft.note.trim();
+  if (note) payload.note = note;
+  return payload;
+}
+
+export function findingUpdateHasChanges(payload: Record<string, unknown>): boolean {
+  return Object.keys(payload).some((field) => field !== "revision");
+}
+
 const MONITORING_ACTIVE_STATES = new Set(["queued", "retrying", "evaluating"]);
+const AUTOMATIC_BASELINE_ACTIVE_STATES = new Set(["pending", "queued", "retrying", "running", "evaluating"]);
 const SAFE_MONITORING_DIAGNOSTIC = /^[a-z0-9][a-z0-9._:-]{0,95}$/i;
 
 export function monitoringEvaluationState(
@@ -257,6 +330,15 @@ export function monitoringEvaluationIsActive(
   evaluation: MonitoringEvaluation | null | undefined,
 ): boolean {
   return MONITORING_ACTIVE_STATES.has(monitoringEvaluationState(evaluation));
+}
+
+export function automaticBaselineIsActive(
+  baseline: AutomaticBaselineCoverage | null | undefined,
+): boolean {
+  const baselineState = String(baseline?.state || "unknown").trim().toLowerCase();
+  const findingsState = String(baseline?.findings_evaluation_state || "unknown").trim().toLowerCase();
+  return AUTOMATIC_BASELINE_ACTIVE_STATES.has(baselineState)
+    || AUTOMATIC_BASELINE_ACTIVE_STATES.has(findingsState);
 }
 
 export function canRetrySourceMonitoring(

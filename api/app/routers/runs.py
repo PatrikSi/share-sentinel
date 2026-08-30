@@ -97,7 +97,47 @@ RUN_ACTIVITY_ACTIONS = {
     "INGEST_RETRY_SCHEDULED",
     "INGEST_COMPLETED",
     "INGEST_FAILED",
+    "AUTOMATIC_BASELINE_UNAVAILABLE",
 }
+RUN_ACTIVITY_PUBLIC_METADATA_FIELDS = frozenset(
+    {
+        "name",
+        "size",
+        "content_type",
+        "upload_ms",
+        "reason",
+        "worker",
+        "resume_from_line",
+        "ts",
+        "line_offset",
+        "counts",
+        "error",
+        "attempt_count",
+        "next_retry_at",
+        "retry_delay_seconds",
+        "retryable",
+        "retry_exhausted",
+        "failure_code",
+        "source_id",
+        "current_run_id",
+        "state",
+        "candidates_considered",
+        "candidate_window_limit",
+        "candidate_window_exhausted",
+        "findings",
+        "automatic_comparison_id",
+        "automation_enabled",
+        "source_run_is_latest_complete",
+    }
+)
+
+
+def _public_run_activity_metadata(metadata: dict | None) -> dict:
+    if not isinstance(metadata, dict):
+        return {}
+    return {key: value for key, value in metadata.items() if key in RUN_ACTIVITY_PUBLIC_METADATA_FIELDS}
+
+
 EMPTY_RUN_SUMMARY = {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
 UPLOADABLE_RUN_STATUSES = frozenset({RunStatus.PENDING_UPLOAD, RunStatus.UPLOADED, RunStatus.FAILED})
 MAX_SEARCH_CHARS = 512
@@ -119,6 +159,8 @@ RECOGNIZED_PROVIDER_EFFECTIVE_DECISIONS = {
     "effective_deny": "deny",
     "mixed": "mixed",
 }
+COMPLETE_RETRIEVAL_COVERAGE_VALUES = frozenset({"complete", "full", "all_returned"})
+COMPLETE_PRINCIPAL_RESOLUTION_VALUES = frozenset({"complete", "resolved", "fully_resolved"})
 
 
 def _provider_computed_effective_decision(
@@ -135,12 +177,11 @@ def _provider_computed_effective_decision(
     decision = RECOGNIZED_PROVIDER_EFFECTIVE_DECISIONS.get(
         str(assessment.effective_access_status or "").strip().lower()
     )
-    complete_resolution_values = {"complete", "resolved", "fully_resolved"}
     complete_provider_computation = (
         assessment.assessment_state == "complete"
-        and assessment.retrieval_coverage in {"complete", "full", "all_returned"}
+        and assessment.retrieval_coverage in COMPLETE_RETRIEVAL_COVERAGE_VALUES
         and assessment.semantic_coverage in {"effective_access", "effective_permissions"}
-        and assessment.principal_resolution in complete_resolution_values
+        and assessment.principal_resolution in COMPLETE_PRINCIPAL_RESOLUTION_VALUES
         and assessment.entries_omitted == 0
         and assessment.unknown_entries == 0
         and decision is not None
@@ -1761,7 +1802,7 @@ def list_run_activity(
                 action=row.action,
                 object_type=row.object_type,
                 object_id=row.object_id,
-                metadata=row.metadata_json,
+                metadata=_public_run_activity_metadata(row.metadata_json),
             ).model_dump(mode="json")
             for row in rows
         ],
@@ -2556,12 +2597,17 @@ def resource_effective_access(
         )
     if any(assessment.assessment_state != "complete" for assessment in assessments):
         global_limitations.append("At least one direct-permission assessment is incomplete.")
-    if any(assessment.retrieval_coverage != "complete" for assessment in assessments):
+    if any(
+        assessment.retrieval_coverage not in COMPLETE_RETRIEVAL_COVERAGE_VALUES
+        for assessment in assessments
+    ):
         global_limitations.append("Provider permission retrieval was partial or indeterminate.")
     if any(assessment.entries_omitted > 0 or assessment.unknown_entries > 0 for assessment in assessments):
         global_limitations.append("Some provider permission entries were omitted or could not be normalized.")
-    complete_resolution_values = {"complete", "resolved", "fully_resolved"}
-    if any(assessment.principal_resolution not in complete_resolution_values for assessment in assessments):
+    if any(
+        assessment.principal_resolution not in COMPLETE_PRINCIPAL_RESOLUTION_VALUES
+        for assessment in assessments
+    ):
         global_limitations.append("Group membership and principal resolution are not complete for this evidence.")
     if any(assessment.semantic_coverage not in {"effective_access", "effective_permissions"} for assessment in assessments):
         global_limitations.append("The provider evidence describes grants or ACL structure, not effective access.")
@@ -2620,7 +2666,7 @@ def resource_effective_access(
         principal_limitations = list(global_limitations)
         if principal.kind in {"group", "sharepoint_group", "security_group", "distribution_group"}:
             principal_limitations.append("Group membership was not expanded; member effective access is unknown.")
-        if principal.resolution_state not in complete_resolution_values:
+        if principal.resolution_state not in COMPLETE_PRINCIPAL_RESOLUTION_VALUES:
             principal_limitations.append("The principal was not fully resolved to a current identity object.")
         rights_truncated = active_entry_counts.get(principal.id, len(entries)) > len(entries)
         if rights_truncated:

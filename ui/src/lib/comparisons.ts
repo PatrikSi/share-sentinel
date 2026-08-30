@@ -98,10 +98,12 @@ export type ResourceComparisonSnapshot = {
 };
 
 export type ResourceItemChanges = {
-  state: string;
-  added: number | null;
-  removed: number | null;
-  moved: number | null;
+  state: "computed" | "not_computed";
+  exact: boolean;
+  counts: Partial<Record<ItemChangeType, number>> | null;
+  total: number | null;
+  before_count: number | null;
+  after_count: number | null;
 };
 
 export type ResourceComparisonChange = {
@@ -203,6 +205,21 @@ export function comparisonSummaryCounts(
   };
 }
 
+export function emptyResourceChangesDescription(
+  summary: ComparisonSummary | null | undefined,
+  filtersApplied: boolean,
+): string {
+  if (filtersApplied) return "No resource changes match the current server-side filters.";
+  const resourceCopy = "No resource-level changes were published within the comparable collected scope.";
+  if (summary?.item_churn_computed === true) {
+    return `${resourceCopy} Item history was computed independently; open the Item history tab for its result.`;
+  }
+  if (summary?.item_churn_computed === false) {
+    return `${resourceCopy} Item history was not computed for this comparison.`;
+  }
+  return `${resourceCopy} Item-history computation state was not recorded.`;
+}
+
 export function comparisonFindingsEvaluation(
   comparison: ProjectComparison | null | undefined,
 ): MonitoringEvaluation | null {
@@ -217,6 +234,14 @@ export function canRetryComparisonFindings(
   return canManageFindings(role)
     && comparison?.state === "complete"
     && monitoringEvaluationState(comparisonFindingsEvaluation(comparison)) === "degraded";
+}
+
+export function canRetryMaterializedComparison(
+  comparison: ProjectComparison | null | undefined,
+  role: string | null | undefined,
+): boolean {
+  const normalizedRole = role?.trim().toLowerCase();
+  return comparison?.state === "failed" && (normalizedRole === "operator" || normalizedRole === "admin");
 }
 
 export function comparisonRunId(comparison: ProjectComparison, side: "current" | "baseline"): string | null {
@@ -300,13 +325,31 @@ export function itemChangeCopy(itemChanges: ResourceItemChanges | null | undefin
   if (!itemChanges || itemChanges.state === "not_computed") {
     return "Item-level changes were not computed for this scalable comparison.";
   }
-  if (itemChanges.state === "indeterminate" || itemChanges.state === "partial") {
-    return "Item-level changes are indeterminate because collection coverage was incomplete.";
+  if (!itemChanges.counts) {
+    return "Computed item history did not publish usable counts; treat this result as indeterminate.";
   }
-  const added = itemChanges.added == null ? "unknown" : itemChanges.added.toLocaleString();
-  const removed = itemChanges.removed == null ? "unknown" : itemChanges.removed.toLocaleString();
-  const moved = itemChanges.moved == null ? "unknown" : itemChanges.moved.toLocaleString();
-  return `${added} added · ${removed} removed · ${moved} moved or renamed`;
+  const count = (type: ItemChangeType): string => {
+    const value = itemChanges.counts?.[type];
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+      ? value.toLocaleString()
+      : "unknown";
+  };
+  const parts = [
+    `${count("added")} added`,
+    `${count("removed")} removed`,
+    `${count("moved")} moved`,
+    `${count("renamed")} renamed`,
+  ];
+  for (const [type, label] of [
+    ["metadata_changed", "metadata changed"],
+    ["permission_changed", "permission changed"],
+    ["indeterminate", "indeterminate"],
+  ] as const) {
+    const value = itemChanges.counts[type];
+    if (typeof value === "number" && value > 0) parts.push(`${value.toLocaleString()} ${label}`);
+  }
+  if (!itemChanges.exact) parts.push("bounded evidence");
+  return parts.join(" · ");
 }
 
 export function changeTypeLabel(changeType: ResourceChangeType): string {
