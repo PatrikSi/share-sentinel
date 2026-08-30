@@ -11,8 +11,11 @@ def test_sanitize_audit_metadata_redacts_nested_secret_fields() -> None:
             "request_id": "request-1",
             "password": "never-store-me",
             "seed_admin_password": "suffix-secret",
+            "database_url": "postgresql://user:password@example.invalid/db",
             "nested": {
                 "client-secret": "also-secret",
+                "signing_client_assertion": "signed-secret",
+                "api_token_hash": "hashed-but-sensitive",
                 "token_id": "safe-reference",
                 "when": datetime(2026, 8, 30, tzinfo=UTC),
             },
@@ -21,7 +24,10 @@ def test_sanitize_audit_metadata_redacts_nested_secret_fields() -> None:
 
     assert payload["password"] == "[redacted]"
     assert payload["seed_admin_password"] == "[redacted]"
+    assert payload["database_url"] == "[redacted]"
     assert payload["nested"]["client-secret"] == "[redacted]"
+    assert payload["nested"]["signing_client_assertion"] == "[redacted]"
+    assert payload["nested"]["api_token_hash"] == "[redacted]"
     assert payload["nested"]["token_id"] == "safe-reference"
     assert payload["nested"]["when"] == "2026-08-30T00:00:00+00:00"
 
