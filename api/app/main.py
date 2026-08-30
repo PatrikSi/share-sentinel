@@ -7,7 +7,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from app.config import get_settings
 from app.error_handlers import register_error_handlers
 from app.middleware import RequestContextMiddleware
-from app.routers import audit, auth, comparisons, health, inventory, projects, runs, settings, users
+from app.routers import audit, auth, comparisons, health, inventory, monitoring, projects, runs, settings, users
 
 app_settings = get_settings()
 app_env = app_settings.app_env.lower()
@@ -51,6 +51,7 @@ app.include_router(auth.router)
 app.include_router(projects.router)
 app.include_router(runs.router)
 app.include_router(comparisons.router)
+app.include_router(monitoring.router)
 app.include_router(inventory.router)
 app.include_router(audit.router)
 app.include_router(users.router)

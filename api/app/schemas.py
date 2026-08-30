@@ -1,8 +1,9 @@
+import json
 import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.enums import ErrorSeverity, ProjectRole, RunStatus, UITheme
 from app.token_scopes import is_scope_allowed, normalize_token_scopes
@@ -203,13 +204,70 @@ class MemberAddByEmailIn(BaseModel):
 class RunCreateIn(BaseModel):
     run_id: uuid.UUID | None = None
     name: str = Field(min_length=1, max_length=255)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=4000)
     target_scope: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("target_scope")
+    @classmethod
+    def validate_target_scope(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("target_scope must contain JSON values") from exc
+        if len(encoded) > 65_536:
+            raise ValueError("target_scope must not exceed 64 KiB")
+        nodes = 0
+
+        def validate_node(node: Any, depth: int) -> None:
+            nonlocal nodes
+            nodes += 1
+            if nodes > 4096:
+                raise ValueError("target_scope contains too many values")
+            if depth > 8:
+                raise ValueError("target_scope nesting must not exceed 8 levels")
+            if isinstance(node, dict):
+                if len(node) > 256:
+                    raise ValueError("target_scope objects must not exceed 256 fields")
+                for key, item in node.items():
+                    fingerprint = "".join(character for character in str(key).casefold() if character.isalnum())
+                    if any(
+                        stem in fingerprint
+                        for stem in (
+                            "password",
+                            "passphrase",
+                            "secret",
+                            "token",
+                            "credential",
+                            "privatekey",
+                            "clientsecret",
+                            "accesskey",
+                            "refreshtoken",
+                            "saskey",
+                        )
+                    ):
+                        raise ValueError("target_scope must not contain credentials or secret-labeled fields")
+                    if len(str(key)) > 256:
+                        raise ValueError("target_scope field names must not exceed 256 characters")
+                    validate_node(item, depth + 1)
+            elif isinstance(node, list):
+                if len(node) > 512:
+                    raise ValueError("target_scope lists must not exceed 512 values")
+                for item in node:
+                    validate_node(item, depth + 1)
+
+        validate_node(value, 0)
+        return value
 
 
 class RunOut(BaseModel):
     id: uuid.UUID
     project_id: uuid.UUID
+    source_id: uuid.UUID | None = None
     name: str
     description: str | None
     target_scope: dict[str, Any]
@@ -259,11 +317,13 @@ class ComparisonCreateIn(BaseModel):
 class ComparisonOut(BaseModel):
     id: uuid.UUID
     project_id: uuid.UUID
+    source_id: uuid.UUID | None = None
     baseline_run_id: uuid.UUID
     current_run_id: uuid.UUID
     baseline_run: dict[str, Any] | None = None
     current_run: dict[str, Any] | None = None
     algorithm_version: str
+    trigger: str = "manual"
     state: str
     compatibility: dict[str, Any] = Field(default_factory=dict)
     progress: dict[str, Any] = Field(default_factory=dict)
@@ -294,6 +354,89 @@ class ComparisonResourceChangeOut(BaseModel):
     match: dict[str, str]
     item_changes: dict[str, Any]
     impact_rank: int
+
+
+class ComparisonItemChangeOut(BaseModel):
+    id: int
+    resource_change_id: int
+    identity_key: str
+    change_type: str
+    provider: str
+    before: dict[str, Any] | None
+    after: dict[str, Any] | None
+    change_categories: list[str]
+    evidence_state: str
+    limitations: list[str]
+    match: dict[str, str]
+    impact_rank: int
+
+
+class CollectionSourceUpdateIn(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=255)
+    enabled: bool | None = None
+    expected_interval_seconds: int | None = Field(default=None, ge=300, le=31_536_000)
+
+    @field_validator("display_name")
+    @classmethod
+    def normalize_display_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("display_name must not be blank")
+        return normalized
+
+
+class FindingUpdateIn(BaseModel):
+    status: str | None = Field(default=None, max_length=24)
+    assignee_user_id: uuid.UUID | None = None
+    accepted_risk_expires_at: datetime | None = None
+    note: str | None = Field(default=None, max_length=4000)
+    revision: int = Field(ge=1)
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"open", "acknowledged", "accepted_risk", "resolved"}:
+            raise ValueError("unsupported finding status")
+        return normalized
+
+
+class FindingBulkUpdateIn(BaseModel):
+    finding_ids: list[uuid.UUID] = Field(min_length=1, max_length=100)
+    expected_revisions: dict[uuid.UUID, int] = Field(min_length=1, max_length=100)
+    status: str | None = Field(default=None, max_length=24)
+    assignee_user_id: uuid.UUID | None = None
+    accepted_risk_expires_at: datetime | None = None
+    note: str | None = Field(default=None, max_length=4000)
+
+    @field_validator("finding_ids")
+    @classmethod
+    def unique_finding_ids(cls, value: list[uuid.UUID]) -> list[uuid.UUID]:
+        if len(set(value)) != len(value):
+            raise ValueError("finding_ids must not contain duplicates")
+        return value
+
+    @model_validator(mode="after")
+    def revisions_cover_findings(self):
+        if set(self.expected_revisions) != set(self.finding_ids):
+            raise ValueError("expected_revisions must contain exactly one revision for every finding_id")
+        if any(revision < 1 for revision in self.expected_revisions.values()):
+            raise ValueError("expected revisions must be positive integers")
+        return self
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"open", "acknowledged", "accepted_risk", "resolved"}:
+            raise ValueError("unsupported finding status")
+        return normalized
 
 
 class AccessEvidenceOut(BaseModel):

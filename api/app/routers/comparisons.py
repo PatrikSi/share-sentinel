@@ -14,11 +14,18 @@ from app.config import get_settings
 from app.db import escape_like, get_db
 from app.deps import AuthContext, get_auth_context, request_meta, require_project_role, require_token_scopes
 from app.enums import ProjectRole, RunStatus
-from app.models import ComparisonResourceChange, RunComparison, ScanRun
-from app.pagination import KeysetColumn, apply_keyset_pagination, paginate_rows, parse_int_cursor_value
+from app.models import ComparisonItemChange, ComparisonResourceChange, RunComparison, ScanRun
+from app.pagination import (
+    KeysetColumn,
+    apply_keyset_pagination,
+    paginate_rows,
+    parse_datetime_cursor_value,
+    parse_int_cursor_value,
+    parse_uuid_cursor_value,
+)
 from app.rate_limit import RateLimiter
 from app.routers.runs import _run_diff_compatibility
-from app.schemas import ComparisonCreateIn, ComparisonOut, ComparisonResourceChangeOut
+from app.schemas import ComparisonCreateIn, ComparisonItemChangeOut, ComparisonOut, ComparisonResourceChangeOut
 from app.services.audit import write_audit_event
 from app.services.queue import enqueue_worker_job
 from app.token_scopes import SCOPE_READ_INVENTORY, SCOPE_READ_RUNS, SCOPE_WRITE_RUNS
@@ -32,7 +39,25 @@ CHANGE_CURSOR = (
     KeysetColumn("impact_rank", ComparisonResourceChange.impact_rank, direction="desc", parser=parse_int_cursor_value),
     KeysetColumn("id", ComparisonResourceChange.id, direction="desc", parser=parse_int_cursor_value),
 )
+COMPARISON_CURSOR = (
+    KeysetColumn("created_at", RunComparison.created_at, direction="desc", parser=parse_datetime_cursor_value),
+    KeysetColumn("id", RunComparison.id, direction="desc", parser=parse_uuid_cursor_value),
+)
+ITEM_CHANGE_CURSOR = (
+    KeysetColumn("impact_rank", ComparisonItemChange.impact_rank, direction="desc", parser=parse_int_cursor_value),
+    KeysetColumn("id", ComparisonItemChange.id, direction="desc", parser=parse_int_cursor_value),
+)
 CHANGE_TYPES = {"appeared", "disappeared", "changed", "indeterminate"}
+ITEM_CHANGE_TYPES = {
+    "added",
+    "removed",
+    "moved",
+    "renamed",
+    "metadata_changed",
+    "permission_changed",
+    "indeterminate",
+}
+COMPARISON_STATES = {"queued", "running", "complete", "failed"}
 KNOWN_COMPARISON_CONTRACTS = {
     "structural": frozenset({"network_share_inventory_v1", "sharepoint_resource_inventory_v1"}),
     "content": frozenset({"smb_tree_inventory_v1", "sharepoint_drive_inventory_v1"}),
@@ -708,11 +733,13 @@ def _comparison_out(
     return ComparisonOut(
         id=comparison.id,
         project_id=comparison.project_id,
+        source_id=getattr(comparison, "source_id", None),
         baseline_run_id=comparison.baseline_run_id,
         current_run_id=comparison.current_run_id,
         baseline_run=_run_label(baseline),
         current_run=_run_label(current),
         algorithm_version=comparison.algorithm_version,
+        trigger=getattr(comparison, "trigger", "manual"),
         state=comparison.state,
         compatibility=comparison.compatibility or {},
         progress=comparison.progress or {},
@@ -768,7 +795,15 @@ def create_comparison(
         RunComparison.options_hash == DEFAULT_OPTIONS_HASH,
     )
     existing = db.execute(select(RunComparison).where(*identity_filter)).scalar_one_or_none()
-    if existing is not None and existing.state != "failed":
+    if existing is not None:
+        if existing.state == "failed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "COMPARISON_RETRY_REQUIRED",
+                    "message": "This comparison failed. Use the dedicated retry action to reset it safely.",
+                },
+            )
         return _comparison_out(existing, baseline, current)
 
     settings = get_settings()
@@ -785,7 +820,15 @@ def create_comparison(
     comparison_lock_key = project_id.int % (2**63 - 1)
     db.execute(select(func.pg_advisory_xact_lock(comparison_lock_key)))
     existing = db.execute(select(RunComparison).where(*identity_filter)).scalar_one_or_none()
-    if existing is not None and existing.state != "failed":
+    if existing is not None:
+        if existing.state == "failed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "COMPARISON_RETRY_REQUIRED",
+                    "message": "This comparison failed. Use the dedicated retry action to reset it safely.",
+                },
+            )
         return _comparison_out(existing, baseline, current)
 
     active_count = int(
@@ -818,37 +861,24 @@ def create_comparison(
         "item_churn_computed": False,
     }
     compatibility = build_comparison_compatibility(current, baseline)
-    if existing is not None:
-        comparison = existing
-        comparison.state = "queued"
-        comparison.compatibility = compatibility
-        comparison.progress = {"phase": "queued", "processed": 0, "retry_requested": True}
-        comparison.summary = initial_summary
-        comparison.error_code = None
-        comparison.error_message = None
-        comparison.attempt_count = 0
-        comparison.started_at = None
-        comparison.completed_at = None
-        comparison.heartbeat_at = None
-        comparison.next_retry_at = None
-        audit_action = "COMPARISON_REQUEUED"
-    else:
-        comparison = RunComparison(
-            id=uuid.uuid4(),
-            project_id=project_id,
-            baseline_run_id=baseline.id,
-            current_run_id=current.id,
-            algorithm_version=ALGORITHM_VERSION,
-            options_hash=DEFAULT_OPTIONS_HASH,
-            state="queued",
-            compatibility=compatibility,
-            progress={"phase": "queued", "processed": 0},
-            summary=initial_summary,
-            created_by_user_id=auth.user_id,
-            created_by_token_id=auth.token_id,
-        )
-        db.add(comparison)
-        audit_action = "COMPARISON_CREATED"
+    comparison = RunComparison(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        source_id=current.source_id if current.source_id == baseline.source_id else None,
+        baseline_run_id=baseline.id,
+        current_run_id=current.id,
+        algorithm_version=ALGORITHM_VERSION,
+        options_hash=DEFAULT_OPTIONS_HASH,
+        trigger="manual",
+        state="queued",
+        compatibility=compatibility,
+        progress={"phase": "queued", "processed": 0},
+        summary=initial_summary,
+        created_by_user_id=auth.user_id,
+        created_by_token_id=auth.token_id,
+    )
+    db.add(comparison)
+    audit_action = "COMPARISON_CREATED"
     write_audit_event(
         db,
         action=audit_action,
@@ -887,6 +917,48 @@ def create_comparison(
     return _comparison_out(comparison, baseline, current)
 
 
+@router.get("", response_model=dict)
+def list_comparisons(
+    project_id: uuid.UUID,
+    comparison_state: str | None = Query(default=None, alias="state", max_length=24),
+    source_id: uuid.UUID | None = Query(default=None),
+    current_run_id: uuid.UUID | None = Query(default=None),
+    baseline_run_id: uuid.UUID | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS, SCOPE_READ_INVENTORY)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    normalized_state = comparison_state.strip().lower() if comparison_state else None
+    if normalized_state and normalized_state not in COMPARISON_STATES:
+        raise HTTPException(status_code=400, detail="unsupported comparison state")
+    stmt = select(RunComparison).where(RunComparison.project_id == project_id)
+    if normalized_state:
+        stmt = stmt.where(RunComparison.state == normalized_state)
+    if source_id:
+        stmt = stmt.where(RunComparison.source_id == source_id)
+    if current_run_id:
+        stmt = stmt.where(RunComparison.current_run_id == current_run_id)
+    if baseline_run_id:
+        stmt = stmt.where(RunComparison.baseline_run_id == baseline_run_id)
+    stmt = apply_keyset_pagination(stmt, COMPARISON_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), COMPARISON_CURSOR, limit)
+    run_ids = {row.baseline_run_id for row in rows} | {row.current_run_id for row in rows}
+    runs = {
+        run.id: run
+        for run in db.execute(select(ScanRun).where(ScanRun.id.in_(run_ids or {uuid.UUID(int=0)}))).scalars()
+    }
+    return {
+        "items": [
+            _comparison_out(row, runs.get(row.baseline_run_id), runs.get(row.current_run_id)).model_dump(mode="json")
+            for row in rows
+        ],
+        "next_cursor": next_cursor,
+    }
+
+
 @router.get("/{comparison_id}", response_model=ComparisonOut)
 def get_comparison(
     project_id: uuid.UUID,
@@ -902,10 +974,90 @@ def get_comparison(
     return _comparison_out(comparison, baseline, current)
 
 
+@router.post("/{comparison_id}/retry", response_model=ComparisonOut, status_code=status.HTTP_202_ACCEPTED)
+def retry_comparison(
+    project_id: uuid.UUID,
+    comparison_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_WRITE_RUNS, SCOPE_READ_INVENTORY)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.OPERATOR, auth, db)
+    comparison = db.execute(
+        select(RunComparison)
+        .where(RunComparison.id == comparison_id, RunComparison.project_id == project_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if comparison is None:
+        raise HTTPException(status_code=404, detail="comparison not found")
+    baseline = _get_complete_run(db, project_id, comparison.baseline_run_id, "baseline")
+    current = _get_complete_run(db, project_id, comparison.current_run_id, "current")
+    if comparison.state in {"queued", "running"}:
+        return _comparison_out(comparison, baseline, current)
+    if comparison.state == "complete":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "COMPARISON_ALREADY_COMPLETE",
+                "message": "A completed comparison cannot be retried; create a comparison with different runs instead.",
+            },
+        )
+    if comparison.state != "failed":
+        raise HTTPException(status_code=409, detail="comparison is not in a retryable state")
+    previous_attempt_count = comparison.attempt_count
+    previous_error_code = comparison.error_code
+    comparison.state = "queued"
+    comparison.progress = {"phase": "queued", "processed": 0, "operator_retry": True}
+    comparison.summary = {
+        "appeared": 0,
+        "disappeared": 0,
+        "changed": 0,
+        "indeterminate": 0,
+        "total": 0,
+        "exact": False,
+        "resource_summary_exact": False,
+        "item_churn_computed": False,
+    }
+    comparison.error_code = None
+    comparison.error_message = None
+    comparison.attempt_count = 0
+    comparison.started_at = None
+    comparison.completed_at = None
+    comparison.heartbeat_at = None
+    comparison.next_retry_at = None
+    write_audit_event(
+        db,
+        action="COMPARISON_RETRY_REQUESTED",
+        object_type="run_comparison",
+        object_id=str(comparison.id),
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata={
+            **request_meta(request),
+            "previous_attempt_count": previous_attempt_count,
+            "previous_error_code": previous_error_code,
+            "baseline_run_id": str(comparison.baseline_run_id),
+            "current_run_id": str(comparison.current_run_id),
+        },
+    )
+    db.commit()
+    db.refresh(comparison)
+    try:
+        enqueue_worker_job(
+            {"job_type": "comparison", "comparison_id": comparison.id, "project_id": project_id}
+        )
+    except Exception:
+        logger.warning("comparison retry enqueue failed; worker recovery will claim it comparison_id=%s", comparison.id)
+    return _comparison_out(comparison, baseline, current)
+
+
 @router.get("/{comparison_id}/resource-changes", response_model=dict)
 def list_resource_changes(
     project_id: uuid.UUID,
     comparison_id: uuid.UUID,
+    request: Request,
     change_type: str | None = Query(default=None, max_length=24),
     provider: str | None = Query(default=None, max_length=32),
     category: str | None = Query(default=None, max_length=64),
@@ -946,6 +1098,23 @@ def list_resource_changes(
         stmt = stmt.where(ComparisonResourceChange.search_text.ilike(pattern, escape="\\"))
     stmt = apply_keyset_pagination(stmt, CHANGE_CURSOR, cursor, limit)
     rows, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), CHANGE_CURSOR, limit)
+    item_counts_by_resource: dict[int, dict[str, int]] = {}
+    if rows:
+        for resource_change_id, item_change_type, count in db.execute(
+            select(
+                ComparisonItemChange.resource_change_id,
+                ComparisonItemChange.change_type,
+                func.count(ComparisonItemChange.id),
+            )
+            .where(
+                ComparisonItemChange.comparison_id == comparison_id,
+                ComparisonItemChange.resource_change_id.in_([row.id for row in rows]),
+            )
+            .group_by(ComparisonItemChange.resource_change_id, ComparisonItemChange.change_type)
+        ).all():
+            item_counts_by_resource.setdefault(int(resource_change_id), {})[str(item_change_type)] = int(count)
+    item_history_computed = bool((comparison.summary or {}).get("item_churn_computed"))
+    item_history_exact = bool((comparison.summary or {}).get("item_summary_exact"))
 
     items: list[ComparisonResourceChangeOut] = []
     for row in rows:
@@ -975,15 +1144,133 @@ def list_resource_changes(
                 content_state=row.content_state,
                 access_interpretation=row.access_interpretation,
                 match={"basis": row.match_basis, "quality": row.match_quality},
-                item_changes={
-                    "state": "not_computed",
-                    "added": None,
-                    "removed": None,
-                    "moved": None,
-                    "before_count": row.item_count_before,
-                    "after_count": row.item_count_after,
-                },
+                item_changes=(
+                    {
+                        "state": "computed",
+                        "exact": item_history_exact,
+                        "counts": {
+                            item_type: item_counts_by_resource.get(row.id, {}).get(item_type, 0)
+                            for item_type in sorted(ITEM_CHANGE_TYPES)
+                        },
+                        "total": sum(item_counts_by_resource.get(row.id, {}).values()),
+                        "before_count": row.item_count_before,
+                        "after_count": row.item_count_after,
+                    }
+                    if item_history_computed
+                    else {
+                        "state": "not_computed",
+                        "exact": False,
+                        "counts": None,
+                        "total": None,
+                        "before_count": row.item_count_before,
+                        "after_count": row.item_count_after,
+                    }
+                ),
                 impact_rank=row.impact_rank,
             )
         )
+    write_audit_event(
+        db,
+        action="COMPARISON_RESOURCE_CHANGES_LISTED",
+        object_type="run_comparison",
+        object_id=str(comparison_id),
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata={
+            **request_meta(request),
+            "change_type": change_type.strip().lower() if change_type else None,
+            "provider": provider.strip().lower() if provider else None,
+            "category": category.strip().lower() if category else None,
+            "query_applied": bool(normalized_query),
+            "cursor_applied": cursor is not None,
+            "limit": limit,
+            "result_count": len(items),
+            "has_next_page": next_cursor is not None,
+        },
+    )
+    db.commit()
     return {"items": items, "next_cursor": next_cursor, "comparison_state": comparison.state}
+
+
+@router.get("/{comparison_id}/item-changes", response_model=dict)
+def list_item_changes(
+    project_id: uuid.UUID,
+    comparison_id: uuid.UUID,
+    request: Request,
+    change_type: str | None = Query(default=None, max_length=32),
+    resource_change_id: int | None = Query(default=None, ge=1),
+    q: str | None = Query(default=None, max_length=512),
+    limit: int = Query(default=100, ge=1, le=500),
+    cursor: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS, SCOPE_READ_INVENTORY)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    comparison = _get_comparison(db, project_id, comparison_id)
+    if comparison.state != "complete":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "COMPARISON_NOT_COMPLETE",
+                "message": f"Comparison results are not available while state is {comparison.state}.",
+            },
+        )
+    stmt = select(ComparisonItemChange).where(ComparisonItemChange.comparison_id == comparison_id)
+    normalized_type = change_type.strip().lower() if change_type else None
+    if normalized_type:
+        if normalized_type not in ITEM_CHANGE_TYPES:
+            raise HTTPException(status_code=400, detail="unsupported item change_type")
+        stmt = stmt.where(ComparisonItemChange.change_type == normalized_type)
+    if resource_change_id:
+        stmt = stmt.where(ComparisonItemChange.resource_change_id == resource_change_id)
+    if q and q.strip():
+        stmt = stmt.where(
+            ComparisonItemChange.search_text.ilike(f"%{escape_like(q.strip())}%", escape="\\")
+        )
+    stmt = apply_keyset_pagination(stmt, ITEM_CHANGE_CURSOR, cursor, limit)
+    rows, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), ITEM_CHANGE_CURSOR, limit)
+    items = [
+        ComparisonItemChangeOut(
+            id=row.id,
+            resource_change_id=row.resource_change_id,
+            identity_key=row.identity_key,
+            change_type=row.change_type,
+            provider=row.provider,
+            before=dict(row.before_snapshot or {}) if row.before_item_id is not None else None,
+            after=dict(row.after_snapshot or {}) if row.after_item_id is not None else None,
+            change_categories=list(row.change_categories or []),
+            evidence_state=row.evidence_state,
+            limitations=[str(item) for item in (row.limitations or [])],
+            match={"basis": row.match_basis, "quality": row.match_quality},
+            impact_rank=row.impact_rank,
+        ).model_dump(mode="json")
+        for row in rows
+    ]
+    write_audit_event(
+        db,
+        action="COMPARISON_ITEM_CHANGES_LISTED",
+        object_type="run_comparison",
+        object_id=str(comparison_id),
+        actor_user_id=auth.user_id,
+        actor_token_id=auth.token_id,
+        project_id=project_id,
+        metadata={
+            **request_meta(request),
+            "result_count": len(rows),
+            "change_type": normalized_type,
+            "resource_change_id": resource_change_id,
+        },
+    )
+    db.commit()
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "comparison_state": comparison.state,
+        "interpretation": {
+            "state": "computed" if (comparison.summary or {}).get("item_churn_computed") else "not_computed",
+            "exact": bool((comparison.summary or {}).get("item_summary_exact")),
+            "limitations": list((comparison.summary or {}).get("item_limitations") or []),
+        },
+    }

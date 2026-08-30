@@ -1,4 +1,5 @@
 import copy
+import inspect
 import json
 import sys
 from datetime import UTC, datetime, timedelta
@@ -839,13 +840,12 @@ def test_producer_inventory_counts_require_complete_nonnegative_integer_stats(st
 
 
 def test_identity_preparation_is_tenant_aware_and_preserves_nfs_case() -> None:
-    conn = _CaptureConn()
-    main.prepare_run_identity_keys(conn, "run-1")
-    resource_sql = " ".join(conn.calls[0][0].split())
+    resource_sql = " ".join(inspect.getsource(main.prepare_run_identity_keys_batch).split())
 
     assert "run.collection_context->>'tenant_id'" in resource_sql
     assert "IN ('smb', 'sharepoint') THEN lower(resource.name) ELSE resource.name" in resource_sql
-    assert "resource.identity_key IS NULL" not in resource_sql
+    assert "resource.identity_key IS NULL" in resource_sql
+    assert "ORDER BY id LIMIT %s" in resource_sql
 
 
 def test_assessment_collision_rejects_immutable_subject_reuse() -> None:

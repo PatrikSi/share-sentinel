@@ -100,10 +100,16 @@ class RefreshToken(Base):
 
 class ScanRun(Base):
     __tablename__ = "scan_runs"
+    __table_args__ = (
+        Index("ix_scan_runs_source_created_id", "source_id", sa.desc("created_at"), sa.desc("id")),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=uuid.uuid4)
     project_id: Mapped[uuid.UUID] = mapped_column(
         sa.Uuid, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, ForeignKey("collection_sources.id", ondelete="SET NULL"), nullable=True
     )
     name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
@@ -191,6 +197,12 @@ class Resource(Base):
         Index("ix_resources_run_endpoint_id", "run_id", "endpoint_id", "id"),
         Index("ix_resources_run_provider_exposure_id", "run_id", "provider", "exposure", "id"),
         Index("ix_resources_run_identity_id", "run_id", "identity_key", "id"),
+        Index(
+            "ix_resources_run_unkeyed_id",
+            "run_id",
+            "id",
+            postgresql_where=sa.text("identity_key IS NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
@@ -247,7 +259,21 @@ class Item(Base):
         Index("ix_items_run_name", "run_id", "name"),
         Index("ix_items_run_id", "run_id", "id"),
         Index("ix_items_run_resource_id", "run_id", "resource_id", "id"),
+        Index("ix_items_run_resource_identity_id", "run_id", "resource_id", "identity_key", "id"),
+        Index(
+            "ix_items_active_resource_identity_id",
+            "resource_id",
+            "identity_key",
+            "id",
+            postgresql_where=sa.text("deleted IS FALSE"),
+        ),
         Index("ix_items_run_provider_exposure_id", "run_id", "provider", "exposure", "id"),
+        Index(
+            "ix_items_run_unkeyed_id",
+            "run_id",
+            "id",
+            postgresql_where=sa.text("identity_key IS NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
@@ -451,7 +477,9 @@ class RunComparison(Base):
             name="uq_run_comparisons_identity",
         ),
         Index("ix_run_comparisons_project_created_id", "project_id", "created_at", "id"),
+        Index("ix_run_comparisons_source_created_id", "source_id", sa.desc("created_at"), sa.desc("id")),
         Index("ix_run_comparisons_state_heartbeat", "state", "heartbeat_at"),
+        sa.CheckConstraint("trigger IN ('manual', 'automatic')", name="ck_run_comparisons_trigger"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=uuid.uuid4)
@@ -459,6 +487,11 @@ class RunComparison(Base):
         sa.Uuid,
         ForeignKey("projects.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid,
+        ForeignKey("collection_sources.id", ondelete="SET NULL"),
+        nullable=True,
     )
     baseline_run_id: Mapped[uuid.UUID] = mapped_column(
         sa.Uuid,
@@ -472,6 +505,7 @@ class RunComparison(Base):
     )
     algorithm_version: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     options_hash: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    trigger: Mapped[str] = mapped_column(sa.String(24), nullable=False, server_default="manual")
     state: Mapped[str] = mapped_column(sa.String(24), nullable=False, server_default="queued")
     compatibility: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
     progress: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
@@ -564,6 +598,232 @@ class ComparisonResourceChange(Base):
     after_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
     search_text: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="")
     impact_rank: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="0")
+
+
+class CollectionSource(Base):
+    __tablename__ = "collection_sources"
+    __table_args__ = (
+        UniqueConstraint("project_id", "source_key", name="uq_collection_sources_project_key"),
+        Index("ix_collection_sources_project_updated_id", "project_id", sa.desc("updated_at"), sa.desc("id")),
+        Index("ix_collection_sources_project_provider_id", "project_id", "provider", "id"),
+        sa.CheckConstraint(
+            "expected_interval_seconds IS NULL OR "
+            "expected_interval_seconds BETWEEN 300 AND 31536000",
+            name="ck_collection_sources_expected_interval",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    source_key: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    display_name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    provider: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+    assessed_identity: Mapped[str | None] = mapped_column(sa.String(512), nullable=True)
+    target_scope: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    enabled: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.true())
+    expected_interval_seconds: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    last_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, ForeignKey("scan_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    last_success_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    last_failure_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    last_comparison_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, ForeignKey("run_comparisons.id", ondelete="SET NULL"), nullable=True
+    )
+    collector_version: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    coverage: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+        onupdate=sa.func.now(),
+    )
+
+
+class ComparisonItemChange(Base):
+    __tablename__ = "comparison_item_changes"
+    __table_args__ = (
+        UniqueConstraint(
+            "comparison_id",
+            "resource_change_id",
+            "identity_key",
+            name="uq_comparison_item_changes_identity",
+        ),
+        Index(
+            "ix_comparison_item_changes_impact_id",
+            "comparison_id",
+            sa.desc("impact_rank"),
+            sa.desc("id"),
+        ),
+        Index(
+            "ix_comparison_item_changes_resource_id",
+            "comparison_id",
+            "resource_change_id",
+            "id",
+        ),
+        Index("ix_comparison_item_changes_type_id", "comparison_id", "change_type", "id"),
+        Index(
+            "ix_comparison_item_changes_search_trgm",
+            "search_text",
+            postgresql_using="gin",
+            postgresql_ops={"search_text": "gin_trgm_ops"},
+        ),
+        sa.CheckConstraint(
+            "change_type IN ('added','removed','moved','renamed','metadata_changed','permission_changed','indeterminate')",
+            name="ck_comparison_item_changes_type",
+        ),
+        sa.CheckConstraint(
+            "evidence_state IN ('exact','bounded','indeterminate')",
+            name="ck_comparison_item_changes_evidence_state",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
+    comparison_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, ForeignKey("run_comparisons.id", ondelete="CASCADE"), nullable=False
+    )
+    resource_change_id: Mapped[int] = mapped_column(
+        sa.BigInteger, ForeignKey("comparison_resource_changes.id", ondelete="CASCADE"), nullable=False
+    )
+    identity_key: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    change_type: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+    provider: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+    before_item_id: Mapped[int | None] = mapped_column(
+        sa.BigInteger, ForeignKey("items.id", ondelete="SET NULL"), nullable=True
+    )
+    after_item_id: Mapped[int | None] = mapped_column(
+        sa.BigInteger, ForeignKey("items.id", ondelete="SET NULL"), nullable=True
+    )
+    match_basis: Mapped[str] = mapped_column(sa.String(40), nullable=False)
+    match_quality: Mapped[str] = mapped_column(sa.String(24), nullable=False)
+    change_categories: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=sa.text("'[]'::jsonb"))
+    evidence_state: Mapped[str] = mapped_column(sa.String(24), nullable=False)
+    limitations: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=sa.text("'[]'::jsonb"))
+    before_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    after_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    search_text: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="")
+    impact_rank: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="0")
+
+
+class Finding(Base):
+    __tablename__ = "findings"
+    __table_args__ = (
+        UniqueConstraint("project_id", "dedupe_key", name="uq_findings_project_dedupe"),
+        Index("ix_findings_project_updated_id", "project_id", sa.desc("updated_at"), sa.desc("id")),
+        Index("ix_findings_project_status_severity_id", "project_id", "status", "severity", "id"),
+        Index(
+            "ix_findings_project_status_updated_id",
+            "project_id",
+            "status",
+            sa.desc("updated_at"),
+            sa.desc("id"),
+        ),
+        Index("ix_findings_source_policy_status_id", "source_id", "policy_id", "status", "id"),
+        Index(
+            "ix_findings_status_risk_expiry_id",
+            "status",
+            "accepted_risk_expires_at",
+            "id",
+        ),
+        Index(
+            "ix_findings_search_trgm",
+            "search_text",
+            postgresql_using="gin",
+            postgresql_ops={"search_text": "gin_trgm_ops"},
+        ),
+        sa.CheckConstraint(
+            "(status = 'accepted_risk') = (accepted_risk_expires_at IS NOT NULL)",
+            name="ck_findings_accepted_risk_expiry",
+        ),
+        sa.CheckConstraint(
+            "severity IN ('critical','high','medium','low','info')",
+            name="ck_findings_severity",
+        ),
+        sa.CheckConstraint(
+            "status IN ('open','acknowledged','accepted_risk','resolved')",
+            name="ck_findings_status",
+        ),
+        sa.CheckConstraint("occurrence_count >= 1 AND revision >= 1", name="ck_findings_counts"),
+        sa.CheckConstraint("policy_version >= 1", name="ck_findings_policy_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, ForeignKey("collection_sources.id", ondelete="SET NULL"), nullable=True
+    )
+    policy_id: Mapped[str] = mapped_column(sa.String(120), nullable=False)
+    policy_version: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    title: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    description: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    severity: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    status: Mapped[str] = mapped_column(sa.String(24), nullable=False, server_default="open")
+    resource_identity_key: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    resource_type: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    provider: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
+    resource_name: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
+    search_text: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="")
+    first_seen_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    accepted_risk_expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    assignee_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    latest_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, ForeignKey("scan_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    latest_comparison_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, ForeignKey("run_comparisons.id", ondelete="SET NULL"), nullable=True
+    )
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    occurrence_count: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="1")
+    revision: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now()
+    )
+
+
+class FindingOccurrence(Base):
+    __tablename__ = "finding_occurrences"
+    __table_args__ = (
+        UniqueConstraint("finding_id", "occurrence_key", name="uq_finding_occurrences_finding_key"),
+        Index("ix_finding_occurrences_finding_observed_id", "finding_id", sa.desc("observed_at"), sa.desc("id")),
+    )
+
+    id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
+    finding_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, ForeignKey("findings.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, ForeignKey("scan_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    comparison_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, ForeignKey("run_comparisons.id", ondelete="SET NULL"), nullable=True
+    )
+    occurrence_key: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    policy_id: Mapped[str] = mapped_column(sa.String(120), nullable=False)
+    policy_version: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    evidence_state: Mapped[str] = mapped_column(sa.String(24), nullable=False)
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
+    observed_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+    )
 
 
 class IngestError(Base):

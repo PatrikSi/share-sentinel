@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import socket
+import stat
 import sys
 import threading
 import time
@@ -16,7 +17,7 @@ import zlib
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
@@ -418,6 +419,7 @@ COLLECTION_CONTEXT_TEXT_FIELDS = {
     "status",
     "discovery_completeness",
     "sync_mode",
+    "tool_version",
 }
 PERMISSION_RECORD_TYPES = {"permission_assessment", "permission_entry"}
 CONSUMER_STRUCTURAL_RECORD_ERROR = "CONSUMER_STRUCTURAL_RECORD_INVALID"
@@ -431,6 +433,66 @@ CONSUMER_UNCLASSIFIED_INVENTORY_ERROR_CODES = {
     "SCHEMA_INVALID",
     "UTF8_DECODE_ERROR",
     "JSON_DECODE_ERROR",
+}
+
+COMPARISON_ALGORITHM_VERSION = "resource-evidence-v2"
+COMPARISON_DEFAULT_OPTIONS_HASH = hashlib.sha256(b"{}").hexdigest()
+COMPARISON_ITEM_BATCH_SIZE = 5000
+COMPARISON_WORK_QUANTUM_SECONDS = _read_int_env(
+    "COMPARISON_WORK_QUANTUM_SECONDS", 30, min_value=5, max_value=300
+)
+COMPARISON_WORK_QUANTUM_BATCHES = _read_int_env(
+    "COMPARISON_WORK_QUANTUM_BATCHES", 20, min_value=1, max_value=1000
+)
+FINDING_EVALUATION_BATCH_SIZE = _read_int_env(
+    "FINDING_EVALUATION_BATCH_SIZE", 500, min_value=50, max_value=5000
+)
+FINDING_RESOLUTION_BATCH_SIZE = _read_int_env(
+    "FINDING_RESOLUTION_BATCH_SIZE", 250, min_value=25, max_value=1000
+)
+FINDING_POLICIES = {
+    "sharepoint.anonymous_access": {
+        "version": 1,
+        "title": "Anonymous SharePoint access",
+        "description": "A SharePoint resource has explicit evidence of an anonymous sharing link.",
+        "severity": "critical",
+    },
+    "sharepoint.broad_internal_access": {
+        "version": 1,
+        "title": "Organization-wide SharePoint access",
+        "description": "A SharePoint resource has explicit organization-wide sharing evidence.",
+        "severity": "medium",
+    },
+    "smb.write_observed": {
+        "version": 1,
+        "title": "SMB write capability observed",
+        "description": "One or more bounded, non-mutating SMB capability probes indicate write access.",
+        "severity": "high",
+    },
+    "resource.appeared": {
+        "version": 1,
+        "title": "Resource appeared",
+        "description": "A resource appeared between structurally comparable collection runs.",
+        "severity": "info",
+    },
+    "resource.disappeared": {
+        "version": 1,
+        "title": "Resource disappeared",
+        "description": "A resource disappeared between structurally comparable collection runs.",
+        "severity": "low",
+    },
+    "permission.evidence_changed": {
+        "version": 1,
+        "title": "Permission evidence changed",
+        "description": "Comparable direct-permission or bounded capability evidence changed.",
+        "severity": "high",
+    },
+    "comparison.indeterminate": {
+        "version": 1,
+        "title": "Change is indeterminate",
+        "description": "Collection coverage or identity continuity does not support a definitive change conclusion.",
+        "severity": "low",
+    },
 }
 
 
@@ -629,7 +691,32 @@ def _artifact_key_to_path(key: str) -> Path:
 
 
 def open_artifact_stream(key: str):
-    return open(_artifact_key_to_path(key), "rb")
+    # Resolve each path component relative to an already-open directory and
+    # refuse symlinks at every level. This closes the shared-volume TOCTOU
+    # window between validating a path and opening the artifact itself.
+    path = _artifact_key_to_path(key)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("artifact storage requires O_NOFOLLOW support")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | nofollow
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | nofollow
+    directory_fd = os.open(Path(ARTIFACT_STORAGE_PATH), directory_flags)
+    try:
+        relative_parts = path.relative_to(Path(ARTIFACT_STORAGE_PATH)).parts
+        for part in relative_parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(relative_parts[-1], file_flags, dir_fd=directory_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                raise OSError("artifact path is not a regular file")
+            return os.fdopen(file_fd, "rb")
+        except Exception:
+            os.close(file_fd)
+            raise
+    finally:
+        os.close(directory_fd)
 
 
 class ArtifactIntegrityError(RuntimeError):
@@ -798,15 +885,137 @@ def verify_artifact_integrity(
         pass
 
 
+MAX_AUDIT_METADATA_BYTES = 64 * 1024
+MAX_AUDIT_STRING_CHARS = 4096
+MAX_AUDIT_COLLECTION_ITEMS = 100
+MAX_AUDIT_DEPTH = 6
+AUDIT_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
+SENSITIVE_AUDIT_KEY_FINGERPRINT_SUFFIXES = (
+    "accesskey",
+    "accesstoken",
+    "apikey",
+    "assertion",
+    "authorization",
+    "bearertoken",
+    "clientsecret",
+    "connectionstring",
+    "cookie",
+    "credential",
+    "databaseurl",
+    "hashes",
+    "jwt",
+    "lmhash",
+    "nthash",
+    "passphrase",
+    "password",
+    "pem",
+    "privatekey",
+    "refreshtoken",
+    "secret",
+    "token",
+    "tokenhash",
+)
+
+
+def _audit_key_is_sensitive(value: object) -> bool:
+    fingerprint = "".join(character for character in str(value).strip().casefold() if character.isalnum())
+    return fingerprint.endswith(SENSITIVE_AUDIT_KEY_FINGERPRINT_SUFFIXES)
+
+
+def _bounded_audit_string(value: object) -> str:
+    normalized = str(value)
+    if len(normalized) <= MAX_AUDIT_STRING_CHARS:
+        return normalized
+    omitted = len(normalized) - MAX_AUDIT_STRING_CHARS
+    return f"{normalized[:MAX_AUDIT_STRING_CHARS]}…[truncated {omitted} chars]"
+
+
+def _sanitize_audit_value(value: object, *, depth: int = 0) -> Any:
+    if depth >= MAX_AUDIT_DEPTH:
+        return "[truncated: maximum audit metadata depth exceeded]"
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, str):
+        return _bounded_audit_string(value)
+    if isinstance(value, (uuid.UUID, date, datetime)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        pairs = list(value.items())
+        for raw_key, item in pairs[:MAX_AUDIT_COLLECTION_ITEMS]:
+            key = _bounded_audit_string(raw_key)
+            sanitized[key] = (
+                "[redacted]" if _audit_key_is_sensitive(key) else _sanitize_audit_value(item, depth=depth + 1)
+            )
+        if len(pairs) > MAX_AUDIT_COLLECTION_ITEMS:
+            sanitized["_truncated_field_count"] = len(pairs) - MAX_AUDIT_COLLECTION_ITEMS
+        return sanitized
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = list(value)
+        sanitized_items = [
+            _sanitize_audit_value(item, depth=depth + 1) for item in items[:MAX_AUDIT_COLLECTION_ITEMS]
+        ]
+        if len(items) > MAX_AUDIT_COLLECTION_ITEMS:
+            sanitized_items.append({"_truncated_item_count": len(items) - MAX_AUDIT_COLLECTION_ITEMS})
+        return sanitized_items
+    return _bounded_audit_string(value)
+
+
+def sanitize_audit_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    sanitized = _sanitize_audit_value(metadata or {})
+    if not isinstance(sanitized, dict):
+        sanitized = {"value": sanitized}
+    encoded = json.dumps(sanitized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) <= MAX_AUDIT_METADATA_BYTES:
+        return sanitized
+    preserved = {
+        key: value
+        for key, value in sanitized.items()
+        if key in {"request_id", "ip", "user_agent", "reason", "status"}
+    }
+    return {
+        **preserved,
+        "_metadata_truncated": True,
+        "_encoded_bytes_before_truncation": len(encoded),
+        "_top_level_keys": list(sanitized)[:MAX_AUDIT_COLLECTION_ITEMS],
+    }
+
+
+def _validate_audit_label(value: str, *, name: str, max_length: int) -> str:
+    normalized = str(value or "").strip()
+    if not normalized or len(normalized) > max_length or not AUDIT_NAME_PATTERN.fullmatch(normalized):
+        raise ValueError(f"{name} must be a bounded audit identifier")
+    return normalized
+
+
+def _validate_audit_object_id(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized or len(normalized) > 255:
+        raise ValueError("object_id must be between 1 and 255 characters")
+    return normalized
+
+
 def write_audit(
     conn: psycopg.Connection, project_id: str, action: str, object_type: str, object_id: str, metadata: dict[str, Any]
 ):
+    action = _validate_audit_label(action, name="action", max_length=120)
+    object_type = _validate_audit_label(object_type, name="object_type", max_length=80)
+    object_id = _validate_audit_object_id(object_id)
+    sanitized_metadata = sanitize_audit_metadata(metadata)
     conn.execute(
         """
         INSERT INTO audit_events (project_id, action, object_type, object_id, metadata)
         VALUES (%s, %s, %s, %s, %s)
         """,
-        (project_id, action, object_type, object_id, json.dumps(metadata)),
+        (
+            project_id,
+            action,
+            object_type,
+            object_id,
+            json.dumps(sanitized_metadata, ensure_ascii=False, separators=(",", ":")),
+        ),
     )
 
 
@@ -1990,6 +2199,67 @@ def reconcile_permission_summaries(conn: psycopg.Connection, run_id: str) -> Non
                     AND entries_omitted = 0
                     AND unknown_entries = 0
                 ) AS comparable,
+                encode(
+                    sha256(
+                        convert_to(
+                            string_agg(
+                                encode(
+                                    sha256(
+                                        convert_to(
+                                            jsonb_build_array(
+                                                subject_key,
+                                                semantics,
+                                                permission_surface,
+                                                entry_set_hash,
+                                                entries_emitted
+                                            )::text,
+                                            'UTF8'
+                                        )
+                                    ),
+                                    'hex'
+                                ),
+                                E'\n' ORDER BY subject_key, semantics, permission_surface
+                            ),
+                            'UTF8'
+                        )
+                    ),
+                    'hex'
+                ) AS comparison_evidence_hash,
+                encode(
+                    sha256(
+                        convert_to(
+                            string_agg(
+                                encode(
+                                    sha256(
+                                        convert_to(
+                                            jsonb_build_array(
+                                                subject_key,
+                                                semantics,
+                                                permission_surface,
+                                                method,
+                                                assessment_state,
+                                                selection_scope,
+                                                selection_coverage,
+                                                retrieval_coverage,
+                                                provider_visibility,
+                                                semantic_coverage,
+                                                principal_resolution,
+                                                entries_omitted,
+                                                unknown_entries,
+                                                provider_details->>'assessed_identity_fingerprint'
+                                            )::text,
+                                            'UTF8'
+                                        )
+                                    ),
+                                    'hex'
+                                ),
+                                E'\n' ORDER BY subject_key, semantics, permission_surface
+                            ),
+                            'UTF8'
+                        )
+                    ),
+                    'hex'
+                ) AS comparison_quality_hash,
                 BOOL_AND(negative_conclusion_supported) AS negative_supported,
                 BOOL_AND(assessment_state = 'complete') AS all_complete,
                 BOOL_OR(assessment_state IN ('complete', 'partial')) AS any_observed,
@@ -2016,6 +2286,8 @@ def reconcile_permission_summaries(conn: psycopg.Connection, run_id: str) -> Non
             'invalid_entry_kind_count', evidence.invalid_entry_kind_count,
             'noncomparable_entry_count', evidence.noncomparable_entry_count,
             'comparable', evidence.comparable,
+            'comparison_evidence_hash', evidence.comparison_evidence_hash,
+            'comparison_quality_hash', evidence.comparison_quality_hash,
             'negative_conclusion_supported', evidence.negative_supported,
             'semantics', to_jsonb(evidence.semantics),
             'permission_surfaces', to_jsonb(evidence.surfaces),
@@ -2329,54 +2601,874 @@ def reconcile_inventory_collection_context(
     return integrity
 
 
-def prepare_run_identity_keys(conn: psycopg.Connection, run_id: str) -> None:
-    """Populate stable resource keys used by the materialized comparison."""
+def prepare_run_identity_keys_batch(
+    conn: psycopg.Connection,
+    run_id: str,
+    *,
+    resource_after_id: int = 0,
+    item_after_id: int = 0,
+    limit: int = COMPARISON_ITEM_BATCH_SIZE,
+) -> dict[str, int | bool]:
+    """Populate one durable keyset batch without rewriting completed rows."""
 
-    conn.execute(
-        """
-        UPDATE resources AS resource
-        SET identity_key = encode(
-            sha256(
-                convert_to(
-                    CASE
-                        WHEN resource.provider_resource_id IS NOT NULL THEN
-                            jsonb_build_array(
-                                COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)),
-                                resource.resource_type::text,
-                                COALESCE(run.collection_context->>'tenant_id', ''),
-                                'provider_id',
-                                resource.provider_resource_id
-                            )::text
-                        ELSE
-                            jsonb_build_array(
-                                COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)),
-                                resource.resource_type::text,
-                                COALESCE(run.collection_context->>'tenant_id', ''),
-                                'location',
-                                lower(endpoint.endpoint_key),
-                                CASE
-                                    WHEN COALESCE(
-                                        resource.provider,
-                                        split_part(resource.resource_type::text, '_', 1)
-                                    ) IN ('smb', 'sharepoint')
-                                    THEN lower(resource.name)
-                                    ELSE resource.name
-                                END
-                            )::text
-                    END,
-                    'UTF8'
-                )
-            ),
-            'hex'
+    bounded_limit = max(1, min(int(limit), 20_000))
+    resource_ids = [
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT id
+            FROM resources
+            WHERE run_id = %s AND identity_key IS NULL AND id > %s
+            ORDER BY id
+            LIMIT %s
+            """,
+            (run_id, resource_after_id, bounded_limit),
+        ).fetchall()
+    ]
+    if resource_ids:
+        conn.execute(
+            """
+            UPDATE resources AS resource
+            SET identity_key = encode(
+                sha256(
+                    convert_to(
+                        CASE
+                            WHEN resource.provider_resource_id IS NOT NULL THEN
+                                jsonb_build_array(
+                                    COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)),
+                                    resource.resource_type::text,
+                                    COALESCE(run.collection_context->>'tenant_id', ''),
+                                    'provider_id',
+                                    resource.provider_resource_id
+                                )::text
+                            ELSE
+                                jsonb_build_array(
+                                    COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)),
+                                    resource.resource_type::text,
+                                    COALESCE(run.collection_context->>'tenant_id', ''),
+                                    'location',
+                                    lower(endpoint.endpoint_key),
+                                    CASE
+                                        WHEN COALESCE(
+                                            resource.provider,
+                                            split_part(resource.resource_type::text, '_', 1)
+                                        ) IN ('smb', 'sharepoint')
+                                        THEN lower(resource.name)
+                                        ELSE resource.name
+                                    END
+                                )::text
+                        END,
+                        'UTF8'
+                    )
+                ),
+                'hex'
+            )
+            FROM endpoints AS endpoint, scan_runs AS run
+            WHERE resource.run_id = %s
+              AND resource.id = ANY(%s)
+              AND resource.identity_key IS NULL
+              AND endpoint.run_id = resource.run_id
+              AND endpoint.id = resource.endpoint_id
+              AND run.id = resource.run_id
+            """,
+            (run_id, resource_ids),
         )
-        FROM endpoints AS endpoint, scan_runs AS run
-        WHERE resource.run_id = %s
-          AND endpoint.run_id = resource.run_id
-          AND endpoint.id = resource.endpoint_id
-          AND run.id = resource.run_id
-        """,
-        (run_id,),
+        return {
+            "resource_after_id": resource_ids[-1],
+            "item_after_id": item_after_id,
+            "resource_complete": False,
+            "item_complete": False,
+            "processed": len(resource_ids),
+        }
+
+    item_ids = [
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT id
+            FROM items
+            WHERE run_id = %s AND identity_key IS NULL AND id > %s
+            ORDER BY id
+            LIMIT %s
+            """,
+            (run_id, item_after_id, bounded_limit),
+        ).fetchall()
+    ]
+    if item_ids:
+        conn.execute(
+            """
+            UPDATE items AS item
+            SET identity_key = encode(
+                sha256(
+                    convert_to(
+                        jsonb_build_array(
+                            COALESCE(
+                                item.provider,
+                                resource.provider,
+                                split_part(resource.resource_type::text, '_', 1)
+                            ),
+                            CASE WHEN item.provider_item_id IS NOT NULL THEN 'provider_id' ELSE 'path' END,
+                            CASE
+                                WHEN item.provider_item_id IS NOT NULL THEN item.provider_item_id
+                                WHEN COALESCE(
+                                    item.provider,
+                                    resource.provider,
+                                    split_part(resource.resource_type::text, '_', 1)
+                                ) = 'smb' THEN lower(item.path)
+                                ELSE item.path
+                            END
+                        )::text,
+                        'UTF8'
+                    )
+                ),
+                'hex'
+            )
+            FROM resources AS resource
+            WHERE item.run_id = %s
+              AND item.id = ANY(%s)
+              AND item.identity_key IS NULL
+              AND resource.run_id = item.run_id
+              AND resource.id = item.resource_id
+            """,
+            (run_id, item_ids),
+        )
+    return {
+        "resource_after_id": resource_after_id,
+        "item_after_id": item_ids[-1] if item_ids else item_after_id,
+        "resource_complete": True,
+        "item_complete": not item_ids,
+        "processed": len(item_ids),
+    }
+
+
+def prepare_run_identity_keys(
+    conn: psycopg.Connection,
+    run_id: str,
+    *,
+    commit_batches: bool = False,
+) -> None:
+    """Populate stable keys in bounded idempotent batches."""
+
+    resource_after_id = 0
+    item_after_id = 0
+    while True:
+        result = prepare_run_identity_keys_batch(
+            conn,
+            run_id,
+            resource_after_id=resource_after_id,
+            item_after_id=item_after_id,
+        )
+        resource_after_id = int(result["resource_after_id"])
+        item_after_id = int(result["item_after_id"])
+        if commit_batches:
+            conn.execute(
+                """
+                UPDATE scan_runs
+                SET ingest_progress = COALESCE(ingest_progress, '{}'::jsonb)
+                    || jsonb_build_object('heartbeat_at', NOW(), 'identity_preparation_worker', %s::text)
+                WHERE id = %s
+                """,
+                (CONSUMER_NAME, run_id),
+            )
+            conn.commit()
+        if result["item_complete"] is True:
+            return
+
+
+def _canonical_monitoring_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _canonical_monitoring_value(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        normalized = [_canonical_monitoring_value(item) for item in value]
+        return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True, default=str))
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _monitoring_provider(context: dict[str, Any]) -> str:
+    raw = str(context.get("provider") or context.get("source") or "unknown")
+    normalized = "+".join(
+        sorted({part.strip().casefold() for part in raw.replace(",", "+").split("+") if part.strip()})
     )
+    return (normalized or "unknown")[:32]
+
+
+def _monitoring_target_scope(context: dict[str, Any], fallback: Any) -> dict[str, Any]:
+    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    collection = metadata.get("collection") if isinstance(metadata.get("collection"), dict) else {}
+    target = collection.get("target_scope")
+    if not isinstance(target, dict):
+        target = fallback if isinstance(fallback, dict) else {}
+
+    def credential_free(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(key): credential_free(item)
+                for key, item in value.items()
+                if not _is_forbidden_provider_metadata_key(str(key))
+            }
+        if isinstance(value, list):
+            return [credential_free(item) for item in value]
+        return value
+
+    return _canonical_monitoring_value(credential_free(target))
+
+
+def _monitoring_identity(context: dict[str, Any]) -> str | None:
+    assessed = str(context.get("assessed_identity") or "").strip()
+    if assessed:
+        return assessed[:512]
+    tenant_id = str(context.get("tenant_id") or "").strip()
+    client_id = str(context.get("client_id") or "").strip()
+    if tenant_id or client_id:
+        return f"tenant={tenant_id or 'unknown'};client={client_id or 'unknown'}"[:512]
+    auth_mode = str(context.get("auth_mode") or "").strip()
+    return auth_mode[:512] or None
+
+
+def _monitoring_coverage(context: dict[str, Any]) -> dict[str, Any]:
+    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    reasons: list[str] = []
+    structural_complete = metadata.get("structural_complete") is True
+    content_expected = metadata.get("files_included") is True
+    content_complete = metadata.get("content_complete") is True
+    partial = context.get("partial") is True
+    if not structural_complete:
+        reasons.append("Structural discovery was not declared complete.")
+    if content_expected and not content_complete:
+        reasons.append("Content enumeration was not declared complete.")
+    if partial:
+        reasons.append("The collector marked the snapshot partial.")
+    if not context:
+        reasons.append("Collection context was unavailable.")
+    if reasons:
+        state = "unknown" if not context else "partial"
+    else:
+        state = "complete"
+    return {"state": state, "reasons": reasons}
+
+
+def _monitoring_source_key(context: dict[str, Any], fallback_target_scope: dict[str, Any]) -> str | None:
+    provider = _monitoring_provider(context)
+    if not context or provider == "unknown":
+        return None
+    identity_payload = {
+        "provider": provider,
+        "graph_cloud": str(context.get("graph_cloud") or context.get("cloud_environment") or "")
+        .strip()
+        .casefold(),
+        "target_scope": _monitoring_target_scope(context, fallback_target_scope),
+        "assessed_identity": _monitoring_identity(context),
+        "auth_mode": str(context.get("auth_mode") or "").strip().casefold(),
+        "collection_mode": str(context.get("collection_mode") or "").strip().casefold(),
+    }
+    return hashlib.sha256(
+        json.dumps(identity_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+
+
+def monitoring_source_advisory_lock_key(
+    conn: psycopg.Connection,
+    run_id: str,
+    project_id: str,
+) -> int | None:
+    row = conn.execute(
+        "SELECT target_scope, collection_context FROM scan_runs WHERE id = %s AND project_id = %s",
+        (run_id, project_id),
+    ).fetchone()
+    if row is None:
+        return None
+    fallback_scope = dict(row[0]) if isinstance(row[0], dict) else {}
+    context = dict(row[1]) if isinstance(row[1], dict) else {}
+    source_key = _monitoring_source_key(context, fallback_scope)
+    if source_key is None:
+        return None
+    return _monitoring_source_advisory_lock_key(source_key)
+
+
+def _monitoring_source_advisory_lock_key(source_key: str) -> int:
+    digest = hashlib.sha256(f"monitoring-source:{source_key}".encode("ascii")).digest()
+    return int.from_bytes(digest[:8], "big") % (2**63 - 1)
+
+
+def monitoring_source_advisory_lock_key_from_id(
+    conn: psycopg.Connection,
+    source_id: str,
+) -> int | None:
+    row = conn.execute("SELECT source_key FROM collection_sources WHERE id = %s", (source_id,)).fetchone()
+    return _monitoring_source_advisory_lock_key(str(row[0])) if row and row[0] else None
+
+
+def _monitoring_source_display_name(provider: str, target_scope: dict[str, Any], run_name: str) -> str:
+    targets: list[str] = []
+    for field in ("targeted_sites", "hosts", "cidrs"):
+        values = target_scope.get(field)
+        if isinstance(values, list):
+            targets.extend(str(value).strip() for value in values if str(value).strip())
+    suffix = targets[0] if len(targets) == 1 else f"{len(targets)} targets" if targets else run_name
+    return f"{provider.upper()} · {suffix}"[:255]
+
+
+def _bounded_source_target_scope(target_scope: dict[str, Any]) -> dict[str, Any]:
+    """Persist a deterministic response-safe summary while identity uses full scope."""
+
+    canonical = _canonical_monitoring_value(target_scope)
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    summary: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    truncated = len(encoded) > 4_096 or len(canonical) > 16
+
+    def within_example_budget(candidate: dict[str, Any]) -> bool:
+        return len(json.dumps(candidate, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) <= 4_096
+
+    for key in sorted(canonical)[:16]:
+        value = canonical[key]
+        bounded_key = str(key)[:64]
+        if isinstance(value, list):
+            counts[bounded_key] = len(value)
+            bounded_values: list[Any] = []
+            for item in value[:20]:
+                if isinstance(item, (str, int, float, bool)) or item is None:
+                    candidate_item = item[:256] if isinstance(item, str) else item
+                else:
+                    candidate_item = {
+                        "value_hash": hashlib.sha256(
+                            json.dumps(item, sort_keys=True, default=str).encode("utf-8")
+                        ).hexdigest()
+                    }
+                candidate_values = [*bounded_values, candidate_item]
+                if not within_example_budget({**summary, bounded_key: candidate_values}):
+                    truncated = True
+                    break
+                bounded_values = candidate_values
+            summary[bounded_key] = bounded_values
+            truncated = truncated or len(value) > len(bounded_values)
+        elif isinstance(value, dict):
+            counts[bounded_key] = len(value)
+            summary[bounded_key] = {
+                "field_count": len(value),
+                "value_hash": hashlib.sha256(
+                    json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest(),
+            }
+            truncated = True
+        elif isinstance(value, str):
+            candidate_value = value[:256]
+            if within_example_budget({**summary, bounded_key: candidate_value}):
+                summary[bounded_key] = candidate_value
+            else:
+                truncated = True
+            truncated = truncated or len(value) > 256
+        elif isinstance(value, (int, float, bool)) or value is None:
+            if within_example_budget({**summary, bounded_key: value}):
+                summary[bounded_key] = value
+            else:
+                truncated = True
+        else:
+            summary[bounded_key] = str(value)[:512]
+            truncated = True
+    summary["_scope_summary"] = {
+        "scope_hash": hashlib.sha256(encoded).hexdigest(),
+        "original_bytes": len(encoded),
+        "top_level_field_count": len(canonical),
+        "list_counts": counts,
+        "truncated": truncated,
+        "limitations": ["Target scope values are bounded examples; scope_hash identifies the full scope."]
+        if truncated
+        else [],
+    }
+    return summary
+
+
+def _recompute_source_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
+    """Keep inventory, policy evaluation, and baseline coverage explicit."""
+
+    inventory = coverage.get("inventory") if isinstance(coverage.get("inventory"), dict) else {}
+    inventory_state = str(inventory.get("state") or coverage.get("state") or "unknown").casefold()
+    inventory_reasons = [str(reason) for reason in inventory.get("reasons", []) if str(reason).strip()]
+    findings = (
+        coverage.get("monitoring_findings")
+        if isinstance(coverage.get("monitoring_findings"), dict)
+        else {"state": "unknown"}
+    )
+    baseline = (
+        coverage.get("automatic_baseline")
+        if isinstance(coverage.get("automatic_baseline"), dict)
+        else {"state": "unknown"}
+    )
+    findings_state = str(findings.get("state") or "unknown").casefold()
+    baseline_state = str(baseline.get("state") or "unknown").casefold()
+    baseline_findings_state = str(baseline.get("findings_evaluation_state") or "complete").casefold()
+    reasons = list(inventory_reasons)
+    if findings_state != "complete":
+        reasons.append(
+            "Security finding evaluation is incomplete."
+            if findings_state not in {"queued", "retrying", "evaluating"}
+            else "Security finding evaluation is pending or retrying."
+        )
+    if baseline_state != "established":
+        reasons.append("Automatic comparison coverage has not established a usable baseline.")
+    elif baseline_findings_state != "complete":
+        reasons.append("Automatic comparison finding evaluation is incomplete.")
+    if inventory_state not in {"complete", "partial", "unknown"}:
+        inventory_state = "unknown"
+    coverage["state"] = (
+        inventory_state
+        if findings_state == "complete"
+        and baseline_state == "established"
+        and baseline_findings_state == "complete"
+        else ("unknown" if inventory_state == "unknown" else "partial")
+    )
+    coverage["reasons"] = list(dict.fromkeys(reasons))
+    return coverage
+
+
+def update_collection_source_monitoring_coverage(
+    conn: psycopg.Connection,
+    *,
+    source_id: str,
+    run_id: str,
+    findings: dict[str, Any] | None = None,
+    baseline: dict[str, Any] | None = None,
+) -> None:
+    """Publish current successful-snapshot coverage while preserving attempt health."""
+
+    row = conn.execute(
+        """
+        SELECT source.coverage, run.collection_context
+        FROM collection_sources AS source
+        JOIN scan_runs AS run ON run.id = %s
+        WHERE source.id = %s AND run.source_id = source.id
+        FOR UPDATE OF source
+        """,
+        (run_id, source_id),
+    ).fetchone()
+    if row is None:
+        return
+    coverage = dict(row[0]) if isinstance(row[0], dict) else {}
+    context = dict(row[1]) if isinstance(row[1], dict) else {}
+    inventory = _monitoring_coverage(context)
+    coverage["inventory"] = inventory
+    if findings is not None:
+        coverage["monitoring_findings"] = {
+            key: findings.get(key)
+            for key in (
+                "state",
+                "phase",
+                "attempt_count",
+                "next_retry_at",
+                "error_code",
+                "reason",
+                "observed",
+                "resolved",
+            )
+            if key in findings
+        } | {
+            "run_id": run_id,
+            "retryable": str(findings.get("state") or "") == "degraded",
+        }
+    if baseline is not None:
+        coverage["automatic_baseline"] = baseline
+    coverage = _recompute_source_coverage(coverage)
+    conn.execute(
+        "UPDATE collection_sources SET coverage = %s::jsonb, updated_at = NOW() WHERE id = %s",
+        (json.dumps(coverage, ensure_ascii=True, separators=(",", ":")), source_id),
+    )
+
+
+def register_collection_source(
+    conn: psycopg.Connection,
+    run_id: str,
+    project_id: str,
+    *,
+    succeeded: bool = True,
+) -> str | None:
+    """Idempotently register a credential-free collection source for a run."""
+
+    row = conn.execute(
+        """
+        SELECT name, target_scope, collection_context, created_at
+        FROM scan_runs
+        WHERE id = %s AND project_id = %s
+        FOR UPDATE
+        """,
+        (run_id, project_id),
+    ).fetchone()
+    if row is None or len(row) != 4:
+        return None
+    run_name, fallback_target_scope, raw_context, run_created_at = row
+    context = dict(raw_context) if isinstance(raw_context, dict) else {}
+    provider = _monitoring_provider(context)
+    # Never guess source identity from a run name or an empty artifact. Doing
+    # so would merge unrelated failures into a misleading health record.
+    if not context or provider == "unknown":
+        return None
+    target_scope = _monitoring_target_scope(context, fallback_target_scope)
+    persisted_target_scope = _bounded_source_target_scope(target_scope)
+    assessed_identity = _monitoring_identity(context)
+    source_key = _monitoring_source_key(context, target_scope)
+    if source_key is None:
+        return None
+    source_id = str(uuid.uuid4())
+    inventory_coverage = _monitoring_coverage(context)
+    coverage = _recompute_source_coverage(
+        {
+            **inventory_coverage,
+            "inventory": inventory_coverage,
+            "monitoring_findings": {"state": "pending" if succeeded else "not_evaluated"},
+            "automatic_baseline": {"state": "pending" if succeeded else "not_evaluated"},
+            "last_terminal_status": "success" if succeeded else "failed",
+        }
+    )
+    collector_version = str(context.get("tool_version") or "").strip()[:64] or None
+    display_name = _monitoring_source_display_name(provider, target_scope, str(run_name or "collection"))
+    persisted = conn.execute(
+        """
+        INSERT INTO collection_sources (
+            id, project_id, source_key, display_name, provider,
+            assessed_identity, target_scope, last_run_id, last_success_at,
+            last_failure_at, collector_version, coverage, created_at, updated_at
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s::jsonb, %s,
+            CASE WHEN %s THEN %s::timestamptz END,
+            CASE WHEN %s THEN NULL ELSE %s::timestamptz END,
+            %s, %s::jsonb, NOW(), NOW()
+        )
+        ON CONFLICT (project_id, source_key) DO UPDATE SET
+            provider = EXCLUDED.provider,
+            assessed_identity = EXCLUDED.assessed_identity,
+            target_scope = EXCLUDED.target_scope,
+            last_run_id = EXCLUDED.last_run_id,
+            last_success_at = CASE
+                WHEN %s THEN EXCLUDED.last_success_at ELSE collection_sources.last_success_at
+            END,
+            last_failure_at = CASE
+                WHEN %s THEN collection_sources.last_failure_at ELSE EXCLUDED.last_failure_at
+            END,
+            collector_version = COALESCE(EXCLUDED.collector_version, collection_sources.collector_version),
+            coverage = EXCLUDED.coverage,
+            updated_at = NOW()
+        WHERE collection_sources.last_run_id IS NULL
+           OR EXISTS (
+                SELECT 1
+                FROM scan_runs AS incoming_run
+                LEFT JOIN scan_runs AS previous_run ON previous_run.id = collection_sources.last_run_id
+                WHERE incoming_run.id = EXCLUDED.last_run_id
+                  AND (
+                        previous_run.id IS NULL
+                        OR (incoming_run.created_at, incoming_run.id)
+                           >= (previous_run.created_at, previous_run.id)
+                  )
+           )
+        RETURNING id::text
+        """,
+        (
+            source_id,
+            project_id,
+            source_key,
+            display_name,
+            provider,
+            assessed_identity,
+            json.dumps(persisted_target_scope, ensure_ascii=True, separators=(",", ":")),
+            run_id,
+            succeeded,
+            run_created_at,
+            succeeded,
+            run_created_at,
+            collector_version,
+            json.dumps(coverage, ensure_ascii=True, separators=(",", ":")),
+            succeeded,
+            succeeded,
+        ),
+    ).fetchone()
+    latest_state_updated = persisted is not None
+    if persisted is None:
+        persisted = conn.execute(
+            "SELECT id::text FROM collection_sources WHERE project_id = %s AND source_key = %s",
+            (project_id, source_key),
+        ).fetchone()
+        if persisted is None:
+            return None
+    source_id = str(persisted[0])
+    timestamp_column = "last_success_at" if succeeded else "last_failure_at"
+    conn.execute(
+        f"""
+        UPDATE collection_sources
+        SET {timestamp_column} = GREATEST(
+                COALESCE({timestamp_column}, %s::timestamptz),
+                %s::timestamptz
+            ),
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (run_created_at, run_created_at, source_id),
+    )
+    conn.execute("UPDATE scan_runs SET source_id = %s WHERE id = %s", (source_id, run_id))
+    write_audit(
+        conn,
+        project_id,
+        "COLLECTION_SOURCE_OBSERVED",
+        "collection_source",
+        source_id,
+        {
+            "worker": CONSUMER_NAME,
+            "run_id": run_id,
+            "provider": provider,
+            "coverage": coverage,
+            "terminal_status": "success" if succeeded else "failed",
+            "latest_state_updated": latest_state_updated,
+        },
+    )
+    return source_id
+
+
+def collection_source_automation_enabled(conn: psycopg.Connection, source_id: str) -> bool:
+    row = conn.execute("SELECT enabled FROM collection_sources WHERE id = %s", (source_id,)).fetchone()
+    return bool(row and row[0] is True)
+
+
+def collection_source_run_is_latest_complete_candidate(
+    conn: psycopg.Connection,
+    source_id: str,
+    run_id: str,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT NOT EXISTS (
+            SELECT 1
+            FROM scan_runs AS newer_run
+            JOIN scan_runs AS current_run ON current_run.id = %s
+            WHERE newer_run.source_id = %s
+              AND newer_run.status = 'COMPLETE'
+              AND (newer_run.created_at, newer_run.id)
+                  > (current_run.created_at, current_run.id)
+        )
+        """,
+        (run_id, source_id),
+    ).fetchone()
+    return bool(row and row[0] is True)
+
+
+def _automatic_comparison_signature(context: dict[str, Any]) -> dict[str, Any]:
+    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    collection = metadata.get("collection") if isinstance(metadata.get("collection"), dict) else {}
+    return _canonical_monitoring_value(
+        {
+            "provider": _monitoring_provider(context),
+            "graph_cloud": context.get("graph_cloud") or context.get("cloud_environment"),
+            "collection_mode": context.get("collection_mode"),
+            "auth_type": context.get("auth_type"),
+            "auth_mode": context.get("auth_mode"),
+            "tenant_id": context.get("tenant_id"),
+            "client_id": context.get("client_id"),
+            "assessed_identity": context.get("assessed_identity"),
+            "scopes": context.get("scopes") or [],
+            "roles": context.get("roles") or [],
+            "target_scope": collection.get("target_scope"),
+            "enumeration": collection.get("enumeration"),
+            "comparison_contracts": metadata.get("comparison_contracts"),
+        }
+    )
+
+
+def _automatic_comparison_compatibility(
+    current_context: dict[str, Any],
+    baseline_context: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not current_context or not baseline_context:
+        return None
+    if _automatic_comparison_signature(current_context) != _automatic_comparison_signature(baseline_context):
+        return None
+    current_meta = current_context.get("metadata") if isinstance(current_context.get("metadata"), dict) else {}
+    baseline_meta = baseline_context.get("metadata") if isinstance(baseline_context.get("metadata"), dict) else {}
+    authoritative = {
+        "authoritative",
+        "complete",
+        "complete_for_declared_scope",
+        "complete_for_granted_scope",
+        "full",
+        "targeted_scope",
+    }
+    structural = all(
+        context.get("materialized_snapshot") is True
+        and str(context.get("discovery_completeness") or "").strip().casefold() in authoritative
+        and metadata.get("structural_complete") is True
+        for context, metadata in ((current_context, current_meta), (baseline_context, baseline_meta))
+    )
+    files_included = all(meta.get("files_included") is True for meta in (current_meta, baseline_meta))
+    content = structural and files_included and all(
+        meta.get("content_complete") is True for meta in (current_meta, baseline_meta)
+    )
+    permissions_assessed = all(meta.get("permissions_assessed") is True for meta in (current_meta, baseline_meta))
+    permissions_complete = permissions_assessed and all(
+        meta.get("permissions_complete") is True for meta in (current_meta, baseline_meta)
+    )
+    providers = set(_monitoring_provider(current_context).split("+"))
+    supported_access = bool(providers) and providers.issubset({"smb", "sharepoint"})
+    direct_permissions = permissions_complete and supported_access
+    capability_applicable = providers == {"smb"}
+    contracts = current_meta.get("comparison_contracts") if isinstance(current_meta.get("comparison_contracts"), dict) else {}
+    capability = capability_applicable and bool(contracts.get("capability"))
+    reasons: list[str] = []
+    if not structural:
+        reasons.append("Automatic baseline context does not support structural conclusions.")
+    if not content:
+        reasons.append("Automatic baseline context does not support item-level conclusions.")
+    if not direct_permissions:
+        reasons.append("Direct-permission evidence is incomplete or unavailable for the automatic baseline.")
+    dimensions = (structural, content, direct_permissions, not capability_applicable or capability)
+    return {
+        "status": "compatible" if all(dimensions) else ("partial" if any(dimensions) else "incompatible"),
+        "structural_interpretable": structural,
+        "content_interpretable": content,
+        "access_context_comparable": True,
+        "access_provider_coverage_complete": supported_access,
+        "capability_applicable": capability_applicable,
+        "capability_provider_coverage_complete": capability_applicable,
+        "smb_identity_required": "smb" in providers,
+        "identity_applicable": "smb" in providers,
+        "identity_scope_exact": "smb" not in providers,
+        "unsupported_access_providers": sorted(providers - {"smb", "sharepoint"}),
+        "access_interpretable": direct_permissions,
+        "capability_interpretable": capability,
+        "direct_permissions_assessed": permissions_assessed,
+        "direct_permissions_complete": permissions_complete,
+        "direct_permissions_interpretable": direct_permissions,
+        "direct_permissions_scope_exact": False,
+        "automatic_baseline": True,
+        "reasons": reasons,
+    }
+
+
+def create_automatic_comparison(
+    conn: psycopg.Connection,
+    *,
+    project_id: str,
+    source_id: str,
+    current_run_id: str,
+) -> str | None:
+    current_row = conn.execute(
+        "SELECT collection_context, created_at FROM scan_runs "
+        "WHERE id = %s AND project_id = %s AND status = 'COMPLETE'",
+        (current_run_id, project_id),
+    ).fetchone()
+    if current_row is None:
+        return None
+    current_context = dict(current_row[0]) if isinstance(current_row[0], dict) else {}
+    current_created_at = current_row[1]
+    candidates = conn.execute(
+        """
+        SELECT id::text, collection_context
+        FROM scan_runs
+        WHERE project_id = %s
+          AND source_id = %s
+          AND id <> %s
+          AND status = 'COMPLETE'
+          AND (created_at, id) < (%s, %s::uuid)
+        ORDER BY created_at DESC, id DESC
+        LIMIT 20
+        """,
+        (project_id, source_id, current_run_id, current_created_at, current_run_id),
+    ).fetchall()
+    baseline_run_id: str | None = None
+    compatibility: dict[str, Any] | None = None
+    for candidate_id, raw_context in candidates:
+        baseline_context = dict(raw_context) if isinstance(raw_context, dict) else {}
+        candidate_compatibility = _automatic_comparison_compatibility(current_context, baseline_context)
+        if candidate_compatibility is not None:
+            baseline_run_id = str(candidate_id)
+            compatibility = candidate_compatibility
+            break
+    if baseline_run_id is None or compatibility is None:
+        update_collection_source_monitoring_coverage(
+            conn,
+            source_id=source_id,
+            run_id=current_run_id,
+            baseline={
+                "state": "unavailable",
+                "reason": "no_prior_complete_run" if not candidates else "no_compatible_prior_run",
+                "candidates_considered": len(candidates),
+                "candidate_window_limit": 20,
+                "candidate_window_exhausted": len(candidates) >= 20,
+            },
+        )
+        return None
+
+    comparison_id = str(uuid.uuid4())
+    inserted = conn.execute(
+        """
+        INSERT INTO run_comparisons (
+            id, project_id, source_id, baseline_run_id, current_run_id,
+            algorithm_version, options_hash, trigger, state, compatibility,
+            progress, summary, attempt_count, created_at
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, 'automatic', 'queued', %s::jsonb,
+            '{"phase":"queued","processed":0,"automatic":true}'::jsonb,
+            '{"appeared":0,"disappeared":0,"changed":0,"indeterminate":0,"total":0,"exact":false,"resource_summary_exact":false,"item_churn_computed":false}'::jsonb,
+            0, NOW()
+        )
+        ON CONFLICT (
+            project_id, baseline_run_id, current_run_id, algorithm_version, options_hash
+        ) DO NOTHING
+        RETURNING id::text
+        """,
+        (
+            comparison_id,
+            project_id,
+            source_id,
+            baseline_run_id,
+            current_run_id,
+            COMPARISON_ALGORITHM_VERSION,
+            COMPARISON_DEFAULT_OPTIONS_HASH,
+            json.dumps(compatibility, ensure_ascii=True, separators=(",", ":")),
+        ),
+    ).fetchone()
+    if inserted is None:
+        existing = conn.execute(
+            """
+            SELECT id::text, state
+            FROM run_comparisons
+            WHERE project_id = %s AND baseline_run_id = %s AND current_run_id = %s
+              AND algorithm_version = %s AND options_hash = %s
+            """,
+            (
+                project_id,
+                baseline_run_id,
+                current_run_id,
+                COMPARISON_ALGORITHM_VERSION,
+                COMPARISON_DEFAULT_OPTIONS_HASH,
+            ),
+        ).fetchone()
+        comparison_id = str(existing[0]) if existing else comparison_id
+    baseline_state = "established" if inserted is None and existing and str(existing[1]) == "complete" else "queued"
+    update_collection_source_monitoring_coverage(
+        conn,
+        source_id=source_id,
+        run_id=current_run_id,
+        baseline={
+            "state": baseline_state,
+            "comparison_id": comparison_id,
+            "baseline_run_id": baseline_run_id,
+        },
+    )
+    if inserted is None:
+        return comparison_id if existing else None
+    write_audit(
+        conn,
+        project_id,
+        "AUTOMATIC_COMPARISON_CREATED",
+        "run_comparison",
+        comparison_id,
+        {
+            "worker": CONSUMER_NAME,
+            "source_id": source_id,
+            "baseline_run_id": baseline_run_id,
+            "current_run_id": current_run_id,
+            "algorithm_version": COMPARISON_ALGORITHM_VERSION,
+        },
+    )
+    return comparison_id
 
 
 def _smb_identity_rows_stable(rows: list[tuple[Any, ...]], baseline_run_id: str, current_run_id: str) -> bool:
@@ -5419,6 +6511,123 @@ def discover_uploaded_runs(limit: int = 8) -> list[dict[str, str]]:
     return discover_recoverable_runs(limit=limit)
 
 
+def discover_recoverable_monitoring_evaluations(limit: int = 8) -> list[dict[str, str]]:
+    """Claim bounded monitoring-only retries without re-ingesting artifacts."""
+
+    with connect_database() as conn:
+        rows = conn.execute(
+            """
+            WITH candidates AS (
+                SELECT id
+                FROM scan_runs
+                WHERE status = 'COMPLETE'
+                  AND source_id IS NOT NULL
+                  AND (
+                      (
+                          COALESCE(ingest_progress #>> '{monitoring_findings,state}', '')
+                              IN ('queued', 'retrying')
+                          AND COALESCE(
+                              CASE
+                                  WHEN pg_input_is_valid(
+                                      NULLIF(ingest_progress #>> '{monitoring_findings,next_retry_at}', ''),
+                                      'timestamp with time zone'
+                                  )
+                                  THEN NULLIF(
+                                      ingest_progress #>> '{monitoring_findings,next_retry_at}', ''
+                                  )::timestamptz
+                              END,
+                              TO_TIMESTAMP(0)
+                          ) <= NOW()
+                      )
+                      OR (
+                          COALESCE(ingest_progress #>> '{monitoring_findings,state}', '') = 'evaluating'
+                          AND COALESCE(
+                              CASE
+                                  WHEN pg_input_is_valid(
+                                      NULLIF(ingest_progress->>'heartbeat_at', ''),
+                                      'timestamp with time zone'
+                                  )
+                                  THEN NULLIF(ingest_progress->>'heartbeat_at', '')::timestamptz
+                              END,
+                              created_at
+                          ) <= NOW() - (%s * INTERVAL '1 second')
+                      )
+                  )
+                ORDER BY created_at, id
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            UPDATE scan_runs AS run
+            SET ingest_progress = COALESCE(run.ingest_progress, '{}'::jsonb)
+                || jsonb_build_object(
+                    'heartbeat_at', NOW(),
+                    'monitoring_worker', %s::text,
+                    'monitoring_findings',
+                        COALESCE(run.ingest_progress->'monitoring_findings', '{}'::jsonb)
+                        || jsonb_build_object(
+                            'state', 'evaluating',
+                            'phase', COALESCE(
+                                run.ingest_progress #>> '{monitoring_findings,phase}',
+                                'candidates'
+                            ),
+                            'recovery_claimed_at', NOW(),
+                            'recovery_claimed_by', %s::text
+                        )
+                )
+            FROM candidates
+            WHERE run.id = candidates.id
+            RETURNING run.id::text, run.project_id::text, run.source_id::text
+            """,
+            (STALE_INGESTING_SECONDS, max(1, min(int(limit), 100)), CONSUMER_NAME, CONSUMER_NAME),
+        ).fetchall()
+    return [
+        {
+            "job_type": "monitoring_evaluation",
+            "run_id": str(row[0]),
+            "project_id": str(row[1]),
+            "source_id": str(row[2]),
+        }
+        for row in rows
+    ]
+
+
+def reopen_expired_accepted_risk_findings(limit: int = 100) -> int:
+    """Boundedly reopen expired risk acceptances and audit in one transaction."""
+
+    with connect_database() as conn:
+        rows = conn.execute(
+            """
+            WITH candidates AS (
+                SELECT id
+                FROM findings
+                WHERE status = 'accepted_risk'
+                  AND accepted_risk_expires_at <= NOW()
+                ORDER BY accepted_risk_expires_at, id
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            UPDATE findings AS finding
+            SET status = 'open', accepted_risk_expires_at = NULL,
+                resolved_at = NULL, revision = finding.revision + 1,
+                updated_at = NOW()
+            FROM candidates
+            WHERE finding.id = candidates.id
+            RETURNING finding.id::text, finding.project_id::text
+            """,
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+        for finding_id, project_id in rows:
+            write_audit(
+                conn,
+                str(project_id),
+                "FINDING_ACCEPTED_RISK_EXPIRED",
+                "finding",
+                str(finding_id),
+                {"worker": CONSUMER_NAME, "new_status": "open"},
+            )
+    return len(rows)
+
+
 def discover_recoverable_comparisons(limit: int = 8) -> list[dict[str, str]]:
     with connect_database() as conn:
         rows = conn.execute(
@@ -5443,7 +6652,6 @@ def discover_recoverable_comparisons(limit: int = 8) -> list[dict[str, str]]:
             SET state = 'running',
                 heartbeat_at = NOW(),
                 progress = COALESCE(comparison.progress, '{}'::jsonb) || jsonb_build_object(
-                    'phase', 'recovery_claimed',
                     'recovery_claimed_at', NOW(),
                     'recovery_claimed_by', %s::text
                 )
@@ -5458,6 +6666,62 @@ def discover_recoverable_comparisons(limit: int = 8) -> list[dict[str, str]]:
             "job_type": "comparison",
             "comparison_id": row[0],
             "project_id": row[1],
+        }
+        for row in rows
+    ]
+
+
+def discover_recoverable_comparison_finding_evaluations(limit: int = 8) -> list[dict[str, str]]:
+    """Claim derived finding retries while keeping a valid comparison visible."""
+
+    with connect_database() as conn:
+        rows = conn.execute(
+            """
+            WITH candidates AS (
+                SELECT id
+                FROM run_comparisons
+                WHERE state = 'complete'
+                  AND COALESCE(summary #>> '{findings_evaluation,state}', '') IN ('queued', 'retrying')
+                  AND COALESCE(
+                      CASE
+                          WHEN pg_input_is_valid(
+                              NULLIF(summary #>> '{findings_evaluation,next_retry_at}', ''),
+                              'timestamp with time zone'
+                          )
+                          THEN NULLIF(
+                              summary #>> '{findings_evaluation,next_retry_at}', ''
+                          )::timestamptz
+                      END,
+                      TO_TIMESTAMP(0)
+                  ) <= NOW()
+                ORDER BY completed_at, id
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            UPDATE run_comparisons AS comparison
+            SET heartbeat_at = NOW(),
+                summary = jsonb_set(
+                    COALESCE(comparison.summary, '{}'::jsonb),
+                    '{findings_evaluation}',
+                    COALESCE(comparison.summary->'findings_evaluation', '{}'::jsonb)
+                        || jsonb_build_object(
+                            'state', 'evaluating',
+                            'recovery_claimed_at', NOW(),
+                            'recovery_claimed_by', %s::text
+                        ),
+                    TRUE
+                )
+            FROM candidates
+            WHERE comparison.id = candidates.id
+            RETURNING comparison.id::text, comparison.project_id::text
+            """,
+            (max(1, min(int(limit), 100)), CONSUMER_NAME),
+        ).fetchall()
+    return [
+        {
+            "job_type": "comparison_findings_evaluation",
+            "comparison_id": str(row[0]),
+            "project_id": str(row[1]),
         }
         for row in rows
     ]
@@ -6091,6 +7355,1209 @@ def _materialize_comparison_batch(
     return len(row)
 
 
+def _next_item_resource_change(
+    conn: psycopg.Connection,
+    comparison_id: str,
+    after_id: int,
+) -> tuple[int, int | None, int | None, str] | None:
+    row = conn.execute(
+        """
+        SELECT id, before_resource_id, after_resource_id, provider
+        FROM comparison_resource_changes
+        WHERE comparison_id = %s
+          AND id > %s
+          AND (before_resource_id IS NOT NULL OR after_resource_id IS NOT NULL)
+        ORDER BY id
+        LIMIT 1
+        """,
+        (comparison_id, after_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row[0]), int(row[1]) if row[1] is not None else None, int(row[2]) if row[2] is not None else None, str(row[3])
+
+
+def _item_resource_change_by_id(
+    conn: psycopg.Connection,
+    comparison_id: str,
+    resource_change_id: int,
+) -> tuple[int, int | None, int | None, str] | None:
+    row = conn.execute(
+        """
+        SELECT id, before_resource_id, after_resource_id, provider
+        FROM comparison_resource_changes
+        WHERE comparison_id = %s AND id = %s
+        """,
+        (comparison_id, resource_change_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row[0]), int(row[1]) if row[1] is not None else None, int(row[2]) if row[2] is not None else None, str(row[3])
+
+
+def _mark_item_identity_indeterminate(
+    conn: psycopg.Connection,
+    comparison_id: str,
+    resource_change_id: int,
+) -> None:
+    conn.execute(
+        """
+        UPDATE comparison_resource_changes
+        SET change_type = CASE
+                WHEN change_categories = '["item_history_candidate"]'::jsonb THEN 'indeterminate'
+                ELSE change_type
+            END,
+            change_categories = CASE
+                WHEN change_categories = '["item_history_candidate"]'::jsonb
+                THEN '["item_identity_ambiguous"]'::jsonb
+                WHEN change_categories ? 'item_identity_ambiguous' THEN change_categories
+                ELSE change_categories || '["item_identity_ambiguous"]'::jsonb
+            END,
+            content_state = 'indeterminate',
+            access_interpretation =
+                'item history is indeterminate because item identities are missing or duplicated',
+            impact_rank = GREATEST(impact_rank, 60)
+        WHERE comparison_id = %s AND id = %s
+        """,
+        (comparison_id, resource_change_id),
+    )
+
+
+def _ensure_item_candidate_resource_changes(
+    conn: psycopg.Connection,
+    *,
+    comparison_id: str,
+    baseline_run_id: str,
+    current_run_id: str,
+    identity_keys: list[str],
+) -> int:
+    if not identity_keys:
+        return 0
+    rows = conn.execute(
+        """
+        WITH baseline AS (
+            SELECT resource.*, endpoint.endpoint_key
+            FROM resources AS resource
+            JOIN endpoints AS endpoint
+              ON endpoint.id = resource.endpoint_id AND endpoint.run_id = resource.run_id
+            WHERE resource.run_id = %(baseline_run_id)s
+              AND resource.identity_key = ANY(%(identity_keys)s)
+        ),
+        current AS (
+            SELECT resource.*, endpoint.endpoint_key
+            FROM resources AS resource
+            JOIN endpoints AS endpoint
+              ON endpoint.id = resource.endpoint_id AND endpoint.run_id = resource.run_id
+            WHERE resource.run_id = %(current_run_id)s
+              AND resource.identity_key = ANY(%(identity_keys)s)
+        )
+        INSERT INTO comparison_resource_changes (
+            comparison_id, identity_key, change_type, provider, resource_type,
+            provider_resource_id, match_basis, match_quality, before_resource_id,
+            after_resource_id, endpoint_key_before, endpoint_key_after,
+            resource_name_before, resource_name_after, change_categories,
+            structural_state, access_state, content_state, access_interpretation,
+            item_count_before, item_count_after, before_snapshot, after_snapshot,
+            search_text, impact_rank
+        )
+        SELECT
+            %(comparison_id)s,
+            current.identity_key,
+            'changed',
+            COALESCE(current.provider, split_part(current.resource_type::text, '_', 1)),
+            current.resource_type::text,
+            current.provider_resource_id,
+            CASE WHEN current.provider_resource_id IS NOT NULL THEN 'provider_resource_id' ELSE 'location' END,
+            CASE WHEN current.provider_resource_id IS NOT NULL THEN 'strong' ELSE 'weak' END,
+            baseline.id,
+            current.id,
+            baseline.endpoint_key,
+            current.endpoint_key,
+            baseline.name,
+            current.name,
+            '["item_history_candidate"]'::jsonb,
+            'unchanged',
+            'not_assessed',
+            'pending',
+            'resource is temporarily materialized while item-level changes are evaluated',
+            NULL,
+            NULL,
+            jsonb_build_object(
+                'resource_id', baseline.id,
+                'endpoint_key', baseline.endpoint_key,
+                'name', baseline.name,
+                'access_level', baseline.access_level,
+                'exposure', baseline.exposure
+            ),
+            jsonb_build_object(
+                'resource_id', current.id,
+                'endpoint_key', current.endpoint_key,
+                'name', current.name,
+                'access_level', current.access_level,
+                'exposure', current.exposure
+            ),
+            lower(concat_ws(' ', baseline.name, current.name, baseline.endpoint_key, current.endpoint_key)),
+            0
+        FROM baseline
+        JOIN current USING (identity_key)
+        WHERE EXISTS (
+            SELECT 1
+            FROM items AS item
+            WHERE (
+                    item.run_id = %(baseline_run_id)s
+                    AND item.resource_id = baseline.id
+                  )
+               OR (
+                    item.run_id = %(current_run_id)s
+                    AND item.resource_id = current.id
+                  )
+            LIMIT 1
+        )
+        ON CONFLICT (comparison_id, identity_key) DO NOTHING
+        RETURNING id
+        """,
+        {
+            "comparison_id": comparison_id,
+            "baseline_run_id": baseline_run_id,
+            "current_run_id": current_run_id,
+            "identity_keys": identity_keys,
+        },
+    ).fetchall()
+    return len(rows)
+
+
+def _finalize_item_candidate_resources(conn: psycopg.Connection, comparison_id: str) -> None:
+    conn.execute(
+        """
+        DELETE FROM comparison_resource_changes AS resource_change
+        WHERE resource_change.comparison_id = %s
+          AND resource_change.change_categories = '["item_history_candidate"]'::jsonb
+          AND resource_change.content_state <> 'indeterminate'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM comparison_item_changes AS item_change
+              WHERE item_change.resource_change_id = resource_change.id
+          )
+        """,
+        (comparison_id,),
+    )
+    conn.execute(
+        """
+        UPDATE comparison_resource_changes AS resource_change
+        SET change_categories = '["item_changes"]'::jsonb,
+            content_state = 'changed',
+            access_interpretation = 'item-level changes were materialized; access evidence was unchanged or not assessed',
+            impact_rank = GREATEST(resource_change.impact_rank, 50)
+        WHERE resource_change.comparison_id = %s
+          AND resource_change.change_categories = '["item_history_candidate"]'::jsonb
+          AND EXISTS (
+              SELECT 1
+              FROM comparison_item_changes AS item_change
+              WHERE item_change.resource_change_id = resource_change.id
+          )
+        """,
+        (comparison_id,),
+    )
+
+
+def _item_identity_is_ambiguous(
+    conn: psycopg.Connection,
+    before_resource_id: int | None,
+    after_resource_id: int | None,
+) -> bool:
+    resource_ids = [resource_id for resource_id in (before_resource_id, after_resource_id) if resource_id is not None]
+    if not resource_ids:
+        return False
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM items
+        WHERE resource_id = ANY(%s)
+          AND deleted IS FALSE
+        GROUP BY resource_id, identity_key
+        HAVING identity_key IS NULL OR COUNT(*) > 1
+        LIMIT 1
+        """,
+        (resource_ids,),
+    ).fetchone()
+    return row is not None
+
+
+def _item_change_batch_keys(
+    conn: psycopg.Connection,
+    before_resource_id: int | None,
+    after_resource_id: int | None,
+    after_key: str | None,
+    limit: int,
+) -> list[str]:
+    return [
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT identity_key
+            FROM (
+                SELECT identity_key
+                FROM items
+                WHERE resource_id = %s AND deleted IS FALSE
+                UNION
+                SELECT identity_key
+                FROM items
+                WHERE resource_id = %s AND deleted IS FALSE
+            ) AS identities
+            WHERE identity_key IS NOT NULL
+              AND (%s::text IS NULL OR identity_key > %s::text)
+            ORDER BY identity_key
+            LIMIT %s
+            """,
+            (before_resource_id, after_resource_id, after_key, after_key, max(1, limit)),
+        ).fetchall()
+    ]
+
+
+def _materialize_item_change_batch(
+    conn: psycopg.Connection,
+    *,
+    comparison_id: str,
+    resource_change_id: int,
+    before_resource_id: int | None,
+    after_resource_id: int | None,
+    provider: str,
+    identity_keys: list[str],
+    direct_permissions_comparable: bool,
+) -> int:
+    if not identity_keys:
+        return 0
+    rows = conn.execute(
+        """
+        WITH baseline AS (
+            SELECT
+                item.id,
+                item.identity_key,
+                item.provider_item_id,
+                item.provider_parent_id,
+                item.path,
+                item.name,
+                item.is_dir,
+                item.size_bytes,
+                item.allocation_size_bytes,
+                item.mtime,
+                item.created_at,
+                item.accessed_at,
+                item.changed_at,
+                item.file_attributes,
+                item.mime_type,
+                item.web_url,
+                item.exposure,
+                encode(sha256(convert_to(item.provider_metadata::text, 'UTF8')), 'hex')
+                    AS provider_metadata_hash,
+                item.permission_summary
+            FROM items AS item
+            WHERE item.resource_id = %(before_resource_id)s
+              AND item.identity_key = ANY(%(identity_keys)s)
+              AND item.deleted IS FALSE
+        ),
+        current AS (
+            SELECT
+                item.id,
+                item.identity_key,
+                item.provider_item_id,
+                item.provider_parent_id,
+                item.path,
+                item.name,
+                item.is_dir,
+                item.size_bytes,
+                item.allocation_size_bytes,
+                item.mtime,
+                item.created_at,
+                item.accessed_at,
+                item.changed_at,
+                item.file_attributes,
+                item.mime_type,
+                item.web_url,
+                item.exposure,
+                encode(sha256(convert_to(item.provider_metadata::text, 'UTF8')), 'hex')
+                    AS provider_metadata_hash,
+                item.permission_summary
+            FROM items AS item
+            WHERE item.resource_id = %(after_resource_id)s
+              AND item.identity_key = ANY(%(identity_keys)s)
+              AND item.deleted IS FALSE
+        ),
+        paired AS (
+            SELECT
+                COALESCE(current.identity_key, baseline.identity_key) AS identity_key,
+                baseline.id AS before_id,
+                current.id AS after_id,
+                COALESCE(current.provider_item_id, baseline.provider_item_id) AS provider_item_id,
+                baseline.provider_parent_id AS before_parent_id,
+                current.provider_parent_id AS after_parent_id,
+                baseline.path AS before_path,
+                current.path AS after_path,
+                baseline.name AS before_name,
+                current.name AS after_name,
+                baseline.is_dir AS before_is_dir,
+                current.is_dir AS after_is_dir,
+                baseline.size_bytes AS before_size,
+                current.size_bytes AS after_size,
+                baseline.allocation_size_bytes AS before_allocation_size,
+                current.allocation_size_bytes AS after_allocation_size,
+                baseline.mtime AS before_mtime,
+                current.mtime AS after_mtime,
+                baseline.created_at AS before_created_at,
+                current.created_at AS after_created_at,
+                baseline.accessed_at AS before_accessed_at,
+                current.accessed_at AS after_accessed_at,
+                baseline.changed_at AS before_changed_at,
+                current.changed_at AS after_changed_at,
+                baseline.file_attributes AS before_attributes,
+                current.file_attributes AS after_attributes,
+                baseline.mime_type AS before_mime_type,
+                current.mime_type AS after_mime_type,
+                baseline.web_url AS before_web_url,
+                current.web_url AS after_web_url,
+                baseline.exposure AS before_exposure,
+                current.exposure AS after_exposure,
+                baseline.provider_metadata_hash AS before_provider_metadata_hash,
+                current.provider_metadata_hash AS after_provider_metadata_hash,
+                baseline.permission_summary AS before_permissions,
+                current.permission_summary AS after_permissions,
+                COALESCE((baseline.permission_summary->>'evidence_available')::boolean, FALSE)
+                    AS before_permission_present,
+                COALESCE((current.permission_summary->>'evidence_available')::boolean, FALSE)
+                    AS after_permission_present,
+                COALESCE((baseline.permission_summary->>'comparable')::boolean, FALSE)
+                    AS before_permission_comparable,
+                COALESCE((current.permission_summary->>'comparable')::boolean, FALSE)
+                    AS after_permission_comparable,
+                baseline.permission_summary->>'comparison_evidence_hash' AS before_permission_hash,
+                current.permission_summary->>'comparison_evidence_hash' AS after_permission_hash,
+                baseline.permission_summary->>'comparison_quality_hash' AS before_permission_quality_hash,
+                current.permission_summary->>'comparison_quality_hash' AS after_permission_quality_hash
+            FROM baseline
+            FULL OUTER JOIN current USING (identity_key)
+        ),
+        classified AS (
+            SELECT
+                *,
+                before_id IS NOT NULL AND after_id IS NOT NULL AND provider_item_id IS NOT NULL
+                    AND (
+                        before_parent_id IS DISTINCT FROM after_parent_id
+                        OR (
+                            before_path IS DISTINCT FROM after_path
+                            AND before_name IS NOT DISTINCT FROM after_name
+                        )
+                    ) AS moved,
+                before_id IS NOT NULL AND after_id IS NOT NULL AND provider_item_id IS NOT NULL
+                    AND before_name IS DISTINCT FROM after_name AS renamed,
+                before_id IS NOT NULL AND after_id IS NOT NULL AND provider_item_id IS NOT NULL
+                    AND before_path IS DISTINCT FROM after_path AS path_changed,
+                before_id IS NOT NULL AND after_id IS NOT NULL AND (
+                    before_is_dir IS DISTINCT FROM after_is_dir
+                    OR before_size IS DISTINCT FROM after_size
+                    OR before_allocation_size IS DISTINCT FROM after_allocation_size
+                    OR before_mtime IS DISTINCT FROM after_mtime
+                    OR before_created_at IS DISTINCT FROM after_created_at
+                    OR before_accessed_at IS DISTINCT FROM after_accessed_at
+                    OR before_changed_at IS DISTINCT FROM after_changed_at
+                    OR before_attributes IS DISTINCT FROM after_attributes
+                    OR before_mime_type IS DISTINCT FROM after_mime_type
+                    OR before_web_url IS DISTINCT FROM after_web_url
+                    OR before_exposure IS DISTINCT FROM after_exposure
+                    OR before_provider_metadata_hash IS DISTINCT FROM after_provider_metadata_hash
+                ) AS metadata_changed,
+                before_id IS NOT NULL AND after_id IS NOT NULL
+                    AND %(direct_permissions_comparable)s
+                    AND before_permission_present AND after_permission_present
+                    AND before_permission_comparable AND after_permission_comparable
+                    AND before_permission_hash IS NOT NULL AND after_permission_hash IS NOT NULL
+                    AND before_permission_quality_hash IS NOT NULL
+                    AND after_permission_quality_hash IS NOT NULL
+                    AND before_permission_quality_hash IS NOT DISTINCT FROM after_permission_quality_hash
+                    AND before_permission_hash IS DISTINCT FROM after_permission_hash
+                    AS raw_permission_changed,
+                before_id IS NOT NULL AND after_id IS NOT NULL
+                    AND (before_permission_present OR after_permission_present)
+                    AND (
+                        NOT %(direct_permissions_comparable)s
+                        OR NOT before_permission_comparable
+                        OR NOT after_permission_comparable
+                        OR before_permission_hash IS NULL
+                        OR after_permission_hash IS NULL
+                        OR before_permission_quality_hash IS DISTINCT FROM after_permission_quality_hash
+                    )
+                    AND (
+                        (before_permissions - 'observed_at') IS DISTINCT FROM
+                            (after_permissions - 'observed_at')
+                        OR before_permission_quality_hash IS DISTINCT FROM after_permission_quality_hash
+                    ) AS permission_indeterminate
+            FROM paired
+        ),
+        shaped AS (
+            SELECT
+                *,
+                ARRAY_REMOVE(ARRAY[
+                    CASE WHEN before_id IS NULL THEN 'added' END,
+                    CASE WHEN after_id IS NULL THEN 'removed' END,
+                    CASE WHEN moved THEN 'moved' END,
+                    CASE WHEN renamed THEN 'renamed' END,
+                    CASE WHEN path_changed THEN 'path' END,
+                    CASE WHEN metadata_changed THEN 'metadata' END,
+                    CASE WHEN raw_permission_changed THEN 'permission' END,
+                    CASE WHEN permission_indeterminate THEN 'permission_not_comparable' END
+                ]::text[], NULL) AS categories,
+                CASE
+                    WHEN before_id IS NULL THEN 'added'
+                    WHEN after_id IS NULL THEN 'removed'
+                    WHEN moved THEN 'moved'
+                    WHEN renamed THEN 'renamed'
+                    WHEN raw_permission_changed THEN 'permission_changed'
+                    WHEN metadata_changed THEN 'metadata_changed'
+                    WHEN permission_indeterminate THEN 'indeterminate'
+                    ELSE NULL
+                END AS change_type
+            FROM classified
+        )
+        INSERT INTO comparison_item_changes (
+            comparison_id, resource_change_id, identity_key, change_type, provider,
+            before_item_id, after_item_id, match_basis, match_quality,
+            change_categories, evidence_state, limitations, before_snapshot,
+            after_snapshot, search_text, impact_rank
+        )
+        SELECT
+            %(comparison_id)s,
+            %(resource_change_id)s,
+            identity_key,
+            change_type,
+            %(provider)s,
+            before_id,
+            after_id,
+            CASE WHEN provider_item_id IS NOT NULL THEN 'provider_item_id' ELSE 'path' END,
+            CASE WHEN provider_item_id IS NOT NULL THEN 'strong' ELSE 'weak' END,
+            to_jsonb(categories),
+            CASE
+                WHEN permission_indeterminate THEN 'indeterminate'
+                WHEN provider_item_id IS NOT NULL THEN 'exact'
+                ELSE 'bounded'
+            END,
+            CASE
+                WHEN permission_indeterminate
+                THEN '["Permission summaries differ, but their evidence planes are not comparable."]'::jsonb
+                WHEN provider_item_id IS NULL
+                THEN '["Path fallback cannot distinguish a move or rename from removal plus addition."]'::jsonb
+                ELSE '[]'::jsonb
+            END,
+            CASE WHEN before_id IS NULL THEN '{}'::jsonb ELSE jsonb_build_object(
+                'item_id', before_id,
+                'provider_item_id', provider_item_id,
+                'provider_parent_id', before_parent_id,
+                'path', before_path,
+                'name', before_name,
+                'is_dir', before_is_dir,
+                'size_bytes', before_size,
+                'allocation_size_bytes', before_allocation_size,
+                'mtime', before_mtime,
+                'created_at', before_created_at,
+                'accessed_at', before_accessed_at,
+                'changed_at', before_changed_at,
+                'file_attributes', before_attributes,
+                'mime_type', before_mime_type,
+                'web_url', before_web_url,
+                'exposure', before_exposure,
+                'provider_metadata_hash', before_provider_metadata_hash,
+                'permission_evidence_hash', before_permission_hash,
+                'permission_quality_hash', before_permission_quality_hash,
+                'permission_comparable', before_permission_comparable
+            ) END,
+            CASE WHEN after_id IS NULL THEN '{}'::jsonb ELSE jsonb_build_object(
+                'item_id', after_id,
+                'provider_item_id', provider_item_id,
+                'provider_parent_id', after_parent_id,
+                'path', after_path,
+                'name', after_name,
+                'is_dir', after_is_dir,
+                'size_bytes', after_size,
+                'allocation_size_bytes', after_allocation_size,
+                'mtime', after_mtime,
+                'created_at', after_created_at,
+                'accessed_at', after_accessed_at,
+                'changed_at', after_changed_at,
+                'file_attributes', after_attributes,
+                'mime_type', after_mime_type,
+                'web_url', after_web_url,
+                'exposure', after_exposure,
+                'provider_metadata_hash', after_provider_metadata_hash,
+                'permission_evidence_hash', after_permission_hash,
+                'permission_quality_hash', after_permission_quality_hash,
+                'permission_comparable', after_permission_comparable
+            ) END,
+            lower(concat_ws(' ', before_path, after_path, before_name, after_name, provider_item_id)),
+            CASE
+                WHEN raw_permission_changed THEN 90
+                WHEN before_id IS NULL OR after_id IS NULL THEN 70
+                WHEN moved OR renamed THEN 60
+                WHEN permission_indeterminate THEN 50
+                ELSE 30
+            END
+        FROM shaped
+        WHERE change_type IS NOT NULL
+        ON CONFLICT (comparison_id, resource_change_id, identity_key) DO NOTHING
+        RETURNING id
+        """,
+        {
+            "comparison_id": comparison_id,
+            "resource_change_id": resource_change_id,
+            "before_resource_id": before_resource_id,
+            "after_resource_id": after_resource_id,
+            "provider": provider,
+            "identity_keys": identity_keys,
+            "direct_permissions_comparable": direct_permissions_comparable,
+        },
+    ).fetchall()
+    return len(rows)
+
+
+def _item_change_summary(
+    conn: psycopg.Connection,
+    comparison_id: str,
+    *,
+    computed: bool,
+    limitations: list[str],
+) -> dict[str, Any]:
+    counts = {
+        "added": 0,
+        "removed": 0,
+        "moved": 0,
+        "renamed": 0,
+        "metadata_changed": 0,
+        "permission_changed": 0,
+        "indeterminate": 0,
+    }
+    bounded = 0
+    if computed:
+        for change_type, count in conn.execute(
+            """
+            SELECT change_type, COUNT(*)::bigint
+            FROM comparison_item_changes
+            WHERE comparison_id = %s
+            GROUP BY change_type
+            """,
+            (comparison_id,),
+        ).fetchall():
+            if str(change_type) in counts:
+                counts[str(change_type)] = int(count)
+        bounded = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)::bigint
+                FROM comparison_item_changes
+                WHERE comparison_id = %s AND evidence_state <> 'exact'
+                """,
+                (comparison_id,),
+            ).fetchone()[0]
+        )
+    counts["total"] = sum(counts.values())
+    return {
+        "item_churn_computed": computed,
+        "item_summary_exact": computed and bounded == 0 and counts["indeterminate"] == 0 and not limitations,
+        "item_changes": counts,
+        "item_limitations": list(dict.fromkeys(limitations)),
+    }
+
+
+def _finding_dedupe_key(policy_id: str, source_id: str, subject_key: str) -> str:
+    return hashlib.sha256(f"{policy_id}\0{source_id}\0{subject_key}".encode("utf-8")).hexdigest()
+
+
+def _upsert_finding(
+    conn: psycopg.Connection,
+    *,
+    project_id: str,
+    source_id: str,
+    policy_id: str,
+    subject_key: str,
+    resource_identity_key: str | None,
+    resource_type: str | None,
+    provider: str | None,
+    resource_name: str | None,
+    run_id: str,
+    comparison_id: str | None,
+    evidence_state: str,
+    evidence: dict[str, Any],
+    authoritative_state: bool = True,
+) -> tuple[str, bool, str]:
+    policy = FINDING_POLICIES[policy_id]
+    dedupe_key = _finding_dedupe_key(policy_id, source_id, subject_key)
+    occurrence_key = hashlib.sha256(
+        f"run={run_id}\0comparison={comparison_id or ''}".encode("utf-8")
+    ).hexdigest()
+    finding_id = str(uuid.uuid4())
+    serialized_evidence = json.dumps(evidence, ensure_ascii=True, separators=(",", ":"))
+    search_text = " ".join(
+        str(value).strip()
+        for value in (
+            policy_id,
+            policy["title"],
+            policy["description"],
+            provider,
+            resource_type,
+            resource_name,
+        )
+        if value is not None and str(value).strip()
+    ).casefold()
+    row = conn.execute(
+        """
+        INSERT INTO findings (
+            id, project_id, source_id, policy_id, policy_version, dedupe_key,
+            title, description, severity, status, resource_identity_key,
+            resource_type, provider, resource_name, search_text, first_seen_at, last_seen_at,
+            resolved_at, latest_run_id, latest_comparison_id, evidence, occurrence_count,
+            revision, created_at, updated_at
+        ) VALUES (
+            %(finding_id)s, %(project_id)s, %(source_id)s, %(policy_id)s,
+            %(policy_version)s, %(dedupe_key)s, %(title)s, %(description)s,
+            %(severity)s, CASE WHEN %(authoritative_state)s THEN 'open' ELSE 'resolved' END,
+            %(resource_identity_key)s, %(resource_type)s, %(provider)s, %(resource_name)s,
+            %(search_text)s, (SELECT created_at FROM scan_runs WHERE id = %(run_id)s),
+            (SELECT created_at FROM scan_runs WHERE id = %(run_id)s),
+            CASE WHEN %(authoritative_state)s THEN NULL
+                 ELSE (SELECT created_at FROM scan_runs WHERE id = %(run_id)s) END,
+            %(run_id)s, %(comparison_id)s, %(evidence)s::jsonb, 1, 1, NOW(), NOW()
+        )
+        ON CONFLICT (project_id, dedupe_key) DO UPDATE SET
+            policy_version = EXCLUDED.policy_version,
+            title = EXCLUDED.title,
+            description = EXCLUDED.description,
+            severity = EXCLUDED.severity,
+            source_id = CASE WHEN %(authoritative_state)s THEN EXCLUDED.source_id ELSE findings.source_id END,
+            resource_identity_key = CASE WHEN %(authoritative_state)s
+                THEN EXCLUDED.resource_identity_key ELSE findings.resource_identity_key END,
+            resource_type = CASE WHEN %(authoritative_state)s
+                THEN EXCLUDED.resource_type ELSE findings.resource_type END,
+            provider = CASE WHEN %(authoritative_state)s THEN EXCLUDED.provider ELSE findings.provider END,
+            resource_name = CASE WHEN %(authoritative_state)s
+                THEN EXCLUDED.resource_name ELSE findings.resource_name END,
+            search_text = CASE WHEN %(authoritative_state)s THEN EXCLUDED.search_text ELSE findings.search_text END,
+            first_seen_at = LEAST(findings.first_seen_at, EXCLUDED.first_seen_at),
+            last_seen_at = CASE
+                WHEN NOT %(authoritative_state)s THEN findings.last_seen_at
+                WHEN EXISTS (
+                    SELECT 1 FROM finding_occurrences
+                    WHERE finding_id = findings.id AND occurrence_key = %(occurrence_key)s
+                ) THEN findings.last_seen_at ELSE GREATEST(findings.last_seen_at, EXCLUDED.last_seen_at)
+            END,
+            latest_run_id = CASE WHEN %(authoritative_state)s
+                THEN EXCLUDED.latest_run_id ELSE findings.latest_run_id END,
+            latest_comparison_id = CASE WHEN %(authoritative_state)s
+                THEN EXCLUDED.latest_comparison_id ELSE findings.latest_comparison_id END,
+            evidence = CASE WHEN %(authoritative_state)s THEN EXCLUDED.evidence ELSE findings.evidence END,
+            occurrence_count = findings.occurrence_count + CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM finding_occurrences
+                    WHERE finding_id = findings.id AND occurrence_key = %(occurrence_key)s
+                ) THEN 0 ELSE 1
+            END,
+            revision = findings.revision + CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM finding_occurrences
+                    WHERE finding_id = findings.id AND occurrence_key = %(occurrence_key)s
+                ) THEN 0 ELSE 1
+            END,
+            status = CASE
+                WHEN %(authoritative_state)s AND NOT EXISTS (
+                    SELECT 1 FROM finding_occurrences
+                    WHERE finding_id = findings.id AND occurrence_key = %(occurrence_key)s
+                ) AND (
+                    findings.status = 'resolved'
+                    OR (
+                        findings.status = 'accepted_risk'
+                        AND findings.accepted_risk_expires_at <= NOW()
+                    )
+                ) THEN 'open'
+                ELSE findings.status
+            END,
+            resolved_at = CASE
+                WHEN %(authoritative_state)s AND NOT EXISTS (
+                    SELECT 1 FROM finding_occurrences
+                    WHERE finding_id = findings.id AND occurrence_key = %(occurrence_key)s
+                ) AND findings.status = 'resolved' THEN NULL
+                ELSE findings.resolved_at
+            END,
+            accepted_risk_expires_at = CASE
+                WHEN %(authoritative_state)s
+                     AND findings.status = 'accepted_risk'
+                     AND findings.accepted_risk_expires_at <= NOW() THEN NULL
+                ELSE findings.accepted_risk_expires_at
+            END,
+            updated_at = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM finding_occurrences
+                    WHERE finding_id = findings.id AND occurrence_key = %(occurrence_key)s
+                ) THEN findings.updated_at ELSE NOW()
+            END
+        RETURNING id::text, status
+        """,
+        {
+            "finding_id": finding_id,
+            "project_id": project_id,
+            "source_id": source_id,
+            "policy_id": policy_id,
+            "policy_version": policy["version"],
+            "dedupe_key": dedupe_key,
+            "title": policy["title"],
+            "description": policy["description"],
+            "severity": policy["severity"],
+            "resource_identity_key": resource_identity_key,
+            "resource_type": resource_type,
+            "provider": provider,
+            "resource_name": resource_name,
+            "search_text": search_text,
+            "run_id": run_id,
+            "comparison_id": comparison_id,
+            "evidence": serialized_evidence,
+            "occurrence_key": occurrence_key,
+            "authoritative_state": authoritative_state,
+        },
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("finding upsert returned no row")
+    persisted_finding_id, finding_status = str(row[0]), str(row[1])
+    inserted_occurrence = conn.execute(
+        """
+        INSERT INTO finding_occurrences (
+            finding_id, run_id, comparison_id, occurrence_key, policy_id,
+            policy_version, evidence_state, evidence, observed_at
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+            (SELECT created_at FROM scan_runs WHERE id = %s)
+        )
+        ON CONFLICT (finding_id, occurrence_key) DO NOTHING
+        RETURNING id
+        """,
+        (
+            persisted_finding_id,
+            run_id,
+            comparison_id,
+            occurrence_key,
+            policy_id,
+            policy["version"],
+            evidence_state,
+            serialized_evidence,
+            run_id,
+        ),
+    ).fetchone()
+    if inserted_occurrence is not None:
+        write_audit(
+            conn,
+            project_id,
+            "FINDING_OBSERVED",
+            "finding",
+            persisted_finding_id,
+            {
+                "worker": CONSUMER_NAME,
+                "policy_id": policy_id,
+                "policy_version": policy["version"],
+                "source_id": source_id,
+                "run_id": run_id,
+                "comparison_id": comparison_id,
+                "evidence_state": evidence_state,
+                "status": finding_status,
+                "authoritative_state": authoritative_state,
+            },
+        )
+    return persisted_finding_id, inserted_occurrence is not None, dedupe_key
+
+
+def _resolve_absent_state_findings(
+    conn: psycopg.Connection,
+    *,
+    project_id: str,
+    source_id: str,
+    policy_id: str,
+    run_id: str,
+    limit: int = FINDING_RESOLUTION_BATCH_SIZE,
+) -> tuple[int, bool]:
+    rows = conn.execute(
+        """
+        WITH candidates AS (
+            SELECT finding.id
+            FROM findings AS finding
+            WHERE finding.project_id = %s
+              AND finding.source_id = %s
+              AND finding.policy_id = %s
+              AND finding.status <> 'resolved'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM finding_occurrences AS occurrence
+                  WHERE occurrence.finding_id = finding.id
+                    AND occurrence.run_id = %s
+              )
+            ORDER BY finding.id
+            FOR UPDATE SKIP LOCKED
+            LIMIT %s
+        )
+        UPDATE findings AS finding
+        SET status = 'resolved', resolved_at = NOW(), accepted_risk_expires_at = NULL,
+            updated_at = NOW(), revision = finding.revision + 1
+        FROM candidates
+        WHERE finding.id = candidates.id
+        RETURNING finding.id::text
+        """,
+        (project_id, source_id, policy_id, run_id, max(1, min(int(limit), 1000))),
+    ).fetchall()
+    for row in rows:
+        write_audit(
+            conn,
+            project_id,
+            "FINDING_AUTO_RESOLVED",
+            "finding",
+            str(row[0]),
+            {"worker": CONSUMER_NAME, "policy_id": policy_id, "source_id": source_id, "run_id": run_id},
+        )
+    return len(rows), len(rows) >= max(1, min(int(limit), 1000))
+
+
+def _persist_finding_evaluation_progress(
+    conn: psycopg.Connection,
+    run_id: str,
+    progress: dict[str, Any],
+) -> None:
+    conn.execute(
+        """
+        UPDATE scan_runs
+        SET ingest_progress = COALESCE(ingest_progress, '{}'::jsonb)
+            || jsonb_build_object(
+                'heartbeat_at', NOW(),
+                'monitoring_worker', %s::text,
+                'monitoring_findings', %s::jsonb
+            )
+        WHERE id = %s
+        """,
+        (CONSUMER_NAME, json.dumps(progress, ensure_ascii=True, separators=(",", ":")), run_id),
+    )
+
+
+def evaluate_run_findings(
+    conn: psycopg.Connection,
+    *,
+    project_id: str,
+    source_id: str,
+    run_id: str,
+) -> dict[str, int]:
+    run_row = conn.execute(
+        "SELECT collection_context, ingest_progress FROM scan_runs WHERE id = %s AND project_id = %s",
+        (run_id, project_id),
+    ).fetchone()
+    context = dict(run_row[0]) if run_row and isinstance(run_row[0], dict) else {}
+    ingest_progress = dict(run_row[1]) if run_row and isinstance(run_row[1], dict) else {}
+    persisted_progress = (
+        dict(ingest_progress.get("monitoring_findings"))
+        if isinstance(ingest_progress.get("monitoring_findings"), dict)
+        else {}
+    )
+    metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    permission_scope_complete = metadata.get("permissions_complete") is True
+    structural_scope_complete = metadata.get("structural_complete") is True and context.get("partial") is not True
+    context_providers = set(_monitoring_provider(context).split("+"))
+    after_resource_id = int(persisted_progress.get("after_resource_id") or 0)
+    observed_count = int(persisted_progress.get("observed") or 0)
+    resolved_count = int(persisted_progress.get("resolved") or 0)
+    write_capabilities = {"create_file", "create_directory", "modify_file", "delete", "write_acl", "write_owner"}
+    while True:
+        rows = conn.execute(
+            """
+            SELECT resource.id, resource.identity_key, resource.resource_type::text,
+                   COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)) AS provider,
+                   resource.name, resource.exposure::text, resource.exposure_evidence,
+                   resource.access_capabilities
+            FROM resources AS resource
+            WHERE resource.run_id = %s
+              AND resource.id > %s
+              AND (
+                    (
+                        COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)) = 'sharepoint'
+                        AND resource.exposure::text IN ('ANONYMOUS', 'BROAD_INTERNAL')
+                    )
+                    OR (
+                        COALESCE(resource.provider, split_part(resource.resource_type::text, '_', 1)) = 'smb'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM jsonb_each(COALESCE(resource.access_capabilities, '{}'::jsonb)) AS capability
+                            WHERE capability.key = ANY(%s::text[])
+                              AND capability.value->>'status' IN ('allowed', 'mixed')
+                        )
+                    )
+              )
+            ORDER BY resource.id
+            LIMIT %s
+            """,
+            (run_id, after_resource_id, sorted(write_capabilities), FINDING_EVALUATION_BATCH_SIZE),
+        ).fetchall()
+        if not rows:
+            break
+        for resource_id, identity_key, resource_type, provider, name, exposure, exposure_evidence, raw_capabilities in rows:
+            identity = str(identity_key or hashlib.sha256(f"resource:{resource_id}".encode()).hexdigest())
+            policy_id: str | None = None
+            evidence_state = "exact"
+            summary: dict[str, Any] = {}
+            limitations: list[str] = []
+            if provider == "sharepoint" and exposure == "ANONYMOUS":
+                policy_id = "sharepoint.anonymous_access"
+                summary = {"exposure": exposure, "positive_evidence": exposure_evidence or {}}
+            elif provider == "sharepoint" and exposure == "BROAD_INTERNAL":
+                policy_id = "sharepoint.broad_internal_access"
+                summary = {"exposure": exposure, "positive_evidence": exposure_evidence or {}}
+            capabilities = raw_capabilities if isinstance(raw_capabilities, dict) else {}
+            if provider == "smb":
+                capability_metadata = (
+                    capabilities.get("_metadata") if isinstance(capabilities.get("_metadata"), dict) else {}
+                )
+                probe_complete = (
+                    capability_metadata.get("complete") is True
+                    and capability_metadata.get("degraded") is not True
+                )
+                allowed_writes = sorted(
+                    capability
+                    for capability in write_capabilities
+                    if isinstance(capabilities.get(capability), dict)
+                    and str(capabilities[capability].get("status") or "") in {"allowed", "mixed"}
+                )
+                if allowed_writes:
+                    policy_id = "smb.write_observed"
+                    evidence_state = "bounded"
+                    summary = {
+                        "allowed_capabilities": allowed_writes,
+                        "probe_method": capability_metadata.get("probe_method"),
+                        "complete": probe_complete,
+                    }
+                    limitations = ["Capability probes apply only to the assessed identity and tested operations."]
+            if policy_id is None:
+                continue
+            evidence = {
+                "state": evidence_state,
+                "summary": summary,
+                "refs": {"run_id": run_id, "resource_id": int(resource_id)},
+                "limitations": limitations,
+            }
+            _finding_id, inserted, _dedupe_key = _upsert_finding(
+                conn,
+                project_id=project_id,
+                source_id=source_id,
+                policy_id=policy_id,
+                subject_key=identity,
+                resource_identity_key=identity,
+                resource_type=str(resource_type),
+                provider=str(provider),
+                resource_name=str(name),
+                run_id=run_id,
+                comparison_id=None,
+                evidence_state=evidence_state,
+                evidence=evidence,
+            )
+            observed_count += int(inserted)
+        after_resource_id = int(rows[-1][0])
+        _persist_finding_evaluation_progress(
+            conn,
+            run_id,
+            {
+                "state": "evaluating",
+                "phase": "candidates",
+                "after_resource_id": after_resource_id,
+                "observed": observed_count,
+                "resolved": resolved_count,
+            },
+        )
+        conn.commit()
+
+    smb_scope_row = conn.execute(
+        """
+        SELECT COUNT(*), COALESCE(
+            BOOL_AND(
+                COALESCE(access_capabilities->'_metadata'->>'complete', 'false') = 'true'
+                AND COALESCE(access_capabilities->'_metadata'->>'degraded', 'false') <> 'true'
+            ),
+            TRUE
+        )
+        FROM resources
+        WHERE run_id = %s
+          AND COALESCE(provider, split_part(resource_type::text, '_', 1)) = 'smb'
+        """,
+        (run_id,),
+    ).fetchone()
+    smb_resource_count = int(smb_scope_row[0]) if smb_scope_row else 0
+    smb_probe_scope_complete = bool(
+        smb_scope_row
+        and (
+            (smb_resource_count == 0 and structural_scope_complete)
+            or (smb_resource_count > 0 and smb_scope_row[1] is True)
+        )
+    )
+    resolution_policies: list[str] = []
+    if "sharepoint" in context_providers and structural_scope_complete and permission_scope_complete:
+        resolution_policies.extend(("sharepoint.anonymous_access", "sharepoint.broad_internal_access"))
+    if "smb" in context_providers and structural_scope_complete and smb_probe_scope_complete:
+        resolution_policies.append("smb.write_observed")
+    completed_policy_index = int(persisted_progress.get("completed_policy_index") or 0)
+    for policy_index, policy_id in enumerate(resolution_policies):
+        if policy_index < completed_policy_index:
+            continue
+        while True:
+            resolved, has_more = _resolve_absent_state_findings(
+                conn,
+                project_id=project_id,
+                source_id=source_id,
+                policy_id=policy_id,
+                run_id=run_id,
+            )
+            resolved_count += resolved
+            _persist_finding_evaluation_progress(
+                conn,
+                run_id,
+                {
+                    "state": "evaluating",
+                    "phase": "resolving",
+                    "after_resource_id": after_resource_id,
+                    "completed_policy_index": policy_index if has_more else policy_index + 1,
+                    "policy_id": policy_id,
+                    "observed": observed_count,
+                    "resolved": resolved_count,
+                },
+            )
+            conn.commit()
+            if not has_more:
+                break
+    _persist_finding_evaluation_progress(
+        conn,
+        run_id,
+        {
+            "state": "complete",
+            "phase": "complete",
+            "after_resource_id": after_resource_id,
+            "completed_policy_index": len(resolution_policies),
+            "observed": observed_count,
+            "resolved": resolved_count,
+        },
+    )
+    conn.commit()
+    return {"observed": observed_count, "resolved": resolved_count}
+
+
+def evaluate_comparison_findings(
+    conn: psycopg.Connection,
+    *,
+    comparison_id: str,
+    project_id: str,
+    source_id: str | None,
+    current_run_id: str,
+    after_id: int = 0,
+    limit: int = FINDING_EVALUATION_BATCH_SIZE,
+    authoritative_state: bool = True,
+) -> tuple[int, int, bool]:
+    if not source_id:
+        return 0, after_id, False
+    bounded_limit = max(1, min(int(limit), 5000))
+    rows = conn.execute(
+        """
+        SELECT id, identity_key, change_type, provider, resource_type,
+               COALESCE(resource_name_after, resource_name_before),
+               change_categories, match_quality, before_snapshot, after_snapshot,
+               structural_state, access_state, content_state
+        FROM comparison_resource_changes
+        WHERE comparison_id = %s
+          AND id > %s
+          AND (
+                (change_type = 'appeared' AND structural_state = 'appeared')
+                OR (change_type = 'disappeared' AND structural_state = 'disappeared')
+                OR (
+                    (change_categories ?| ARRAY['access', 'permission_evidence'])
+                    AND change_type <> 'indeterminate'
+                    AND access_state = 'changed'
+                )
+                OR change_type = 'indeterminate'
+                OR access_state = 'indeterminate'
+          )
+        ORDER BY id
+        LIMIT %s
+        """,
+        (comparison_id, after_id, bounded_limit + 1),
+    ).fetchall()
+    has_more = len(rows) > bounded_limit
+    rows = rows[:bounded_limit]
+    inserted_count = 0
+    for row in rows:
+        (
+            row_id,
+            identity_key,
+            change_type,
+            provider,
+            resource_type,
+            resource_name,
+            raw_categories,
+            match_quality,
+            before_snapshot,
+            after_snapshot,
+            structural_state,
+            access_state,
+            content_state,
+        ) = row
+        categories = {str(category) for category in (raw_categories or [])}
+        policy_id: str | None = None
+        if change_type == "appeared" and structural_state == "appeared":
+            policy_id = "resource.appeared"
+        elif change_type == "disappeared" and structural_state == "disappeared":
+            policy_id = "resource.disappeared"
+        elif (
+            {"access", "permission_evidence"}.intersection(categories)
+            and change_type != "indeterminate"
+            and access_state == "changed"
+        ):
+            policy_id = "permission.evidence_changed"
+        elif change_type == "indeterminate" or access_state == "indeterminate":
+            policy_id = "comparison.indeterminate"
+        if policy_id is None:
+            continue
+        evidence_state = "indeterminate" if policy_id == "comparison.indeterminate" else (
+            "exact" if match_quality == "strong" else "bounded"
+        )
+        limitations = []
+        if evidence_state == "bounded":
+            limitations.append("The resource was matched by a location-bound or otherwise non-strong identity.")
+        if evidence_state == "indeterminate":
+            limitations.append("Collection coverage or evidence compatibility does not support a definitive conclusion.")
+        evidence = {
+            "state": evidence_state,
+            "summary": {
+                "change_type": str(change_type),
+                "categories": sorted(categories),
+                "structural_state": str(structural_state),
+                "access_state": str(access_state),
+                "content_state": str(content_state),
+                "before": before_snapshot or {},
+                "after": after_snapshot or {},
+            },
+            "refs": {"run_id": current_run_id, "comparison_id": comparison_id},
+            "limitations": limitations,
+        }
+        _finding_id, inserted, _dedupe = _upsert_finding(
+            conn,
+            project_id=project_id,
+            source_id=source_id,
+            policy_id=policy_id,
+            subject_key=str(identity_key),
+            resource_identity_key=str(identity_key),
+            resource_type=str(resource_type),
+            provider=str(provider),
+            resource_name=str(resource_name or "resource"),
+            run_id=current_run_id,
+            comparison_id=comparison_id,
+            evidence_state=evidence_state,
+            evidence=evidence,
+            authoritative_state=authoritative_state,
+        )
+        inserted_count += int(inserted)
+        after_id = int(row_id)
+    return inserted_count, after_id, has_more
+
+
 def _build_comparison_summary(
     summary_rows: list[tuple[str, int]],
     compatibility: dict[str, Any],
@@ -6184,6 +8651,37 @@ def _comparison_retry_is_deferred(
     return due_at > (now or datetime.now(tz=UTC))
 
 
+def comparison_is_latest_complete_candidate(
+    conn: psycopg.Connection,
+    *,
+    comparison_id: str,
+    source_id: str,
+    current_run_id: str,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT NOT EXISTS (
+            SELECT 1 FROM scan_runs AS newer_run
+            JOIN scan_runs AS current_run ON current_run.id = %s
+            WHERE newer_run.source_id = %s
+              AND newer_run.status = 'COMPLETE'
+              AND (newer_run.created_at, newer_run.id) > (current_run.created_at, current_run.id)
+        ) AND NOT EXISTS (
+            SELECT 1 FROM run_comparisons AS newer_comparison
+            JOIN scan_runs AS newer_comparison_run ON newer_comparison_run.id = newer_comparison.current_run_id
+            JOIN scan_runs AS current_run ON current_run.id = %s
+            WHERE newer_comparison.source_id = %s
+              AND newer_comparison.id <> %s
+              AND newer_comparison.state = 'complete'
+              AND (newer_comparison_run.created_at, newer_comparison_run.id)
+                  > (current_run.created_at, current_run.id)
+        )
+        """,
+        (current_run_id, source_id, current_run_id, source_id, comparison_id),
+    ).fetchone()
+    return bool(row and row[0] is True)
+
+
 def process_comparison_job(fields: dict[str, str]) -> str:
     comparison_id = _normalize_uuid_str(fields.get("comparison_id"))
     if not comparison_id:
@@ -6192,6 +8690,7 @@ def process_comparison_job(fields: dict[str, str]) -> str:
 
     with connect_database() as conn:
         lock_key = advisory_lock_key(comparison_id)
+        source_lock_key: int | None = None
         if not conn.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]:
             return "busy"
         project_id: str | None = None
@@ -6199,8 +8698,8 @@ def process_comparison_job(fields: dict[str, str]) -> str:
         try:
             row = conn.execute(
                 """
-                SELECT project_id::text, baseline_run_id::text, current_run_id::text,
-                       state, compatibility, attempt_count, next_retry_at
+                SELECT project_id::text, source_id::text, baseline_run_id::text, current_run_id::text,
+                       state, compatibility, attempt_count, next_retry_at, progress, trigger
                 FROM run_comparisons
                 WHERE id = %s
                 FOR UPDATE
@@ -6211,12 +8710,15 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                 return "ignored"
             (
                 project_id,
+                source_id,
                 baseline_run_id,
                 current_run_id,
                 state,
                 compatibility,
                 attempt_count,
                 next_retry_at,
+                raw_progress,
+                comparison_trigger,
             ) = row
             if state in {"complete", "failed"}:
                 return "ignored"
@@ -6227,7 +8729,57 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                     next_retry_at.isoformat(),
                 )
                 return "deferred"
-            attempt_count = int(attempt_count or 0) + 1
+            if source_id:
+                source_lock_key = monitoring_source_advisory_lock_key_from_id(conn, source_id)
+                if source_lock_key is not None:
+                    conn.execute("SELECT pg_advisory_lock(%s)", (source_lock_key,))
+            if (
+                str(comparison_trigger) == "automatic"
+                and source_id
+                and not collection_source_automation_enabled(conn, source_id)
+            ):
+                conn.execute(
+                    """
+                    UPDATE run_comparisons
+                    SET state = 'failed', completed_at = NOW(), heartbeat_at = NOW(),
+                        error_code = 'SOURCE_DISABLED',
+                        error_message = 'Automatic monitoring is disabled for this collection source.',
+                        progress = jsonb_build_object('phase', 'skipped', 'reason', 'source_disabled')
+                    WHERE id = %s
+                    """,
+                    (comparison_id,),
+                )
+                write_audit(
+                    conn,
+                    project_id,
+                    "COMPARISON_SKIPPED",
+                    "run_comparison",
+                    comparison_id,
+                    {"worker": CONSUMER_NAME, "reason": "source_disabled", "source_id": source_id},
+                )
+                conn.commit()
+                return "failed"
+            progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
+            operator_retry = progress.get("operator_retry") is True
+            resume_phase = str(progress.get("phase") or "")
+            durable_resume = resume_phase in {
+                "preparing_identities",
+                "materializing",
+                "materializing_resources",
+                "materializing_items",
+                "finalizing",
+                "evaluating_findings",
+                "yielded",
+            }
+            if operator_retry:
+                conn.execute("DELETE FROM comparison_resource_changes WHERE comparison_id = %s", (comparison_id,))
+                progress = {"phase": "preparing_identities", "processed": 0}
+                durable_resume = False
+            retry_resume = progress.pop("resume_after_error", False) is True
+            if not durable_resume or retry_resume:
+                attempt_count = int(attempt_count or 0) + 1
+            else:
+                attempt_count = int(attempt_count or 0)
             run_states = conn.execute(
                 """
                 SELECT id::text, project_id::text, status::text
@@ -6244,12 +8796,15 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                 SET state = 'running', started_at = COALESCE(started_at, NOW()),
                     heartbeat_at = NOW(), attempt_count = %s,
                     next_retry_at = NULL, error_code = NULL, error_message = NULL,
-                    progress = jsonb_build_object('phase', 'preparing_identities', 'processed', 0)
+                    progress = %s::jsonb
                 WHERE id = %s
                 """,
-                (attempt_count, comparison_id),
+                (
+                    attempt_count,
+                    json.dumps(progress if durable_resume else {"phase": "preparing_identities", "processed": 0}),
+                    comparison_id,
+                ),
             )
-            conn.execute("DELETE FROM comparison_resource_changes WHERE comparison_id = %s", (comparison_id,))
             conn.commit()
 
             compatibility = dict(compatibility) if isinstance(compatibility, dict) else {}
@@ -6313,8 +8868,69 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                     reasons.append(bounded_identity_reason)
                 compatibility["reasons"] = reasons
 
-            prepare_run_identity_keys(conn, baseline_run_id)
-            prepare_run_identity_keys(conn, current_run_id)
+            identity_runs = (baseline_run_id, current_run_id)
+            later_phase = resume_phase in {
+                "materializing",
+                "materializing_resources",
+                "materializing_items",
+                "finalizing",
+                "evaluating_findings",
+            }
+            identity_run_index = 2 if later_phase else int(progress.get("identity_run_index") or 0)
+            identity_resource_after = int(progress.get("identity_resource_after_id") or 0)
+            identity_item_after = int(progress.get("identity_item_after_id") or 0)
+            identity_processed = int(progress.get("identity_processed") or 0)
+            identity_started = time.monotonic()
+            identity_batches = 0
+            while identity_run_index < len(identity_runs):
+                identity_result = prepare_run_identity_keys_batch(
+                    conn,
+                    identity_runs[identity_run_index],
+                    resource_after_id=identity_resource_after,
+                    item_after_id=identity_item_after,
+                )
+                identity_resource_after = int(identity_result["resource_after_id"])
+                identity_item_after = int(identity_result["item_after_id"])
+                identity_processed += int(identity_result["processed"])
+                if identity_result["item_complete"] is True:
+                    identity_run_index += 1
+                    identity_resource_after = 0
+                    identity_item_after = 0
+                progress = {
+                    **progress,
+                    "phase": "preparing_identities",
+                    "identity_run_index": identity_run_index,
+                    "identity_resource_after_id": identity_resource_after,
+                    "identity_item_after_id": identity_item_after,
+                    "identity_processed": identity_processed,
+                }
+                conn.execute(
+                    "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb WHERE id = %s",
+                    (json.dumps(progress), comparison_id),
+                )
+                conn.commit()
+                identity_batches += 1
+                if identity_run_index < len(identity_runs) and (
+                    identity_batches >= COMPARISON_WORK_QUANTUM_BATCHES
+                    or time.monotonic() - identity_started >= COMPARISON_WORK_QUANTUM_SECONDS
+                ):
+                    progress = {
+                        **progress,
+                        "yielded_at": now_iso(),
+                        "yield_reason": "identity_work_quantum_exhausted",
+                    }
+                    conn.execute(
+                        "UPDATE run_comparisons SET state = 'queued', heartbeat_at = NOW(), progress = %s::jsonb "
+                        "WHERE id = %s",
+                        (json.dumps(progress), comparison_id),
+                    )
+                    conn.commit()
+                    return "yielded"
+            progress = {
+                **progress,
+                "phase": "materializing_resources",
+                "processed": int(progress.get("processed") or 0),
+            }
             ambiguous = conn.execute(
                 """
                 SELECT run_id::text, identity_key, COUNT(*)
@@ -6357,42 +8973,100 @@ def process_comparison_job(fields: dict[str, str]) -> str:
             )
             conn.commit()
             batch_size = 5000
-            after_key: str | None = None
-            processed = 0
-            emitted = 0
-            while not _shutdown_event.is_set():
-                keys = _comparison_batch_keys(
-                    conn,
-                    baseline_run_id,
-                    current_run_id,
-                    after_key,
-                    batch_size,
+            quantum_started = time.monotonic()
+            quantum_batches = 0
+
+            def quantum_exhausted() -> bool:
+                return (
+                    quantum_batches >= COMPARISON_WORK_QUANTUM_BATCHES
+                    or time.monotonic() - quantum_started >= COMPARISON_WORK_QUANTUM_SECONDS
                 )
-                if not keys:
-                    break
-                emitted += _materialize_comparison_batch(
-                    conn,
-                    comparison_id,
-                    baseline_run_id,
-                    current_run_id,
-                    keys,
-                    compatibility,
-                )
-                processed += len(keys)
-                after_key = keys[-1]
+
+            def yield_comparison(progress_payload: dict[str, Any], reason: str) -> str:
+                progress_payload = {
+                    **progress_payload,
+                    "yielded_at": now_iso(),
+                    "yield_reason": reason,
+                }
                 conn.execute(
                     """
                     UPDATE run_comparisons
-                    SET heartbeat_at = NOW(),
-                        progress = jsonb_build_object(
-                            'phase', 'materializing',
-                            'processed', %s::bigint,
-                            'changes_emitted', %s::bigint,
-                            'last_identity_key', %s::text
-                        )
+                    SET state = 'queued', heartbeat_at = NOW(), progress = %s::jsonb
                     WHERE id = %s
                     """,
-                    (processed, emitted, after_key, comparison_id),
+                    (json.dumps(progress_payload), comparison_id),
+                )
+                conn.commit()
+                return "yielded"
+
+            resume_phase = str(progress.get("phase") or "")
+            resource_phase_complete = resume_phase in {
+                "materializing_items",
+                "finalizing",
+                "evaluating_findings",
+            }
+            after_key: str | None = (
+                str(progress.get("last_identity_key"))
+                if resource_phase_complete or resume_phase in {"materializing", "materializing_resources"}
+                else None
+            )
+            processed = int(progress.get("processed") or 0) if after_key else 0
+            emitted = int(progress.get("changes_emitted") or 0) if after_key else 0
+            if not resource_phase_complete:
+                while not _shutdown_event.is_set():
+                    keys = _comparison_batch_keys(
+                        conn,
+                        baseline_run_id,
+                        current_run_id,
+                        after_key,
+                        batch_size,
+                    )
+                    if not keys:
+                        break
+                    emitted += _materialize_comparison_batch(
+                        conn,
+                        comparison_id,
+                        baseline_run_id,
+                        current_run_id,
+                        keys,
+                        compatibility,
+                    )
+                    if compatibility.get("content_interpretable") is True:
+                        _ensure_item_candidate_resource_changes(
+                            conn,
+                            comparison_id=comparison_id,
+                            baseline_run_id=baseline_run_id,
+                            current_run_id=current_run_id,
+                            identity_keys=keys,
+                        )
+                    processed += len(keys)
+                    after_key = keys[-1]
+                    progress = {
+                        "phase": "materializing_resources",
+                        "processed": processed,
+                        "changes_emitted": emitted,
+                        "last_identity_key": after_key,
+                    }
+                    conn.execute(
+                        "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb WHERE id = %s",
+                        (json.dumps(progress), comparison_id),
+                    )
+                    conn.commit()
+                    quantum_batches += 1
+                    if quantum_exhausted():
+                        return yield_comparison(progress, "work_quantum_exhausted")
+                progress = {
+                    "phase": "materializing_items",
+                    "processed": processed,
+                    "changes_emitted": emitted,
+                    "last_identity_key": after_key,
+                    "completed_resource_change_id": 0,
+                    "resource_change_id": None,
+                    "last_item_identity_key": None,
+                }
+                conn.execute(
+                    "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb WHERE id = %s",
+                    (json.dumps(progress), comparison_id),
                 )
                 conn.commit()
 
@@ -6402,7 +9076,192 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                     UPDATE run_comparisons
                     SET state = 'queued', heartbeat_at = NOW(),
                         progress = COALESCE(progress, '{}'::jsonb) || jsonb_build_object(
-                            'phase', 'paused', 'reason', 'worker_shutdown'
+                            'paused_at', NOW(), 'pause_reason', 'worker_shutdown'
+                        )
+                    WHERE id = %s
+                    """,
+                    (comparison_id,),
+                )
+                conn.commit()
+                return "shutdown"
+
+            item_limitations: list[str] = []
+            item_emitted = int(progress.get("item_changes_emitted") or 0)
+            item_processed = int(progress.get("processed_items") or 0)
+            item_computed = compatibility.get("content_interpretable") is True
+            if item_computed:
+                completed_resource_change_id = int(progress.get("completed_resource_change_id") or 0)
+                current_resource_change_id = int(progress.get("resource_change_id") or 0)
+                resume_item_key = (
+                    str(progress.get("last_item_identity_key"))
+                    if progress.get("last_item_identity_key")
+                    else None
+                )
+                while not _shutdown_event.is_set():
+                    candidate = (
+                        _item_resource_change_by_id(conn, comparison_id, current_resource_change_id)
+                        if current_resource_change_id
+                        else _next_item_resource_change(conn, comparison_id, completed_resource_change_id)
+                    )
+                    if candidate is None:
+                        break
+                    resource_change_id, before_resource_id, after_resource_id, provider = candidate
+                    if _item_identity_is_ambiguous(conn, before_resource_id, after_resource_id):
+                        _mark_item_identity_indeterminate(conn, comparison_id, resource_change_id)
+                        completed_resource_change_id = resource_change_id
+                        current_resource_change_id = 0
+                        resume_item_key = None
+                        progress = {
+                            **progress,
+                            "phase": "materializing_items",
+                            "completed_resource_change_id": completed_resource_change_id,
+                            "resource_change_id": None,
+                            "last_item_identity_key": None,
+                            "processed_items": item_processed,
+                            "item_changes_emitted": item_emitted,
+                        }
+                        conn.execute(
+                            "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb WHERE id = %s",
+                            (json.dumps(progress), comparison_id),
+                        )
+                        conn.commit()
+                        quantum_batches += 1
+                        if quantum_exhausted():
+                            return yield_comparison(progress, "work_quantum_exhausted")
+                        continue
+                    after_item_key = resume_item_key if current_resource_change_id == resource_change_id else None
+                    current_resource_change_id = resource_change_id
+                    while not _shutdown_event.is_set():
+                        item_keys = _item_change_batch_keys(
+                            conn,
+                            before_resource_id,
+                            after_resource_id,
+                            after_item_key,
+                            COMPARISON_ITEM_BATCH_SIZE,
+                        )
+                        if not item_keys:
+                            break
+                        item_emitted += _materialize_item_change_batch(
+                            conn,
+                            comparison_id=comparison_id,
+                            resource_change_id=resource_change_id,
+                            before_resource_id=before_resource_id,
+                            after_resource_id=after_resource_id,
+                            provider=provider,
+                            identity_keys=item_keys,
+                            direct_permissions_comparable=(
+                                compatibility.get("direct_permissions_interpretable") is True
+                            ),
+                        )
+                        item_processed += len(item_keys)
+                        after_item_key = item_keys[-1]
+                        conn.execute(
+                            """
+                            UPDATE run_comparisons
+                            SET heartbeat_at = NOW(),
+                                progress = %s::jsonb
+                            WHERE id = %s
+                            """,
+                            (
+                                json.dumps(
+                                    {
+                                        **progress,
+                                        "phase": "materializing_items",
+                                        "processed": processed,
+                                        "processed_items": item_processed,
+                                        "item_changes_emitted": item_emitted,
+                                        "completed_resource_change_id": completed_resource_change_id,
+                                        "resource_change_id": resource_change_id,
+                                        "last_item_identity_key": after_item_key,
+                                    }
+                                ),
+                                comparison_id,
+                            ),
+                        )
+                        conn.commit()
+                        progress = {
+                            **progress,
+                            "phase": "materializing_items",
+                            "processed": processed,
+                            "processed_items": item_processed,
+                            "item_changes_emitted": item_emitted,
+                            "completed_resource_change_id": completed_resource_change_id,
+                            "resource_change_id": resource_change_id,
+                            "last_item_identity_key": after_item_key,
+                        }
+                        quantum_batches += 1
+                        if quantum_exhausted():
+                            return yield_comparison(progress, "work_quantum_exhausted")
+                    completed_resource_change_id = resource_change_id
+                    current_resource_change_id = 0
+                    resume_item_key = None
+                    progress = {
+                        **progress,
+                        "phase": "materializing_items",
+                        "completed_resource_change_id": completed_resource_change_id,
+                        "resource_change_id": None,
+                        "last_item_identity_key": None,
+                        "processed_items": item_processed,
+                        "item_changes_emitted": item_emitted,
+                    }
+                    conn.execute(
+                        "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb WHERE id = %s",
+                        (json.dumps(progress), comparison_id),
+                    )
+                    conn.commit()
+                    quantum_batches += 1
+                    if quantum_exhausted():
+                        return yield_comparison(progress, "work_quantum_exhausted")
+                ambiguous_item_resources = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM comparison_resource_changes
+                        WHERE comparison_id = %s AND change_categories ? 'item_identity_ambiguous'
+                        """,
+                        (comparison_id,),
+                    ).fetchone()[0]
+                )
+                if ambiguous_item_resources:
+                    ambiguous_examples = [
+                        int(row[0])
+                        for row in conn.execute(
+                            """
+                            SELECT id FROM comparison_resource_changes
+                            WHERE comparison_id = %s AND change_categories ? 'item_identity_ambiguous'
+                            ORDER BY id LIMIT 20
+                            """,
+                            (comparison_id,),
+                        ).fetchall()
+                    ]
+                    item_limitations.append(
+                        "Item history was skipped for "
+                        f"{ambiguous_item_resources} resource change(s) with duplicate or missing item identities; "
+                        f"examples={ambiguous_examples}."
+                    )
+                _finalize_item_candidate_resources(conn, comparison_id)
+                conn.execute(
+                    """
+                    UPDATE run_comparisons
+                    SET heartbeat_at = NOW(),
+                        progress = COALESCE(progress, '{}'::jsonb) || jsonb_build_object('phase', 'finalizing')
+                    WHERE id = %s
+                    """,
+                    (comparison_id,),
+                )
+                conn.commit()
+            else:
+                item_limitations.append(
+                    "Item history was not materialized because content scope or completeness was not comparable."
+                )
+
+            if _shutdown_event.is_set():
+                conn.execute(
+                    """
+                    UPDATE run_comparisons
+                    SET state = 'queued', heartbeat_at = NOW(),
+                        progress = COALESCE(progress, '{}'::jsonb) || jsonb_build_object(
+                            'paused_at', NOW(), 'pause_reason', 'worker_shutdown'
                         )
                     WHERE id = %s
                     """,
@@ -6421,6 +9280,196 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                 (comparison_id,),
             ).fetchall()
             summary = _build_comparison_summary(summary_rows, compatibility)
+            item_summary = _item_change_summary(
+                conn,
+                comparison_id,
+                computed=item_computed,
+                limitations=item_limitations,
+            )
+            summary.update(item_summary)
+            summary["exact"] = bool(summary.get("resource_summary_exact") and summary.get("item_summary_exact"))
+            emitted = int(summary.get("total") or 0)
+            findings_authoritative = bool(
+                not source_id
+                or comparison_is_latest_complete_candidate(
+                    conn,
+                    comparison_id=comparison_id,
+                    source_id=source_id,
+                    current_run_id=current_run_id,
+                )
+            )
+            finding_cursor = int(progress.get("findings_cursor") or 0)
+            finding_count = int(progress.get("findings_observed") or 0)
+            progress = {
+                **progress,
+                "phase": "evaluating_findings",
+                "processed": processed,
+                "changes_emitted": emitted,
+                "processed_items": item_processed,
+                "item_changes_emitted": item_emitted,
+                "findings_cursor": finding_cursor,
+                "findings_observed": finding_count,
+            }
+            conn.execute(
+                "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb WHERE id = %s",
+                (json.dumps(progress), comparison_id),
+            )
+            conn.commit()
+            findings_evaluation_state = "complete"
+            try:
+                while not _shutdown_event.is_set():
+                    inserted, finding_cursor, has_more = evaluate_comparison_findings(
+                        conn,
+                        comparison_id=comparison_id,
+                        project_id=project_id,
+                        source_id=source_id,
+                        current_run_id=current_run_id,
+                        after_id=finding_cursor,
+                        authoritative_state=findings_authoritative,
+                    )
+                    finding_count += inserted
+                    progress = {
+                        **progress,
+                        "phase": "complete",
+                        "findings_cursor": finding_cursor,
+                        "findings_observed": finding_count,
+                    }
+                    conn.execute(
+                        "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb WHERE id = %s",
+                        (json.dumps(progress), comparison_id),
+                    )
+                    conn.commit()
+                    quantum_batches += 1
+                    if has_more and quantum_exhausted():
+                        return yield_comparison(progress, "work_quantum_exhausted")
+                    if not has_more:
+                        break
+            except Exception as findings_exc:
+                logger.exception("comparison finding evaluation degraded comparison_id=%s", comparison_id)
+                conn.rollback()
+                finding_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM finding_occurrences WHERE comparison_id = %s",
+                        (comparison_id,),
+                    ).fetchone()[0]
+                )
+                findings_attempt_count = int(progress.get("findings_attempt_count") or 0) + 1
+                if findings_attempt_count < 3:
+                    retry_delay_seconds = _retry_backoff_seconds(
+                        findings_attempt_count,
+                        jitter_key=f"comparison-findings:{comparison_id}",
+                    )
+                    next_retry_at = datetime.now(tz=UTC) + timedelta(seconds=retry_delay_seconds)
+                    progress = {
+                        **progress,
+                        "phase": "evaluating_findings",
+                        "findings_cursor": finding_cursor,
+                        "findings_observed": finding_count,
+                        "findings_attempt_count": findings_attempt_count,
+                        "findings_evaluation_state": "retrying",
+                        "findings_next_retry_at": next_retry_at.isoformat(),
+                        "findings_error_code": "FINDING_EVALUATION_FAILED",
+                    }
+                    summary["findings_evaluation"] = {
+                        "state": "retrying",
+                        "attempt_count": findings_attempt_count,
+                        "next_retry_at": next_retry_at.isoformat(),
+                        "partial_positive_evidence_retained": finding_count > 0,
+                    }
+                    conn.execute(
+                        """
+                        UPDATE run_comparisons
+                        SET state = 'complete', completed_at = NOW(), heartbeat_at = NOW(), next_retry_at = NULL,
+                            progress = %s::jsonb, summary = %s::jsonb
+                        WHERE id = %s
+                        """,
+                        (json.dumps(progress), json.dumps(summary), comparison_id),
+                    )
+                    if source_id and findings_authoritative:
+                        conn.execute(
+                            "UPDATE collection_sources SET last_comparison_id = %s, updated_at = NOW() "
+                            "WHERE id = %s AND project_id = %s",
+                            (comparison_id, source_id, project_id),
+                        )
+                        if str(comparison_trigger) == "automatic":
+                            update_collection_source_monitoring_coverage(
+                                conn,
+                                source_id=source_id,
+                                run_id=current_run_id,
+                                baseline={
+                                    "state": "established",
+                                    "comparison_id": comparison_id,
+                                    "baseline_run_id": baseline_run_id,
+                                    "findings_evaluation_state": "retrying",
+                                    "findings_next_retry_at": next_retry_at.isoformat(),
+                                },
+                            )
+                    write_audit(
+                        conn,
+                        project_id,
+                        "COMPARISON_COMPLETED",
+                        "run_comparison",
+                        comparison_id,
+                        {
+                            "worker": CONSUMER_NAME,
+                            "summary": summary,
+                            "findings_evaluation_state": "retrying",
+                        },
+                    )
+                    write_audit(
+                        conn,
+                        project_id,
+                        "COMPARISON_FINDINGS_EVALUATION_RETRY_SCHEDULED",
+                        "run_comparison",
+                        comparison_id,
+                        {
+                            "worker": CONSUMER_NAME,
+                            "error_code": "FINDING_EVALUATION_FAILED",
+                            "error_type": type(findings_exc).__name__[:120],
+                            "findings_observed": finding_count,
+                            "attempt_count": findings_attempt_count,
+                            "next_retry_at": next_retry_at.isoformat(),
+                        },
+                    )
+                    conn.commit()
+                    return "complete"
+                findings_evaluation_state = "degraded"
+                progress = {
+                    **progress,
+                    "findings_cursor": finding_cursor,
+                    "findings_observed": finding_count,
+                    "findings_attempt_count": findings_attempt_count,
+                    "findings_evaluation_state": "degraded",
+                }
+                summary["findings_evaluation"] = {
+                    "state": "degraded",
+                    "attempt_count": findings_attempt_count,
+                    "error_code": "FINDING_EVALUATION_FAILED",
+                    "error_type": type(findings_exc).__name__[:120],
+                    "partial_positive_evidence_retained": finding_count > 0,
+                }
+                write_audit(
+                    conn,
+                    project_id,
+                    "COMPARISON_FINDINGS_EVALUATION_FAILED",
+                    "run_comparison",
+                    comparison_id,
+                    {
+                        "worker": CONSUMER_NAME,
+                        "error_code": "FINDING_EVALUATION_FAILED",
+                        "error_type": type(findings_exc).__name__[:120],
+                        "findings_observed": finding_count,
+                    },
+                )
+            if _shutdown_event.is_set():
+                return yield_comparison(progress, "worker_shutdown")
+            summary.setdefault(
+                "findings_evaluation",
+                {
+                    "state": findings_evaluation_state,
+                    "authoritative_state": findings_authoritative,
+                },
+            )
             conn.execute(
                 """
                 UPDATE run_comparisons
@@ -6429,13 +9478,51 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                     progress = jsonb_build_object(
                         'phase', 'complete',
                         'processed', %s::bigint,
-                        'changes_emitted', %s::bigint
+                        'changes_emitted', %s::bigint,
+                        'processed_items', %s::bigint,
+                        'item_changes_emitted', %s::bigint,
+                        'findings_observed', %s::bigint,
+                        'findings_cursor', %s::bigint,
+                        'findings_evaluation_state', %s::text,
+                        'findings_attempt_count', %s::integer
                     ),
                     summary = %s::jsonb, error_code = NULL, error_message = NULL
                 WHERE id = %s
                 """,
-                (processed, emitted, json.dumps(summary), comparison_id),
+                (
+                    processed,
+                    emitted,
+                    item_processed,
+                    item_emitted,
+                    finding_count,
+                    finding_cursor,
+                    findings_evaluation_state,
+                    int(progress.get("findings_attempt_count") or 0),
+                    json.dumps(summary),
+                    comparison_id,
+                ),
             )
+            if source_id and findings_authoritative:
+                conn.execute(
+                    """
+                    UPDATE collection_sources
+                    SET last_comparison_id = %s, updated_at = NOW()
+                    WHERE id = %s AND project_id = %s
+                    """,
+                    (comparison_id, source_id, project_id),
+                )
+                if str(comparison_trigger) == "automatic":
+                    update_collection_source_monitoring_coverage(
+                        conn,
+                        source_id=source_id,
+                        run_id=current_run_id,
+                        baseline={
+                            "state": "established",
+                            "comparison_id": comparison_id,
+                            "baseline_run_id": baseline_run_id,
+                            "findings_evaluation_state": findings_evaluation_state,
+                        },
+                    )
             write_audit(
                 conn,
                 project_id,
@@ -6475,7 +9562,7 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                     completed_at = CASE WHEN %s = 'failed' THEN NOW() ELSE NULL END,
                     next_retry_at = %s,
                     error_code = %s, error_message = %s,
-                    progress = %s::jsonb
+                    progress = COALESCE(progress, '{}'::jsonb) || %s::jsonb
                 WHERE id = %s
                 """,
                 (
@@ -6486,16 +9573,40 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                     error_message,
                     json.dumps(
                         {
-                            "phase": "retry_queued" if should_retry else "failed",
+                            "last_error_phase": "retry_queued" if should_retry else "failed",
                             "attempt_count": attempt_count,
                             "retryable": retryable,
                             "retry_delay_seconds": retry_delay_seconds,
                             "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+                            "resume_after_error": should_retry,
                         }
                     ),
                     comparison_id,
                 ),
             )
+            if source_id and str(comparison_trigger) == "automatic":
+                try:
+                    if comparison_is_latest_complete_candidate(
+                        conn,
+                        comparison_id=comparison_id,
+                        source_id=source_id,
+                        current_run_id=current_run_id,
+                    ):
+                        update_collection_source_monitoring_coverage(
+                            conn,
+                            source_id=source_id,
+                            run_id=current_run_id,
+                            baseline={
+                                "state": "retrying" if should_retry else "failed",
+                                "comparison_id": comparison_id,
+                                "error_code": error_code,
+                                "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+                            },
+                        )
+                except psycopg.Error:
+                    logger.exception(
+                        "failed updating automatic comparison coverage comparison_id=%s", comparison_id
+                    )
             if project_id:
                 write_audit(
                     conn,
@@ -6520,12 +9631,431 @@ def process_comparison_job(fields: dict[str, str]) -> str:
                 # error in status persistence can leave the transaction aborted.
                 # Clear that state before attempting the explicit unlock.
                 conn.rollback()
+                if source_lock_key is not None:
+                    conn.execute("SELECT pg_advisory_unlock(%s)", (source_lock_key,))
                 conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
             except psycopg.Error:
                 logger.exception("failed to release comparison advisory lock comparison_id=%s", comparison_id)
 
 
+def process_monitoring_evaluation_job(fields: dict[str, str]) -> str:
+    """Resume only the durable finding-evaluation phase for a COMPLETE run."""
+
+    run_id = _normalize_uuid_str(fields.get("run_id"))
+    if not run_id:
+        return "ignored"
+    with connect_database() as conn:
+        run_lock_key = advisory_lock_key(run_id)
+        source_lock_key: int | None = None
+        if not conn.execute("SELECT pg_try_advisory_lock(%s)", (run_lock_key,)).fetchone()[0]:
+            return "busy"
+        project_id: str | None = None
+        source_id: str | None = None
+        try:
+            row = conn.execute(
+                """
+                SELECT project_id::text, source_id::text, status::text, ingest_progress
+                FROM scan_runs
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return "ignored"
+            project_id, source_id, run_status, raw_progress = row
+            if run_status != "COMPLETE" or not source_id:
+                return "ignored"
+            progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
+            findings_progress = (
+                dict(progress.get("monitoring_findings"))
+                if isinstance(progress.get("monitoring_findings"), dict)
+                else {}
+            )
+            if str(findings_progress.get("state") or "") not in {
+                "queued",
+                "retrying",
+                "evaluating",
+                "degraded",
+            }:
+                return "ignored"
+            source_lock_key = monitoring_source_advisory_lock_key_from_id(conn, source_id)
+            if source_lock_key is not None:
+                conn.execute("SELECT pg_advisory_lock(%s)", (source_lock_key,))
+            if not collection_source_automation_enabled(conn, source_id):
+                skipped = {**findings_progress, "state": "skipped", "phase": "skipped", "reason": "source_disabled"}
+                _persist_finding_evaluation_progress(conn, run_id, skipped)
+                update_collection_source_monitoring_coverage(
+                    conn,
+                    source_id=source_id,
+                    run_id=run_id,
+                    findings=skipped,
+                )
+                write_audit(
+                    conn,
+                    project_id,
+                    "MONITORING_EVALUATION_SKIPPED",
+                    "scan_run",
+                    run_id,
+                    {"worker": CONSUMER_NAME, "source_id": source_id, "reason": "source_disabled"},
+                )
+                conn.commit()
+                return "complete"
+            if not collection_source_run_is_latest_complete_candidate(conn, source_id, run_id):
+                skipped = {**findings_progress, "state": "skipped", "phase": "skipped", "reason": "superseded"}
+                _persist_finding_evaluation_progress(conn, run_id, skipped)
+                write_audit(
+                    conn,
+                    project_id,
+                    "MONITORING_EVALUATION_SKIPPED",
+                    "scan_run",
+                    run_id,
+                    {"worker": CONSUMER_NAME, "source_id": source_id, "reason": "superseded"},
+                )
+                conn.commit()
+                return "complete"
+            evaluating = {**findings_progress, "state": "evaluating"}
+            evaluating.pop("next_retry_at", None)
+            _persist_finding_evaluation_progress(conn, run_id, evaluating)
+            update_collection_source_monitoring_coverage(
+                conn,
+                source_id=source_id,
+                run_id=run_id,
+                findings=evaluating,
+            )
+            conn.commit()
+            try:
+                summary = evaluate_run_findings(
+                    conn,
+                    project_id=project_id,
+                    source_id=source_id,
+                    run_id=run_id,
+                )
+            except Exception as exc:
+                logger.exception("monitoring-only evaluation failed run_id=%s", run_id)
+                conn.rollback()
+                checkpoint = conn.execute(
+                    "SELECT ingest_progress->'monitoring_findings' FROM scan_runs WHERE id = %s",
+                    (run_id,),
+                ).fetchone()
+                checkpoint_payload = dict(checkpoint[0]) if checkpoint and isinstance(checkpoint[0], dict) else {}
+                attempt_count = int(checkpoint_payload.get("attempt_count") or findings_progress.get("attempt_count") or 0) + 1
+                retry_scheduled = attempt_count < 3
+                retry_delay_seconds = (
+                    _retry_backoff_seconds(attempt_count, jitter_key=f"run-findings:{run_id}")
+                    if retry_scheduled
+                    else None
+                )
+                next_retry_at = (
+                    datetime.now(tz=UTC) + timedelta(seconds=retry_delay_seconds)
+                    if retry_delay_seconds is not None
+                    else None
+                )
+                failed_progress = {
+                    **checkpoint_payload,
+                    "state": "retrying" if retry_scheduled else "degraded",
+                    "phase": "queued" if retry_scheduled else "failed",
+                    "attempt_count": attempt_count,
+                    "error_code": "FINDING_EVALUATION_FAILED",
+                    "error_type": type(exc).__name__[:120],
+                    "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+                }
+                _persist_finding_evaluation_progress(conn, run_id, failed_progress)
+                update_collection_source_monitoring_coverage(
+                    conn,
+                    source_id=source_id,
+                    run_id=run_id,
+                    findings=failed_progress,
+                )
+                write_audit(
+                    conn,
+                    project_id,
+                    (
+                        "MONITORING_EVALUATION_RETRY_SCHEDULED"
+                        if retry_scheduled
+                        else "MONITORING_EVALUATION_FAILED"
+                    ),
+                    "scan_run",
+                    run_id,
+                    {
+                        "worker": CONSUMER_NAME,
+                        "source_id": source_id,
+                        "attempt_count": attempt_count,
+                        "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+                        "error_code": "FINDING_EVALUATION_FAILED",
+                        "error_type": type(exc).__name__[:120],
+                    },
+                )
+                conn.commit()
+                return "retry_scheduled" if retry_scheduled else "degraded"
+            complete_progress = {
+                "state": "complete",
+                "phase": "complete",
+                "observed": summary["observed"],
+                "resolved": summary["resolved"],
+                "attempt_count": int(findings_progress.get("attempt_count") or 0),
+            }
+            _persist_finding_evaluation_progress(conn, run_id, complete_progress)
+            update_collection_source_monitoring_coverage(
+                conn,
+                source_id=source_id,
+                run_id=run_id,
+                findings=complete_progress,
+            )
+            write_audit(
+                conn,
+                project_id,
+                "MONITORING_EVALUATION_RECOVERED",
+                "scan_run",
+                run_id,
+                {"worker": CONSUMER_NAME, "source_id": source_id, **summary},
+            )
+            conn.commit()
+            return "complete"
+        finally:
+            try:
+                conn.rollback()
+                if source_lock_key is not None:
+                    conn.execute("SELECT pg_advisory_unlock(%s)", (source_lock_key,))
+                conn.execute("SELECT pg_advisory_unlock(%s)", (run_lock_key,))
+            except psycopg.Error:
+                    logger.exception("failed to release monitoring evaluation locks run_id=%s", run_id)
+
+
+def process_comparison_finding_evaluation_job(fields: dict[str, str]) -> str:
+    """Resume policy evaluation without hiding or rebuilding a valid materialized diff."""
+
+    comparison_id = _normalize_uuid_str(fields.get("comparison_id"))
+    if not comparison_id:
+        return "ignored"
+    with connect_database() as conn:
+        comparison_lock_key = advisory_lock_key(comparison_id)
+        source_lock_key: int | None = None
+        if not conn.execute("SELECT pg_try_advisory_lock(%s)", (comparison_lock_key,)).fetchone()[0]:
+            return "busy"
+        try:
+            row = conn.execute(
+                """
+                SELECT project_id::text, source_id::text, baseline_run_id::text,
+                       current_run_id::text, state, progress, summary, trigger
+                FROM run_comparisons
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (comparison_id,),
+            ).fetchone()
+            if row is None:
+                return "ignored"
+            project_id, source_id, baseline_run_id, current_run_id, state, raw_progress, raw_summary, trigger = row
+            summary = dict(raw_summary) if isinstance(raw_summary, dict) else {}
+            evaluation = (
+                dict(summary.get("findings_evaluation"))
+                if isinstance(summary.get("findings_evaluation"), dict)
+                else {}
+            )
+            if str(state) != "complete" or str(evaluation.get("state") or "") not in {
+                "queued",
+                "retrying",
+                "evaluating",
+                "degraded",
+            }:
+                return "ignored"
+            if source_id:
+                source_lock_key = monitoring_source_advisory_lock_key_from_id(conn, source_id)
+                if source_lock_key is not None:
+                    conn.execute("SELECT pg_advisory_lock(%s)", (source_lock_key,))
+            authoritative = bool(
+                not source_id
+                or comparison_is_latest_complete_candidate(
+                    conn,
+                    comparison_id=comparison_id,
+                    source_id=source_id,
+                    current_run_id=current_run_id,
+                )
+            )
+            progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
+            cursor = int(progress.get("findings_cursor") or 0)
+            observed = int(progress.get("findings_observed") or 0)
+            attempt_count = int(progress.get("findings_attempt_count") or evaluation.get("attempt_count") or 0)
+            batches = 0
+            started = time.monotonic()
+            try:
+                while not _shutdown_event.is_set():
+                    inserted, cursor, has_more = evaluate_comparison_findings(
+                        conn,
+                        comparison_id=comparison_id,
+                        project_id=project_id,
+                        source_id=source_id,
+                        current_run_id=current_run_id,
+                        after_id=cursor,
+                        authoritative_state=authoritative,
+                    )
+                    observed += inserted
+                    progress = {
+                        **progress,
+                        "phase": "complete",
+                        "findings_cursor": cursor,
+                        "findings_observed": observed,
+                        "findings_attempt_count": attempt_count,
+                        "findings_evaluation_state": "evaluating",
+                    }
+                    evaluation = {
+                        **evaluation,
+                        "state": "evaluating",
+                        "attempt_count": attempt_count,
+                        "next_retry_at": None,
+                    }
+                    summary["findings_evaluation"] = evaluation
+                    conn.execute(
+                        "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb, "
+                        "summary = %s::jsonb WHERE id = %s",
+                        (json.dumps(progress), json.dumps(summary), comparison_id),
+                    )
+                    conn.commit()
+                    batches += 1
+                    if not has_more:
+                        break
+                    if (
+                        batches >= COMPARISON_WORK_QUANTUM_BATCHES
+                        or time.monotonic() - started >= COMPARISON_WORK_QUANTUM_SECONDS
+                    ):
+                        evaluation = {**evaluation, "state": "retrying", "next_retry_at": now_iso()}
+                        summary["findings_evaluation"] = evaluation
+                        conn.execute(
+                            "UPDATE run_comparisons SET summary = %s::jsonb, heartbeat_at = NOW() WHERE id = %s",
+                            (json.dumps(summary), comparison_id),
+                        )
+                        conn.commit()
+                        return "yielded"
+            except Exception as exc:
+                logger.exception("comparison finding-only recovery failed comparison_id=%s", comparison_id)
+                conn.rollback()
+                attempt_count += 1
+                retry_scheduled = attempt_count < 3
+                delay = (
+                    _retry_backoff_seconds(attempt_count, jitter_key=f"comparison-findings:{comparison_id}")
+                    if retry_scheduled
+                    else None
+                )
+                next_retry = datetime.now(tz=UTC) + timedelta(seconds=delay) if delay else None
+                evaluation = {
+                    **evaluation,
+                    "state": "retrying" if retry_scheduled else "degraded",
+                    "attempt_count": attempt_count,
+                    "next_retry_at": next_retry.isoformat() if next_retry else None,
+                    "error_code": "FINDING_EVALUATION_FAILED",
+                    "error_type": type(exc).__name__[:120],
+                    "partial_positive_evidence_retained": observed > 0,
+                }
+                summary["findings_evaluation"] = evaluation
+                progress = {
+                    **progress,
+                    "phase": "complete",
+                    "findings_cursor": cursor,
+                    "findings_observed": observed,
+                    "findings_attempt_count": attempt_count,
+                    "findings_evaluation_state": evaluation["state"],
+                }
+                conn.execute(
+                    "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb, "
+                    "summary = %s::jsonb WHERE id = %s",
+                    (json.dumps(progress), json.dumps(summary), comparison_id),
+                )
+                if source_id and authoritative and str(trigger) == "automatic":
+                    update_collection_source_monitoring_coverage(
+                        conn,
+                        source_id=source_id,
+                        run_id=current_run_id,
+                        baseline={
+                            "state": "established",
+                            "comparison_id": comparison_id,
+                            "baseline_run_id": baseline_run_id,
+                            "findings_evaluation_state": evaluation["state"],
+                            "findings_next_retry_at": evaluation.get("next_retry_at"),
+                        },
+                    )
+                write_audit(
+                    conn,
+                    project_id,
+                    (
+                        "COMPARISON_FINDINGS_EVALUATION_RETRY_SCHEDULED"
+                        if retry_scheduled
+                        else "COMPARISON_FINDINGS_EVALUATION_FAILED"
+                    ),
+                    "run_comparison",
+                    comparison_id,
+                    {
+                        "worker": CONSUMER_NAME,
+                        "attempt_count": attempt_count,
+                        "next_retry_at": evaluation.get("next_retry_at"),
+                        "error_code": "FINDING_EVALUATION_FAILED",
+                        "error_type": type(exc).__name__[:120],
+                    },
+                )
+                conn.commit()
+                return "retry_scheduled" if retry_scheduled else "degraded"
+            evaluation = {
+                **evaluation,
+                "state": "complete",
+                "attempt_count": attempt_count,
+                "next_retry_at": None,
+                "authoritative_state": authoritative,
+            }
+            evaluation.pop("error_code", None)
+            evaluation.pop("error_type", None)
+            summary["findings_evaluation"] = evaluation
+            progress = {
+                **progress,
+                "phase": "complete",
+                "findings_cursor": cursor,
+                "findings_observed": observed,
+                "findings_attempt_count": attempt_count,
+                "findings_evaluation_state": "complete",
+            }
+            conn.execute(
+                "UPDATE run_comparisons SET heartbeat_at = NOW(), progress = %s::jsonb, "
+                "summary = %s::jsonb WHERE id = %s",
+                (json.dumps(progress), json.dumps(summary), comparison_id),
+            )
+            if source_id and authoritative and str(trigger) == "automatic":
+                update_collection_source_monitoring_coverage(
+                    conn,
+                    source_id=source_id,
+                    run_id=current_run_id,
+                    baseline={
+                        "state": "established",
+                        "comparison_id": comparison_id,
+                        "baseline_run_id": baseline_run_id,
+                        "findings_evaluation_state": "complete",
+                    },
+                )
+            write_audit(
+                conn,
+                project_id,
+                "COMPARISON_FINDINGS_EVALUATION_RECOVERED",
+                "run_comparison",
+                comparison_id,
+                {"worker": CONSUMER_NAME, "findings_observed": observed, "authoritative_state": authoritative},
+            )
+            conn.commit()
+            return "complete"
+        finally:
+            try:
+                conn.rollback()
+                if source_lock_key is not None:
+                    conn.execute("SELECT pg_advisory_unlock(%s)", (source_lock_key,))
+                conn.execute("SELECT pg_advisory_unlock(%s)", (comparison_lock_key,))
+            except psycopg.Error:
+                logger.exception(
+                    "failed to release comparison finding evaluation locks comparison_id=%s", comparison_id
+                )
+
+
 def process_job(fields: dict[str, str]) -> str:
+    if str(fields.get("job_type") or "").strip().lower() == "comparison_findings_evaluation":
+        return process_comparison_finding_evaluation_job(fields)
+    if str(fields.get("job_type") or "").strip().lower() == "monitoring_evaluation":
+        return process_monitoring_evaluation_job(fields)
     if str(fields.get("job_type") or "").strip().lower() == "comparison" or fields.get("comparison_id"):
         return process_comparison_job(fields)
 
@@ -6545,6 +10075,7 @@ def process_job(fields: dict[str, str]) -> str:
 
     with connect_database() as conn:
         lock_key = advisory_lock_key(run_id)
+        source_lock_key: int | None = None
         locked = conn.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,)).fetchone()[0]
         if not locked:
             logger.info("run is already being processed run_id=%s", run_id)
@@ -6619,6 +10150,8 @@ def process_job(fields: dict[str, str]) -> str:
                 progress = {"attempt_count": attempt_count}
                 if producer_run_end_counts is not None:
                     progress["producer_inventory_counts"] = producer_run_end_counts
+                if isinstance(progress_raw, dict) and isinstance(progress_raw.get("monitoring_findings"), dict):
+                    progress["monitoring_findings"] = progress_raw["monitoring_findings"]
                 progress.update(extra)
                 return progress
 
@@ -7268,7 +10801,6 @@ def process_job(fields: dict[str, str]) -> str:
                         run_id,
                         permission_integrity,
                     )
-                prepare_run_identity_keys(conn, run_id)
             persisted_counts = load_persisted_summary(conn, run_id)
             persisted_inventory_counts = {
                 field: persisted_counts[field] for field in ("endpoints", "resources", "items")
@@ -7303,14 +10835,211 @@ def process_job(fields: dict[str, str]) -> str:
                 artifact_integrity,
                 progress_callback=report_preflight_progress,
             )
-            update_run_status(conn, run_id, "COMPLETE", line_offset, counts)
+            source_lock_key = monitoring_source_advisory_lock_key(conn, run_id, project_id)
+            if source_lock_key is not None:
+                # Session-scoped by design: findings checkpoints commit each
+                # batch, but another worker for the same source must not
+                # interleave a newer authoritative snapshot.
+                conn.execute("SELECT pg_advisory_lock(%s)", (source_lock_key,))
+            source_id = register_collection_source(conn, run_id, project_id)
+            finding_summary = {"observed": 0, "resolved": 0}
+            automatic_comparison_id = None
+            automation_enabled = bool(source_id and collection_source_automation_enabled(conn, source_id))
+            source_run_is_latest = bool(
+                source_id
+                and collection_source_run_is_latest_complete_candidate(conn, source_id, run_id)
+            )
+            if source_id and automation_enabled and source_run_is_latest:
+                # Legacy artifacts without normalized source context do not
+                # participate in monitoring. Avoid an unnecessary full-table
+                # identity rewrite for those imports; comparisons prepare
+                # identities independently when explicitly requested.
+                prepare_run_identity_keys(conn, run_id, commit_batches=True)
+                existing_monitoring_progress = (
+                    progress_raw.get("monitoring_findings")
+                    if isinstance(progress_raw, dict) and isinstance(progress_raw.get("monitoring_findings"), dict)
+                    else None
+                )
+                if not existing_monitoring_progress:
+                    _persist_finding_evaluation_progress(
+                        conn,
+                        run_id,
+                        {
+                            "state": "evaluating",
+                            "phase": "candidates",
+                            "after_resource_id": 0,
+                            "observed": 0,
+                            "resolved": 0,
+                        },
+                    )
+                # Persist a durable monitoring checkpoint only after the
+                # artifact and normalized inventory have passed integrity
+                # reconciliation. A recovered ingest resumes this cursor
+                # rather than accumulating an unbounded findings transaction.
+                conn.commit()
+                try:
+                    finding_summary = evaluate_run_findings(
+                        conn,
+                        project_id=project_id,
+                        source_id=source_id,
+                        run_id=run_id,
+                    )
+                    monitoring_progress = {
+                        "state": "complete",
+                        "phase": "complete",
+                        "observed": finding_summary["observed"],
+                        "resolved": finding_summary["resolved"],
+                    }
+                except Exception as monitoring_exc:
+                    # Inventory integrity is already verified. Monitoring is a
+                    # derived workflow and must not turn a valid collection
+                    # into a FAILED parent after durable positive-evidence
+                    # batches have committed. Absence resolution starts only
+                    # after the complete candidate pass.
+                    logger.exception("finding evaluation degraded run_id=%s", run_id)
+                    conn.rollback()
+                    checkpoint = conn.execute(
+                        "SELECT ingest_progress->'monitoring_findings' FROM scan_runs WHERE id = %s",
+                        (run_id,),
+                    ).fetchone()
+                    checkpoint_payload = (
+                        dict(checkpoint[0]) if checkpoint and isinstance(checkpoint[0], dict) else {}
+                    )
+                    finding_summary = {
+                        "observed": int(checkpoint_payload.get("observed") or 0),
+                        "resolved": int(checkpoint_payload.get("resolved") or 0),
+                    }
+                    findings_attempt_count = int(checkpoint_payload.get("attempt_count") or 0) + 1
+                    retry_scheduled = findings_attempt_count < 3
+                    retry_delay_seconds = (
+                        _retry_backoff_seconds(
+                            findings_attempt_count,
+                            jitter_key=f"run-findings:{run_id}",
+                        )
+                        if retry_scheduled
+                        else None
+                    )
+                    next_retry_at = (
+                        datetime.now(tz=UTC) + timedelta(seconds=retry_delay_seconds)
+                        if retry_delay_seconds is not None
+                        else None
+                    )
+                    monitoring_progress = {
+                        **checkpoint_payload,
+                        "state": "retrying" if retry_scheduled else "degraded",
+                        "phase": "queued" if retry_scheduled else "failed",
+                        "attempt_count": findings_attempt_count,
+                        "error_code": "FINDING_EVALUATION_FAILED",
+                        "error_type": type(monitoring_exc).__name__[:120],
+                        "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+                    }
+                    write_audit(
+                        conn,
+                        project_id,
+                        "MONITORING_EVALUATION_FAILED",
+                        "scan_run",
+                        run_id,
+                        {
+                            "worker": CONSUMER_NAME,
+                            "source_id": source_id,
+                            "error_code": "FINDING_EVALUATION_FAILED",
+                            "error_type": type(monitoring_exc).__name__[:120],
+                            "attempt_count": findings_attempt_count,
+                            "retry_scheduled": retry_scheduled,
+                            "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+                            "checkpoint": monitoring_progress,
+                        },
+                    )
+                update_run_status(
+                    conn,
+                    run_id,
+                    "COMPLETE",
+                    line_offset,
+                    counts,
+                    extra_progress=ingest_progress_extra(monitoring_findings=monitoring_progress),
+                )
+                update_collection_source_monitoring_coverage(
+                    conn,
+                    source_id=source_id,
+                    run_id=run_id,
+                    findings=monitoring_progress,
+                )
+                if collection_source_run_is_latest_complete_candidate(conn, source_id, run_id):
+                    automatic_comparison_id = create_automatic_comparison(
+                        conn,
+                        project_id=project_id,
+                        source_id=source_id,
+                        current_run_id=run_id,
+                    )
+                else:
+                    write_audit(
+                        conn,
+                        project_id,
+                        "MONITORING_AUTOMATION_SKIPPED",
+                        "collection_source",
+                        source_id,
+                        {
+                            "worker": CONSUMER_NAME,
+                            "run_id": run_id,
+                            "reason": "source_superseded_before_comparison",
+                        },
+                    )
+            elif source_id:
+                skip_reason = "source_superseded" if not source_run_is_latest else "source_disabled"
+                monitoring_progress = {
+                    "state": "skipped",
+                    "phase": "skipped",
+                    "reason": skip_reason,
+                    "observed": 0,
+                    "resolved": 0,
+                }
+                update_run_status(
+                    conn,
+                    run_id,
+                    "COMPLETE",
+                    line_offset,
+                    counts,
+                    extra_progress=ingest_progress_extra(monitoring_findings=monitoring_progress),
+                )
+                if skip_reason == "source_disabled":
+                    update_collection_source_monitoring_coverage(
+                        conn,
+                        source_id=source_id,
+                        run_id=run_id,
+                        findings=monitoring_progress,
+                    )
+                write_audit(
+                    conn,
+                    project_id,
+                    "MONITORING_AUTOMATION_SKIPPED",
+                    "collection_source",
+                    source_id,
+                    {
+                        "worker": CONSUMER_NAME,
+                        "run_id": run_id,
+                        "reason": skip_reason,
+                        "source_enabled": automation_enabled,
+                        "source_run_is_latest": source_run_is_latest,
+                    },
+                )
+            else:
+                update_run_status(conn, run_id, "COMPLETE", line_offset, counts)
             write_audit(
                 conn,
                 project_id,
                 "INGEST_COMPLETED",
                 "scan_run",
                 run_id,
-                {"worker": CONSUMER_NAME, "line_offset": line_offset, "counts": counts},
+                {
+                    "worker": CONSUMER_NAME,
+                    "line_offset": line_offset,
+                    "counts": counts,
+                    "source_id": source_id,
+                    "findings": finding_summary,
+                    "automatic_comparison_id": automatic_comparison_id,
+                    "automation_enabled": automation_enabled,
+                    "source_run_is_latest_complete": source_run_is_latest,
+                },
             )
             conn.commit()
             last_line_offset = line_offset
@@ -7337,10 +11066,28 @@ def process_job(fields: dict[str, str]) -> str:
             except psycopg.Error:
                 logger.exception("failed to rollback aborted ingest transaction run_id=%s", run_id)
             try:
+                durable_progress_row = conn.execute(
+                    "SELECT ingest_progress, summary FROM scan_runs WHERE id = %s",
+                    (run_id,),
+                ).fetchone()
+                durable_progress = (
+                    dict(durable_progress_row[0])
+                    if durable_progress_row and isinstance(durable_progress_row[0], dict)
+                    else {}
+                )
+                if durable_progress_row:
+                    last_line_offset = max(last_line_offset, parse_offset(durable_progress))
+                    last_counts = parse_summary(durable_progress_row[1])
+                monitoring_findings_progress = (
+                    durable_progress.get("monitoring_findings")
+                    if isinstance(durable_progress.get("monitoring_findings"), dict)
+                    else None
+                )
                 if isinstance(exc, (ArtifactFramingError, ArtifactIntegrityError)):
                     clear_persisted_ingest_inventory(conn, run_id)
                     last_line_offset = 0
                     last_counts = {"endpoints": 0, "resources": 0, "items": 0, "errors": 0}
+                    monitoring_findings_progress = None
                 if retryable and attempt_count <= INGEST_MAX_RETRIES:
                     retry_delay_seconds = _retry_backoff_seconds(attempt_count, jitter_key=run_id)
                     next_retry_at = datetime.now(tz=UTC) + timedelta(seconds=retry_delay_seconds)
@@ -7357,6 +11104,11 @@ def process_job(fields: dict[str, str]) -> str:
                             "next_retry_at": next_retry_at.isoformat(),
                             "retry_delay_seconds": retry_delay_seconds,
                             "retryable": True,
+                            **(
+                                {"monitoring_findings": monitoring_findings_progress}
+                                if monitoring_findings_progress
+                                else {}
+                            ),
                         },
                     )
                     if project_id:
@@ -7391,8 +11143,21 @@ def process_job(fields: dict[str, str]) -> str:
                         "retryable": retryable,
                         "retry_exhausted": retryable and attempt_count > INGEST_MAX_RETRIES,
                         **({"failure_code": failure_code} if failure_code else {}),
+                        **(
+                            {"monitoring_findings": monitoring_findings_progress}
+                            if monitoring_findings_progress
+                            else {}
+                        ),
                     },
                 )
+                failed_source_id = None
+                if project_id:
+                    failed_source_id = register_collection_source(
+                        conn,
+                        run_id,
+                        project_id,
+                        succeeded=False,
+                    )
                 if project_id:
                     write_audit(
                         conn,
@@ -7407,6 +11172,7 @@ def process_job(fields: dict[str, str]) -> str:
                             "retryable": retryable,
                             "retry_exhausted": retryable and attempt_count > INGEST_MAX_RETRIES,
                             **({"failure_code": failure_code} if failure_code else {}),
+                            "source_id": failed_source_id,
                         },
                     )
                 conn.commit()
@@ -7421,9 +11187,17 @@ def process_job(fields: dict[str, str]) -> str:
             raise
         finally:
             try:
+                if source_lock_key is not None:
+                    conn.execute("SELECT pg_advisory_unlock(%s)", (source_lock_key,))
                 conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
             except psycopg.Error:
-                logger.exception("failed to release ingest advisory lock run_id=%s", run_id)
+                try:
+                    conn.rollback()
+                    if source_lock_key is not None:
+                        conn.execute("SELECT pg_advisory_unlock(%s)", (source_lock_key,))
+                    conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                except psycopg.Error:
+                    logger.exception("failed to release ingest advisory locks run_id=%s", run_id)
 
 
 def ensure_group() -> None:
@@ -7537,6 +11311,15 @@ def _run_worker_loop() -> None:
                     _shutdown_event.wait(1)
 
         if not _shutdown_event.is_set() and time.time() - last_recovery_scan >= RECOVERY_SCAN_SECONDS:
+            try:
+                reopened_findings = reopen_expired_accepted_risk_findings(limit=100)
+                if reopened_findings:
+                    logger.info("reopened expired accepted-risk findings count=%s", reopened_findings)
+            except psycopg.Error as exc:
+                now = time.time()
+                if _should_log_redis_error(last_database_recovery_error_log, now):
+                    logger.warning("finding expiry recovery failed; retrying: %s", exc)
+                    last_database_recovery_error_log = now
             recovered_count = 0
             for _ in range(RECOVERY_SCAN_LIMIT):
                 recovered_runs: list[dict[str, str]] = []
@@ -7565,6 +11348,28 @@ def _run_worker_loop() -> None:
                     break
             if recovered_count:
                 logger.info("processed recoverable ingest runs count=%s", recovered_count)
+            if not _shutdown_event.is_set():
+                try:
+                    recoverable_monitoring = discover_recoverable_monitoring_evaluations(limit=1)
+                except psycopg.Error as exc:
+                    now = time.time()
+                    if _should_log_redis_error(last_database_recovery_error_log, now):
+                        logger.warning("database monitoring recovery scan failed; retrying: %s", exc)
+                        last_database_recovery_error_log = now
+                else:
+                    if recoverable_monitoring:
+                        process_job(recoverable_monitoring[0])
+            if not _shutdown_event.is_set():
+                try:
+                    recoverable_comparison_findings = discover_recoverable_comparison_finding_evaluations(limit=1)
+                except psycopg.Error as exc:
+                    now = time.time()
+                    if _should_log_redis_error(last_database_recovery_error_log, now):
+                        logger.warning("database comparison findings recovery scan failed; retrying: %s", exc)
+                        last_database_recovery_error_log = now
+                else:
+                    if recoverable_comparison_findings:
+                        process_job(recoverable_comparison_findings[0])
             if not _shutdown_event.is_set():
                 try:
                     recoverable_comparisons = discover_recoverable_comparisons(limit=1)

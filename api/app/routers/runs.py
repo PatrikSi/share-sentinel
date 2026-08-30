@@ -7,6 +7,7 @@ import unicodedata
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy import String, and_, case, cast, delete, func, or_, select, text
@@ -79,6 +80,9 @@ RUN_ACTIVITY_CURSOR = (
     KeysetColumn("ts", AuditEvent.ts, direction="desc", parser=parse_datetime_cursor_value),
     KeysetColumn("id", AuditEvent.id, direction="desc", parser=parse_int_cursor_value),
 )
+EFFECTIVE_ACCESS_PRINCIPAL_CURSOR = (
+    KeysetColumn("id", PermissionPrincipal.id, parser=parse_int_cursor_value),
+)
 RUN_ACTIVITY_ACTIONS = {
     "RUN_CREATED",
     "ARTIFACT_UPLOADED",
@@ -98,6 +102,47 @@ MAX_RUN_DIFF_DETAIL_RECORDS = 2000
 DEFAULT_RUN_DIFF_DETAIL_RECORDS = 500
 ACCESS_EVIDENCE_ASSESSMENT_PAGE_MAX = 25
 ACCESS_EVIDENCE_ENTRY_PAGE_MAX = 100
+EFFECTIVE_ACCESS_ENTRY_RESPONSE_MAX = 1000
+EFFECTIVE_ACCESS_ENTRY_PRINCIPAL_MAX = 100
+EFFECTIVE_ACCESS_ASSESSMENT_MAX = 100
+RECOGNIZED_PROVIDER_EFFECTIVE_DECISIONS = {
+    "allow": "allow",
+    "allowed": "allow",
+    "effective_allow": "allow",
+    "deny": "deny",
+    "denied": "deny",
+    "no_access": "deny",
+    "effective_deny": "deny",
+    "mixed": "mixed",
+}
+
+
+def _provider_computed_effective_decision(
+    assessments: list[PermissionAssessment],
+    *,
+    assessments_truncated: bool,
+    principal_filtered: bool,
+) -> tuple[str, PermissionAssessment | None]:
+    """Trust only one complete, explicit provider-computed resource assessment."""
+
+    if principal_filtered or assessments_truncated or len(assessments) != 1:
+        return "unknown", None
+    assessment = assessments[0]
+    decision = RECOGNIZED_PROVIDER_EFFECTIVE_DECISIONS.get(
+        str(assessment.effective_access_status or "").strip().lower()
+    )
+    complete_resolution_values = {"complete", "resolved", "fully_resolved"}
+    complete_provider_computation = (
+        assessment.assessment_state == "complete"
+        and assessment.retrieval_coverage in {"complete", "full", "all_returned"}
+        and assessment.semantic_coverage in {"effective_access", "effective_permissions"}
+        and assessment.principal_resolution in complete_resolution_values
+        and assessment.entries_omitted == 0
+        and assessment.unknown_entries == 0
+        and decision is not None
+        and (decision != "deny" or assessment.negative_conclusion_supported)
+    )
+    return (decision, assessment) if complete_provider_computation and decision is not None else ("unknown", None)
 
 
 def _provider_from_resource_type_expression():
@@ -212,6 +257,7 @@ def _to_run_out(run: ScanRun) -> RunOut:
     return RunOut(
         id=run.id,
         project_id=run.project_id,
+        source_id=getattr(run, "source_id", None),
         name=run.name,
         description=run.description,
         target_scope=run.target_scope,
@@ -1451,6 +1497,9 @@ def create_run(
 def list_runs(
     project_id: uuid.UUID,
     request: Request,
+    q: str | None = Query(default=None, max_length=MAX_SEARCH_CHARS),
+    run_status: RunStatus | None = Query(default=None, alias="status"),
+    source_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -1460,6 +1509,18 @@ def list_runs(
     require_project_role(project_id, ProjectRole.VIEWER, auth, db)
 
     stmt = select(ScanRun).where(ScanRun.project_id == project_id)
+    if q and q.strip():
+        pattern = f"%{escape_like(q.strip())}%"
+        stmt = stmt.where(
+            or_(
+                ScanRun.name.ilike(pattern, escape="\\"),
+                ScanRun.description.ilike(pattern, escape="\\"),
+            )
+        )
+    if run_status is not None:
+        stmt = stmt.where(ScanRun.status == run_status)
+    if source_id is not None:
+        stmt = stmt.where(ScanRun.source_id == source_id)
     stmt = apply_keyset_pagination(stmt, RUN_LIST_CURSOR, cursor, limit)
     runs, next_cursor = paginate_rows(db.execute(stmt).scalars().all(), RUN_LIST_CURSOR, limit)
 
@@ -1471,7 +1532,14 @@ def list_runs(
         action="RUNS_LISTED",
         object_type="project",
         object_id=str(project_id),
-        metadata={"limit": limit, "cursor": cursor, "result_count": len(runs)},
+        metadata={
+            "limit": limit,
+            "cursor": cursor,
+            "result_count": len(runs),
+            "q": q,
+            "status": run_status.value if run_status else None,
+            "source_id": str(source_id) if source_id else None,
+        },
     )
     db.commit()
 
@@ -2224,6 +2292,398 @@ def resource_access_evidence(
             },
         },
     )
+
+
+@router.get("/{run_id}/resources/{resource_id}/effective-access", response_model=dict)
+def resource_effective_access(
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+    resource_id: int,
+    request: Request,
+    principal_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=100, ge=1, le=200),
+    cursor: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    _: AuthContext = Depends(require_token_scopes(SCOPE_READ_RUNS)),
+    _inventory_scope: AuthContext = Depends(require_token_scopes(SCOPE_READ_INVENTORY)),
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Explain current evidence without overstating effective authorization.
+
+    Direct provider entries and observed capability probes are intentionally
+    separate planes. Current collectors do not emit group membership graphs
+    or a provider-computed effective decision, so ACL entries remain bounded
+    evidence unless an assessment explicitly declares effective computation.
+    """
+
+    require_project_role(project_id, ProjectRole.VIEWER, auth, db)
+    resource = _require_resource(db, project_id, run_id, resource_id)
+    run = _get_run(db, project_id, run_id)
+    endpoint = db.execute(
+        select(Endpoint).where(Endpoint.id == resource.endpoint_id, Endpoint.run_id == run_id)
+    ).scalar_one_or_none()
+
+    assessment_rows = list(
+        db.execute(
+            select(PermissionAssessment)
+            .where(
+                PermissionAssessment.run_id == run_id,
+                PermissionAssessment.resource_id == resource_id,
+                PermissionAssessment.item_id.is_(None),
+            )
+            .order_by(PermissionAssessment.id)
+            .limit(EFFECTIVE_ACCESS_ASSESSMENT_MAX + 1)
+        ).scalars()
+    )
+    assessments_truncated = len(assessment_rows) > EFFECTIVE_ACCESS_ASSESSMENT_MAX
+    assessments = assessment_rows[:EFFECTIVE_ACCESS_ASSESSMENT_MAX]
+    assessment_ids = [assessment.id for assessment in assessments]
+    principal_stmt = select(PermissionPrincipal).where(
+        PermissionPrincipal.run_id == run_id,
+        PermissionPrincipal.id.in_(
+            select(PermissionEntry.principal_id).where(
+                PermissionEntry.run_id == run_id,
+                PermissionEntry.assessment_id.in_(assessment_ids or [-1]),
+                PermissionEntry.principal_id.is_not(None),
+            )
+        ),
+    )
+    if principal_id is not None:
+        principal_stmt = principal_stmt.where(PermissionPrincipal.id == principal_id)
+    principal_stmt = apply_keyset_pagination(principal_stmt, EFFECTIVE_ACCESS_PRINCIPAL_CURSOR, cursor, limit)
+    principals, next_cursor = paginate_rows(
+        db.execute(principal_stmt).scalars().all(), EFFECTIVE_ACCESS_PRINCIPAL_CURSOR, limit
+    )
+    if principal_id is not None and not principals:
+        raise HTTPException(status_code=404, detail="principal was not observed for this resource")
+
+    principal_ids = [principal.id for principal in principals]
+    entry_rows: list[PermissionEntry] = []
+    entry_counts: dict[int, int] = {}
+    active_entry_counts: dict[int, int] = {}
+    expired_entry_counts: dict[int, int] = {}
+    expiration_indeterminate_counts: dict[int, int] = {}
+    entry_effects: dict[int, tuple[bool, bool]] = {}
+    if principal_ids and assessment_ids:
+        known_active_at_observation = or_(
+            PermissionEntry.expiration_at.is_(None),
+            and_(
+                PermissionAssessment.observed_at.is_not(None),
+                PermissionEntry.expiration_at > PermissionAssessment.observed_at,
+            ),
+        )
+        known_expired_at_observation = and_(
+            PermissionEntry.expiration_at.is_not(None),
+            PermissionAssessment.observed_at.is_not(None),
+            PermissionEntry.expiration_at <= PermissionAssessment.observed_at,
+        )
+        expiration_indeterminate = and_(
+            PermissionEntry.expiration_at.is_not(None),
+            PermissionAssessment.observed_at.is_(None),
+        )
+        entry_summary_rows = db.execute(
+            select(
+                PermissionEntry.principal_id,
+                func.count(PermissionEntry.id),
+                func.count(PermissionEntry.id).filter(known_active_at_observation),
+                func.count(PermissionEntry.id).filter(known_expired_at_observation),
+                func.count(PermissionEntry.id).filter(expiration_indeterminate),
+                func.bool_or(PermissionEntry.entry_effect == "allow").filter(
+                    known_active_at_observation
+                ),
+                func.bool_or(PermissionEntry.entry_effect == "deny").filter(
+                    known_active_at_observation
+                ),
+            )
+            .join(PermissionAssessment, PermissionAssessment.id == PermissionEntry.assessment_id)
+            .where(
+                PermissionEntry.run_id == run_id,
+                PermissionEntry.assessment_id.in_(assessment_ids),
+                PermissionEntry.principal_id.in_(principal_ids),
+            )
+            .group_by(PermissionEntry.principal_id)
+        ).all()
+        entry_counts = {int(row[0]): int(row[1]) for row in entry_summary_rows if row[0] is not None}
+        active_entry_counts = {
+            int(row[0]): int(row[2]) for row in entry_summary_rows if row[0] is not None
+        }
+        expired_entry_counts = {
+            int(row[0]): int(row[3]) for row in entry_summary_rows if row[0] is not None
+        }
+        expiration_indeterminate_counts = {
+            int(row[0]): int(row[4]) for row in entry_summary_rows if row[0] is not None
+        }
+        entry_effects = {
+            int(row[0]): (bool(row[5]), bool(row[6])) for row in entry_summary_rows if row[0] is not None
+        }
+        ranked_entries = (
+            select(
+                PermissionEntry.id.label("entry_id"),
+                func.row_number()
+                .over(partition_by=PermissionEntry.principal_id, order_by=PermissionEntry.id)
+                .label("principal_rank"),
+            )
+            .join(PermissionAssessment, PermissionAssessment.id == PermissionEntry.assessment_id)
+            .where(
+                PermissionEntry.run_id == run_id,
+                PermissionEntry.assessment_id.in_(assessment_ids),
+                PermissionEntry.principal_id.in_(principal_ids),
+                known_active_at_observation,
+            )
+            .subquery()
+        )
+        entry_rows = list(
+            db.execute(
+                select(PermissionEntry)
+                .join(ranked_entries, ranked_entries.c.entry_id == PermissionEntry.id)
+                .where(ranked_entries.c.principal_rank <= EFFECTIVE_ACCESS_ENTRY_PRINCIPAL_MAX)
+                .order_by(PermissionEntry.principal_id, PermissionEntry.id)
+                .limit(EFFECTIVE_ACCESS_ENTRY_RESPONSE_MAX + 1)
+            ).scalars()
+        )
+    response_entries_truncated = len(entry_rows) > EFFECTIVE_ACCESS_ENTRY_RESPONSE_MAX
+    entry_rows = entry_rows[:EFFECTIVE_ACCESS_ENTRY_RESPONSE_MAX]
+    entries_by_principal: dict[int, list[PermissionEntry]] = {principal.id: [] for principal in principals}
+    for entry in entry_rows:
+        if entry.principal_id is not None:
+            entries = entries_by_principal.setdefault(entry.principal_id, [])
+            if len(entries) < EFFECTIVE_ACCESS_ENTRY_PRINCIPAL_MAX:
+                entries.append(entry)
+
+    global_limitations: list[str] = []
+    if not assessments:
+        global_limitations.append("No normalized direct-permission assessment was collected for this resource.")
+    if assessments_truncated:
+        global_limitations.append(
+            "Resource-level assessments exceeded the response analysis limit; effective conclusions are unknown."
+        )
+    if any(assessment.assessment_state != "complete" for assessment in assessments):
+        global_limitations.append("At least one direct-permission assessment is incomplete.")
+    if any(assessment.retrieval_coverage != "complete" for assessment in assessments):
+        global_limitations.append("Provider permission retrieval was partial or indeterminate.")
+    if any(assessment.entries_omitted > 0 or assessment.unknown_entries > 0 for assessment in assessments):
+        global_limitations.append("Some provider permission entries were omitted or could not be normalized.")
+    complete_resolution_values = {"complete", "resolved", "fully_resolved"}
+    if any(assessment.principal_resolution not in complete_resolution_values for assessment in assessments):
+        global_limitations.append("Group membership and principal resolution are not complete for this evidence.")
+    if any(assessment.semantic_coverage not in {"effective_access", "effective_permissions"} for assessment in assessments):
+        global_limitations.append("The provider evidence describes grants or ACL structure, not effective access.")
+    if sum(expired_entry_counts.values()):
+        global_limitations.append(
+            "Known-expired permission entries were excluded using each assessment's observation timestamp."
+        )
+    if sum(expiration_indeterminate_counts.values()):
+        global_limitations.append(
+            "Some expiring entries lacked an assessment observation timestamp; their effect is indeterminate and excluded."
+        )
+    for assessment in assessments:
+        global_limitations.extend(str(item) for item in (assessment.limitations or []) if str(item).strip())
+    global_limitations = list(dict.fromkeys(global_limitations))
+
+    provider_computed_decision, provider_assessment = _provider_computed_effective_decision(
+        assessments,
+        assessments_truncated=assessments_truncated,
+        principal_filtered=principal_id is not None,
+    )
+    provider_computed_subject: dict[str, Any] | None = None
+    if provider_assessment is not None:
+        provider_computed_subject = {
+            "assessment_id": provider_assessment.id,
+            "subject_kind": provider_assessment.subject_kind,
+            "subject_key": provider_assessment.subject_key,
+            "subject_provider_id": provider_assessment.subject_provider_id,
+            "subject_path": provider_assessment.subject_path,
+            "provider": provider_assessment.provider,
+            "method": provider_assessment.method,
+            "observed_at": (
+                provider_assessment.observed_at.isoformat() if provider_assessment.observed_at else None
+            ),
+        }
+
+    principal_payloads: list[dict] = []
+    any_direct = False
+    for principal in principals:
+        entries = entries_by_principal.get(principal.id, [])
+        allow_rights = sorted(
+            {str(right) for entry in entries if entry.entry_effect == "allow" for right in (entry.normalized_rights or [])}
+        )
+        deny_rights = sorted(
+            {str(right) for entry in entries if entry.entry_effect == "deny" for right in (entry.normalized_rights or [])}
+        )
+        allow_observed, deny_observed = entry_effects.get(principal.id, (False, False))
+        any_direct = any_direct or active_entry_counts.get(principal.id, 0) > 0
+        if allow_observed and deny_observed:
+            direct_decision = "mixed"
+        elif allow_observed:
+            direct_decision = "allow_evidence"
+        elif deny_observed:
+            direct_decision = "deny_evidence"
+        else:
+            direct_decision = "unknown"
+        principal_limitations = list(global_limitations)
+        if principal.kind in {"group", "sharepoint_group", "security_group", "distribution_group"}:
+            principal_limitations.append("Group membership was not expanded; member effective access is unknown.")
+        if principal.resolution_state not in complete_resolution_values:
+            principal_limitations.append("The principal was not fully resolved to a current identity object.")
+        rights_truncated = active_entry_counts.get(principal.id, len(entries)) > len(entries)
+        if rights_truncated:
+            principal_limitations.append("Displayed rights are truncated; effect summary uses all matching entries.")
+        effective_decision = "unknown"
+        principal_payloads.append(
+            {
+                "id": principal.id,
+                "principal_key": principal.principal_key,
+                "provider": principal.provider,
+                "identifier_namespace": principal.identifier_namespace,
+                "authority": principal.authority,
+                "native_id": principal.native_id,
+                "kind": principal.kind,
+                "display_name": principal.display_name,
+                "login_name": principal.login_name,
+                "email": principal.email,
+                "resolution": principal.resolution_state,
+                "resolution_source": principal.resolution_source,
+                "direct_decision": direct_decision,
+                "effective_decision": effective_decision,
+                "allow_rights": allow_rights,
+                "deny_rights": deny_rights,
+                "rights_truncated": rights_truncated,
+                "entries": [
+                    {
+                        "id": entry.id,
+                        "assessment_id": entry.assessment_id,
+                        "effect": entry.entry_effect,
+                        "rights": entry.normalized_rights or [],
+                        "inherited_state": entry.inherited_state,
+                        "expiration_at": entry.expiration_at.isoformat() if entry.expiration_at else None,
+                        "evidence_hash": entry.evidence_hash,
+                    }
+                    for entry in entries
+                ],
+                "entry_count": entry_counts.get(principal.id, len(entries)),
+                "active_entry_count": active_entry_counts.get(principal.id, len(entries)),
+                "expired_entry_count": expired_entry_counts.get(principal.id, 0),
+                "expiration_indeterminate_entry_count": expiration_indeterminate_counts.get(
+                    principal.id, 0
+                ),
+                "entries_returned": len(entries),
+                "entries_truncated": active_entry_counts.get(principal.id, len(entries)) > len(entries),
+                "limitations": list(dict.fromkeys(principal_limitations)),
+            }
+        )
+
+    observed = build_access_evidence_summary(
+        resource.permission_summary,
+        resource.access_level,
+        resource.access_capabilities,
+        resource.exposure,
+    )["capability_observations"]
+    observed_decision = "unknown"
+    if observed.get("allowed") and observed.get("denied"):
+        observed_decision = "mixed_observations"
+    elif observed.get("allowed"):
+        observed_decision = "allow_observed"
+    elif observed.get("denied"):
+        observed_decision = "deny_observed"
+    # A keyset page of principals cannot establish a resource-wide effective
+    # decision. Preserve unknown until complete, fresh identity-membership and
+    # inheritance evidence can be proven.
+    decision = provider_computed_decision
+    analysis_state = (
+        "computed"
+        if provider_computed_decision != "unknown"
+        else ("bounded" if any_direct or observed.get("evidence_available") else "indeterminate")
+    )
+    page_decision = "unknown"
+
+    _write_read_audit(
+        db,
+        request,
+        auth,
+        project_id,
+        action="EFFECTIVE_ACCESS_ANALYZED",
+        object_type="resource",
+        object_id=str(resource_id),
+        metadata={
+            "run_id": str(run_id),
+            "principal_id": principal_id,
+            "principal_count": len(principals),
+            "analysis_state": analysis_state,
+            "assessments_truncated": assessments_truncated,
+            "entries_returned": sum(len(entries) for entries in entries_by_principal.values()),
+            "entries_truncated": response_entries_truncated,
+        },
+    )
+    db.commit()
+    return {
+        "resource": {
+            "id": resource.id,
+            "name": resource.name,
+            "resource_type": resource.resource_type.value
+            if hasattr(resource.resource_type, "value")
+            else str(resource.resource_type),
+            "provider": resource.provider or share_type_from_resource_type(resource.resource_type),
+            "provider_resource_id": resource.provider_resource_id,
+            "endpoint_key": endpoint.endpoint_key if endpoint else None,
+            "web_url": resource.web_url,
+        },
+        "analysis_state": analysis_state,
+        "decision": decision,
+        "capabilities": resource.access_capabilities or {},
+        "principals": {
+            "items": principal_payloads,
+            "next_cursor": next_cursor,
+            "page_decision": page_decision,
+            "page_decision_scope": "returned_principals_only",
+        },
+        "evidence_planes": {
+            "direct_provider": {
+                "state": "available" if assessments else "not_assessed",
+                "assessment_count": len(assessments),
+                "assessments_truncated": assessments_truncated,
+                "assessment_limit": EFFECTIVE_ACCESS_ASSESSMENT_MAX,
+                "page_entry_count": sum(entry_counts.values()),
+                "page_active_entry_count": sum(active_entry_counts.values()),
+                "page_expired_entry_count": sum(expired_entry_counts.values()),
+                "page_expiration_indeterminate_entry_count": sum(
+                    expiration_indeterminate_counts.values()
+                ),
+                "entries_returned": sum(len(entries) for entries in entries_by_principal.values()),
+                "entries_truncated": response_entries_truncated
+                or sum(active_entry_counts.values())
+                > sum(len(entries) for entries in entries_by_principal.values()),
+                "entry_response_limit": EFFECTIVE_ACCESS_ENTRY_RESPONSE_MAX,
+                "entry_per_principal_limit": EFFECTIVE_ACCESS_ENTRY_PRINCIPAL_MAX,
+                "interpretation": "provider grants or ACL structure; not automatically effective access",
+            },
+            "observed_capability": {
+                **observed,
+                "decision": observed_decision,
+                "subject_scope": "assessed_identity_only",
+            },
+            "computed_effective": {
+                "state": "provider_computed" if provider_computed_decision != "unknown" else "not_computed",
+                "decision": decision,
+                "decision_scope": "single_declared_assessment_subject"
+                if provider_computed_decision != "unknown"
+                else "unknown",
+                "subject": provider_computed_subject,
+                "qualifying_assessment_count": int(provider_assessment is not None),
+                "reason": None
+                if provider_computed_decision != "unknown"
+                else (
+                    "no single complete assessment supplied a recognized provider-computed effective decision; "
+                    "complete group membership and inheritance evidence is unavailable"
+                ),
+            },
+        },
+        "limitations": global_limitations,
+        "provenance": {
+            "run_id": str(run.id),
+            "run_created_at": run.created_at.isoformat() if run.created_at else None,
+            "collection_context": run.collection_context or {},
+        },
+    }
 
 
 @router.get("/{run_id}/resources/{resource_id}/items")
