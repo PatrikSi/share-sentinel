@@ -197,6 +197,7 @@ SMB_STATUS_REASONS = {
     0xC00000BB: "unsupported_request",  # STATUS_NOT_SUPPORTED
     0xC0000002: "unsupported_request",  # STATUS_NOT_IMPLEMENTED
     0xC0000010: "unsupported_request",  # STATUS_INVALID_DEVICE_REQUEST
+    0xC0000257: "dfs_referral_required",  # STATUS_PATH_NOT_COVERED
     0xC000000D: "invalid_request",  # STATUS_INVALID_PARAMETER
     0xC000007F: "capacity_constraint",  # STATUS_DISK_FULL
     0xC0000044: "capacity_constraint",  # STATUS_QUOTA_EXCEEDED
@@ -1964,6 +1965,91 @@ def _is_smb_transport_failure(exc: BaseException) -> bool:
 
 def _smb_handle_path(path: str) -> str:
     return str(path or "").replace("/", "\\").strip("\\")
+
+
+def _smb_dfs_namespace_evidence(
+    conn: object,
+    tree_id: object | None,
+    *,
+    referral_required_observed: bool = False,
+    referral_protocol_status: str | None = None,
+    observed_tree_connect_capability: str | None = None,
+) -> dict[str, object]:
+    """Describe bounded DFS evidence without resolving or following referrals.
+
+    Impacket exposes the SMB2/3 tree-connect DFS capability only through its
+    connection state. Treat that implementation detail as optional evidence:
+    missing or malformed state remains indeterminate and never becomes a
+    negative DFS conclusion.
+    """
+
+    tree_connect_capability = observed_tree_connect_capability or "unavailable"
+    if tree_connect_capability not in {"unavailable", "malformed", "dfs", "non_dfs"}:
+        tree_connect_capability = "malformed"
+    if observed_tree_connect_capability is None and tree_id is not None:
+        get_smb_server = getattr(conn, "getSMBServer", None)
+        if callable(get_smb_server):
+            try:
+                smb_server = get_smb_server()
+            except Exception:
+                smb_server = None
+            session = getattr(smb_server, "_Session", None)
+            if isinstance(session, dict):
+                tree_table = session.get("TreeConnectTable")
+                if isinstance(tree_table, dict):
+                    tree_entry = tree_table.get(tree_id)
+                    if isinstance(tree_entry, dict):
+                        is_dfs_share = tree_entry.get("IsDfsShare")
+                        if isinstance(is_dfs_share, bool):
+                            tree_connect_capability = "dfs" if is_dfs_share else "non_dfs"
+                        else:
+                            tree_connect_capability = "malformed"
+                    elif tree_entry is not None:
+                        tree_connect_capability = "malformed"
+                elif tree_table is not None:
+                    tree_connect_capability = "malformed"
+
+    namespace_detected = tree_connect_capability == "dfs" or referral_required_observed
+    if namespace_detected:
+        namespace_status = "detected"
+        coverage = "logical_namespace_only"
+        physical_target_status = "not_resolved"
+        target_following_reason = "disabled_no_referral_target_trust_policy"
+        limitations = [
+            "referral_targets_not_requested_or_followed",
+            "physical_target_coverage_not_assessed",
+        ]
+    elif tree_connect_capability == "non_dfs":
+        namespace_status = "not_detected"
+        coverage = "connected_share_only"
+        physical_target_status = "not_applicable"
+        target_following_reason = "not_applicable_no_dfs_evidence"
+        limitations = ["dfs_detection_limited_to_smb2_tree_connect_and_path_not_covered_evidence"]
+    else:
+        namespace_status = "indeterminate"
+        coverage = "indeterminate"
+        physical_target_status = "not_resolved"
+        target_following_reason = "disabled_no_referral_target_trust_policy"
+        limitations = [
+            "smb2_tree_connect_dfs_capability_unavailable",
+            "referral_targets_not_requested_or_followed",
+        ]
+
+    evidence: dict[str, object] = {
+        "namespace_status": namespace_status,
+        "tree_connect_capability": tree_connect_capability,
+        "referral_status": "required_not_followed" if referral_required_observed else "not_observed",
+        "referral_required_observed": referral_required_observed,
+        "target_following": False,
+        "target_following_reason": target_following_reason,
+        "logical_resource_identity_preserved": True,
+        "physical_target_status": physical_target_status,
+        "coverage": coverage,
+        "limitations": limitations,
+    }
+    if referral_required_observed and referral_protocol_status:
+        evidence["referral_protocol_status"] = referral_protocol_status
+    return evidence
 
 
 def _normalized_identity_text(value: object) -> str:
@@ -4262,6 +4348,13 @@ def scan_host_smb(
                 method="directory_listing",
                 scope="directory",
             )
+            hint = _session_error_hint(detail, attempted_auth)
+            if classification.reason_code == "dfs_referral_required":
+                hint = (
+                    "The path requires a DFS referral. This collector preserves the logical namespace but does not "
+                    "forward credentials to referral targets; assess those targets explicitly under an approved "
+                    "trust policy."
+                )
             _emit_error(
                 writer,
                 run_id,
@@ -4271,7 +4364,7 @@ def scan_host_smb(
                 endpoint_key=endpoint_key,
                 resource_name=share_name,
                 path=denied_path,
-                hint=_session_error_hint(detail, attempted_auth),
+                hint=hint,
             )
             _record_error(stats, lock, "LIST_SESSION_ERROR", message)
 
@@ -4348,6 +4441,7 @@ def scan_host_smb(
                 "metadata": {
                     "server_identity": server_identity["provider_endpoint_id"],
                     "server_identity_strength": server_identity["identity_strength"],
+                    "dfs": _smb_dfs_namespace_evidence(conn, None),
                 },
                 "access_level": "unknown",
                 "access_capabilities": _access_capability_snapshot(
@@ -4380,6 +4474,9 @@ def scan_host_smb(
             workflow_finished = False
             workflow_reason: str | None = None
             tree_id = None
+            dfs_referral_required_observed = False
+            dfs_referral_protocol_status: str | None = None
+            dfs_evidence = _smb_dfs_namespace_evidence(conn, tree_id)
             listed_directory_paths: set[str] = set()
             probe_circuit = _SMBProbeCircuit()
             permission_selector = _SMBPermissionCandidateSelector(
@@ -4399,7 +4496,11 @@ def scan_host_smb(
                 )
 
             def _handle_share_list_error(denied_path: str, exc: BaseException) -> None:
+                nonlocal dfs_referral_protocol_status, dfs_referral_required_observed
                 classification = _classify_smb_probe_failure(exc)
+                if classification.reason_code == "dfs_referral_required":
+                    dfs_referral_required_observed = True
+                    dfs_referral_protocol_status = classification.protocol_status
                 if classification.transport_fatal:
                     probe_circuit.transport_failed = True
                     probe_circuit.reason_code = classification.reason_code
@@ -4446,6 +4547,9 @@ def scan_host_smb(
                         OSError,
                     ) as exc:
                         classification = _classify_smb_probe_failure(exc)
+                        if classification.reason_code == "dfs_referral_required":
+                            dfs_referral_required_observed = True
+                            dfs_referral_protocol_status = classification.protocol_status
                         outcome = classification.outcome
                         _record_capability(
                             capabilities,
@@ -4464,6 +4568,12 @@ def scan_host_smb(
                             probe_circuit.reason_code = classification.reason_code
                         message = f"SMB tree connection failed for {share_name}: {_error_detail(exc)}"
                         code = "TREE_CONNECT_DENIED" if outcome == "denied" else "TREE_CONNECT_FAILED"
+                        hint = _session_error_hint(_error_detail(exc), attempted_auth)
+                        if classification.reason_code == "dfs_referral_required":
+                            hint = (
+                                "The logical share requires a DFS referral. Referral targets are not followed or "
+                                "given credentials automatically; assess approved physical targets explicitly."
+                            )
                         _emit_error(
                             writer,
                             run_id,
@@ -4473,10 +4583,11 @@ def scan_host_smb(
                             endpoint_key=endpoint_key,
                             resource_name=share_name,
                             path="\\",
-                            hint=_session_error_hint(_error_detail(exc), attempted_auth),
+                            hint=hint,
                         )
                         _record_error(stats, lock, code, message)
                     else:
+                        dfs_evidence = _smb_dfs_namespace_evidence(conn, tree_id)
                         _record_capability(
                             capabilities,
                             "tree_connect",
@@ -4875,12 +4986,20 @@ def scan_host_smb(
             )
             share_presence = _smb_share_presence(capabilities, enumerated=share_was_enumerated)
             final_access_level = _legacy_access_level(capabilities)
+            dfs_evidence = _smb_dfs_namespace_evidence(
+                conn,
+                None,
+                referral_required_observed=dfs_referral_required_observed,
+                referral_protocol_status=dfs_referral_protocol_status,
+                observed_tree_connect_capability=str(dfs_evidence.get("tree_connect_capability") or "unavailable"),
+            )
             # These are observations from a bounded sample, never a complete
             # effective-permissions calculation for every object in the share.
             capability_partial = True
             writer.emit(
                 {
                     **resource_record,
+                    "metadata": {**resource_record["metadata"], "dfs": dfs_evidence},
                     "access_level": final_access_level,
                     **({"permission_summary": permission_summary} if permission_summary is not None else {}),
                     "access_capabilities": _access_capability_snapshot(
@@ -6092,7 +6211,7 @@ def main() -> int:
             "permissions_complete": permission_requested
             and stats.permission_assessments > 0
             and not permission_incomplete
-            and structural_coverage_complete,
+            and structural_complete,
             "structural_complete": structural_complete,
             "structural_coverage_gaps": stats.structural_coverage_gaps,
             "content_complete": not collection_partial and "nfs" not in selected_share_types,

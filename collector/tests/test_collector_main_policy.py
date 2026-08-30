@@ -169,6 +169,39 @@ def test_main_marks_structural_coverage_gaps_non_authoritative(monkeypatch, tmp_
     assert context["metadata"]["structural_coverage_gaps"] == 1
 
 
+def test_main_never_marks_permissions_complete_when_any_target_scan_failed(monkeypatch, tmp_path) -> None:
+    collector = _load_collector_module()
+    output_path = tmp_path / "host-failure.json"
+    args = _base_args(str(output_path))
+    args.cidr = ["10.0.0.5/32"]
+    args.smb_permissions = "root"
+    args.smb_permission_sample_limit = 2
+
+    def _scan_targets(_targets, _args, run_id, writer, stats, lock):
+        writer.emit({"type": "endpoint", "run_id": run_id, "endpoint_key": "10.0.0.5:445"})
+        with lock:
+            stats.endpoints += 1
+            stats.permission_assessments += 1
+        return collector.ScanOutcome(
+            targets_submitted=1,
+            targets_completed=1,
+            host_failures=1,
+        )
+
+    monkeypatch.setattr(collector, "parse_args", lambda: args)
+    monkeypatch.setattr(collector, "_scan_targets", _scan_targets)
+    monkeypatch.setattr(collector, "SMBConnection", object())
+
+    assert collector.main() == collector.EXIT_PARTIAL
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    metadata = payload["collection_context"]["metadata"]
+    assert metadata["structural_coverage_gaps"] == 0
+    assert metadata["structural_complete"] is False
+    assert metadata["permissions_assessed"] is True
+    assert metadata["permissions_complete"] is False
+
+
 def test_main_does_not_claim_nfs_file_content_enumeration(monkeypatch, tmp_path) -> None:
     collector = _load_collector_module()
     output_path = tmp_path / "nfs-exports-only.json"

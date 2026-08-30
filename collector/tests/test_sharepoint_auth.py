@@ -57,6 +57,59 @@ def test_inspect_application_token_uses_roles() -> None:
 
 
 @pytest.mark.parametrize(
+    ("cloud_name", "authority", "graph_resource", "sharepoint_host"),
+    [
+        ("global", "https://login.microsoftonline.com", "https://graph.microsoft.com", "tenant.sharepoint.com"),
+        ("gcc-high", "https://login.microsoftonline.us", "https://graph.microsoft.us", "tenant.sharepoint.us"),
+        (
+            "dod",
+            "https://login.microsoftonline.us",
+            "https://dod-graph.microsoft.us",
+            "tenant.sharepoint-mil.us",
+        ),
+        (
+            "china",
+            "https://login.chinacloudapi.cn",
+            "https://microsoftgraph.chinacloudapi.cn",
+            "tenant.sharepoint.cn",
+        ),
+    ],
+)
+def test_graph_cloud_profiles_keep_identity_graph_and_sharepoint_boundaries_aligned(
+    cloud_name: str,
+    authority: str,
+    graph_resource: str,
+    sharepoint_host: str,
+) -> None:
+    profile = auth.resolve_graph_cloud(cloud_name)
+
+    assert profile.authority_host == authority
+    assert profile.graph_resource == graph_resource
+    assert profile.graph_base_url == f"{graph_resource}/v1.0/"
+    assert profile.app_scope == (f"{graph_resource}/.default",)
+    assert profile.allows_sharepoint_hostname(sharepoint_host) is True
+    assert profile.allows_sharepoint_hostname("attacker.example") is False
+
+
+def test_selected_national_cloud_rejects_global_url_audience() -> None:
+    claims = {
+        **_base_claims(),
+        "scp": "Sites.Read.All",
+        "aud": "https://graph.microsoft.us",
+    }
+
+    context = auth.inspect_access_token(_jwt(claims), auth_mode="token", cloud="gcc-high")
+
+    assert context.cloud == "gcc-high"
+    with pytest.raises(auth.TokenAcquisitionError, match="selected gcc-high cloud"):
+        auth.inspect_access_token(
+            _jwt({**claims, "aud": "https://graph.microsoft.com"}),
+            auth_mode="token",
+            cloud="gcc-high",
+        )
+
+
+@pytest.mark.parametrize(
     "claim_update,message",
     [
         ({"aud": "https://management.azure.com"}, "audience"),
@@ -161,6 +214,68 @@ def test_app_secret_is_required_without_echoing_value() -> None:
             client_secret="",
         )
     assert "client_secret" not in str(exc.value)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+def test_certificate_credential_requires_protected_pem_and_never_returns_source_bundle(tmp_path) -> None:
+    credential_file = tmp_path / "graph-credential.pem"
+    credential_file.write_text(
+        "-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----\n"
+        "-----BEGIN CERTIFICATE-----\npublic-material\n-----END CERTIFICATE-----\n",
+        encoding="ascii",
+    )
+    credential_file.chmod(0o644)
+
+    with pytest.raises(auth.TokenAcquisitionError, match="permissions are too broad"):
+        auth.certificate_credential_from_file(str(credential_file))
+
+    credential_file.chmod(0o600)
+    credential = auth.certificate_credential_from_file(str(credential_file), passphrase="secret-passphrase")
+
+    assert credential["private_key"].startswith("-----BEGIN PRIVATE KEY-----")
+    assert credential["public_certificate"].startswith("-----BEGIN CERTIFICATE-----")
+    assert credential["passphrase"] == "secret-passphrase"
+    assert str(credential_file) not in str(credential)
+
+
+def test_certificate_provider_uses_selected_cloud_authority_and_scope(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    token = _jwt(
+        {
+            **_base_claims(),
+            "aud": "https://graph.microsoft.us",
+            "roles": ["Sites.Read.All"],
+        }
+    )
+
+    class _Application:
+        def acquire_token_for_client(self, *, scopes):
+            captured["scopes"] = scopes
+            return {"access_token": token}
+
+    def _build(client_id, **kwargs):
+        captured["client_id"] = client_id
+        captured.update(kwargs)
+        return _Application()
+
+    class _Msal:
+        ConfidentialClientApplication = staticmethod(_build)
+
+    monkeypatch.setattr(auth, "msal", _Msal())
+    provider = auth.CertificateCredentialAuthProvider(
+        tenant_id="tenant.example",
+        client_id="client-id",
+        client_credential={"private_key": "private", "thumbprint": "A" * 40},
+        cloud="gcc-high",
+    )
+
+    context = provider.acquire_token()
+
+    assert context.auth_mode == "app_certificate"
+    assert context.cloud == "gcc-high"
+    assert captured["authority"] == "https://login.microsoftonline.us/tenant.example"
+    assert captured["scopes"] == ["https://graph.microsoft.us/.default"]
+    assert captured["enable_pii_log"] is False
 
 
 def test_no_ropc_or_password_provider_is_exposed() -> None:

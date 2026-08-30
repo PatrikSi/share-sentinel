@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
-from typing import Iterable, Protocol
+from typing import Iterable, Iterator, Protocol
 from urllib.parse import quote, unquote, urlparse
 
 from .auth import GraphTokenContext
@@ -21,11 +21,15 @@ from .permissions import (
 )
 from .state import DriveState, SharePointStateStore, StateStoreError, state_scope_key
 
-DRIVE_SELECT = "id,name,description,driveType,webUrl,createdDateTime,lastModifiedDateTime"
-SITE_SELECT = "id,name,displayName,webUrl,createdDateTime,lastModifiedDateTime,siteCollection"
-ITEM_SELECT = (
+CORE_DRIVE_SELECT = "id,name,description,driveType,webUrl,createdDateTime,lastModifiedDateTime"
+DRIVE_SELECT = f"{CORE_DRIVE_SELECT},createdBy,lastModifiedBy,owner,quota,system"
+CORE_SITE_SELECT = "id,name,displayName,webUrl,createdDateTime,lastModifiedDateTime,siteCollection"
+SITE_SELECT = f"{CORE_SITE_SELECT},root,isPersonalSite"
+CORE_ITEM_SELECT = (
     "id,name,parentReference,file,folder,root,size,createdDateTime,lastModifiedDateTime,webUrl,eTag,cTag,deleted"
 )
+ITEM_SELECT = f"{CORE_ITEM_SELECT},createdBy,lastModifiedBy"
+GOVERNANCE_SELECT_LIMITATION = "optional_graph_governance_select_rejected"
 ITEM_NAME_MAX_CHARACTERS = 255
 ITEM_PATH_MAX_CHARACTERS = 400
 ITEM_PATH_MAX_BYTES = 2000
@@ -96,6 +100,11 @@ class Site:
     archive_status_checked: bool = False
     archive_status_authoritative: bool = False
     requested_target: str | None = None
+    data_location_code: str | None = None
+    is_root_site: bool | None = None
+    is_personal_site: bool | None = None
+    governance_observation: str = "best_effort_provider_response"
+    governance_limitations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -108,6 +117,18 @@ class Drive:
     description: str | None
     created_at: str | None
     modified_at: str | None
+    owner: dict[str, object] | None = None
+    owner_observation: str = "not_returned"
+    created_by: dict[str, object] | None = None
+    created_by_observation: str = "not_returned"
+    last_modified_by: dict[str, object] | None = None
+    last_modified_by_observation: str = "not_returned"
+    quota: dict[str, object] | None = None
+    quota_observation: str = "not_returned"
+    system_managed: bool = False
+    system_observation: str = "not_returned"
+    governance_observation: str = "selected"
+    governance_limitations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,6 +147,7 @@ class PendingDrive:
     reactivating_file_count: int
     active_file_count: int
     unknown_file_archive_count: int
+    item_governance_observation: str = "selected"
     descendant_permission_summary: dict[str, object] | None = None
 
 
@@ -145,6 +167,7 @@ class LibraryObservation:
     reactivating_file_count: int | None = None
     active_file_count: int | None = None
     unknown_file_archive_count: int | None = None
+    item_governance_observation: str | None = None
     permission_result: PermissionAssessmentResult | None = None
     descendant_permission_summary: dict[str, object] | None = None
 
@@ -440,12 +463,70 @@ def _archive_status_from_graph(
     return normalized, True, True
 
 
+def _identity_set_metadata(raw: object) -> tuple[dict[str, object] | None, str]:
+    if raw is None:
+        return None, "not_returned"
+    if not isinstance(raw, dict):
+        return None, "invalid"
+
+    normalized: dict[str, object] = {}
+    invalid_member = False
+    for identity_type in ("user", "application", "device", "group", "siteUser", "siteGroup"):
+        member = raw.get(identity_type)
+        if member is None:
+            continue
+        if not isinstance(member, dict):
+            invalid_member = True
+            continue
+        identity: dict[str, object] = {}
+        native_id = _bounded_exact_text(member.get("id"), PROVIDER_ID_MAX_CHARACTERS)
+        display_name = _bounded_text(member.get("displayName"), RESOURCE_NAME_MAX_CHARACTERS)
+        tenant_id = _bounded_exact_text(member.get("tenantId"), PROVIDER_ID_MAX_CHARACTERS)
+        if native_id:
+            identity["id"] = native_id
+        if display_name:
+            identity["display_name"] = display_name
+        if tenant_id:
+            identity["tenant_id"] = tenant_id
+        if identity:
+            normalized[identity_type] = identity
+    if normalized:
+        return normalized, "partial" if invalid_member else "observed"
+    return None, "invalid" if raw or invalid_member else "observed_empty"
+
+
+def _quota_metadata(raw: object) -> tuple[dict[str, object] | None, str]:
+    if raw is None:
+        return None, "not_returned"
+    if not isinstance(raw, dict):
+        return None, "invalid"
+    normalized: dict[str, object] = {}
+    invalid_value = False
+    for field_name in ("deleted", "remaining", "total", "used"):
+        value = raw.get(field_name)
+        if value is None:
+            continue
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2**63 - 1:
+            normalized[field_name] = value
+        else:
+            invalid_value = True
+    state = _bounded_text(raw.get("state"), 64)
+    if state:
+        normalized["state"] = state
+    elif raw.get("state") is not None:
+        invalid_value = True
+    if normalized:
+        return normalized, "partial" if invalid_value else "observed"
+    return None, "invalid" if raw or invalid_value else "observed_empty"
+
+
 def _site_from_graph(
     raw: dict[str, object],
     *,
     archive_status_selected: bool = False,
     existence_status: str = "confirmed_from_discovery",
     requested_target: str | None = None,
+    governance_available: bool | None = None,
 ) -> Site:
     site_id = _bounded_exact_text(raw.get("id"), PROVIDER_ID_MAX_CHARACTERS)
     if not site_id:
@@ -458,6 +539,11 @@ def _site_from_graph(
             site_collection.get("hostname") or site_collection.get("hostName"),
             255,
         )
+    data_location_code = (
+        _bounded_text(site_collection.get("dataLocationCode"), 64)
+        if governance_available is not False and isinstance(site_collection, dict)
+        else None
+    )
     archive_status, archive_status_checked, archive_status_authoritative = _archive_status_from_graph(
         site_collection,
         explicitly_selected=archive_status_selected,
@@ -481,14 +567,44 @@ def _site_from_graph(
         archive_status_checked=archive_status_checked,
         archive_status_authoritative=archive_status_authoritative,
         requested_target=requested_target,
+        data_location_code=data_location_code,
+        is_root_site=(True if isinstance(raw.get("root"), dict) else None)
+        if governance_available is not False
+        else None,
+        is_personal_site=(raw.get("isPersonalSite") if isinstance(raw.get("isPersonalSite"), bool) else None)
+        if governance_available is not False
+        else None,
+        governance_observation=(
+            "selected"
+            if governance_available is True
+            else (
+                "unavailable_unsupported_select" if governance_available is False else "best_effort_provider_response"
+            )
+        ),
+        governance_limitations=((GOVERNANCE_SELECT_LIMITATION,) if governance_available is False else ()),
     )
 
 
-def _drive_from_graph(site: Site, raw: dict[str, object]) -> Drive:
+def _drive_from_graph(site: Site, raw: dict[str, object], *, governance_available: bool = True) -> Drive:
     drive_id = _bounded_exact_text(raw.get("id"), PROVIDER_ID_MAX_CHARACTERS)
     name = _bounded_exact_text(raw.get("name"), RESOURCE_NAME_MAX_CHARACTERS)
     if not drive_id or not name:
         raise GraphProtocolError(status_code=None, code="library_missing_identity")
+    if governance_available:
+        owner, owner_observation = _identity_set_metadata(raw.get("owner"))
+        created_by, created_by_observation = _identity_set_metadata(raw.get("createdBy"))
+        last_modified_by, last_modified_by_observation = _identity_set_metadata(raw.get("lastModifiedBy"))
+        quota, quota_observation = _quota_metadata(raw.get("quota"))
+        raw_system = raw.get("system")
+        system_managed = isinstance(raw_system, dict)
+        system_observation = "observed" if system_managed else "not_returned" if raw_system is None else "invalid"
+    else:
+        owner = created_by = last_modified_by = quota = None
+        owner_observation = created_by_observation = last_modified_by_observation = quota_observation = (
+            "unavailable_unsupported_select"
+        )
+        system_managed = False
+        system_observation = "unavailable_unsupported_select"
     return Drive(
         site=site,
         drive_id=drive_id,
@@ -498,6 +614,18 @@ def _drive_from_graph(site: Site, raw: dict[str, object]) -> Drive:
         description=_bounded_text(raw.get("description"), METADATA_TEXT_MAX_CHARACTERS),
         created_at=_bounded_text(raw.get("createdDateTime"), 128),
         modified_at=_bounded_text(raw.get("lastModifiedDateTime"), 128),
+        owner=owner,
+        owner_observation=owner_observation,
+        created_by=created_by,
+        created_by_observation=created_by_observation,
+        last_modified_by=last_modified_by,
+        last_modified_by_observation=last_modified_by_observation,
+        quota=quota,
+        quota_observation=quota_observation,
+        system_managed=system_managed,
+        system_observation=system_observation,
+        governance_observation="selected" if governance_available else "unavailable_unsupported_select",
+        governance_limitations=((GOVERNANCE_SELECT_LIMITATION,) if not governance_available else ()),
     )
 
 
@@ -526,6 +654,54 @@ def _encoded_site_path(raw_path: str) -> str:
     return encoded
 
 
+def _sharepoint_hostname_allowed(client: GraphClient, hostname: str) -> bool:
+    validator = getattr(client, "sharepoint_hostname_allowed", None)
+    if callable(validator):
+        return bool(validator(hostname))
+    # Compatibility for narrow test/client adapters that predate cloud
+    # profiles. The production GraphClient always supplies the validator.
+    return bool(SHAREPOINT_HOST_PATTERN.fullmatch(hostname))
+
+
+def _optional_select_unsupported(exc: BaseException) -> bool:
+    return isinstance(exc, GraphAPIError) and exc.status_code == 400 and exc.code == "unsupported_select"
+
+
+def _get_with_optional_select_fallback(
+    client: GraphClient,
+    selected_url: str,
+    core_url: str,
+) -> tuple[dict[str, object], bool]:
+    """Retry once without optional governance fields on an explicit select rejection."""
+
+    try:
+        return client.get(selected_url), True
+    except GraphAPIError as exc:
+        if not _optional_select_unsupported(exc):
+            raise
+    return client.get(core_url), False
+
+
+def _iter_pages_with_optional_select_fallback(
+    client: GraphClient,
+    selected_url: str,
+    core_url: str,
+) -> Iterator[tuple[dict[str, object], bool]]:
+    """Fall back only before any selected page has been accepted."""
+
+    yielded_selected_page = False
+    try:
+        for page in client.iter_pages(selected_url):
+            yielded_selected_page = True
+            yield page, True
+        return
+    except GraphAPIError as exc:
+        if yielded_selected_page or not _optional_select_unsupported(exc):
+            raise
+    for page in client.iter_pages(core_url):
+        yield page, False
+
+
 def resolve_target_site(client: GraphClient, reference: str) -> Site:
     normalized = str(reference or "").strip()
     if not normalized:
@@ -544,7 +720,7 @@ def resolve_target_site(client: GraphClient, reference: str) -> Site:
             raise GraphProtocolError(status_code=None, code="invalid_site_url") from exc
         if (
             parsed.scheme.casefold() != "https"
-            or not SHAREPOINT_HOST_PATTERN.fullmatch(hostname)
+            or not _sharepoint_hostname_allowed(client, hostname)
             or parsed.username is not None
             or parsed.password is not None
             or port is not None
@@ -553,7 +729,12 @@ def resolve_target_site(client: GraphClient, reference: str) -> Site:
         ):
             raise GraphProtocolError(status_code=None, code="invalid_site_url")
         encoded_path = _encoded_site_path(parsed.path)
-        raw = client.get(f"sites/{hostname}:{encoded_path}?$select={SITE_SELECT}")
+        site_path = f"sites/{hostname}:{encoded_path}"
+        raw, governance_available = _get_with_optional_select_fallback(
+            client,
+            f"{site_path}?$select={SITE_SELECT}",
+            f"{site_path}?$select={CORE_SITE_SELECT}",
+        )
     else:
         if (
             len(normalized) > PROVIDER_ID_MAX_CHARACTERS
@@ -561,12 +742,18 @@ def resolve_target_site(client: GraphClient, reference: str) -> Site:
             or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
         ):
             raise GraphProtocolError(status_code=None, code="invalid_site_id")
-        raw = client.get(f"sites/{_graph_id_path(normalized)}?$select={SITE_SELECT}")
+        site_path = f"sites/{_graph_id_path(normalized)}"
+        raw, governance_available = _get_with_optional_select_fallback(
+            client,
+            f"{site_path}?$select={SITE_SELECT}",
+            f"{site_path}?$select={CORE_SITE_SELECT}",
+        )
     return _site_from_graph(
         raw,
         archive_status_selected=True,
         existence_status="confirmed",
         requested_target=normalized,
+        governance_available=governance_available,
     )
 
 
@@ -681,11 +868,18 @@ def _discover_drive_search_sites(
             if urlparse(site_target).scheme == "https":
                 sites.append(replace(resolve_target_site(client, site_target), requested_target=None))
             else:
+                site_path = f"sites/{_graph_id_path(site_target)}"
+                raw_site, governance_available = _get_with_optional_select_fallback(
+                    client,
+                    f"{site_path}?$select={SITE_SELECT}",
+                    f"{site_path}?$select={CORE_SITE_SELECT}",
+                )
                 sites.append(
                     _site_from_graph(
-                        client.get(f"sites/{_graph_id_path(site_target)}?$select={SITE_SELECT}"),
+                        raw_site,
                         archive_status_selected=True,
                         existence_status="confirmed",
+                        governance_available=governance_available,
                     )
                 )
         except GraphAPIError as exc:
@@ -815,8 +1009,13 @@ def discover_drives(
     truncated = False
     for site in sites:
         try:
-            pages = client.iter_pages(f"sites/{_graph_id_path(site.site_id)}/drives?$select={DRIVE_SELECT}")
-            for page in pages:
+            drive_path = f"sites/{_graph_id_path(site.site_id)}/drives"
+            pages = _iter_pages_with_optional_select_fallback(
+                client,
+                f"{drive_path}?$select={DRIVE_SELECT}",
+                f"{drive_path}?$select={CORE_DRIVE_SELECT}",
+            )
+            for page, governance_available in pages:
                 values = page.get("value")
                 if not isinstance(values, list):
                     raise GraphProtocolError(status_code=None, code="missing_page_values")
@@ -828,7 +1027,7 @@ def discover_drives(
                         )
                         continue
                     try:
-                        drive = _drive_from_graph(site, raw)
+                        drive = _drive_from_graph(site, raw, governance_available=governance_available)
                     except GraphAPIError as exc:
                         on_drive_error(site, exc)
                         continue
@@ -895,6 +1094,7 @@ def normalize_drive_item(
     drive_id: str,
     exposure: str,
     exposure_evidence: dict[str, object],
+    governance_available: bool = True,
 ) -> dict[str, object] | None:
     provider_item_id = _bounded_exact_text(raw.get("id"), PROVIDER_ID_MAX_CHARACTERS)
     if not provider_item_id:
@@ -952,6 +1152,12 @@ def normalize_drive_item(
     normalized_file_facet = file_facet if isinstance(file_facet, dict) else None
     mime_type = _bounded_text(normalized_file_facet.get("mimeType"), 255) if normalized_file_facet else None
     file_archive_status = _file_archive_status(normalized_file_facet)
+    if governance_available:
+        created_by, created_by_observation = _identity_set_metadata(raw.get("createdBy"))
+        last_modified_by, last_modified_by_observation = _identity_set_metadata(raw.get("lastModifiedBy"))
+    else:
+        created_by = last_modified_by = None
+        created_by_observation = last_modified_by_observation = "unavailable_unsupported_select"
     return {
         "provider": "sharepoint",
         "provider_resource_id": drive_id,
@@ -975,6 +1181,18 @@ def normalize_drive_item(
             "ctag": _bounded_text(raw.get("cTag"), METADATA_TEXT_MAX_CHARACTERS),
             "folder_child_count": folder_child_count,
             "file_archive_status": file_archive_status,
+            "created_by": created_by,
+            "created_by_observation": created_by_observation,
+            "last_modified_by": last_modified_by,
+            "last_modified_by_observation": last_modified_by_observation,
+            **(
+                {
+                    "governance_observation": "unavailable_unsupported_select",
+                    "governance_limitation": GOVERNANCE_SELECT_LIMITATION,
+                }
+                if not governance_available
+                else {}
+            ),
         },
     }
 
@@ -1348,10 +1566,16 @@ class SharePointCollector:
                     "display_name": site.display_name,
                     "web_url": site.web_url,
                     "site_collection_hostname": site.site_collection_hostname,
+                    "data_location_code": site.data_location_code,
+                    "is_root_site": site.is_root_site,
+                    "is_personal_site": site.is_personal_site,
+                    "governance_observation": site.governance_observation,
+                    "governance_limitations": list(site.governance_limitations),
                     "created_at": site.created_at,
                     "modified_at": site.modified_at,
                     "collection_mode": self.collection_mode,
                     "auth_type": self.context.auth_type,
+                    "graph_cloud": self.context.cloud,
                     "assessed_identity": self.context.assessed_identity,
                     "existence_status": site.existence_status,
                     "archive_status": site.archive_status,
@@ -1386,6 +1610,7 @@ class SharePointCollector:
                 "provider": "sharepoint",
                 "metadata": {
                     "tenant_id": self.context.tenant_id,
+                    "graph_cloud": self.context.cloud,
                     "collection_mode": self.collection_mode,
                     "auth_type": self.context.auth_type,
                     "assessed_identity": self.context.assessed_identity,
@@ -1429,10 +1654,23 @@ class SharePointCollector:
         access_level = "list_only" if observation.enumeration_status == "complete" else "unknown"
         metadata: dict[str, object] = {
             "tenant_id": self.context.tenant_id,
+            "graph_cloud": self.context.cloud,
             "site_id": drive.site.site_id,
             "drive_id": drive.drive_id,
             "drive_type": drive.drive_type,
             "description": drive.description,
+            "owner": drive.owner,
+            "owner_observation": drive.owner_observation,
+            "created_by": drive.created_by,
+            "created_by_observation": drive.created_by_observation,
+            "last_modified_by": drive.last_modified_by,
+            "last_modified_by_observation": drive.last_modified_by_observation,
+            "quota": drive.quota,
+            "quota_observation": drive.quota_observation,
+            "system_managed": drive.system_managed,
+            "system_observation": drive.system_observation,
+            "governance_observation": drive.governance_observation,
+            "governance_limitations": list(drive.governance_limitations),
             "created_at": drive.created_at,
             "modified_at": drive.modified_at,
             "content_read_tested": False,
@@ -1455,6 +1693,10 @@ class SharePointCollector:
             "active_file_count": observation.active_file_count,
             "unknown_file_archive_count": observation.unknown_file_archive_count,
         }
+        if observation.item_governance_observation is not None:
+            metadata["item_governance_observation"] = observation.item_governance_observation
+            if observation.item_governance_observation == "unavailable_unsupported_select":
+                metadata["item_governance_limitations"] = [GOVERNANCE_SELECT_LIMITATION]
         if permission_summary is not None:
             metadata["permission_summary"] = permission_summary
         if observation.descendant_permission_summary is not None:
@@ -1882,6 +2124,7 @@ class SharePointCollector:
                     reactivating_file_count=pending.reactivating_file_count,
                     active_file_count=pending.active_file_count,
                     unknown_file_archive_count=pending.unknown_file_archive_count,
+                    item_governance_observation=pending.item_governance_observation,
                     permission_result=permission_result,
                     descendant_permission_summary=pending.descendant_permission_summary,
                 ),
@@ -1962,7 +2205,7 @@ class SharePointCollector:
 
         reset_happened = False
         try:
-            changed, deleted, invalid_items = self._stage_drive(
+            changed, deleted, invalid_items, item_governance_observation = self._stage_drive(
                 drive,
                 state,
                 sync_mode=sync_mode,
@@ -1988,7 +2231,7 @@ class SharePointCollector:
             # Preserve the last working state until this replacement stage is
             # emitted and finalized. Graph's Location is opaque and validated
             # by GraphClient before any Authorization header is sent.
-            changed, deleted, invalid_items = self._stage_drive(
+            changed, deleted, invalid_items, item_governance_observation = self._stage_drive(
                 drive,
                 state,
                 sync_mode="full",
@@ -2175,6 +2418,7 @@ class SharePointCollector:
             reactivating_file_count=reactivating_file_count,
             active_file_count=active_file_count,
             unknown_file_archive_count=unknown_file_archive_count,
+            item_governance_observation=item_governance_observation,
             descendant_permission_summary=descendant_permission_summary,
         )
 
@@ -2185,7 +2429,7 @@ class SharePointCollector:
         *,
         sync_mode: str,
         initial_url: str | None = None,
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, str]:
         self.state.begin_drive_stage(
             session_id=self.run_id,
             scope_key=self.scope_key,
@@ -2195,19 +2439,38 @@ class SharePointCollector:
             base_version=state.version,
             sync_mode=sync_mode,
         )
+        selected_initial_url: str | None = None
+        core_initial_url: str | None = None
         if initial_url:
             url = initial_url
         elif sync_mode == "delta" and state.delta_link:
             url = state.delta_link
         else:
-            url = f"drives/{quote(drive.drive_id, safe='')}/root/delta?$select={ITEM_SELECT}"
+            drive_path = f"drives/{quote(drive.drive_id, safe='')}/root/delta"
+            selected_initial_url = f"{drive_path}?$select={ITEM_SELECT}"
+            core_initial_url = f"{drive_path}?$select={CORE_ITEM_SELECT}"
+            url = selected_initial_url
 
         exposure, evidence = self._exposure()
         changed = 0
         deleted = 0
         invalid_items = 0
         final_delta_link: str | None = None
-        for page in self.client.iter_pages(url):
+        item_governance_observation = (
+            "selected" if selected_initial_url is not None else state.item_governance_observation
+        )
+        if selected_initial_url is not None and core_initial_url is not None:
+            pages: Iterable[tuple[dict[str, object], bool]] = _iter_pages_with_optional_select_fallback(
+                self.client,
+                selected_initial_url,
+                core_initial_url,
+            )
+        else:
+            governance_available = item_governance_observation != "unavailable_unsupported_select"
+            pages = ((page, governance_available) for page in self.client.iter_pages(url))
+        for page, governance_available in pages:
+            if not governance_available:
+                item_governance_observation = "unavailable_unsupported_select"
             raw_values = page.get("value")
             if not isinstance(raw_values, list):
                 raise GraphProtocolError(status_code=None, code="missing_page_values")
@@ -2222,6 +2485,7 @@ class SharePointCollector:
                         drive_id=drive.drive_id,
                         exposure=exposure,
                         exposure_evidence=evidence,
+                        governance_available=governance_available,
                     )
                 except GraphProtocolError as exc:
                     metadata_bound_codes = {
@@ -2301,8 +2565,9 @@ class SharePointCollector:
             site_id=drive.site.site_id,
             drive_id=drive.drive_id,
             delta_link=final_delta_link,
+            item_governance_observation=item_governance_observation,
         )
-        return changed, deleted, invalid_items
+        return changed, deleted, invalid_items, item_governance_observation
 
     @property
     def sync_mode(self) -> str:

@@ -24,7 +24,7 @@ Use `.ndjson` or `.ndjson.gz` for normal scans. Filenames and paths can themselv
 
 ### Scheduled application scan
 
-Create an Entra application with Microsoft Graph application permission `Sites.Read.All` and grant tenant admin consent. The first implementation supports a client secret supplied only through the environment:
+Create an Entra application with Microsoft Graph application permission `Sites.Read.All` and grant tenant admin consent. For a short-lived bootstrap, supply a client secret only through the environment:
 
 ```bash
 export SHARE_SENTINEL_GRAPH_TENANT_ID='<tenant-id>'
@@ -44,7 +44,41 @@ Application mode uses the supported [`/sites/getAllSites`](https://learn.microso
 
 For a deliberately restricted application assessment, `Sites.Selected` is supported only with one or more explicit `--site` targets and matching site grants. It cannot be used for tenant discovery. When JWT roles are inspectable, the collector rejects that ambiguous combination before collection; for an opaque token, Graph enforces it when discovery begins.
 
-Client secrets are acceptable for an initial deployment, but certificates or workload identity are preferable for long-lived automation. Certificate authentication is not implemented in this first collector version.
+For recurring automation, prefer a certificate credential. Put one PEM private key and its public certificate in an owner-only bundle; encrypted keys read their passphrase from a named environment variable, never a command-line value:
+
+```bash
+chmod 600 ./graph-collector.pem
+export SHARE_SENTINEL_GRAPH_TENANT_ID='<tenant-id>'
+export SHARE_SENTINEL_GRAPH_CLIENT_ID='<application-client-id>'
+read -rsp 'Certificate passphrase (leave empty for an unencrypted key): ' \
+  SHARE_SENTINEL_GRAPH_CERTIFICATE_PASSPHRASE && echo
+export SHARE_SENTINEL_GRAPH_CERTIFICATE_PASSPHRASE
+
+python collector/share_sentinel_sharepoint.py \
+  --auth app \
+  --certificate-path ./graph-collector.pem \
+  --output sharepoint.ndjson.gz \
+  --gzip
+
+unset SHARE_SENTINEL_GRAPH_CERTIFICATE_PASSPHRASE
+```
+
+On POSIX systems the collector rejects a certificate file that is not a regular file owned by the current user or is readable by group/other users. On Windows, protect the bundle with an ACL limited to the collector account; the collector cannot infer an equivalent POSIX mode check there. A PEM bundle containing the public certificate lets current MSAL use a SHA-256 thumbprint. `--certificate-thumbprint` remains available for an explicitly configured legacy SHA-1 thumbprint, and `--certificate-send-x5c` opts into Subject Name/Issuer authentication. Do not configure a client secret and certificate at the same time. Managed/workload identity is not yet implemented.
+
+### Microsoft cloud selection
+
+`--graph-cloud` selects one coherent identity, Graph API, token-audience, and SharePoint hostname boundary:
+
+| Value | Microsoft 365 environment | Authority | Graph endpoint | Accepted site URLs |
+|---|---|---|---|---|
+| `global` | Worldwide, including GCC | `login.microsoftonline.com` | `graph.microsoft.com` | `*.sharepoint.com` |
+| `gcc-high` | GCC High | `login.microsoftonline.us` | `graph.microsoft.us` | `*.sharepoint.us` |
+| `dod` | US Government DoD | `login.microsoftonline.us` | `dod-graph.microsoft.us` | `*.sharepoint-mil.us` |
+| `china` | Microsoft 365 operated by 21Vianet | `login.chinacloudapi.cn` | `microsoftgraph.chinacloudapi.cn` | `*.sharepoint.cn` |
+
+Microsoft 365 GCC uses `global`, not `gcc-high`. The selected cloud applies to app, certificate, delegated, and imported-token modes. Cross-cloud token audiences, pagination links, and target-site hostnames are rejected instead of being followed. Delta state is partitioned by cloud, so observations from isolated deployments cannot share checkpoints.
+
+Endpoint mappings follow Microsoft's [national-cloud deployment table](https://learn.microsoft.com/graph/deployments).
 
 “Metadata-only” describes the calls Share Sentinel makes, not the maximum capability of the credential. Microsoft Graph `Sites.Read.All` and delegated `Files.Read.All` can authorize document-content reads even though this collector never requests content. Treat tokens and client secrets as high-impact credentials, prefer explicit `Sites.Selected` grants where tenant-wide discovery is unnecessary, store secrets in an approved secret manager, and rotate them after suspected exposure. See the [Microsoft Graph permissions reference](https://learn.microsoft.com/graph/permissions-reference).
 
@@ -139,7 +173,11 @@ Each discovered site is followed by a bounded, read-only Graph lookup of its sit
 
 Explicit `--site` targets retain a synthetic endpoint record even when resolution fails, so the requested target and the observed failure are not lost. The statuses distinguish invalid syntax, authentication failure, permission denial, temporary unavailability, and an indeterminate failure. A Graph `404` is recorded as `not_found_or_not_visible`, not as proof of deletion: SharePoint security trimming can hide an existing site from the assessed identity. Confirm a suspected stale link with an independently authorized identity before treating it as deleted.
 
-Document-library records describe how far content enumeration actually got. A successful complete delta traversal reports `content_state=populated` or `empty`, file/folder/item counts, observed file bytes, and `collection_complete=true`. It also preserves a file's Microsoft 365 Archive state when Graph supplies it and summarizes fully archived, reactivating, not-archived, and unknown file counts per library. This is deliberately best-effort on the production Graph v1.0 endpoint: Microsoft documents archive metadata in current developer guidance, but the v1.0 `file` facet does not yet make the property a universal contract, so omitted metadata remains unknown rather than being guessed active. The state schema upgrade performs one automatic full metadata sync before resuming delta collection so unchanged files from an older checkpoint do not remain permanently unassessed. `empty` is never inferred from a denied, interrupted, limited, or metadata-only request. When any file lacks usable size metadata, `total_size_bytes` remains the sum observed and `size_observation_complete=false`. A failed traversal instead reports its concrete state (for example `permission_denied` or `temporarily_unreachable`), leaves counts unknown, and preserves a resource-scoped error code. If even one item has invalid metadata, the library emits no apparently complete item subset and its checkpoint does not advance. `--no-files` deliberately reports `not_requested` / `not_assessed`; it does not claim the library is empty.
+Document-library records describe how far content enumeration actually got. A successful complete delta traversal reports `content_state=populated` or `empty`, file/folder/item counts, observed file bytes, and `collection_complete=true`. It also preserves a file's Microsoft 365 Archive state when Graph supplies it and summarizes fully archived, reactivating, not-archived, and unknown file counts per library. This is deliberately best-effort on the production Graph v1.0 endpoint: Microsoft documents archive metadata in current developer guidance, but the v1.0 `file` facet does not yet make the property a universal contract, so omitted metadata remains unknown rather than being guessed active. State upgrades perform one automatic full metadata sync before resuming delta collection so unchanged files from an older checkpoint do not remain permanently unassessed for archive or governance fields. `empty` is never inferred from a denied, interrupted, limited, or metadata-only request. When any file lacks usable size metadata, `total_size_bytes` remains the sum observed and `size_observation_complete=false`. A failed traversal instead reports its concrete state (for example `permission_denied` or `temporarily_unreachable`), leaves counts unknown, and preserves a resource-scoped error code. If even one item has invalid metadata, the library emits no apparently complete item subset and its checkpoint does not advance. `--no-files` deliberately reports `not_requested` / `not_assessed`; it does not claim the library is empty.
+
+The same GET-only metadata requests retain bounded governance context when Graph returns it: site data-location, root/personal-site flags; library owner, creator, last modifier, quota/state, and system-managed facet; and item creator/last-modifier identities. Identity records keep only bounded IDs, display names, and tenant IDs. Each nullable owner/identity/quota value is paired with observation semantics such as `observed`, `not_returned`, `partial`, or `invalid`; omission is never interpreted as no owner, unlimited quota, or no governance control. These fields do not require or trigger document-content downloads.
+
+National-cloud API versions can lag the global endpoint. If Graph explicitly reports that an optional governance `$select` property is unsupported, the collector retries that request once with the prior core inventory fields and marks governance as `unavailable_unsupported_select` with `optional_graph_governance_select_rejected`. It does not use this fallback for authentication, authorization, not-found, throttling, generic bad-request, or later-page failures. The selected/core mode is retained with the drive checkpoint so subsequent deltas do not turn an unsupported field into a misleading `not_returned` observation.
 
 In the web inventory, enable the optional **File Archive State** item column to inspect the result and use its inline exact/exclude shortcuts. The advanced inventory query field is `file_archive_status`, for example `provider=sharepoint AND file_archive_status=fully_archived`; filtering remains server-side for large inventories and CSV exports.
 
@@ -167,7 +205,9 @@ python collector/share_sentinel_sharepoint.py \
 
 The defaults (10,000 permission objects and 100,000 normalized entries) are the supported starting envelope, not a claim that the CLI hard ceilings are validated throughput targets. The hard ceilings only reject pathological configuration. Load-test the complete collect/upload/ingest/compare path against representative data before raising defaults substantially; for very large tenants, prefer targeted-site runs with stable scope. Monitor artifact size, Graph throttling, ingest duration, PostgreSQL statement time, and permission table growth.
 
-Each attempted object emits one `permission_assessment`, followed by bounded `permission_entry` records, under the `sharepoint_graph_permission_v1` semantics and `sharepoint_graph_permissions` surface. Assessments record selection, retrieval, provider-visibility, semantic, and principal-resolution coverage separately. Empty entries mean only that no entries were returned to this caller for this request; they never prove an object has no permissions. Stable assessment, subject, principal, entry, evidence, and complete entry-set hashes exclude mutable display paths and aliases. Display names and login names are retained only as bounded aliases. The collector preserves Graph's `inheritedFrom` source IDs if supplied, but Microsoft documents that SharePoint document libraries do not return this generic driveItem property, so an absent value remains inheritance `unknown` rather than being called direct. Group membership is not expanded and effective access is not computed.
+Each attempted object emits one `permission_assessment`, followed by bounded `permission_entry` records, under the `sharepoint_graph_permission_v1` semantics and `sharepoint_graph_permissions` surface. Assessments record selection, retrieval, provider-visibility, semantic, and principal-resolution coverage separately. Empty entries mean only that no entries were returned to this caller for this request; they never prove an object has no permissions. Stable assessment, subject, principal, entry, evidence, and complete entry-set hashes exclude mutable display paths and aliases. Display names and login names are retained only as bounded aliases. The collector preserves Graph's `inheritedFrom` source IDs if supplied, but Microsoft documents that SharePoint document libraries do not return this generic driveItem property, so an absent value remains inheritance `unknown` rather than being called direct.
+
+Group membership is not expanded and effective access remains `not_computed`. The collector's existing `Sites.Read.All` / `Files.Read.All` grants do not authorize Entra transitive membership enumeration. A future opt-in resolver would need an explicit `GroupMember.Read.All` grant, would still require `Member.Read.Hidden` for hidden memberships, and would need separate object/page/edge/depth budgets and completeness evidence. SharePoint groups are a separate provider surface and cannot be treated as Entra groups. Share Sentinel therefore does not silently assume `Directory.Read.All`, does not emit a partial membership graph as complete, and preserves principal-resolution/effective-access results as unknown when those additional surfaces are unavailable.
 
 The [Graph driveItem permissions endpoint](https://learn.microsoft.com/graph/api/driveitem-list-permissions?view=graph-rest-1.0) exposes effective sharing permission objects, including direct and inherited sharing entries, not a complete SharePoint ACL/effective-access evaluation. Its result depends on the caller and authorization mode; a non-owner caller can receive only permissions applicable to that caller. Share Sentinel therefore makes only two positive exposure classifications from authoritative link scope returned in the response:
 
@@ -262,7 +302,7 @@ Tenant and client IDs can be placed in the generated owner-only `.env`; the clie
 
 | Mode | Required setup | MFA / Conditional Access | Unattended | Assessment perspective |
 |---|---|---:|---:|---|
-| `app` | Tenant ID, confidential client ID, client secret, and `Sites.Read.All` or targeted `Sites.Selected` grants | Not applicable | Yes | Sites available to the application grant |
+| `app` | Tenant ID, confidential client ID, client secret or protected certificate, and `Sites.Read.All` or targeted `Sites.Selected` grants | Not applicable | Yes | Sites available to the application grant |
 | `interactive` | Public-client ID and delegated consent | Yes | No | Selected user's security-trimmed view |
 | `wam` | Windows, MSAL broker support, public-client redirect configuration | Yes | SSO-assisted | Current/selected user's security-trimmed view |
 | `token` | Existing Microsoft Graph access token | Depends on issuer flow | Depends | Identity and permissions represented by the token |
@@ -272,11 +312,11 @@ The collector requests read-only delegated `Sites.Read.All` and `Files.Read.All`
 
 ## Current boundaries
 
-- Microsoft Graph global cloud is the supported endpoint in this initial implementation; sovereign cloud selection is not yet exposed.
-- App authentication currently supports client secrets, not certificates or managed/workload identity.
+- Microsoft Graph global (including GCC), GCC High, DoD, and China deployments are supported through `--graph-cloud`; a tenant, token, site URL, and state database scope must stay within the selected cloud boundary.
+- App authentication supports environment-supplied client secrets and protected PEM certificate assertions. Managed/workload identity is not yet implemented.
 - The project does not ship a multi-tenant Share Sentinel public-client registration. Interactive and WAM users must provide a public-client ID; token mode works with an already authorized external session without a customer-created app.
 - Delegated Search discovery is useful but not tenant-authoritative.
-- Permission evidence is bounded, opt-in, caller-dependent sharing metadata rather than a complete SharePoint ACL, group-membership, inheritance, or effective-access evaluation. Only explicit anonymous and organization link scopes support positive exposure classification; external and restricted states are not guessed.
+- Permission evidence is bounded, opt-in, caller-dependent sharing metadata rather than a complete SharePoint ACL, group-membership, inheritance, or effective-access evaluation. Entra transitive membership would require an explicit additional grant, hidden membership needs another grant, and SharePoint groups remain separate; none are silently requested. Only explicit anonymous and organization link scopes support positive exposure classification; external and restricted states are not guessed.
 - `--site` accepts canonical SharePoint site URLs and Graph site IDs. It does not redeem or enumerate arbitrary `/:f:/`, `/:x:/`, `1drv.ms`, or other sharing URLs; Graph sharing-link redemption can change sharing state and requires a different permission model, so those links are not presented as stale/valid findings.
 - Site pages, list rows outside document libraries, document contents, malware scanning, and content classification are outside this collector's scope.
 - Collection is read-only but still produces normal Entra, Graph, and SharePoint audit activity.

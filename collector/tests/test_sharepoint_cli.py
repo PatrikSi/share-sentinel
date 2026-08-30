@@ -10,7 +10,7 @@ import collector_entrypoint
 import pytest
 import share_sentinel_sharepoint as cli
 from share_sentinel_collector import NDJSONWriter as RealNDJSONWriter
-from sharepoint.auth import GraphTokenContext, TokenAcquisitionError
+from sharepoint.auth import CertificateCredentialAuthProvider, GraphTokenContext, TokenAcquisitionError
 from sharepoint.state import StateConflictError
 
 
@@ -40,6 +40,8 @@ def test_sharepoint_cli_requires_no_host_or_cidr_target() -> None:
     assert args.max_permission_http_attempts == 25_000
     assert args.max_permission_entries == 100_000
     assert args.permission_concurrency == 2
+    assert args.graph_cloud == "global"
+    assert args.certificate_path is None
 
 
 def test_permission_cli_modes_and_hard_bounds_are_explicit() -> None:
@@ -93,6 +95,61 @@ def test_cli_has_no_password_or_inline_bearer_token_argument() -> None:
     assert "--token-env" in help_text
     assert "--token-file" in help_text
     assert "--token-stdin" in help_text
+    assert "--graph-cloud" in help_text
+    assert "--certificate-path" in help_text
+    assert "--certificate-passphrase-env" in help_text
+    assert "--certificate-passphrase " not in help_text
+
+
+def test_cloud_and_certificate_cli_options_are_bounded_to_app_authentication(tmp_path) -> None:
+    with pytest.raises(TokenAcquisitionError, match="requires --auth app"):
+        cli.parse_args(["--auth", "token", "--certificate-path", str(tmp_path / "credential.pem")])
+    with pytest.raises(TokenAcquisitionError, match="require --certificate-path"):
+        cli.parse_args(["--auth", "app", "--certificate-thumbprint", "A" * 40])
+    with pytest.raises(TokenAcquisitionError, match="valid environment variable"):
+        cli.parse_args(["--auth", "app", "--certificate-passphrase-env", "BAD-NAME"])
+
+    args = cli.parse_args(["--auth", "token", "--graph-cloud", "dod"])
+    provider = cli._build_auth_provider(args)
+    assert provider.cloud_profile.name == "dod"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+def test_cli_builds_certificate_provider_without_exposing_passphrase(monkeypatch, tmp_path) -> None:
+    credential_file = tmp_path / "credential.pem"
+    credential_file.write_text(
+        "-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----\n"
+        "-----BEGIN CERTIFICATE-----\npublic-material\n-----END CERTIFICATE-----\n",
+        encoding="ascii",
+    )
+    credential_file.chmod(0o600)
+    monkeypatch.delenv(cli.DEFAULT_CLIENT_SECRET_ENV, raising=False)
+    monkeypatch.setenv(cli.DEFAULT_CERTIFICATE_PASSPHRASE_ENV, "never-print-this-passphrase")
+    args = cli.parse_args(
+        [
+            "--auth",
+            "app",
+            "--tenant-id",
+            "tenant.example",
+            "--client-id",
+            "client-id",
+            "--certificate-path",
+            str(credential_file),
+            "--graph-cloud",
+            "china",
+        ]
+    )
+
+    provider = cli._build_auth_provider(args)
+
+    assert isinstance(provider, CertificateCredentialAuthProvider)
+    assert provider.cloud_profile.name == "china"
+    assert "never-print-this-passphrase" not in repr(provider)
+
+    monkeypatch.setenv(cli.DEFAULT_CLIENT_SECRET_ENV, "conflicting-secret")
+    with pytest.raises(TokenAcquisitionError, match="both app secret and certificate") as exc:
+        cli._build_auth_provider(args)
+    assert "conflicting-secret" not in str(exc.value)
 
 
 def test_cli_help_describes_unlimited_safety_limits_and_page_default() -> None:

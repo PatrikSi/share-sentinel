@@ -111,6 +111,56 @@ def test_graph_pagination_follows_absolute_next_links() -> None:
     assert len(session.calls) == 3
 
 
+def test_national_cloud_client_uses_only_its_selected_graph_boundary() -> None:
+    provider = StaticProvider()
+    provider.context = replace(provider.context, cloud="gcc-high")
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "value": [{"id": "1"}],
+                    "@odata.nextLink": "https://graph.microsoft.us/v1.0/sites?page=2",
+                },
+            ),
+            FakeResponse(200, {"value": [{"id": "2"}]}),
+        ]
+    )
+    client = GraphClient(provider, cloud="gcc-high", session=session, sleep=lambda _delay: None)
+
+    assert [row["id"] for row in iter_values(client.iter_pages("sites"))] == ["1", "2"]
+    assert session.calls[0]["url"] == "https://graph.microsoft.us/v1.0/sites"
+    assert client.sharepoint_hostname_allowed("tenant.sharepoint.us") is True
+    assert client.sharepoint_hostname_allowed("tenant.sharepoint.com") is False
+
+
+def test_national_cloud_client_rejects_cross_cloud_continuation_and_token_context() -> None:
+    provider = StaticProvider()
+    provider.context = replace(provider.context, cloud="gcc-high")
+    client = GraphClient(
+        provider,
+        cloud="gcc-high",
+        session=FakeSession(
+            [
+                FakeResponse(
+                    200,
+                    {
+                        "value": [],
+                        "@odata.nextLink": "https://graph.microsoft.com/v1.0/sites?page=2",
+                    },
+                )
+            ]
+        ),
+        sleep=lambda _delay: None,
+    )
+
+    with pytest.raises(GraphProtocolError, match="unsafe_continuation_url"):
+        list(client.iter_pages("sites"))
+
+    with pytest.raises(ValueError, match="does not match the selected cloud"):
+        GraphClient(StaticProvider(), cloud="gcc-high", initial_token_context=StaticProvider().context)
+
+
 @pytest.mark.parametrize(
     "next_link,code",
     [
@@ -227,6 +277,37 @@ def test_stream_failure_is_retried_and_sanitized() -> None:
         failing.get("sites")
     assert "skiptoken" not in str(exc.value)
     assert "sensitive-token" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "raw_error",
+    [
+        {"code": "Request_UnsupportedQuery", "message": "The requested query is not supported."},
+        {"code": "BadRequest", "message": "Could not find a property named 'owner' on this type."},
+        {"code": "BadRequest", "message": "The $select property 'createdBy' is not supported."},
+    ],
+)
+def test_explicit_optional_select_rejections_receive_a_safe_specific_code(raw_error) -> None:
+    client = _client(FakeSession([FakeResponse(400, {"error": raw_error})]))
+
+    with pytest.raises(GraphAPIError) as exc:
+        client.get("sites?$select=id,root")
+
+    assert exc.value.status_code == 400
+    assert exc.value.code == "unsupported_select"
+    assert "owner" not in str(exc.value)
+    assert "createdBy" not in str(exc.value)
+
+
+def test_generic_bad_request_is_not_mislabeled_as_an_optional_select_rejection() -> None:
+    client = _client(
+        FakeSession([FakeResponse(400, {"error": {"code": "BadRequest", "message": "Malformed identifier."}})])
+    )
+
+    with pytest.raises(GraphAPIError) as exc:
+        client.get("sites/not-valid")
+
+    assert exc.value.code == "BadRequest"
 
 
 def test_delta_410_preserves_reset_location_without_logging_it() -> None:

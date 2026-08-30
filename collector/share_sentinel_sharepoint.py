@@ -18,10 +18,14 @@ from share_sentinel_collector import (
     upload_artifact,
 )
 from sharepoint.auth import (
+    GRAPH_CLOUD_PROFILES,
     AppCredentialAuthProvider,
+    CertificateCredentialAuthProvider,
     ExistingTokenAuthProvider,
     PublicClientAuthProvider,
     TokenAcquisitionError,
+    certificate_credential_from_file,
+    resolve_graph_cloud,
     token_reader_from_env,
     token_reader_from_file,
     token_reader_from_stdin,
@@ -49,6 +53,7 @@ EXIT_FAILURE = 2
 EXIT_INTERRUPTED = 130
 DEFAULT_TOKEN_ENV = "GRAPH_ACCESS_TOKEN"
 DEFAULT_CLIENT_SECRET_ENV = "SHARE_SENTINEL_GRAPH_CLIENT_SECRET"
+DEFAULT_CERTIFICATE_PASSPHRASE_ENV = "SHARE_SENTINEL_GRAPH_CERTIFICATE_PASSPHRASE"
 DEFAULT_API_TOKEN_ENV = "SHARE_SENTINEL_API_TOKEN"
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 MAX_TARGETED_SITES = 128
@@ -120,6 +125,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Entra tenant ID (or SHARE_SENTINEL_GRAPH_TENANT_ID)",
     )
     parser.add_argument(
+        "--graph-cloud",
+        choices=tuple(GRAPH_CLOUD_PROFILES),
+        default=os.environ.get("SHARE_SENTINEL_GRAPH_CLOUD", "global"),
+        help=("Microsoft Graph deployment: global (including Microsoft 365 GCC), gcc-high, dod, or china"),
+    )
+    parser.add_argument(
         "--client-id",
         default=os.environ.get("SHARE_SENTINEL_GRAPH_CLIENT_ID"),
         help="Entra application/public-client ID (or SHARE_SENTINEL_GRAPH_CLIENT_ID)",
@@ -128,6 +139,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--client-secret-env",
         default=DEFAULT_CLIENT_SECRET_ENV,
         help=f"environment variable containing app secret (default: {DEFAULT_CLIENT_SECRET_ENV})",
+    )
+    parser.add_argument(
+        "--certificate-path",
+        default=os.environ.get("SHARE_SENTINEL_GRAPH_CERTIFICATE_PATH"),
+        help="user-protected PEM private-key/certificate bundle for app authentication",
+    )
+    parser.add_argument(
+        "--certificate-thumbprint",
+        default=os.environ.get("SHARE_SENTINEL_GRAPH_CERTIFICATE_THUMBPRINT"),
+        help="optional SHA-1 certificate thumbprint; prefer a bundle with its public certificate",
+    )
+    parser.add_argument(
+        "--certificate-passphrase-env",
+        default=DEFAULT_CERTIFICATE_PASSPHRASE_ENV,
+        help=(
+            "environment variable containing an encrypted PEM key passphrase "
+            f"(default: {DEFAULT_CERTIFICATE_PASSPHRASE_ENV})"
+        ),
+    )
+    parser.add_argument(
+        "--certificate-send-x5c",
+        action="store_true",
+        help="send the configured public certificate chain for Subject Name/Issuer authentication",
     )
     parser.add_argument(
         "--login-hint",
@@ -377,8 +411,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise TokenAcquisitionError("token input options require --auth token")
     if args.auth != "token" and (args.token_type != "auto" or args.assessed_identity is not None):
         raise TokenAcquisitionError("--token-type and --assessed-identity require --auth token")
+    if args.certificate_path and args.auth != "app":
+        raise TokenAcquisitionError("--certificate-path requires --auth app")
+    if (args.certificate_thumbprint or args.certificate_send_x5c) and not args.certificate_path:
+        raise TokenAcquisitionError("certificate thumbprint/x5c options require --certificate-path")
     for field_name, value in (
         ("--client-secret-env", args.client_secret_env),
+        ("--certificate-passphrase-env", args.certificate_passphrase_env),
         ("--api-token-env", args.api_token_env),
     ):
         if not ENV_NAME_PATTERN.fullmatch(str(value or "")):
@@ -389,10 +428,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _build_auth_provider(args: argparse.Namespace):
     if args.auth == "app":
         secret = os.environ.get(args.client_secret_env, "")
+        if args.certificate_path:
+            if secret:
+                raise TokenAcquisitionError(
+                    "both app secret and certificate credentials are configured; unset one credential source"
+                )
+            passphrase = os.environ.get(args.certificate_passphrase_env, "")
+            credential = certificate_credential_from_file(
+                args.certificate_path,
+                thumbprint=args.certificate_thumbprint,
+                passphrase=passphrase or None,
+                send_certificate_chain=args.certificate_send_x5c,
+            )
+            return CertificateCredentialAuthProvider(
+                tenant_id=args.tenant_id,
+                client_id=args.client_id,
+                client_credential=credential,
+                cloud=args.graph_cloud,
+            )
         return AppCredentialAuthProvider(
             tenant_id=args.tenant_id,
             client_id=args.client_id,
             client_secret=secret,
+            cloud=args.graph_cloud,
         )
     if args.auth in {"interactive", "wam", "iwa"}:
         return PublicClientAuthProvider(
@@ -400,6 +458,7 @@ def _build_auth_provider(args: argparse.Namespace):
             tenant_id=args.tenant_id,
             client_id=args.client_id,
             login_hint=args.login_hint,
+            cloud=args.graph_cloud,
         )
     if args.token_file:
         reader = token_reader_from_file(args.token_file)
@@ -413,6 +472,7 @@ def _build_auth_provider(args: argparse.Namespace):
         tenant_id=args.tenant_id,
         client_id=args.client_id,
         assessed_identity=args.assessed_identity,
+        cloud=args.graph_cloud,
     )
 
 
@@ -458,7 +518,7 @@ def _print_auth_summary(context, *, quiet: bool) -> None:
     permission_summary = permissions or ("not locally inspectable" if opaque else "none")
     summary = (
         "authentication: "
-        f"mode={context.auth_mode} type={context.auth_type} tenant={context.tenant_id} "
+        f"mode={context.auth_mode} type={context.auth_type} cloud={context.cloud} tenant={context.tenant_id} "
         f"identity={identity} audience={audience} permissions={permission_summary} "
         f"expires={expiration}"
     )
@@ -522,8 +582,11 @@ def _commit_pending(
 
 def run(args: argparse.Namespace) -> int:
     run_id = _run_id(args.run_id)
+    cloud_profile = resolve_graph_cloud(args.graph_cloud)
     provider = _build_auth_provider(args)
     context = provider.acquire_token()
+    if context.cloud != cloud_profile.name:
+        raise TokenAcquisitionError("acquired token context does not match the selected Microsoft Graph cloud")
     if args.tenant_id and args.tenant_id not in {"common", "organizations"}:
         if str(args.tenant_id).casefold() != context.tenant_id.casefold():
             raise TokenAcquisitionError("configured tenant ID does not match the acquired token")
@@ -551,6 +614,7 @@ def run(args: argparse.Namespace) -> int:
     )
     client = GraphClient(
         provider,
+        cloud=cloud_profile,
         connect_timeout=args.connect_timeout,
         read_timeout=args.read_timeout,
         max_attempts=args.graph_attempts,
@@ -595,6 +659,7 @@ def run(args: argparse.Namespace) -> int:
     collection_details = {
         "target_scope": {
             "provider": "sharepoint",
+            "graph_cloud": cloud_profile.name,
             "targeted_sites": list(args.site),
             "max_sites": args.max_sites,
             "max_libraries": args.max_libraries,

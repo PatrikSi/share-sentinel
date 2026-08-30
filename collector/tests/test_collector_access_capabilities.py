@@ -216,6 +216,7 @@ def test_invalid_smb1_tree_aborts_remaining_probes_without_claiming_transport_fa
         (0xC00000CC, "inconclusive", "share_unavailable", False, False),
         (0xC0000043, "inconclusive", "sharing_violation", False, False),
         (0xC00000C9, "inconclusive", "transport_failure", True, False),
+        (0xC0000257, "inconclusive", "dfs_referral_required", False, False),
         (0xC000000D, "inconclusive", "invalid_request", False, True),
     ],
 )
@@ -235,6 +236,78 @@ def test_smb_probe_failures_retain_structured_protocol_reasons(
     assert classification.protocol_status == f"0x{status_code:08X}"
     assert classification.transport_fatal is transport_fatal
     assert classification.root_path_fallback is root_path_fallback
+
+
+def test_dfs_tree_capability_is_reported_without_following_or_replacing_logical_identity() -> None:
+    collector = _load_collector_module()
+
+    class _Connection:
+        def getSMBServer(self):
+            return SimpleNamespace(
+                _Session={"TreeConnectTable": {7: {"IsDfsShare": True}}},
+            )
+
+    evidence = collector._smb_dfs_namespace_evidence(_Connection(), 7)
+
+    assert evidence == {
+        "namespace_status": "detected",
+        "tree_connect_capability": "dfs",
+        "referral_status": "not_observed",
+        "referral_required_observed": False,
+        "target_following": False,
+        "target_following_reason": "disabled_no_referral_target_trust_policy",
+        "logical_resource_identity_preserved": True,
+        "physical_target_status": "not_resolved",
+        "coverage": "logical_namespace_only",
+        "limitations": [
+            "referral_targets_not_requested_or_followed",
+            "physical_target_coverage_not_assessed",
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("server_state", "expected_capability"),
+    [
+        (None, "unavailable"),
+        ({"TreeConnectTable": {7: "not-a-tree-record"}}, "malformed"),
+        ({"TreeConnectTable": {7: {"IsDfsShare": "yes"}}}, "malformed"),
+    ],
+)
+def test_dfs_detection_keeps_unavailable_or_malformed_client_state_indeterminate(
+    server_state,
+    expected_capability,
+) -> None:
+    collector = _load_collector_module()
+
+    class _Connection:
+        def getSMBServer(self):
+            return SimpleNamespace(_Session=server_state)
+
+    evidence = collector._smb_dfs_namespace_evidence(_Connection(), 7)
+
+    assert evidence["namespace_status"] == "indeterminate"
+    assert evidence["tree_connect_capability"] == expected_capability
+    assert evidence["target_following"] is False
+    assert evidence["coverage"] == "indeterminate"
+    assert "referral_targets_not_requested_or_followed" in evidence["limitations"]
+
+
+def test_path_not_covered_is_explicit_referral_evidence_even_when_tree_state_is_unavailable() -> None:
+    collector = _load_collector_module()
+
+    evidence = collector._smb_dfs_namespace_evidence(
+        object(),
+        None,
+        referral_required_observed=True,
+        referral_protocol_status="0xC0000257",
+    )
+
+    assert evidence["namespace_status"] == "detected"
+    assert evidence["referral_status"] == "required_not_followed"
+    assert evidence["referral_protocol_status"] == "0xC0000257"
+    assert evidence["physical_target_status"] == "not_resolved"
+    assert evidence["target_following"] is False
 
 
 def test_root_handle_probe_retries_explicit_root_only_for_compatible_path_failure(monkeypatch) -> None:
@@ -1522,6 +1595,94 @@ def test_configured_missing_share_is_reported_as_unavailable(monkeypatch) -> Non
     assert metadata["assessment_reason"] == "share_unavailable"
     assert metadata["share_presence"] == "unavailable"
     assert final["access_capabilities"]["tree_connect"]["protocol_status"] == "0xC00000CC"
+
+
+def test_scan_emits_dfs_namespace_evidence_but_never_follows_referral_targets(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class _ReferralRequired(Exception):
+        def getErrorCode(self):
+            return 0xC0000257
+
+    monkeypatch.setattr(collector, "SessionError", _ReferralRequired)
+
+    class _Connection:
+        def __init__(self):
+            self._server = SimpleNamespace(
+                _Session={"TreeConnectTable": {9: {"IsDfsShare": True}}},
+            )
+            self.disconnected = []
+
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def getDialect(self):
+            return "785"
+
+        def isSigningRequired(self):
+            return False
+
+        def connectTree(self, _share_name):
+            return 9
+
+        def getSMBServer(self):
+            return self._server
+
+        def listPath(self, *_args):
+            raise _ReferralRequired()
+
+        def disconnectTree(self, tree_id):
+            self.disconnected.append(tree_id)
+
+        def logoff(self):
+            return None
+
+    connection = _Connection()
+    monkeypatch.setattr(collector, "SMBConnection", lambda *_args, **_kwargs: connection)
+    writer = SimpleNamespace(records=[], emit=lambda record: writer.records.append(record))
+    args = SimpleNamespace(
+        timeout=1.0,
+        kerberos=False,
+        smb_anonymous=True,
+        username="",
+        password="",
+        domain="",
+        ccache=None,
+        hashes=None,
+        local_auth=False,
+        include_share=["Namespace"],
+        exclude_share=[],
+        exclude_path_regex=None,
+        exclude_path_pattern=None,
+        extensions_only=None,
+        max_depth=1,
+        max_entries_per_share=10,
+        access_probe_limit=0,
+        cancel_event=threading.Event(),
+    )
+
+    assert (
+        collector.scan_host_smb(
+            "dfs.example.test",
+            args,
+            "run-dfs",
+            writer,
+            collector.Stats(),
+            threading.Lock(),
+        )
+        is True
+    )
+
+    final = [record for record in writer.records if record.get("type") == "resource"][-1]
+    evidence = final["metadata"]["dfs"]
+    assert evidence["namespace_status"] == "detected"
+    assert evidence["tree_connect_capability"] == "dfs"
+    assert evidence["referral_status"] == "required_not_followed"
+    assert evidence["referral_protocol_status"] == "0xC0000257"
+    assert evidence["target_following"] is False
+    assert evidence["logical_resource_identity_preserved"] is True
+    assert final["provider_resource_id"].startswith("smb-share:v1:")
+    assert connection.disconnected == [9]
 
 
 def test_cancellation_closes_granted_handle_and_disconnects_tree(monkeypatch) -> None:

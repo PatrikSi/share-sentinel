@@ -42,7 +42,9 @@ python share_sentinel_sharepoint.py --auth app \
   --output sharepoint-tenant.ndjson
 ```
 
-Client-secret authentication is supported for the initial release. Certificate credentials are preferred for long-lived production deployments but are not implemented yet.
+For recurring automation, certificate assertions are supported and preferred over a long-lived client secret. Supply an owner-only PEM private-key/public-certificate bundle with `--certificate-path` (or `SHARE_SENTINEL_GRAPH_CERTIFICATE_PATH`). Encrypted-key passphrases are read only from `--certificate-passphrase-env`; the default variable is `SHARE_SENTINEL_GRAPH_CERTIFICATE_PASSPHRASE`. On POSIX systems, group/world-readable files and files owned by another account are rejected. On Windows, apply an ACL that limits the bundle to the collector account. A secret and certificate cannot be configured together.
+
+Use `--graph-cloud global|gcc-high|dod|china` to keep the identity authority, Graph endpoint/scopes, token audience, SharePoint hostname validation, and delta state in the same cloud. `global` includes Microsoft 365 GCC; `gcc-high` uses `graph.microsoft.us` and `*.sharepoint.us`; `dod` uses `dod-graph.microsoft.us` and `*.sharepoint-mil.us`; and `china` uses `microsoftgraph.chinacloudapi.cn` and `*.sharepoint.cn`. Cross-cloud targets and continuations are rejected.
 
 ### Quick delegated assessment
 
@@ -100,7 +102,11 @@ Progress goes to stderr: the default emits start, periodic, and final summaries;
 
 SharePoint exposure labels are evidence-based. A delegated result is `USER_VISIBLE`, meaning only that the collector enumerated its metadata in the assessed identity's Graph context. App-only inventory is `UNKNOWN` unless direct permission evidence provides stronger evidence. Opt-in `--permissions library_roots` checks library roots; `--permissions all_items` checks roots and every materialized file/folder. Only an explicit anonymous or organization link scope can strengthen an object to `ANONYMOUS` or `BROAD_INTERNAL`. Empty, partial, specific-people, and principal results never become guessed `RESTRICTED` or `EXTERNAL` conclusions.
 
-Permission collection is GET-only and declares schema v2 with the `direct_permissions_v1` feature. It emits a coverage-bearing `permission_assessment` followed by bounded `permission_entry` records and never stores a Graph `shareId`, link URL, or embeddable HTML. The default caps are 10,000 objects, 25,000 HTTP attempts (including retries/pages), 100,000 entries, and concurrency 2; tune them with `--max-permission-objects`, `--max-permission-http-attempts`, `--max-permission-entries`, and `--permission-concurrency`. Those defaults are the supported starting envelope; CLI hard ceilings are input guardrails, not validated throughput guarantees. Load-test representative collect/upload/ingest/compare runs before materially increasing them, or split very large tenants into stable targeted-site scopes. Graph permission visibility is caller-dependent. Source IDs are retained if `inheritedFrom` appears, but SharePoint document libraries normally omit it, so absence remains inheritance unknown; group membership is not expanded and effective access is not computed. A permission failure leaves successful content staging intact but makes the run partial.
+Permission collection is GET-only and declares schema v2 with the `direct_permissions_v1` feature. It emits a coverage-bearing `permission_assessment` followed by bounded `permission_entry` records and never stores a Graph `shareId`, link URL, or embeddable HTML. The default caps are 10,000 objects, 25,000 HTTP attempts (including retries/pages), 100,000 entries, and concurrency 2; tune them with `--max-permission-objects`, `--max-permission-http-attempts`, `--max-permission-entries`, and `--permission-concurrency`. Those defaults are the supported starting envelope; CLI hard ceilings are input guardrails, not validated throughput guarantees. Load-test representative collect/upload/ingest/compare runs before materially increasing them, or split very large tenants into stable targeted-site scopes. Graph permission visibility is caller-dependent. Source IDs are retained if `inheritedFrom` appears, but SharePoint document libraries normally omit it, so absence remains inheritance unknown. Group membership is not expanded and effective access is not computed: the current grants do not include Entra `GroupMember.Read.All`, hidden membership also needs `Member.Read.Hidden`, and SharePoint groups are a separate surface. The collector does not silently assume `Directory.Read.All`; it preserves unknown coverage. A permission failure leaves successful content staging intact but makes the run partial.
+
+Site, library, and item records also retain bounded GET-only governance metadata when Graph returns it: site data-location/root/personal flags, library owner/creator/last-modifier/quota/system facets, and item creator/last-modifier identities. Missing or malformed provider fields carry explicit observation semantics and are never interpreted as a negative conclusion. The state schema performs one safe full metadata resynchronization when upgrading so unchanged delta items receive the new fields.
+
+If a national-cloud endpoint explicitly rejects an optional governance `$select`, the collector retries once with core inventory fields, records `unavailable_unsupported_select` and its limitation, and persists that mode with the delta checkpoint. Auth, permission, not-found, throttling, generic request, and later-page failures never trigger this fallback.
 
 Direct upload uses the same durable raw-body artifact workflow as the network-share collector:
 
@@ -443,6 +449,17 @@ and denial are retained as useful partial evidence; known shares can still be
 assessed with `--include-share`. Session loss, transport status responses, and
 other protocol failures during enumeration are reported as failed host
 assessments rather than being mislabeled as permission denial.
+
+SMB resource metadata contains a bounded `dfs` observation. For SMB2/3, the
+collector records the tree-connect DFS capability when Impacket exposes it and
+also classifies `STATUS_PATH_NOT_COVERED` as a required-referral observation.
+Missing or malformed client state remains `indeterminate`; no absent flag is
+treated as proof that a logical path is not DFS. Share Sentinel preserves the
+logical server/share identity and never requests or follows referral targets,
+forwards credentials to another host, or claims physical-target coverage.
+Detected namespaces report `target_following=false`, `physical_target_status`
+as `not_resolved`, and the exact coverage limitations. Assess approved referral
+targets explicitly under an operator-defined trust policy.
 
 ### Direct SMB ACL evidence
 

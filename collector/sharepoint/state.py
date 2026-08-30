@@ -14,7 +14,7 @@ from typing import Iterator
 
 from .auth import GraphTokenContext
 
-STATE_SCHEMA_VERSION = 3
+STATE_SCHEMA_VERSION = 4
 MAX_DELTA_LINK_BYTES = 256 * 1024
 MAX_ITEM_PAYLOAD_BYTES = 256 * 1024
 MAX_PROVIDER_ITEM_ID_CHARACTERS = 512
@@ -39,12 +39,14 @@ class DriveState:
     status: str = "new"
     last_successful_sync: str | None = None
     last_full_sync: str | None = None
+    item_governance_observation: str = "selected"
 
 
 def state_scope_key(context: GraphTokenContext) -> str:
     """Partition delta/snapshot state by the effective assessment context."""
 
     payload = {
+        "cloud": context.cloud,
         "auth_type": context.auth_type,
         "tenant_id": context.tenant_id,
         "client_id": context.client_id,
@@ -121,6 +123,7 @@ class SharePointStateStore:
                             status TEXT NOT NULL,
                             last_successful_sync TEXT,
                             last_full_sync TEXT,
+                            item_governance_observation TEXT NOT NULL DEFAULT 'selected',
                             updated_at REAL NOT NULL,
                             PRIMARY KEY (scope_key, tenant_id, site_id, drive_id)
                         );
@@ -148,6 +151,7 @@ class SharePointStateStore:
                             base_version INTEGER NOT NULL,
                             sync_mode TEXT NOT NULL,
                             delta_link TEXT,
+                            item_governance_observation TEXT NOT NULL DEFAULT 'selected',
                             complete INTEGER NOT NULL DEFAULT 0,
                             created_at REAL NOT NULL,
                             PRIMARY KEY (session_id, scope_key, tenant_id, site_id, drive_id)
@@ -183,29 +187,37 @@ class SharePointStateStore:
                     )
                     row = conn.execute("SELECT value FROM state_metadata WHERE key = 'schema_version'").fetchone()
                     existing_version = int(row[0]) if row is not None else None
-                    if existing_version not in {None, 1, 2, STATE_SCHEMA_VERSION}:
+                    if existing_version not in {None, 1, 2, 3, STATE_SCHEMA_VERSION}:
                         raise StateStoreError(f"unsupported SharePoint state schema version: {row[0]}")
                     conn.execute("BEGIN IMMEDIATE")
-                    hierarchy_columns = {
+                    required_columns = {
                         "items": {"parent_id": "TEXT", "item_name": "TEXT"},
                         "staged_items": {"parent_id": "TEXT", "item_name": "TEXT"},
+                        "drive_state": {
+                            "item_governance_observation": "TEXT NOT NULL DEFAULT 'selected'",
+                        },
+                        "pending_syncs": {
+                            "item_governance_observation": "TEXT NOT NULL DEFAULT 'selected'",
+                        },
                     }
                     missing_columns = False
-                    for table_name, expected_columns in hierarchy_columns.items():
+                    for table_name, expected_columns in required_columns.items():
                         present = {str(column[1]) for column in conn.execute(f"PRAGMA table_info({table_name})")}
                         for column_name, column_type in expected_columns.items():
                             if column_name in present:
                                 continue
                             if existing_version == STATE_SCHEMA_VERSION:
-                                raise StateStoreError("SharePoint state schema is missing hierarchy metadata")
+                                raise StateStoreError("SharePoint state schema is missing required metadata")
                             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
                             missing_columns = True
-                    if existing_version in {1, 2} or missing_columns:
+                    if existing_version in {1, 2, 3} or missing_columns:
                         # Version 1 did not retain stable parent relationships.
-                        # Version 2 predates file archive-state metadata, which
-                        # delta cannot backfill for unchanged items. Invalidate
-                        # either snapshot transactionally and let the next run
-                        # perform one complete, checkpoint-safe metadata sync.
+                        # Version 2 predates file archive-state metadata and
+                        # version 3 predates ownership/governance metadata.
+                        # Delta cannot backfill either field set for unchanged
+                        # items. Invalidate the snapshot transactionally and
+                        # let the next run perform one complete, checkpoint-safe
+                        # metadata sync.
                         conn.execute("DELETE FROM staged_items")
                         conn.execute("DELETE FROM pending_syncs")
                         conn.execute("DELETE FROM items")
@@ -288,7 +300,8 @@ class SharePointStateStore:
             with self._connection() as conn:
                 row = conn.execute(
                     """
-                    SELECT version, delta_link, status, last_successful_sync, last_full_sync
+                    SELECT version, delta_link, status, last_successful_sync, last_full_sync,
+                           item_governance_observation
                     FROM drive_state
                     WHERE scope_key = ? AND tenant_id = ? AND site_id = ? AND drive_id = ?
                     """,
@@ -304,6 +317,7 @@ class SharePointStateStore:
             status=str(row[2]),
             last_successful_sync=str(row[3]) if row[3] else None,
             last_full_sync=str(row[4]) if row[4] else None,
+            item_governance_observation=str(row[5] or "selected"),
         )
 
     def begin_drive_stage(
@@ -488,6 +502,7 @@ class SharePointStateStore:
         site_id: str,
         drive_id: str,
         delta_link: str,
+        item_governance_observation: str = "selected",
     ) -> None:
         if not isinstance(delta_link, str) or not delta_link or "\x00" in delta_link:
             raise StateStoreError("Graph delta response is missing a bounded delta link")
@@ -498,6 +513,8 @@ class SharePointStateStore:
         if delta_link_size > MAX_DELTA_LINK_BYTES:
             raise StateStoreError("Graph delta response is missing a bounded delta link")
         normalized = delta_link
+        if item_governance_observation not in {"selected", "unavailable_unsupported_select"}:
+            raise StateStoreError("invalid SharePoint governance observation state")
         key = (session_id, scope_key, tenant_id, site_id, drive_id)
         try:
             with self._connection() as conn:
@@ -519,11 +536,12 @@ class SharePointStateStore:
                 )
                 cursor = conn.execute(
                     """
-                    UPDATE pending_syncs SET delta_link = ?, complete = 1, created_at = ?
+                    UPDATE pending_syncs
+                    SET delta_link = ?, item_governance_observation = ?, complete = 1, created_at = ?
                     WHERE session_id = ? AND scope_key = ? AND tenant_id = ?
                       AND site_id = ? AND drive_id = ?
                     """,
-                    (normalized, time.time(), *key),
+                    (normalized, item_governance_observation, time.time(), *key),
                 )
                 if cursor.rowcount != 1:
                     raise StateStoreError("SharePoint drive staging session is missing")
@@ -839,10 +857,11 @@ class SharePointStateStore:
             raise StateStoreError("unable to stream SharePoint snapshot items") from exc
 
     @staticmethod
-    def _pending_row(conn: sqlite3.Connection, key: tuple[str, ...]) -> tuple[int, str, str]:
+    def _pending_row(conn: sqlite3.Connection, key: tuple[str, ...]) -> tuple[int, str, str, str]:
         row = conn.execute(
             """
-            SELECT base_version, sync_mode, delta_link FROM pending_syncs
+            SELECT base_version, sync_mode, delta_link, item_governance_observation
+            FROM pending_syncs
             WHERE session_id = ? AND scope_key = ? AND tenant_id = ?
               AND site_id = ? AND drive_id = ? AND complete = 1
             """,
@@ -850,7 +869,7 @@ class SharePointStateStore:
         ).fetchone()
         if row is None:
             raise StateStoreError("SharePoint drive staging is incomplete")
-        return int(row[0]), str(row[1]), str(row[2])
+        return int(row[0]), str(row[1]), str(row[2]), str(row[3] or "selected")
 
     def commit_drive(
         self,
@@ -868,7 +887,7 @@ class SharePointStateStore:
         try:
             with self._connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                base_version, sync_mode, delta_link = self._pending_row(conn, key)
+                base_version, sync_mode, delta_link, item_governance_observation = self._pending_row(conn, key)
                 state_row = conn.execute(
                     """
                     SELECT version, last_full_sync FROM drive_state
@@ -939,8 +958,9 @@ class SharePointStateStore:
                     """
                     INSERT INTO drive_state (
                         scope_key, tenant_id, site_id, drive_id, version,
-                        delta_link, status, last_successful_sync, last_full_sync, updated_at
-                    ) VALUES (?, ?, ?, ?, 1, ?, 'ok', ?, ?, ?)
+                        delta_link, status, last_successful_sync, last_full_sync,
+                        item_governance_observation, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, 'ok', ?, ?, ?, ?)
                     ON CONFLICT (scope_key, tenant_id, site_id, drive_id)
                     DO UPDATE SET
                         version = drive_state.version + 1,
@@ -948,6 +968,7 @@ class SharePointStateStore:
                         status = 'ok',
                         last_successful_sync = excluded.last_successful_sync,
                         last_full_sync = excluded.last_full_sync,
+                        item_governance_observation = excluded.item_governance_observation,
                         updated_at = excluded.updated_at
                     """,
                     (
@@ -958,6 +979,7 @@ class SharePointStateStore:
                         delta_link,
                         timestamp,
                         full_sync,
+                        item_governance_observation,
                         time.time(),
                     ),
                 )

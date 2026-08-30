@@ -8,8 +8,12 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from sharepoint.auth import GraphTokenContext
+from sharepoint.auth import GraphTokenContext, resolve_graph_cloud
 from sharepoint.collection import (
+    CORE_DRIVE_SELECT,
+    CORE_ITEM_SELECT,
+    CORE_SITE_SELECT,
+    DRIVE_SELECT,
     ITEM_NAME_MAX_CHARACTERS,
     ITEM_PATH_MAX_CHARACTERS,
     ITEM_SELECT,
@@ -36,6 +40,7 @@ SITE_COLLECTION_ID = "contoso.sharepoint.com,site-guid"
 DELTA_1 = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=1"
 DELTA_2 = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=2"
 INITIAL_DELTA_1 = f"drives/drive-1/root/delta?$select={ITEM_SELECT}"
+CORE_INITIAL_DELTA_1 = f"drives/drive-1/root/delta?$select={CORE_ITEM_SELECT}"
 ROOT_LOOKUP_1 = "drives/drive-1/root?$select=id"
 ROOT_PERMISSIONS_1 = f"drives/drive-1/items/root-1/permissions?$select={PERMISSION_SELECT}"
 
@@ -148,9 +153,7 @@ def _routes(delta_pages: object, *, delegated: bool = True, drives=None) -> dict
             "id": SITE_COLLECTION_ID,
             "siteCollection": {"hostname": "contoso.sharepoint.com"},
         },
-        f"sites/{SITE_ID}/drives?$select=id,name,description,driveType,webUrl,createdDateTime,lastModifiedDateTime": [
-            {"value": drives or [_drive()]}
-        ],
+        f"sites/{SITE_ID}/drives?$select={DRIVE_SELECT}": [{"value": drives or [_drive()]}],
         INITIAL_DELTA_1: delta_pages,
         DELTA_1: delta_pages,
     }
@@ -209,6 +212,73 @@ def test_delegated_discovery_is_explicitly_security_trimmed() -> None:
     assert context["collection_mode"] == "delegated_user_view"
     assert context["discovery_completeness"] == "security_trimmed"
     assert context["materialized_snapshot"] is True
+
+
+def test_target_site_validation_uses_selected_cloud_sharepoint_suffix() -> None:
+    reference = "https://contoso.sharepoint.us/sites/Finance"
+    expected = f"sites/contoso.sharepoint.us:/sites/Finance?$select={SITE_SELECT}"
+
+    class CloudClient(FakeClient):
+        def sharepoint_hostname_allowed(self, hostname: str) -> bool:
+            return resolve_graph_cloud("gcc-high").allows_sharepoint_hostname(hostname)
+
+    client = CloudClient(
+        {
+            expected: {
+                **_site(),
+                "id": "contoso.sharepoint.us,site-guid,web-guid",
+                "webUrl": reference,
+                "siteCollection": {"hostname": "contoso.sharepoint.us"},
+            }
+        }
+    )
+
+    site = resolve_target_site(client, reference)
+
+    assert site.hostname == "contoso.sharepoint.us"
+    with pytest.raises(GraphProtocolError, match="invalid_site_url"):
+        resolve_target_site(client, "https://contoso.sharepoint.com/sites/Finance")
+
+
+def test_target_site_falls_back_once_when_optional_governance_select_is_explicitly_unsupported() -> None:
+    reference = "https://contoso.sharepoint.com/sites/Finance"
+    site_path = "sites/contoso.sharepoint.com:/sites/Finance"
+    client = FakeClient(
+        {
+            f"{site_path}?$select={SITE_SELECT}": GraphAPIError(
+                status_code=400,
+                code="unsupported_select",
+            ),
+            f"{site_path}?$select={CORE_SITE_SELECT}": _site(),
+        }
+    )
+
+    site = resolve_target_site(client, reference)
+
+    assert site.site_id == SITE_ID
+    assert site.governance_observation == "unavailable_unsupported_select"
+    assert site.governance_limitations == ("optional_graph_governance_select_rejected",)
+    assert site.data_location_code is None
+    assert client.calls == [
+        ("get", f"{site_path}?$select={SITE_SELECT}"),
+        ("get", f"{site_path}?$select={CORE_SITE_SELECT}"),
+    ]
+
+
+def test_target_site_does_not_fallback_for_auth_or_generic_request_failures() -> None:
+    reference = "https://contoso.sharepoint.com/sites/Finance"
+    selected = f"sites/contoso.sharepoint.com:/sites/Finance?$select={SITE_SELECT}"
+    for failure in (
+        GraphAPIError(status_code=403, code="accessDenied"),
+        GraphAPIError(status_code=400, code="BadRequest"),
+    ):
+        client = FakeClient({selected: failure})
+
+        with pytest.raises(GraphAPIError) as exc:
+            resolve_target_site(client, reference)
+
+        assert exc.value is failure
+        assert client.calls == [("get", selected)]
 
 
 def test_dimension_completeness_keeps_permission_failures_independent() -> None:
@@ -683,9 +753,7 @@ def test_malformed_site_identity_is_skipped_without_inventing_one() -> None:
 
 def test_non_object_site_and_drive_records_are_scoped_and_skipped() -> None:
     site_discovery = "sites?search=*"
-    drive_discovery = (
-        f"sites/{SITE_ID}/drives?$select=id,name,description,driveType,webUrl,createdDateTime,lastModifiedDateTime"
-    )
+    drive_discovery = f"sites/{SITE_ID}/drives?$select={DRIVE_SELECT}"
     client = FakeClient(
         {
             site_discovery: [{"value": ["malformed", _site()]}],
@@ -1218,6 +1286,93 @@ def test_complete_library_reports_specific_items_counts_and_partial_observed_siz
         next(item for item in items if item["provider_item_id"] == "known")["metadata"]["file_archive_status"]
         == "fully_archived"
     )
+
+
+def test_sharepoint_governance_metadata_is_bounded_and_emitted_without_content_download(tmp_path) -> None:
+    site = {
+        **_site(),
+        "root": {},
+        "isPersonalSite": False,
+        "siteCollection": {
+            "hostname": "contoso.sharepoint.com",
+            "dataLocationCode": "EUR",
+        },
+    }
+    drive = {
+        **_drive(),
+        "owner": {"user": {"id": "owner-1", "displayName": "Data Owner"}},
+        "createdBy": {"application": {"id": "app-1", "displayName": "Provisioning"}},
+        "lastModifiedBy": {"user": {"id": "user-2", "displayName": "Maintainer"}},
+        "quota": {"state": "normal", "total": 1000, "used": 250, "remaining": 750},
+        "system": {},
+    }
+    item = {
+        **_file("a", "a.txt"),
+        "createdBy": {"user": {"id": "user-1", "displayName": "Author"}},
+        "lastModifiedBy": {"user": {"id": "user-2", "displayName": "Editor"}},
+    }
+    routes = _routes([{"value": [item], "@odata.deltaLink": DELTA_1}], drives=[drive])
+    routes["sites?search=*"] = [{"value": [site]}]
+    collector, _, writer = _collector(tmp_path, routes)
+
+    _, status = collector.collect()
+
+    assert status == "success"
+    endpoint = next(record for record in writer.records if record["type"] == "endpoint")
+    resource = [record for record in writer.records if record["type"] == "resource"][-1]
+    item_record = next(record for record in writer.records if record["type"] == "item")
+    assert endpoint["metadata"]["data_location_code"] == "EUR"
+    assert endpoint["metadata"]["is_root_site"] is True
+    assert endpoint["metadata"]["is_personal_site"] is False
+    assert resource["metadata"]["owner"] == {"user": {"id": "owner-1", "display_name": "Data Owner"}}
+    assert resource["metadata"]["owner_observation"] == "observed"
+    assert resource["metadata"]["created_by_observation"] == "observed"
+    assert resource["metadata"]["last_modified_by_observation"] == "observed"
+    assert resource["metadata"]["quota"] == {
+        "state": "normal",
+        "total": 1000,
+        "used": 250,
+        "remaining": 750,
+    }
+    assert resource["metadata"]["system_managed"] is True
+    assert resource["metadata"]["system_observation"] == "observed"
+    assert resource["metadata"]["content_read_tested"] is False
+    assert item_record["metadata"]["created_by"]["user"]["id"] == "user-1"
+    assert item_record["metadata"]["last_modified_by"]["user"]["display_name"] == "Editor"
+
+
+def test_drive_and_item_governance_selects_fall_back_without_losing_core_inventory(tmp_path) -> None:
+    routes = _routes(
+        GraphAPIError(status_code=400, code="unsupported_select"),
+    )
+    selected_drives = f"sites/{SITE_ID}/drives?$select={DRIVE_SELECT}"
+    core_drives = f"sites/{SITE_ID}/drives?$select={CORE_DRIVE_SELECT}"
+    routes[selected_drives] = GraphAPIError(status_code=400, code="unsupported_select")
+    routes[core_drives] = [{"value": [_drive()]}]
+    routes[CORE_INITIAL_DELTA_1] = [{"value": [_file("a", "a.txt")], "@odata.deltaLink": DELTA_1}]
+    collector, state, writer = _collector(tmp_path, routes)
+
+    pending, status = collector.collect()
+
+    assert status == "success"
+    assert len(pending) == 1
+    resource = [record for record in writer.records if record["type"] == "resource"][-1]
+    item = next(record for record in writer.records if record["type"] == "item")
+    assert resource["metadata"]["governance_observation"] == "unavailable_unsupported_select"
+    assert resource["metadata"]["owner_observation"] == "unavailable_unsupported_select"
+    assert resource["metadata"]["item_governance_observation"] == "unavailable_unsupported_select"
+    assert resource["metadata"]["item_governance_limitations"] == ["optional_graph_governance_select_rejected"]
+    assert item["name"] == "a.txt"
+    assert item["metadata"]["created_by_observation"] == "unavailable_unsupported_select"
+    assert item["metadata"]["governance_limitation"] == "optional_graph_governance_select_rejected"
+    assert collector.client.calls.count(("pages", selected_drives)) == 1
+    assert collector.client.calls.count(("pages", core_drives)) == 1
+    assert collector.client.calls.count(("pages", INITIAL_DELTA_1)) == 1
+    assert collector.client.calls.count(("pages", CORE_INITIAL_DELTA_1)) == 1
+
+    _commit(state, "run-1", pending)
+    persisted = state.get_drive_state(pending[0].scope_key, "tenant-1", SITE_ID, "drive-1")
+    assert persisted.item_governance_observation == "unavailable_unsupported_select"
 
 
 def test_initial_then_incremental_collection_emits_full_materialized_snapshot(tmp_path) -> None:

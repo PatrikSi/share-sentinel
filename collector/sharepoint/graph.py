@@ -12,7 +12,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-from .auth import GraphAuthProvider, GraphTokenContext
+from .auth import GraphAuthProvider, GraphCloudProfile, GraphTokenContext, resolve_graph_cloud
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0/"
 RETRIABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
@@ -58,6 +58,29 @@ def _safe_graph_code(value: object, fallback: str) -> str:
     return fallback
 
 
+def _explicit_unsupported_select_error(status_code: int, raw_error: object) -> bool:
+    """Recognize only provider errors that explicitly reject a select field."""
+
+    if status_code != 400 or not isinstance(raw_error, dict):
+        return False
+    code = str(raw_error.get("code") or "").strip().casefold()
+    if code in {
+        "invalidselect",
+        "propertynotfound",
+        "request_unsupportedquery",
+        "selectnotsupported",
+        "unsupportedquery",
+    }:
+        return True
+    message = str(raw_error.get("message") or "")[:4096].casefold()
+    if "$select" in message and any(
+        marker in message
+        for marker in ("could not find", "does not exist", "invalid", "not declared", "not supported", "unknown")
+    ):
+        return True
+    return "could not find a property named" in message or ("property" in message and "does not exist" in message)
+
+
 def _retry_after_seconds(value: str | None, *, now: Callable[[], datetime]) -> float | None:
     raw = str(value or "").strip()
     if not raw:
@@ -82,6 +105,7 @@ def _assessment_context_signature(context: GraphTokenContext) -> tuple[object, .
         return value.casefold() if value else None
 
     return (
+        context.cloud,
         context.auth_mode,
         context.auth_type,
         folded(context.tenant_id),
@@ -98,7 +122,7 @@ class GraphClient:
         self,
         auth_provider: GraphAuthProvider,
         *,
-        base_url: str = GRAPH_BASE_URL,
+        base_url: str | None = None,
         connect_timeout: float = 10.0,
         read_timeout: float = 60.0,
         max_attempts: int = 5,
@@ -111,11 +135,14 @@ class GraphClient:
         sleep: Callable[[float], None] = time.sleep,
         random_source: Callable[[], float] = random.random,
         now: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
+        cloud: str | GraphCloudProfile | None = None,
     ) -> None:
-        parsed_base = urlparse(base_url)
+        self.cloud_profile = resolve_graph_cloud(cloud)
+        effective_base_url = base_url or self.cloud_profile.graph_base_url
+        parsed_base = urlparse(effective_base_url)
         if parsed_base.scheme != "https" or not parsed_base.hostname:
             raise ValueError("Microsoft Graph base URL must be HTTPS")
-        self.base_url = base_url.rstrip("/") + "/"
+        self.base_url = effective_base_url.rstrip("/") + "/"
         self._allowed_host = parsed_base.hostname.casefold()
         self._allowed_port = parsed_base.port or 443
         self._allowed_path_prefix = parsed_base.path.rstrip("/") + "/"
@@ -133,12 +160,17 @@ class GraphClient:
         self._random = random_source
         self._now = now
         self._token_lock = threading.Lock()
+        if initial_token_context is not None and initial_token_context.cloud != self.cloud_profile.name:
+            raise ValueError("initial Microsoft Graph token context does not match the selected cloud")
         self._token_context = initial_token_context
         self._assessment_context = (
             _assessment_context_signature(initial_token_context) if initial_token_context is not None else None
         )
         self._stats_lock = threading.Lock()
         self._retry_count = 0
+
+    def sharepoint_hostname_allowed(self, hostname: str) -> bool:
+        return self.cloud_profile.allows_sharepoint_hostname(hostname)
 
     @property
     def token_context(self) -> GraphTokenContext:
@@ -189,6 +221,12 @@ class GraphClient:
             return context
 
     def _accept_token_context(self, candidate: GraphTokenContext) -> None:
+        if candidate.cloud != self.cloud_profile.name:
+            raise GraphAPIError(
+                status_code=401,
+                code="auth_cloud_mismatch",
+                retryable=False,
+            )
         signature = _assessment_context_signature(candidate)
         if self._assessment_context is None:
             self._assessment_context = signature
@@ -331,6 +369,8 @@ class GraphClient:
             raw_error = payload.get("error") if isinstance(payload, dict) else None
             graph_code = raw_error.get("code") if isinstance(raw_error, dict) else None
             code = _safe_graph_code(graph_code, f"http_{response.status_code}")
+            if _explicit_unsupported_select_error(response.status_code, raw_error):
+                code = "unsupported_select"
             reset_url = response.headers.get("Location") if response.status_code == 410 else None
             if (
                 response.status_code == 401
