@@ -9,7 +9,7 @@ import pytest
 
 @pytest.fixture(scope="module")
 def reconcile_module():
-    script_path = Path(__file__).parents[2] / "scripts" / "reconcile-artifacts.py"
+    script_path = Path(__file__).parents[1] / "app" / "maintenance" / "reconcile_artifacts.py"
     spec = importlib.util.spec_from_file_location("reconcile_artifacts_tool", script_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
