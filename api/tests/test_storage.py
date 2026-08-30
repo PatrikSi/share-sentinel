@@ -95,6 +95,112 @@ def test_artifact_storage_status_rejects_low_free_space(tmp_path, monkeypatch) -
     assert status["reason"] == "low_free_space"
 
 
+def test_multipart_upload_rejects_low_capacity_before_creating_state(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage, "_artifact_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        storage,
+        "artifact_storage_status",
+        lambda: {"ok": False, "reason": "low_free_space"},
+    )
+
+    with pytest.raises(storage.ArtifactStorageUnavailableError) as exc_info:
+        storage.create_multipart_upload("project/run/artifact.ndjson")
+
+    assert exc_info.value.reason == "low_free_space"
+    assert not (tmp_path / ".multipart").exists()
+
+
+def test_upload_part_rechecks_capacity_and_preserves_abortability(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage, "_artifact_root", lambda: tmp_path)
+    states = iter(
+        (
+            {
+                "ok": True,
+                "reason": None,
+                "free_bytes": 1_000_000,
+                "total_bytes": 2_000_000,
+                "minimum_free_bytes": 0,
+                "minimum_free_percent": 0,
+            },
+            {"ok": False, "reason": "low_free_space"},
+        )
+    )
+    monkeypatch.setattr(storage, "artifact_storage_status", lambda: next(states))
+    key = "project/run/artifact.ndjson"
+    upload_id = storage.create_multipart_upload(key)
+
+    with pytest.raises(storage.ArtifactStorageUnavailableError):
+        storage.upload_part(key, upload_id, 1, b"bounded")
+
+    storage.abort_multipart_upload(key, upload_id)
+    assert not storage._multipart_path(key, upload_id).exists()
+
+
+def test_known_upload_size_must_leave_configured_headroom(monkeypatch) -> None:
+    monkeypatch.setattr(
+        storage,
+        "artifact_storage_status",
+        lambda: {
+            "ok": True,
+            "reason": None,
+            "free_bytes": 1_000,
+            "total_bytes": 2_000,
+            "minimum_free_bytes": 200,
+            "minimum_free_percent": 10,
+        },
+    )
+
+    storage.require_artifact_upload_capacity(additional_bytes=800)
+    with pytest.raises(storage.ArtifactStorageUnavailableError) as exc_info:
+        storage.require_artifact_upload_capacity(additional_bytes=801)
+
+    assert exc_info.value.reason == "insufficient_capacity_for_upload"
+
+
+def test_upload_part_does_not_follow_replaced_multipart_symlink(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+    key = "projects/p/artifact.ndjson"
+    upload_id = storage.create_multipart_upload(key)
+    multipart_path = storage._multipart_path(key, upload_id)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"unchanged")
+    multipart_path.unlink()
+    multipart_path.symlink_to(victim)
+
+    with pytest.raises(OSError):
+        storage.upload_part(key, upload_id, 1, b"unsafe")
+
+    assert victim.read_bytes() == b"unchanged"
+    storage.abort_multipart_upload(key, upload_id)
+
+
+def test_multipart_upload_rejects_symlinked_parent_component(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "artifacts"
+    outside = tmp_path / "outside"
+    (root / ".multipart").mkdir(parents=True)
+    outside.mkdir()
+    (root / ".multipart" / "projects").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(root)))
+
+    with pytest.raises(OSError):
+        storage.create_multipart_upload("projects/p/artifact.ndjson")
+
+    assert list(outside.iterdir()) == []
+
+
+def test_get_object_stream_rejects_symlink(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+    key = "projects/p/artifact.ndjson"
+    artifact_path = storage._artifact_path(key)
+    artifact_path.parent.mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"secret")
+    artifact_path.symlink_to(victim)
+
+    with pytest.raises(OSError):
+        storage.get_object_stream(key)
+
+
 def test_multipart_upload_rejects_untrusted_upload_id(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
 
