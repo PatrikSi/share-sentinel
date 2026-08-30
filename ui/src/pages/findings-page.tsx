@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 
+import { FindingAssigneePicker, KEEP_ASSIGNEE_VALUE } from "@/components/finding-assignee-picker";
 import { ProviderBadge } from "@/components/provider-context";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
@@ -8,6 +9,7 @@ import { apiFetch } from "@/lib/api";
 import {
   canManageFindings,
   evidenceTrustCopy,
+  findingEvidenceFacts,
   findingTone,
   formatMonitoringTimestamp,
   humanizeMonitoringValue,
@@ -51,32 +53,35 @@ function localDateTimeValue(value: string | null | undefined): string {
 }
 
 function EvidenceDetail({ finding }: { finding: Finding }) {
-  const limitations = finding.evidence?.limitations || [];
-  const references = finding.evidence?.refs || [];
+  const limitations = Array.isArray(finding.evidence?.limitations)
+    ? finding.evidence.limitations.filter((limitation): limitation is string => typeof limitation === "string").slice(0, 20)
+    : [];
+  const summaryFacts = findingEvidenceFacts(finding.evidence?.summary, "summary");
+  const referenceFacts = findingEvidenceFacts(finding.evidence?.refs, "references", 8);
   return (
     <section aria-labelledby="finding-evidence-title" className="monitoring-detail-section">
       <div className="monitoring-detail-heading">
         <div>
           <h3 id="finding-evidence-title">Detection evidence</h3>
-          <p>{finding.evidence?.summary || "No evidence summary was recorded."}</p>
+          <p>Bounded policy evidence from the latest occurrence. Unknown provider fields are acknowledged without exposing raw values.</p>
         </div>
         <span className={`evidence-state is-${finding.evidence?.state || "indeterminate"}`}>
           {humanizeMonitoringValue(finding.evidence?.state || "indeterminate")}
         </span>
       </div>
       <p className="monitoring-trust-copy">{evidenceTrustCopy(finding.evidence?.state || "indeterminate")}</p>
+      {summaryFacts.length > 0 ? (
+        <dl aria-label="Finding evidence summary" className="monitoring-evidence-facts">
+          {summaryFacts.map((fact) => <div key={fact.key}><dt>{fact.label}</dt><dd className={fact.withheld ? "is-withheld" : ""}>{fact.value}</dd></div>)}
+        </dl>
+      ) : <p className="monitoring-evidence-empty">No structured evidence summary was recorded.</p>}
       {limitations.length > 0 ? (
         <div className="monitoring-limitations">
           <strong>Limitations</strong>
           <ul>{limitations.map((limitation) => <li key={limitation}>{limitation}</li>)}</ul>
         </div>
       ) : null}
-      {references.length > 0 ? (
-        <details className="monitoring-raw-details">
-          <summary>Evidence references ({references.length.toLocaleString()})</summary>
-          <pre>{JSON.stringify(references, null, 2)}</pre>
-        </details>
-      ) : null}
+      {referenceFacts.length > 0 ? <div className="monitoring-evidence-references"><strong>Evidence references</strong><dl>{referenceFacts.map((fact) => <div key={fact.key}><dt>{fact.label}</dt><dd className={fact.withheld ? "is-withheld" : ""}>{fact.value}</dd></div>)}</dl></div> : null}
     </section>
   );
 }
@@ -195,18 +200,23 @@ function FindingDetail({ canManage, permissionsReady, permissionError, finding, 
   const [status, setStatus] = useState<FindingStatus>("open");
   const [expiry, setExpiry] = useState("");
   const [note, setNote] = useState("");
+  const [assignee, setAssignee] = useState("");
+  const [assigneeChanged, setAssigneeChanged] = useState(false);
 
   useEffect(() => {
     if (!finding) return;
     setStatus(finding.status);
     setExpiry(localDateTimeValue(finding.accepted_risk_expires_at));
     setNote("");
+    setAssignee(finding.assignee_user_id || "");
+    setAssigneeChanged(false);
   }, [finding?.id, finding?.revision]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!finding) return;
     const payload: Record<string, unknown> = { status, note: note.trim() || undefined, revision: finding.revision };
+    if (assigneeChanged) payload.assignee_user_id = assignee || null;
     if (status === "accepted_risk") {
       const parsed = new Date(expiry);
       if (!expiry || Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) return;
@@ -221,7 +231,8 @@ function FindingDetail({ canManage, permissionsReady, permissionError, finding, 
   }
   if (!finding) return <StatePanel description="Choose a finding from the queue to inspect evidence and lifecycle history without losing filters." title="Select a finding" />;
 
-  const acceptedRiskInvalid = status === "accepted_risk" && (!expiry || new Date(expiry).getTime() <= Date.now());
+  const expiryTimestamp = new Date(expiry).getTime();
+  const acceptedRiskInvalid = status === "accepted_risk" && (!expiry || Number.isNaN(expiryTimestamp) || expiryTimestamp <= Date.now());
   return (
     <article className="monitoring-detail-card">
       <header className="monitoring-detail-header">
@@ -243,7 +254,7 @@ function FindingDetail({ canManage, permissionsReady, permissionError, finding, 
         <div><dt>Occurrences</dt><dd>{finding.occurrence_count.toLocaleString()}</dd></div>
         <div><dt>First seen</dt><dd>{formatMonitoringTimestamp(finding.first_seen_at)}</dd></div>
         <div><dt>Last seen</dt><dd>{formatMonitoringTimestamp(finding.last_seen_at)}</dd></div>
-        <div><dt>Assignee</dt><dd>{finding.assignee_user_id || "Unassigned"}</dd></div>
+        <div><dt>Assignee</dt><dd>{finding.assignee_user_id ? "Assigned" : "Unassigned"}</dd></div>
         <div><dt>Finding ID</dt><dd className="font-mono" title={finding.id}>{finding.id}</dd></div>
       </dl>
 
@@ -262,17 +273,18 @@ function FindingDetail({ canManage, permissionsReady, permissionError, finding, 
 
       <section aria-labelledby="finding-lifecycle-title" className="monitoring-detail-section">
         <div className="monitoring-detail-heading">
-          <div><h3 id="finding-lifecycle-title">Lifecycle action</h3><p>Status changes and analyst notes are recorded in the audit trail.</p></div>
+          <div><h3 id="finding-lifecycle-title">Lifecycle and ownership</h3><p>Status, assignment, and analyst notes are recorded in the audit trail.</p></div>
         </div>
         {canManage ? (
           <form className="monitoring-action-form" onSubmit={(event) => void submit(event)}>
             <label>Status<select disabled={busy} onChange={(event) => setStatus(event.target.value as FindingStatus)} value={status}>{FINDING_STATUSES.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label>
-            {status === "accepted_risk" ? <label>Risk acceptance expires<input aria-invalid={acceptedRiskInvalid} disabled={busy} min={localDateTimeValue(new Date(Date.now() + 60_000).toISOString())} onChange={(event) => setExpiry(event.target.value)} required type="datetime-local" value={expiry} /></label> : null}
+            {status === "accepted_risk" ? <label>Risk acceptance expires<input aria-describedby={acceptedRiskInvalid ? "accepted-risk-validation" : undefined} aria-invalid={acceptedRiskInvalid} disabled={busy} min={localDateTimeValue(new Date(Date.now() + 60_000).toISOString())} onChange={(event) => setExpiry(event.target.value)} required type="datetime-local" value={expiry} /></label> : null}
+            <FindingAssigneePicker disabled={busy} onChange={(value) => { setAssignee(value); setAssigneeChanged(true); }} projectId={finding.project_id} value={assignee} />
             <label className="monitoring-action-note">Analyst note<textarea disabled={busy} maxLength={4000} onChange={(event) => setNote(event.target.value)} placeholder="Explain the decision or handoff context" rows={3} value={note} /></label>
-            {acceptedRiskInvalid ? <p className="monitoring-validation" role="alert">Accepted risk requires an expiry time in the future.</p> : null}
-            <div className="monitoring-action-row"><button className="inventory-button-primary" disabled={busy || acceptedRiskInvalid} type="submit">{busy ? "Updating…" : "Apply lifecycle update"}</button></div>
+            {acceptedRiskInvalid ? <p className="monitoring-validation" id="accepted-risk-validation" role="alert">Accepted risk requires an expiry time in the future.</p> : null}
+            <div className="monitoring-action-row"><button className="inventory-button-primary" disabled={busy || acceptedRiskInvalid} type="submit">{busy ? "Updating…" : "Save finding update"}</button></div>
           </form>
-        ) : permissionError ? <StatusBanner tone="warning" title="Action permissions unavailable"><p>{permissionError} No lifecycle action is enabled until the project role can be verified.</p></StatusBanner> : permissionsReady ? <StatusBanner title="Read-only project role"><p>Operator or project admin access is required to change finding status. Evidence and current state remain available.</p></StatusBanner> : <StatePanel description="Checking whether this project role can update finding lifecycle state." title="Loading action permissions" />}
+        ) : permissionError ? <StatusBanner tone="warning" title="Action permissions unavailable"><p>{permissionError} No lifecycle or assignment action is enabled until the project role can be verified.</p></StatusBanner> : permissionsReady ? <StatusBanner title="Read-only project role"><p>Operator or project admin access is required to change finding status or assignment. Evidence and current state remain available.</p></StatusBanner> : <StatePanel description="Checking whether this project role can update finding lifecycle and ownership." title="Loading action permissions" />}
       </section>
     </article>
   );
@@ -310,7 +322,8 @@ export function FindingsPage() {
   const [mutationBusy, setMutationBusy] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const [mutationInfo, setMutationInfo] = useState<string | null>(null);
-  const [bulkStatus, setBulkStatus] = useState<Exclude<FindingStatus, "accepted_risk">>("acknowledged");
+  const [bulkStatus, setBulkStatus] = useState<Exclude<FindingStatus, "accepted_risk"> | typeof KEEP_ASSIGNEE_VALUE>(KEEP_ASSIGNEE_VALUE);
+  const [bulkAssignee, setBulkAssignee] = useState(KEEP_ASSIGNEE_VALUE);
   const requestProjectRef = useRef(projectId);
   requestProjectRef.current = projectId;
   const sourceIdInvalid = !!sourceId && !UUID_PATTERN.test(sourceId);
@@ -438,7 +451,7 @@ export function FindingsPage() {
       const updated = await apiFetch(`/projects/${encodeURIComponent(projectId)}/findings/${encodeURIComponent(detail.id)}`, { method: "PATCH", body: JSON.stringify(payload) }) as Finding;
       setDetail(updated);
       setFindings((rows) => rows.map((row) => row.id === updated.id ? updated : row));
-      setMutationInfo(`Finding moved to ${humanizeMonitoringValue(updated.status)}.`);
+      setMutationInfo(`Finding lifecycle and assignment saved at revision ${updated.revision}.`);
       setReloadNonce((value) => value + 1);
     } catch (caught) {
       setMutationError(`${caught instanceof Error ? caught.message : "Finding update failed."} The update was not applied. The current finding has been reloaded; review it before retrying.`);
@@ -449,17 +462,22 @@ export function FindingsPage() {
   }
 
   async function bulkUpdate() {
-    if (!projectId || selectedIds.size === 0) return;
+    if (!projectId || selectedIds.size === 0 || (bulkStatus === KEEP_ASSIGNEE_VALUE && bulkAssignee === KEEP_ASSIGNEE_VALUE)) return;
     setMutationBusy(true);
     setMutationError(null);
     setMutationInfo(null);
     try {
+      const payload: Record<string, unknown> = { finding_ids: [...selectedIds] };
+      if (bulkStatus !== KEEP_ASSIGNEE_VALUE) payload.status = bulkStatus;
+      if (bulkAssignee !== KEEP_ASSIGNEE_VALUE) payload.assignee_user_id = bulkAssignee || null;
       const data = await apiFetch(`/projects/${encodeURIComponent(projectId)}/findings/bulk`, {
         method: "POST",
-        body: JSON.stringify({ finding_ids: [...selectedIds], status: bulkStatus }),
+        body: JSON.stringify(payload),
       });
       setMutationInfo(`${Number(data?.updated_count || selectedIds.size).toLocaleString()} selected finding${selectedIds.size === 1 ? "" : "s"} updated.`);
       setSelectedIds(new Set());
+      setBulkStatus(KEEP_ASSIGNEE_VALUE);
+      setBulkAssignee(KEEP_ASSIGNEE_VALUE);
       setReloadNonce((value) => value + 1);
       if (selectedId) setDetailNonce((value) => value + 1);
     } catch (caught) {
@@ -502,7 +520,24 @@ export function FindingsPage() {
       <div className="monitoring-split-layout">
         <section aria-busy={loading} aria-labelledby="findings-queue-title" className="monitoring-queue">
           <header className="monitoring-queue-header"><div><h2 id="findings-queue-title">Analyst queue</h2><p>Selection applies only to the {findings.length.toLocaleString()} rows on this page.</p></div><span>Page {cursorHistory.length + 1}</span></header>
-          {canManage && selectedIds.size > 0 ? <div className="monitoring-bulk-bar" role="region" aria-label="Bulk finding actions"><strong>{selectedIds.size.toLocaleString()} selected on this page</strong><select aria-label="Bulk status" disabled={mutationBusy} onChange={(event) => setBulkStatus(event.target.value as Exclude<FindingStatus, "accepted_risk">)} value={bulkStatus}><option value="acknowledged">Acknowledge</option><option value="resolved">Resolve</option><option value="open">Reopen</option></select><button className="inventory-button-primary" disabled={mutationBusy} onClick={() => void bulkUpdate()} type="button">{mutationBusy ? "Updating…" : "Apply to selected"}</button><button className="inventory-button-secondary" onClick={() => setSelectedIds(new Set())} type="button">Clear selection</button></div> : null}
+          {canManage && projectId && selectedIds.size > 0 ? (
+            <div className="monitoring-bulk-bar" role="region" aria-label="Bulk finding actions">
+              <strong>{selectedIds.size.toLocaleString()} selected on this page</strong>
+              <label className="monitoring-bulk-status">Status
+                <select aria-label="Bulk status" disabled={mutationBusy} onChange={(event) => setBulkStatus(event.target.value as Exclude<FindingStatus, "accepted_risk"> | typeof KEEP_ASSIGNEE_VALUE)} value={bulkStatus}>
+                  <option value={KEEP_ASSIGNEE_VALUE}>Keep status unchanged</option>
+                  <option value="acknowledged">Acknowledge</option>
+                  <option value="resolved">Resolve</option>
+                  <option value="open">Reopen</option>
+                </select>
+              </label>
+              <FindingAssigneePicker allowUnchanged compact disabled={mutationBusy} onChange={setBulkAssignee} projectId={projectId} value={bulkAssignee} />
+              <div className="monitoring-bulk-actions">
+                <button className="inventory-button-primary" disabled={mutationBusy || (bulkStatus === KEEP_ASSIGNEE_VALUE && bulkAssignee === KEEP_ASSIGNEE_VALUE)} onClick={() => void bulkUpdate()} type="button">{mutationBusy ? "Updating…" : "Apply to selected"}</button>
+                <button className="inventory-button-secondary" disabled={mutationBusy} onClick={() => setSelectedIds(new Set())} type="button">Clear selection</button>
+              </div>
+            </div>
+          ) : null}
           {error ? <StatePanel actions={<button className="inventory-button-primary" onClick={() => setReloadNonce((value) => value + 1)} type="button">Retry findings</button>} description={`${error} No new queue state is shown.`} title="Findings unavailable" tone="error" /> : null}
           {loading ? <div aria-label="Loading findings" className="inventory-skeleton" role="status">{Array.from({ length: 8 }, (_, index) => <span key={index} />)}</div> : null}
           {!sourceIdInvalid && !loading && !error && findings.length === 0 ? <StatePanel description={status || severity || debouncedQuery || policyId || sourceId ? "No findings match the current server-side filters." : "No findings have been created for this project yet. A successful comparable collection will evaluate the built-in monitoring policies."} title="No findings in view" /> : null}
@@ -510,8 +545,8 @@ export function FindingsPage() {
             <div className="monitoring-table-scroll">
               <table className="monitoring-table">
                 <caption className="sr-only">Security findings for this project</caption>
-                <thead><tr><th><input aria-label="Select all findings on this page" checked={allPageSelected} onChange={() => setSelectedIds(allPageSelected ? new Set() : new Set(findings.map((finding) => finding.id)))} type="checkbox" /></th><th>Severity</th><th>Finding</th><th>Status</th><th>Resource</th><th>Evidence</th><th>Last seen</th></tr></thead>
-                <tbody>{findings.map((finding) => <tr className={selectedId === finding.id ? "is-selected" : ""} key={finding.id}><td><input aria-label={`Select ${finding.title}`} checked={selectedIds.has(finding.id)} onChange={() => toggleSelected(finding.id)} type="checkbox" /></td><td><span className={`finding-severity is-${findingTone(finding.severity)}`}>{humanizeMonitoringValue(finding.severity)}</span></td><td><button className="monitoring-row-title" onClick={() => setSelectedId(finding.id)} type="button"><strong>{finding.title}</strong><span>{finding.policy_id} · {finding.occurrence_count.toLocaleString()} occurrence{finding.occurrence_count === 1 ? "" : "s"}</span></button></td><td><span className={`finding-status is-${finding.status}`}>{humanizeMonitoringValue(finding.status)}</span></td><td><span className="monitoring-resource-name" title={finding.resource_name || finding.resource_identity_key || undefined}>{finding.resource_name || finding.resource_identity_key || "Not recorded"}</span><ProviderBadge provider={finding.provider || "unknown"} /></td><td><span className={`evidence-state is-${finding.evidence?.state || "indeterminate"}`}>{humanizeMonitoringValue(finding.evidence?.state || "indeterminate")}</span></td><td>{formatMonitoringTimestamp(finding.last_seen_at)}</td></tr>)}</tbody>
+                <thead><tr>{canManage ? <th><input aria-label="Select all findings on this page" checked={allPageSelected} onChange={() => setSelectedIds(allPageSelected ? new Set() : new Set(findings.map((finding) => finding.id)))} type="checkbox" /></th> : null}<th>Severity</th><th>Finding</th><th>Status</th><th>Resource</th><th>Evidence</th><th>Last seen</th></tr></thead>
+                <tbody>{findings.map((finding) => <tr className={selectedId === finding.id ? "is-selected" : ""} key={finding.id}>{canManage ? <td><input aria-label={`Select ${finding.title}`} checked={selectedIds.has(finding.id)} onChange={() => toggleSelected(finding.id)} type="checkbox" /></td> : null}<td><span className={`finding-severity is-${findingTone(finding.severity)}`}>{humanizeMonitoringValue(finding.severity)}</span></td><td><button className="monitoring-row-title" onClick={() => setSelectedId(finding.id)} type="button"><strong>{finding.title}</strong><span>{finding.policy_id} · {finding.occurrence_count.toLocaleString()} occurrence{finding.occurrence_count === 1 ? "" : "s"}</span></button></td><td><span className={`finding-status is-${finding.status}`}>{humanizeMonitoringValue(finding.status)}</span></td><td><span className="monitoring-resource-name" title={finding.resource_name || finding.resource_identity_key || undefined}>{finding.resource_name || finding.resource_identity_key || "Not recorded"}</span><ProviderBadge provider={finding.provider || "unknown"} /></td><td><span className={`evidence-state is-${finding.evidence?.state || "indeterminate"}`}>{humanizeMonitoringValue(finding.evidence?.state || "indeterminate")}</span></td><td>{formatMonitoringTimestamp(finding.last_seen_at)}</td></tr>)}</tbody>
               </table>
             </div>
           ) : null}

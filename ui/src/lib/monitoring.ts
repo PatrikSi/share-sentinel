@@ -4,9 +4,16 @@ export type EvidenceState = "exact" | "bounded" | "indeterminate";
 
 export type FindingEvidence = {
   state: EvidenceState;
-  summary?: string | null;
-  refs?: Array<Record<string, unknown> | string> | null;
+  summary?: Record<string, unknown> | null;
+  refs?: Record<string, unknown> | null;
   limitations?: string[] | null;
+};
+
+export type FindingEvidenceFact = {
+  key: string;
+  label: string;
+  value: string;
+  withheld: boolean;
 };
 
 export type Finding = {
@@ -38,6 +45,11 @@ export type Finding = {
 };
 
 export type FindingSummary = Record<FindingStatus, number> & { total: number };
+
+export type FindingAssigneeCandidate = {
+  id: string;
+  email: string;
+};
 
 export type FindingPolicy = {
   id: string;
@@ -171,6 +183,95 @@ export function evidenceTrustCopy(state: EvidenceState): string {
   if (state === "exact") return "Exact within the declared collection scope.";
   if (state === "bounded") return "Based on bounded observations; review limitations before acting.";
   return "Collection evidence is insufficient for a definitive conclusion.";
+}
+
+const SAFE_EVIDENCE_TEXT_FIELDS = new Set([
+  "access_state",
+  "change_type",
+  "content_state",
+  "exposure",
+  "match_quality",
+  "method",
+  "outcome",
+  "probe_method",
+  "provider",
+  "scope",
+  "state",
+  "status",
+  "structural_state",
+]);
+const SAFE_EVIDENCE_LIST_FIELDS = new Set(["allowed_capabilities", "capabilities", "categories", "change_categories"]);
+const SAFE_EVIDENCE_REFERENCE_FIELDS = new Set(["comparison_id", "finding_id", "resource_id", "run_id"]);
+const SAFE_EVIDENCE_CONTAINER_FIELDS = new Set(["after", "before", "positive_evidence"]);
+const SENSITIVE_EVIDENCE_FIELD = /(^|_)(authorization|cookie|credential|password|secret|token|private_key|client_secret|access_key)($|_)/i;
+
+function evidenceLabel(key: string): string {
+  return humanizeMonitoringValue(key);
+}
+
+function boundedText(value: unknown, maxLength = 160): string {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 1)}…`;
+}
+
+/**
+ * Convert collector-controlled evidence into a small, conservative display model.
+ * Only schema-known operational fields are rendered verbatim. Unknown structured
+ * values remain acknowledged without exposing their contents, because snapshots
+ * and provider metadata may contain sensitive material.
+ */
+export function findingEvidenceFacts(raw: unknown, kind: "summary" | "references" = "summary", maxFacts = 16): FindingEvidenceFact[] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return raw == null
+      ? []
+      : [{
+          key: kind,
+          label: kind === "references" ? "References" : "Summary",
+          value: "Legacy evidence was recorded; raw content is withheld.",
+          withheld: true,
+        }];
+  }
+
+  return Object.entries(raw as Record<string, unknown>).slice(0, Math.max(1, maxFacts)).map(([key, value]) => {
+    if (SENSITIVE_EVIDENCE_FIELD.test(key)) {
+      return { key, label: "Sensitive field", value: "Sensitive value withheld", withheld: true };
+    }
+
+    const knownField = kind === "references"
+      ? SAFE_EVIDENCE_REFERENCE_FIELDS.has(key)
+      : SAFE_EVIDENCE_TEXT_FIELDS.has(key) || SAFE_EVIDENCE_LIST_FIELDS.has(key) || SAFE_EVIDENCE_CONTAINER_FIELDS.has(key) || key === "complete";
+    const label = knownField ? evidenceLabel(key) : "Additional evidence";
+
+    if (kind === "references" && SAFE_EVIDENCE_REFERENCE_FIELDS.has(key) && ["string", "number"].includes(typeof value)) {
+      return { key, label, value: boundedText(value, 80), withheld: false };
+    }
+    if (kind === "summary" && SAFE_EVIDENCE_TEXT_FIELDS.has(key) && ["string", "number", "boolean"].includes(typeof value)) {
+      return { key, label, value: boundedText(value), withheld: false };
+    }
+    if (kind === "summary" && key === "complete" && typeof value === "boolean") {
+      return { key, label, value: value ? "Yes" : "No", withheld: false };
+    }
+    if (kind === "summary" && SAFE_EVIDENCE_LIST_FIELDS.has(key) && Array.isArray(value)) {
+      const safeValues = value.filter((entry): entry is string => typeof entry === "string").slice(0, 12);
+      const omitted = Math.max(0, value.length - safeValues.length);
+      return {
+        key,
+        label,
+        value: safeValues.length ? `${safeValues.map((entry) => boundedText(entry, 80)).join(", ")}${omitted ? ` (+${omitted} more)` : ""}` : "None recorded",
+        withheld: safeValues.length !== value.length,
+      };
+    }
+
+    if (Array.isArray(value)) {
+      return { key, label, value: `${value.length.toLocaleString()} values recorded; raw values withheld`, withheld: true };
+    }
+    if (value && typeof value === "object") {
+      const count = Object.keys(value as Record<string, unknown>).length;
+      return { key, label, value: `${count.toLocaleString()} fields recorded; raw values withheld`, withheld: true };
+    }
+    return { key, label, value: "Recorded; raw value withheld", withheld: true };
+  });
 }
 
 export function formatMonitoringTimestamp(value: string | null | undefined): string {

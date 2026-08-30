@@ -32,6 +32,13 @@ export function errorMessageFromBody(body: string, status: number, requestId: st
             : null;
       const resolvedRequestId = requestId || bodyRequestId;
       if (typeof payload.detail === "string") return appendRequestId(payload.detail, resolvedRequestId);
+      if (payload.detail && typeof payload.detail === "object" && !Array.isArray(payload.detail)) {
+        const detail = payload.detail as { code?: unknown; message?: unknown };
+        if (typeof detail.message === "string") {
+          const code = typeof detail.code === "string" ? ` (${detail.code})` : "";
+          return appendRequestId(`${detail.message}${code}`, resolvedRequestId);
+        }
+      }
       if (typeof payload.error?.message === "string") {
         return appendRequestId(payload.error.message, resolvedRequestId);
       }
