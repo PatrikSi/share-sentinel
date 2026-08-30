@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import shutil
 import stat
@@ -21,6 +22,7 @@ except ImportError:  # pragma: no cover - the supported container runtime is POS
 
 ARTIFACT_CAPACITY_LOCK_FILE = ".share-sentinel-capacity.lock"
 ARTIFACT_CAPACITY_LOCK_TIMEOUT_SECONDS = 10.0
+logger = logging.getLogger("share_sentinel.storage")
 
 
 class ArtifactStorageUnavailableError(OSError):
@@ -331,6 +333,7 @@ def complete_multipart_upload(key: str, upload_id: str, parts: list[dict]) -> No
     multipart_parent_fd = _open_storage_parent(multipart_parts[:-1], create=False)
     target_parent_fd = _open_storage_parent(target_parts[:-1], create=True)
     linked_by_this_call = False
+    publication_durable = False
     try:
         os.link(
             multipart_parts[-1],
@@ -340,16 +343,26 @@ def complete_multipart_upload(key: str, upload_id: str, parts: list[dict]) -> No
             follow_symlinks=False,
         )
         linked_by_this_call = True
-        os.unlink(multipart_parts[-1], dir_fd=multipart_parent_fd)
         os.fsync(target_parent_fd)
-        os.fsync(multipart_parent_fd)
+        publication_durable = True
+        try:
+            os.unlink(multipart_parts[-1], dir_fd=multipart_parent_fd)
+            os.fsync(multipart_parent_fd)
+        except OSError as exc:
+            # The immutable target is already durable. A stale multipart entry
+            # is safe and can be removed by reconciliation; deleting the
+            # published name here would risk leaving no live path at all.
+            logger.warning(
+                "artifact_multipart_cleanup_deferred error_type=%s",
+                type(exc).__name__,
+            )
     except BaseException:
         # Publishing is complete only after both directory entries are
         # durable. If a later unlink/fsync step fails, remove only the target
         # created by this invocation so a retry cannot mistake a partially
         # durable object for a committed artifact. In particular, never
         # remove a pre-existing immutable target after FileExistsError.
-        if linked_by_this_call:
+        if linked_by_this_call and not publication_durable:
             try:
                 os.unlink(target_parts[-1], dir_fd=target_parent_fd)
                 os.fsync(target_parent_fd)

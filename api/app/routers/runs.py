@@ -71,6 +71,7 @@ ALLOWED_ARTIFACT_CONTENT_TYPES = {
 }
 RAW_ARTIFACT_FILENAME_HEADER = "x-artifact-filename"
 ARTIFACT_SIGNATURE_SNIFF_BYTES = 4096
+MAX_CONTENT_LENGTH_DIGITS = 20
 RUN_LIST_CURSOR = (
     KeysetColumn("created_at", ScanRun.created_at, direction="desc", parser=parse_datetime_cursor_value),
     KeysetColumn("id", ScanRun.id, direction="desc", parser=parse_uuid_cursor_value),
@@ -1255,6 +1256,11 @@ def _raw_upload_content_length(request: Request) -> int | None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="invalid Content-Length header",
         )
+    if len(normalized) > MAX_CONTENT_LENGTH_DIGITS:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="upload too large",
+        )
     return int(normalized)
 
 
@@ -1356,7 +1362,7 @@ async def _upload_artifact_stream(
                     break
                 size += len(chunk)
                 if size > settings.upload_max_bytes:
-                    raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="upload too large")
+                    raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="upload too large")
                 sha256.update(chunk)
                 inspect_signature(chunk)
                 buffer.extend(chunk)
@@ -1367,7 +1373,7 @@ async def _upload_artifact_stream(
                     continue
                 size += len(chunk)
                 if size > settings.upload_max_bytes:
-                    raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="upload too large")
+                    raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="upload too large")
                 sha256.update(chunk)
                 inspect_signature(chunk)
                 buffer.extend(chunk)
@@ -1907,7 +1913,7 @@ async def upload_artifact(
     raw_content_length = _raw_upload_content_length(request) if file is None else None
     if raw_content_length is not None and raw_content_length > settings.upload_max_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="upload too large",
         )
     suffix = _artifact_suffix(content_type, filename)

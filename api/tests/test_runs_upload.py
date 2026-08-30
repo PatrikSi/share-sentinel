@@ -293,6 +293,15 @@ def test_raw_upload_content_length_accepts_bounded_decimal() -> None:
     assert runs_router._raw_upload_content_length(SimpleNamespace(headers={})) is None
 
 
+def test_raw_upload_content_length_rejects_unreasonably_large_decimal_without_parsing_it() -> None:
+    request = SimpleNamespace(headers={"content-length": "9" * 5000})
+
+    with pytest.raises(runs_router.HTTPException, match="upload too large") as exc:
+        runs_router._raw_upload_content_length(request)
+
+    assert exc.value.status_code == 413
+
+
 @pytest.mark.parametrize(
     ("storage_error", "expected_status", "expected_retry"),
     [

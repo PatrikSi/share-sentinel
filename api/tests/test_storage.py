@@ -303,11 +303,12 @@ def test_complete_multipart_upload_does_not_replace_immutable_artifact(tmp_path,
         assert artifact.read() == b"first"
 
 
-def test_complete_multipart_upload_removes_target_after_partial_publication_failure(tmp_path, monkeypatch) -> None:
+def test_complete_multipart_upload_keeps_durable_target_when_temp_cleanup_fails(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
     key = "projects/p/artifact.ndjson"
     upload_id = storage.create_multipart_upload(key)
     storage.upload_part(key, upload_id, 1, b"pending")
+    storage._artifact_path(key).parent.mkdir(parents=True)
     real_unlink = storage.os.unlink
     failed_pending_unlink = False
 
@@ -320,9 +321,64 @@ def test_complete_multipart_upload_removes_target_after_partial_publication_fail
 
     monkeypatch.setattr(storage.os, "unlink", fail_first_pending_unlink)
 
-    with pytest.raises(OSError, match="simulated pending-entry failure"):
+    storage.complete_multipart_upload(key, upload_id, [])
+
+    assert storage._artifact_path(key).read_bytes() == b"pending"
+    assert storage._multipart_path(key, upload_id).read_bytes() == b"pending"
+    storage.abort_multipart_upload(key, upload_id)
+
+
+def test_complete_multipart_upload_rolls_back_target_when_publication_fsync_fails(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+    key = "projects/p/artifact.ndjson"
+    upload_id = storage.create_multipart_upload(key)
+    storage.upload_part(key, upload_id, 1, b"pending")
+    storage._artifact_path(key).parent.mkdir(parents=True)
+    real_fsync = storage.os.fsync
+    fsync_call = 0
+
+    def fail_target_parent_fsync(descriptor: int) -> None:
+        nonlocal fsync_call
+        fsync_call += 1
+        # Completion first syncs the pending regular file, then the target
+        # directory that makes the hard-link publication durable.
+        if fsync_call == 2:
+            raise OSError("simulated publication fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(storage.os, "fsync", fail_target_parent_fsync)
+
+    with pytest.raises(OSError, match="simulated publication fsync failure"):
         storage.complete_multipart_upload(key, upload_id, [])
 
     assert not storage._artifact_path(key).exists()
     assert storage._multipart_path(key, upload_id).read_bytes() == b"pending"
     storage.abort_multipart_upload(key, upload_id)
+
+
+def test_complete_multipart_upload_keeps_target_when_temp_directory_fsync_fails(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+    key = "projects/p/artifact.ndjson"
+    upload_id = storage.create_multipart_upload(key)
+    storage.upload_part(key, upload_id, 1, b"published")
+    storage._artifact_path(key).parent.mkdir(parents=True)
+    real_fsync = storage.os.fsync
+    fsync_call = 0
+
+    def fail_temp_parent_fsync(descriptor: int) -> None:
+        nonlocal fsync_call
+        fsync_call += 1
+        if fsync_call == 3:
+            raise OSError("simulated multipart cleanup fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(storage.os, "fsync", fail_temp_parent_fsync)
+
+    storage.complete_multipart_upload(key, upload_id, [])
+
+    assert storage._artifact_path(key).read_bytes() == b"published"
+    assert not storage._multipart_path(key, upload_id).exists()
