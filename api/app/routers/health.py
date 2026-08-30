@@ -9,6 +9,7 @@ from app.db import engine, get_db
 from app.deps import require_sysadmin
 from app.redis_client import create_redis_client
 from app.services import storage
+from app.services.operational_metrics import render_operational_metrics
 
 router = APIRouter(tags=["health"])
 redis_client = create_redis_client()
@@ -59,8 +60,8 @@ def healthz_deep(
 
 
 @router.get("/metrics", include_in_schema=False)
-def metrics(_=Depends(require_sysadmin)):
+def metrics(db: Session = Depends(get_db), _=Depends(require_sysadmin)):
     return PlainTextResponse(
-        metrics_module.render_prometheus(engine.pool),
+        metrics_module.render_prometheus(engine.pool) + render_operational_metrics(db, redis_client),
         media_type="text/plain; version=0.0.4; charset=utf-8",
     )
