@@ -199,23 +199,78 @@ if [[ "$comparison_state" != "complete" ]]; then
   jq . <<<"$comparison_response" >&2
   exit 1
 fi
-jq -e '
+if ! jq -e '
   .summary.exact == false
-  and .summary.item_churn_computed == false
+  and .summary.resource_summary_exact == false
+  and .summary.item_churn_computed == true
+  and .summary.item_summary_exact == true
+  and .summary.item_changes.removed == 1
+  and .summary.item_changes.renamed == 2
+  and .summary.item_changes.total == 3
+  and (.summary.item_limitations | length) == 0
   and .summary.total >= 1
   and .progress.phase == "complete"
-' <<<"$comparison_response" >/dev/null
+' <<<"$comparison_response" >/dev/null; then
+  echo "FAIL: materialized comparison summary did not match the SharePoint item-history contract" >&2
+  jq . <<<"$comparison_response" >&2
+  exit 1
+fi
 comparison_changes=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" \
   "$api_base/projects/$project_id/comparisons/$comparison_id/resource-changes?limit=100")
-jq -e '
+if ! jq -e '
   (.items | length) >= 1
   and (.items | map(select(
     .provider_resource_id == "b!synthetic-drive-id"
     and .change_type == "changed"
     and (.change_categories | index("item_count")) != null
-    and .item_changes.state == "not_computed"
+    and .item_changes.state == "computed"
+    and .item_changes.exact == true
+    and .item_changes.counts.removed == 1
+    and .item_changes.counts.renamed == 2
+    and .item_changes.total == 3
+    and .item_changes.before_count == 3
+    and .item_changes.after_count == 2
   )) | length) == 1
-' <<<"$comparison_changes" >/dev/null
+' <<<"$comparison_changes" >/dev/null; then
+  echo "FAIL: materialized resource changes did not expose the computed item-history summary" >&2
+  jq . <<<"$comparison_changes" >&2
+  exit 1
+fi
+
+item_changes_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" \
+  "$api_base/projects/$project_id/comparisons/$comparison_id/item-changes?limit=100")
+if ! jq -e '
+  .interpretation.state == "computed"
+  and .interpretation.exact == true
+  and (.interpretation.limitations | length) == 0
+  and (.items | length) == 3
+  and (.items | map(select(
+    .change_type == "removed"
+    and .provider == "sharepoint"
+    and .before.provider_item_id == "synthetic-obsolete-id"
+    and .before.path == "/Records/obsolete.txt"
+    and .after == null
+    and .evidence_state == "exact"
+  )) | length) == 1
+  and (.items | map(select(
+    .change_type == "renamed"
+    and .after.provider_item_id == "synthetic-folder-id"
+    and .before.path == "/Records"
+    and .after.path == "/Archive"
+    and .evidence_state == "exact"
+  )) | length) == 1
+  and (.items | map(select(
+    .change_type == "renamed"
+    and .after.provider_item_id == "synthetic-file-id"
+    and .before.path == "/Records/report.docx"
+    and .after.path == "/Archive/quarterly-review.docx"
+    and .evidence_state == "exact"
+  )) | length) == 1
+' <<<"$item_changes_response" >/dev/null; then
+  echo "FAIL: materialized SharePoint item history did not match the expected removal and renames" >&2
+  jq . <<<"$item_changes_response" >&2
+  exit 1
+fi
 
 resources_response=$(curl "${curl_common_args[@]}" -fsS -b "$cookies" \
   "$api_base/projects/$project_id/inventory/resources?provider=sharepoint&resource_type=sharepoint_library&exposure=USER_VISIBLE&run_ids=$current_run_id")
@@ -279,4 +334,4 @@ jq -e '.ok == true
   and (.artifact_delete_failures | length) == 0' <<<"$delete_response" >/dev/null
 project_id=""
 
-echo "SharePoint ingest smoke passed: baseline=$baseline_run_id current=$current_run_id moves=2 removals=1"
+echo "SharePoint ingest smoke passed: baseline=$baseline_run_id current=$current_run_id diff_moves=2 materialized_renames=2 removals=1"
