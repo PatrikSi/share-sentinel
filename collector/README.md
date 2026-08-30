@@ -96,7 +96,7 @@ Opaque-token rotation creates a new isolated state scope and a safe full sync. S
 
 `--full-sync` ignores a working checkpoint for one safe replacement run. `--reset-delta` also requests a replacement full sync; neither deletes working state before the replacement artifact succeeds. HTTP 410 delta invalidation performs the same per-library recovery without failing unrelated libraries.
 
-Useful safety controls include `--max-sites`, `--max-libraries`, `--max-items`, `--max-pages`, `--graph-concurrency`, bounded response size, request timeouts, and bounded retry delay. Zero site/library/item limits mean unlimited. Graph `Retry-After` is respected; a delay beyond the configured budget fails that library as retriable/partial instead of retrying too early.
+Useful safety controls include `--max-sites`, `--max-libraries`, `--max-items`, `--max-pages`, `--graph-concurrency`, bounded response size, request timeouts, and bounded retry delay. Site, library, and item limits must be positive; use the corresponding explicit `--unlimited-sites`, `--unlimited-libraries`, or `--unlimited-items` switch when a reviewed collection intentionally removes one of those count guards. Graph `Retry-After` is respected; a delay beyond the configured budget fails that library as retriable/partial instead of retrying too early.
 
 Progress goes to stderr: the default emits start, periodic, and final summaries; `-v` adds per-library detail, repeated `-v` adds more request context, `--progress-interval 0` disables periodic summaries, and `--quiet` suppresses progress. Terminal failures still return a non-zero status and an actionable error.
 
@@ -563,10 +563,10 @@ treated as an empty server. A confirmed NFSv4 endpoint is also partial because
 not mount exports or traverse their contents. Discovered exports remain `unknown`;
 an advertised export name does not prove that the scanner can mount or list it.
 `showmount` retention is bounded to 4 MiB of stdout, 64 KiB of stderr, 10,000
-exports, and 4,096 bytes per path. Output truncation, a pipe-drain failure, or an
-exceeded export/path bound is reported as a structural coverage gap. Unless NFSv4
-is authoritatively excluded, the v4 pseudo-filesystem remains unassessed even when
-legacy export enumeration succeeds.
+exports, and both 255 characters and 4,096 UTF-8 bytes per path. Output truncation,
+a pipe-drain failure, or an exceeded export/path bound is reported as a structural
+coverage gap. Unless NFSv4 is authoritatively excluded, the v4 pseudo-filesystem
+remains unassessed even when legacy export enumeration succeeds.
 
 ## Exit codes
 
