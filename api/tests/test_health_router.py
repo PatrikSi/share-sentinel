@@ -28,7 +28,11 @@ class _RedisFail:
 
 def test_healthz_ready_ok(monkeypatch) -> None:
     monkeypatch.setattr(health_router, "redis_client", _RedisOK())
-    monkeypatch.setattr(health_router.storage, "artifact_storage_ready", lambda: True)
+    monkeypatch.setattr(
+        health_router.storage,
+        "artifact_storage_status",
+        lambda **_kwargs: {"ok": True, "state": "ok", "reason": None},
+    )
 
     def _override_db():
         yield _DbOK()
@@ -47,7 +51,11 @@ def test_healthz_ready_ok(monkeypatch) -> None:
 
 def test_healthz_ready_unhealthy(monkeypatch) -> None:
     monkeypatch.setattr(health_router, "redis_client", _RedisFail())
-    monkeypatch.setattr(health_router.storage, "artifact_storage_ready", lambda: False)
+    monkeypatch.setattr(
+        health_router.storage,
+        "artifact_storage_status",
+        lambda **_kwargs: {"ok": False, "state": "error", "reason": "low_free_space"},
+    )
 
     def _override_db():
         yield _DbFail()
@@ -67,7 +75,12 @@ def test_healthz_ready_unhealthy(monkeypatch) -> None:
 
 def test_healthz_deep_ok(monkeypatch) -> None:
     monkeypatch.setattr(health_router, "redis_client", _RedisOK())
-    monkeypatch.setattr(health_router.storage, "artifact_storage_ready", lambda: True)
+    calls = []
+    monkeypatch.setattr(
+        health_router.storage,
+        "artifact_storage_status",
+        lambda **kwargs: calls.append(kwargs) or {"ok": True, "state": "ok", "reason": None},
+    )
 
     def _override_db():
         yield _DbOK()
@@ -84,11 +97,16 @@ def test_healthz_deep_ok(monkeypatch) -> None:
     assert payload["checks"]["database"] == "ok"
     assert payload["checks"]["redis"] == "ok"
     assert payload["checks"]["artifact_storage"] == "ok"
+    assert calls == [{"verify_write": True}]
 
 
 def test_healthz_deep_unhealthy(monkeypatch) -> None:
     monkeypatch.setattr(health_router, "redis_client", _RedisFail())
-    monkeypatch.setattr(health_router.storage, "artifact_storage_ready", lambda: False)
+    monkeypatch.setattr(
+        health_router.storage,
+        "artifact_storage_status",
+        lambda **_kwargs: {"ok": False, "state": "error", "reason": "storage_io_error"},
+    )
 
     def _override_db():
         yield _DbFail()

@@ -41,7 +41,15 @@ def test_storage_rejects_path_traversal(tmp_path, monkeypatch) -> None:
 
 
 def test_artifact_storage_ready_requires_existing_accessible_directory(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+    monkeypatch.setattr(
+        storage,
+        "get_settings",
+        lambda: SimpleNamespace(
+            artifact_storage_path=str(tmp_path),
+            artifact_storage_min_free_bytes=0,
+            artifact_storage_min_free_percent=0,
+        ),
+    )
 
     assert storage.artifact_storage_ready() is True
 
@@ -49,3 +57,63 @@ def test_artifact_storage_ready_requires_existing_accessible_directory(tmp_path,
     monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(missing)))
 
     assert storage.artifact_storage_ready() is False
+
+
+def test_artifact_storage_status_enforces_capacity_and_write_probe(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        storage,
+        "get_settings",
+        lambda: SimpleNamespace(
+            artifact_storage_path=str(tmp_path),
+            artifact_storage_min_free_bytes=0,
+            artifact_storage_min_free_percent=0,
+        ),
+    )
+
+    status = storage.artifact_storage_status(verify_write=True)
+
+    assert status["ok"] is True
+    assert status["capacity_ok"] is True
+    assert status["free_bytes"] >= 0
+    assert list(tmp_path.glob(".share-sentinel-health-*")) == []
+
+
+def test_artifact_storage_status_rejects_low_free_space(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        storage,
+        "get_settings",
+        lambda: SimpleNamespace(
+            artifact_storage_path=str(tmp_path),
+            artifact_storage_min_free_bytes=2**63,
+            artifact_storage_min_free_percent=0,
+        ),
+    )
+
+    status = storage.artifact_storage_status()
+
+    assert status["ok"] is False
+    assert status["reason"] == "low_free_space"
+
+
+def test_multipart_upload_rejects_untrusted_upload_id(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+
+    with pytest.raises(ValueError, match="upload_id must be a UUID"):
+        storage.upload_part("projects/p/artifact.ndjson", "../../outside", 1, b"payload")
+
+
+def test_complete_multipart_upload_does_not_replace_immutable_artifact(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+    key = "projects/p/artifact.ndjson"
+    first_id = storage.create_multipart_upload(key)
+    storage.upload_part(key, first_id, 1, b"first")
+    storage.complete_multipart_upload(key, first_id, [])
+    second_id = storage.create_multipart_upload(key)
+    storage.upload_part(key, second_id, 1, b"second")
+
+    with pytest.raises(FileExistsError):
+        storage.complete_multipart_upload(key, second_id, [])
+
+    storage.abort_multipart_upload(key, second_id)
+    with storage.get_object_stream(key) as artifact:
+        assert artifact.read() == b"first"

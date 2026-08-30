@@ -14,6 +14,13 @@ def test_read_timeout_falls_back_for_non_finite_values(monkeypatch) -> None:
         assert healthcheck._read_timeout("TEST_TIMEOUT", 5.0) == 5.0
 
 
+def test_read_non_negative_accepts_zero_and_rejects_negative(monkeypatch) -> None:
+    monkeypatch.setenv("TEST_THRESHOLD", "0")
+    assert healthcheck._read_non_negative("TEST_THRESHOLD", 5.0) == 0
+    monkeypatch.setenv("TEST_THRESHOLD", "-1")
+    assert healthcheck._read_non_negative("TEST_THRESHOLD", 5.0) == 5.0
+
+
 def test_check_redis_uses_bounded_socket_timeouts(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
@@ -120,8 +127,27 @@ def test_run_healthcheck_reports_dependency_failures(tmp_path: Path, monkeypatch
     assert ok is False
     assert checks["heartbeat"] == "ok"
     assert checks["database"] == "error"
-    assert checks["redis"] == "error"
+    assert checks["redis"] == "degraded"
     assert checks["artifact_storage"] == "error"
+
+
+def test_run_healthcheck_stays_available_during_redis_degradation(tmp_path: Path, monkeypatch) -> None:
+    heartbeat_path = tmp_path / "worker-heartbeat.json"
+    heartbeat_path.write_text(json.dumps({"ts": datetime.now(tz=UTC).isoformat()}), encoding="utf-8")
+    monkeypatch.setattr(healthcheck, "check_database", lambda _database_url: None)
+    monkeypatch.setattr(
+        healthcheck,
+        "check_redis",
+        lambda _redis_url: (_ for _ in ()).throw(RuntimeError("redis down")),
+    )
+    monkeypatch.setattr(healthcheck, "check_artifact_storage", lambda _artifact_storage_path: None)
+
+    ok, checks = healthcheck.run_healthcheck(
+        "postgresql://db", "redis://redis", str(tmp_path), str(heartbeat_path), timeout_seconds=45
+    )
+
+    assert ok is True
+    assert checks["redis"] == "degraded"
 
 
 def test_main_uses_bounded_fallback_for_malformed_health_timeout(monkeypatch) -> None:

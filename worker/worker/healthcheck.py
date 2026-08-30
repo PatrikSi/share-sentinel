@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import shutil
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +20,16 @@ def _read_timeout(name: str, default: float) -> float:
     return max(0.1, value)
 
 
+def _read_non_negative(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value) or value < 0:
+        return default
+    return value
+
+
 REDIS_CONNECT_TIMEOUT_SECONDS = _read_timeout("REDIS_CONNECT_TIMEOUT_SECONDS", 3.0)
 REDIS_SOCKET_TIMEOUT_SECONDS = _read_timeout("REDIS_SOCKET_TIMEOUT_SECONDS", 5.0)
 WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS = max(
@@ -28,6 +39,14 @@ WORKER_DATABASE_CONNECT_TIMEOUT_SECONDS = max(
 WORKER_DATABASE_STATEMENT_TIMEOUT_MS = max(
     1000,
     int(_read_timeout("WORKER_DATABASE_STATEMENT_TIMEOUT_MS", 120000.0)),
+)
+ARTIFACT_STORAGE_MIN_FREE_BYTES = max(
+    0,
+    int(_read_non_negative("ARTIFACT_STORAGE_MIN_FREE_BYTES", 1024 * 1024 * 1024)),
+)
+ARTIFACT_STORAGE_MIN_FREE_PERCENT = min(
+    100.0,
+    _read_non_negative("ARTIFACT_STORAGE_MIN_FREE_PERCENT", 5.0),
 )
 
 
@@ -68,6 +87,15 @@ def check_artifact_storage(artifact_storage_path: str) -> None:
     if not root.exists() or not root.is_dir():
         raise RuntimeError("artifact storage path is missing")
     next(root.iterdir(), None)
+    if not os.access(root, os.R_OK | os.W_OK | os.X_OK):
+        raise RuntimeError("artifact storage path is not accessible")
+    usage = shutil.disk_usage(root)
+    free_percent = (usage.free / usage.total * 100.0) if usage.total else 0.0
+    if usage.free < ARTIFACT_STORAGE_MIN_FREE_BYTES or free_percent < ARTIFACT_STORAGE_MIN_FREE_PERCENT:
+        raise RuntimeError(
+            "artifact storage free space is below the configured threshold "
+            f"free_bytes={usage.free} free_percent={free_percent:.3f}"
+        )
 
 
 def run_healthcheck(
@@ -103,7 +131,12 @@ def run_healthcheck(
     except Exception:  # noqa: BLE001
         checks["artifact_storage"] = "error"
 
-    ok = all(value == "ok" for value in checks.values())
+    # Redis transports prompt delivery, but the worker deliberately recovers
+    # durable database-backed ingest and comparison work while Redis is down.
+    # Report that dependency as degraded without causing a restart loop.
+    if checks["redis"] == "error":
+        checks["redis"] = "degraded"
+    ok = all(checks[name] == "ok" for name in ("heartbeat", "database", "artifact_storage"))
     return ok, checks
 
 

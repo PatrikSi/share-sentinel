@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
+import tempfile
 import uuid
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from app.config import get_settings
 
@@ -12,15 +15,77 @@ def _artifact_root() -> Path:
     return Path(get_settings().artifact_storage_path)
 
 
-def artifact_storage_ready() -> bool:
+def _capacity_status(root: Path) -> dict[str, Any]:
+    settings = get_settings()
+    minimum_free_bytes = max(0, int(getattr(settings, "artifact_storage_min_free_bytes", 0)))
+    minimum_free_percent = max(0.0, float(getattr(settings, "artifact_storage_min_free_percent", 0.0)))
+    usage = shutil.disk_usage(root)
+    free_percent = (usage.free / usage.total * 100.0) if usage.total else 0.0
+    enough_bytes = usage.free >= minimum_free_bytes
+    enough_percent = free_percent >= minimum_free_percent
+    return {
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+        "free_percent": round(free_percent, 3),
+        "minimum_free_bytes": minimum_free_bytes,
+        "minimum_free_percent": minimum_free_percent,
+        "capacity_ok": enough_bytes and enough_percent,
+    }
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(path, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _write_probe(root: Path) -> None:
+    probe_path: Path | None = None
+    renamed_path: Path | None = None
+    try:
+        descriptor, raw_path = tempfile.mkstemp(prefix=".share-sentinel-health-", suffix=".tmp", dir=root)
+        probe_path = Path(raw_path)
+        with os.fdopen(descriptor, "wb") as probe:
+            probe.write(b"share-sentinel-storage-probe\n")
+            probe.flush()
+            os.fsync(probe.fileno())
+        renamed_path = probe_path.with_suffix(".ready")
+        os.replace(probe_path, renamed_path)
+        probe_path = None
+        _fsync_directory(root)
+    finally:
+        for candidate in (probe_path, renamed_path):
+            if candidate is not None:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+def artifact_storage_status(*, verify_write: bool = False) -> dict[str, Any]:
     root = _artifact_root()
     if not root.exists() or not root.is_dir():
-        return False
+        return {"ok": False, "state": "error", "reason": "path_missing"}
     try:
         next(root.iterdir(), None)
+        if not os.access(root, os.R_OK | os.W_OK | os.X_OK):
+            return {"ok": False, "state": "error", "reason": "path_not_accessible"}
+        capacity = _capacity_status(root)
+        if not capacity["capacity_ok"]:
+            return {"ok": False, "state": "error", "reason": "low_free_space", **capacity}
+        if verify_write:
+            _write_probe(root)
     except OSError:
-        return False
-    return os.access(root, os.R_OK | os.W_OK | os.X_OK)
+        return {"ok": False, "state": "error", "reason": "storage_io_error"}
+    return {"ok": True, "state": "ok", "reason": None, **capacity}
+
+
+def artifact_storage_ready() -> bool:
+    return bool(artifact_storage_status()["ok"])
 
 
 def _key_parts(key: str) -> tuple[str, ...]:
@@ -37,8 +102,15 @@ def _artifact_path(key: str) -> Path:
     return _artifact_root().joinpath(*_key_parts(key))
 
 
+def _validated_upload_id(upload_id: str) -> str:
+    try:
+        return str(uuid.UUID(str(upload_id)))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("upload_id must be a UUID") from exc
+
+
 def _multipart_path(key: str, upload_id: str) -> Path:
-    return _artifact_root().joinpath(".multipart", *_key_parts(key), f"{upload_id}.part")
+    return _artifact_root().joinpath(".multipart", *_key_parts(key), f"{_validated_upload_id(upload_id)}.part")
 
 
 def upload_fileobj(fileobj, key: str, content_type: str | None = None) -> None:
@@ -66,7 +138,8 @@ def create_multipart_upload(key: str, content_type: str | None = None) -> str:
 
 
 def upload_part(key: str, upload_id: str, part_number: int, body: bytes) -> str:
-    del part_number
+    if part_number < 1:
+        raise ValueError("part_number must be greater than zero")
     multipart_path = _multipart_path(key, upload_id)
     if not multipart_path.exists():
         raise FileNotFoundError(multipart_path)
@@ -80,7 +153,13 @@ def complete_multipart_upload(key: str, upload_id: str, parts: list[dict]) -> No
     multipart_path = _multipart_path(key, upload_id)
     target_path = _artifact_path(key)
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(multipart_path, target_path)
+    with open(multipart_path, "rb") as pending_artifact:
+        os.fsync(pending_artifact.fileno())
+    # Artifact keys are immutable. A hard-link publish is atomic and refuses
+    # to replace an already referenced object when two completions race.
+    os.link(multipart_path, target_path)
+    multipart_path.unlink()
+    _fsync_directory(target_path.parent)
 
 
 def abort_multipart_upload(key: str, upload_id: str) -> None:

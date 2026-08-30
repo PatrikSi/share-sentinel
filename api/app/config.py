@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     redis_socket_timeout_seconds: float = 5.0
 
     artifact_storage_path: str = "/artifacts"
+    artifact_storage_min_free_bytes: int = 1024 * 1024 * 1024
+    artifact_storage_min_free_percent: float = 5.0
 
     jwt_secret: str = DEFAULT_JWT_SECRET
     jwt_issuer: str = "share-sentinel"
@@ -289,6 +291,20 @@ class Settings(BaseSettings):
     def _validate_non_negative_runtime_setting(cls, value: int, info) -> int:
         if value < 0:
             raise ValueError(f"{info.field_name} must be zero or greater")
+        return value
+
+    @field_validator("artifact_storage_min_free_bytes")
+    @classmethod
+    def _validate_artifact_storage_min_free_bytes(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("artifact_storage_min_free_bytes must be zero or greater")
+        return value
+
+    @field_validator("artifact_storage_min_free_percent")
+    @classmethod
+    def _validate_artifact_storage_min_free_percent(cls, value: float) -> float:
+        if not isfinite(value) or value < 0 or value > 100:
+            raise ValueError("artifact_storage_min_free_percent must be between 0 and 100")
         return value
 
     @field_validator("upload_chunk_bytes")
