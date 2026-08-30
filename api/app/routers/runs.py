@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import hashlib
 import heapq
 import logging
@@ -46,10 +47,12 @@ from app.services.access_evidence import build_access_evidence_summary
 from app.services.audit import write_audit_event
 from app.services.queue import enqueue_ingest_job
 from app.services.storage import (
+    ArtifactStorageUnavailableError,
     abort_multipart_upload,
     complete_multipart_upload,
     create_multipart_upload,
     delete_object,
+    require_artifact_upload_capacity,
     upload_part,
 )
 from app.share_types import share_type_from_resource_type
@@ -1177,8 +1180,13 @@ def _write_enqueue_audit(
         _close_upload_session_quietly(db, run_id, "ingest enqueue audit")
 
 
-async def _run_critical_upload_step(func, *args):
-    """Let a bounded durable step finish before propagating cancellation."""
+async def _run_critical_upload_step(func, *args, cancellation_cleanup=None):
+    """Let a bounded durable step finish before propagating cancellation.
+
+    Some storage operations publish state before returning. Their optional
+    cancellation cleanup receives the completed result and runs durably before
+    the request cancellation becomes visible to the caller.
+    """
     task = asyncio.create_task(run_in_threadpool(func, *args))
     cancellation_requested = False
     while not task.done():
@@ -1192,6 +1200,8 @@ async def _run_critical_upload_step(func, *args):
     # logs retain the actual database failure. Cleanup is owned by the helper.
     result = task.result()
     if cancellation_requested:
+        if cancellation_cleanup is not None:
+            await _run_cleanup_in_threadpool(cancellation_cleanup, result)
         raise asyncio.CancelledError
     return result
 
@@ -1235,6 +1245,60 @@ async def _run_cleanup_in_threadpool(func, *args) -> None:
         logger.exception("artifact cleanup failed")
 
 
+def _raw_upload_content_length(request: Request) -> int | None:
+    raw_value = request.headers.get("content-length")
+    if raw_value is None:
+        return None
+    normalized = raw_value.strip()
+    if not normalized or not normalized.isascii() or not normalized.isdigit():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid Content-Length header",
+        )
+    return int(normalized)
+
+
+def _storage_upload_http_exception(
+    exc: OSError,
+    *,
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+) -> HTTPException:
+    reason = (
+        exc.reason
+        if isinstance(exc, ArtifactStorageUnavailableError)
+        else "filesystem_capacity_exhausted"
+        if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}
+        else "storage_io_error"
+    )
+    capacity_failure = reason in {
+        "low_free_space",
+        "insufficient_capacity_for_upload",
+        "filesystem_capacity_exhausted",
+    }
+    logger.warning(
+        "artifact_upload_storage_failure project_id=%s run_id=%s reason=%s error_type=%s",
+        project_id,
+        run_id,
+        reason,
+        type(exc).__name__,
+    )
+    if capacity_failure:
+        return HTTPException(
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+            detail=(
+                "artifact storage cannot accept this upload without crossing its configured "
+                "free-space reserve; free capacity or reduce the upload and retry"
+            ),
+            headers={"Retry-After": "30"},
+        )
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="artifact storage is temporarily unavailable; retry shortly",
+        headers={"Retry-After": "5"},
+    )
+
+
 async def _upload_artifact_stream(
     request: Request,
     file: UploadFile | None,
@@ -1245,7 +1309,12 @@ async def _upload_artifact_stream(
     chunk_bytes = settings.upload_chunk_bytes
     artifact_kind = _artifact_kind(content_type, key)
 
-    upload_id = await run_in_threadpool(create_multipart_upload, key, content_type)
+    upload_id = await _run_critical_upload_step(
+        create_multipart_upload,
+        key,
+        content_type,
+        cancellation_cleanup=lambda created_upload_id: abort_multipart_upload(key, created_upload_id),
+    )
     sha256 = hashlib.sha256()
     size = 0
     part_number = 1
@@ -1275,7 +1344,7 @@ async def _upload_artifact_stream(
                 payload = bytes(buffer)
                 buffer.clear()
 
-            etag = await run_in_threadpool(upload_part, key, upload_id, part_number, payload)
+            etag = await _run_critical_upload_step(upload_part, key, upload_id, part_number, payload)
             parts.append({"ETag": etag, "PartNumber": part_number})
             part_number += 1
 
@@ -1310,7 +1379,13 @@ async def _upload_artifact_stream(
             _validate_artifact_signature(artifact_kind, bytes(signature_buffer), final=True)
 
         await flush_parts(force=True)
-        await run_in_threadpool(complete_multipart_upload, key, upload_id, parts)
+        await _run_critical_upload_step(
+            complete_multipart_upload,
+            key,
+            upload_id,
+            parts,
+            cancellation_cleanup=lambda _result: delete_object(key),
+        )
         return size, sha256.hexdigest()
     except BaseException:
         await _run_cleanup_in_threadpool(abort_multipart_upload, key, upload_id)
@@ -1829,11 +1904,27 @@ async def upload_artifact(
     )
     filename = file.filename if file else _raw_artifact_filename(request)
     _validate_artifact_upload_headers(content_type, filename)
+    raw_content_length = _raw_upload_content_length(request) if file is None else None
+    if raw_content_length is not None and raw_content_length > settings.upload_max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="upload too large",
+        )
     suffix = _artifact_suffix(content_type, filename)
     key = _new_artifact_key(project_id, run_id, suffix)
     request_metadata = request_meta(request)
     started = time.perf_counter()
-    size, digest = await _upload_artifact_stream(request, file, key, content_type)
+    try:
+        if raw_content_length:
+            await run_in_threadpool(
+                require_artifact_upload_capacity,
+                additional_bytes=raw_content_length,
+            )
+        size, digest = await _upload_artifact_stream(request, file, key, content_type)
+    except ArtifactStorageUnavailableError as exc:
+        raise _storage_upload_http_exception(exc, project_id=project_id, run_id=run_id) from exc
+    except OSError as exc:
+        raise _storage_upload_http_exception(exc, project_id=project_id, run_id=run_id) from exc
     authoritative_run_id = await _run_critical_upload_step(
         _commit_uploaded_artifact,
         project_id,

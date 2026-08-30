@@ -25,6 +25,8 @@ HTTP_ERROR_CODES = {
     415: "unsupported_media_type",
     422: "validation_error",
     429: "rate_limited",
+    503: "service_unavailable",
+    507: "insufficient_storage",
 }
 
 

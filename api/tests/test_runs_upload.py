@@ -131,6 +131,114 @@ def test_upload_stream_aborts_when_request_task_is_cancelled(monkeypatch) -> Non
     assert aborted == [("projects/p/runs/r/artifact.ndjson", "upload-cancelled")]
 
 
+def test_upload_stream_cancellation_waits_for_created_upload_and_aborts_it(monkeypatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    aborted: list[tuple[str, str]] = []
+
+    def _create(*_args):
+        started.set()
+        release.wait(timeout=2)
+        return "upload-created-after-cancel"
+
+    monkeypatch.setattr(
+        runs_router,
+        "get_settings",
+        lambda: SimpleNamespace(upload_chunk_bytes=8 * 1024 * 1024, upload_max_bytes=1024 * 1024),
+    )
+    monkeypatch.setattr(runs_router, "create_multipart_upload", _create)
+    monkeypatch.setattr(runs_router, "abort_multipart_upload", lambda key, upload_id: aborted.append((key, upload_id)))
+
+    async def _exercise() -> None:
+        task = asyncio.create_task(_run_upload(_FakeUploadFile([b'{"type":"run_meta"}'])))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_exercise())
+    assert aborted == [("projects/p/runs/r/artifact.ndjson", "upload-created-after-cancel")]
+
+
+def test_upload_stream_cancellation_waits_for_part_then_aborts(monkeypatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    aborted: list[tuple[str, str]] = []
+
+    def _part(*_args):
+        started.set()
+        release.wait(timeout=2)
+        return "etag"
+
+    monkeypatch.setattr(
+        runs_router,
+        "get_settings",
+        lambda: SimpleNamespace(upload_chunk_bytes=8, upload_max_bytes=1024 * 1024),
+    )
+    monkeypatch.setattr(runs_router, "create_multipart_upload", lambda *_args: "upload-part-cancelled")
+    monkeypatch.setattr(runs_router, "upload_part", _part)
+    monkeypatch.setattr(runs_router, "abort_multipart_upload", lambda key, upload_id: aborted.append((key, upload_id)))
+
+    async def _exercise() -> None:
+        task = asyncio.create_task(_run_upload(_FakeUploadFile([b'{"type":"run_meta"}'])))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_exercise())
+    assert aborted == [("projects/p/runs/r/artifact.ndjson", "upload-part-cancelled")]
+
+
+def test_upload_stream_cancellation_removes_completed_artifact(monkeypatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    completed: list[str] = []
+    deleted: list[str] = []
+    aborted: list[tuple[str, str]] = []
+
+    def _complete(key, *_args):
+        started.set()
+        release.wait(timeout=2)
+        completed.append(key)
+
+    monkeypatch.setattr(
+        runs_router,
+        "get_settings",
+        lambda: SimpleNamespace(upload_chunk_bytes=8 * 1024 * 1024, upload_max_bytes=1024 * 1024),
+    )
+    monkeypatch.setattr(runs_router, "create_multipart_upload", lambda *_args: "upload-complete-cancelled")
+    monkeypatch.setattr(runs_router, "upload_part", lambda *_args: "etag")
+    monkeypatch.setattr(runs_router, "complete_multipart_upload", _complete)
+    monkeypatch.setattr(runs_router, "delete_object", lambda key: deleted.append(key))
+    monkeypatch.setattr(runs_router, "abort_multipart_upload", lambda key, upload_id: aborted.append((key, upload_id)))
+
+    async def _exercise() -> None:
+        task = asyncio.create_task(_run_upload(_FakeUploadFile([b'{"type":"run_meta"}'])))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_exercise())
+    key = "projects/p/runs/r/artifact.ndjson"
+    assert completed == [key]
+    assert deleted == [key]
+    assert aborted == [(key, "upload-complete-cancelled")]
+
+
 @pytest.mark.parametrize("chunks", [[b" " * 64, b"not-json"], [b" \r\n\t" * 20]])
 def test_upload_stream_rejects_payloads_hidden_behind_leading_whitespace(monkeypatch, chunks) -> None:
     aborted: list[tuple[str, str]] = []
@@ -168,6 +276,47 @@ def test_raw_artifact_filename_preserves_unambiguous_gzip_format() -> None:
 
     assert filename == "scan.JSON.GZ"
     assert runs_router._artifact_suffix("application/gzip", filename) == ".json.gz"
+
+
+@pytest.mark.parametrize("value", ["", "-1", "+1", "1.5", "1, 2", "not-a-number"])
+def test_raw_upload_content_length_rejects_malformed_values(value: str) -> None:
+    request = SimpleNamespace(headers={"content-length": value})
+
+    with pytest.raises(runs_router.HTTPException, match="invalid Content-Length") as exc:
+        runs_router._raw_upload_content_length(request)
+
+    assert exc.value.status_code == 400
+
+
+def test_raw_upload_content_length_accepts_bounded_decimal() -> None:
+    assert runs_router._raw_upload_content_length(SimpleNamespace(headers={"content-length": "001024"})) == 1024
+    assert runs_router._raw_upload_content_length(SimpleNamespace(headers={})) is None
+
+
+@pytest.mark.parametrize(
+    ("storage_error", "expected_status", "expected_retry"),
+    [
+        (runs_router.ArtifactStorageUnavailableError("low_free_space"), 507, "30"),
+        (runs_router.ArtifactStorageUnavailableError("insufficient_capacity_for_upload"), 507, "30"),
+        (OSError(28, "host path must not leak"), 507, "30"),
+        (runs_router.ArtifactStorageUnavailableError("capacity_lock_timeout"), 503, "5"),
+        (OSError(5, "host path must not leak"), 503, "5"),
+    ],
+)
+def test_storage_upload_errors_have_safe_recoverable_http_contract(
+    storage_error: OSError,
+    expected_status: int,
+    expected_retry: str,
+) -> None:
+    exc = runs_router._storage_upload_http_exception(
+        storage_error,
+        project_id=uuid.uuid4(),
+        run_id=uuid.uuid4(),
+    )
+
+    assert exc.status_code == expected_status
+    assert exc.headers == {"Retry-After": expected_retry}
+    assert "host path" not in str(exc.detail)
 
 
 @pytest.mark.parametrize(
@@ -748,6 +897,93 @@ def test_upload_preflight_closes_its_session_before_streaming(monkeypatch) -> No
 
     assert result["ok"] is True
     assert events == ["preflight-close", "stream"]
+
+
+def test_raw_upload_rejects_known_oversize_body_before_storage(monkeypatch) -> None:
+    called = False
+
+    async def _rate_limit(*_args, **_kwargs):
+        return None
+
+    async def _upload(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return 0, ""
+
+    monkeypatch.setattr(runs_router, "_preflight_artifact_upload", lambda *_args: None)
+    monkeypatch.setattr(runs_router, "_check_upload_rate_limit", _rate_limit)
+    monkeypatch.setattr(runs_router, "_upload_artifact_stream", _upload)
+    monkeypatch.setattr(
+        runs_router,
+        "get_settings",
+        lambda: SimpleNamespace(upload_max_bytes=10, redis_stream_retries=1),
+    )
+
+    with pytest.raises(runs_router.HTTPException, match="upload too large") as exc:
+        asyncio.run(
+            runs_router.upload_artifact(
+                project_id=uuid.uuid4(),
+                run_id=uuid.uuid4(),
+                request=SimpleNamespace(
+                    headers={
+                        "content-type": "application/x-ndjson",
+                        "content-length": "11",
+                    }
+                ),
+                file=None,
+                auth=SimpleNamespace(user_id=uuid.uuid4(), token_id=None),
+            )
+        )
+
+    assert exc.value.status_code == 413
+    assert called is False
+
+
+def test_raw_upload_capacity_precheck_returns_507_before_streaming(monkeypatch) -> None:
+    called = False
+
+    async def _rate_limit(*_args, **_kwargs):
+        return None
+
+    async def _upload(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return 0, ""
+
+    def _capacity(*, additional_bytes: int = 0):
+        assert additional_bytes == 8
+        raise runs_router.ArtifactStorageUnavailableError("insufficient_capacity_for_upload")
+
+    monkeypatch.setattr(runs_router, "_preflight_artifact_upload", lambda *_args: None)
+    monkeypatch.setattr(runs_router, "_check_upload_rate_limit", _rate_limit)
+    monkeypatch.setattr(runs_router, "_upload_artifact_stream", _upload)
+    monkeypatch.setattr(runs_router, "require_artifact_upload_capacity", _capacity)
+    monkeypatch.setattr(runs_router, "request_meta", lambda *_args: {})
+    monkeypatch.setattr(
+        runs_router,
+        "get_settings",
+        lambda: SimpleNamespace(upload_max_bytes=10, redis_stream_retries=1),
+    )
+
+    with pytest.raises(runs_router.HTTPException) as exc:
+        asyncio.run(
+            runs_router.upload_artifact(
+                project_id=uuid.uuid4(),
+                run_id=uuid.uuid4(),
+                request=SimpleNamespace(
+                    headers={
+                        "content-type": "application/x-ndjson",
+                        "content-length": "8",
+                    }
+                ),
+                file=None,
+                auth=SimpleNamespace(user_id=uuid.uuid4(), token_id=None),
+            )
+        )
+
+    assert exc.value.status_code == 507
+    assert exc.value.headers == {"Retry-After": "30"}
+    assert called is False
 
 
 @pytest.mark.parametrize("queued", [True, False])

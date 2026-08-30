@@ -1,5 +1,5 @@
 from app.main import app
-from fastapi import Query
+from fastapi import HTTPException, Query
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
@@ -23,6 +23,16 @@ def _ensure_error_contract_routes() -> None:
         @app.get("/_test/error-contract-unhandled", include_in_schema=False)
         def _unhandled_route() -> None:
             raise RuntimeError("sensitive internal context")
+
+    if "/_test/error-contract-storage" not in known_paths:
+
+        @app.get("/_test/error-contract-storage", include_in_schema=False)
+        def _storage_route(capacity: bool = False) -> None:
+            raise HTTPException(
+                status_code=507 if capacity else 503,
+                detail="storage unavailable",
+                headers={"Retry-After": "30" if capacity else "5"},
+            )
 
 
 def test_http_errors_keep_detail_and_add_traceable_error_contract() -> None:
@@ -85,3 +95,18 @@ def test_unhandled_errors_are_traceable_without_leaking_internal_context() -> No
     }
     assert response.headers["x-request-id"] == "internal-error-test"
     assert "sensitive internal context" not in response.text
+
+
+def test_storage_http_errors_use_stable_retryable_codes() -> None:
+    _ensure_error_contract_routes()
+    client = TestClient(app)
+
+    unavailable = client.get("/_test/error-contract-storage")
+    exhausted = client.get("/_test/error-contract-storage?capacity=true")
+
+    assert unavailable.status_code == 503
+    assert unavailable.headers["retry-after"] == "5"
+    assert unavailable.json()["error"]["code"] == "service_unavailable"
+    assert exhausted.status_code == 507
+    assert exhausted.headers["retry-after"] == "30"
+    assert exhausted.json()["error"]["code"] == "insufficient_storage"
