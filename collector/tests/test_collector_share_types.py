@@ -52,6 +52,159 @@ not-a-path value
     assert exports == ["/srv/public", "/srv/private"]
 
 
+def test_showmount_export_parser_bounds_count_and_path_size() -> None:
+    collector = _load_collector_module()
+    output = "/one host\n/two host\n/three host\n/" + ("x" * 32) + " host\n"
+
+    result = collector._parse_showmount_exports_bounded(output, max_exports=2, max_path_bytes=16)
+
+    assert result.exports == ("/one", "/two")
+    assert result.observed_export_lines == 4
+    assert result.truncated is True
+    assert set(result.limitations) == {"nfs_export_count_limit_reached", "nfs_export_path_limit_reached"}
+
+
+def test_bounded_process_drains_stdout_and_stderr_without_unbounded_retention() -> None:
+    collector = _load_collector_module()
+
+    result = collector._run_bounded_process(
+        [
+            sys.executable,
+            "-c",
+            "import os; os.write(1, b'x' * 200000); os.write(2, b'y' * 200000)",
+        ],
+        timeout=5,
+        stdout_limit=1024,
+        stderr_limit=2048,
+    )
+
+    assert result.returncode == 0
+    assert len(result.stdout) == 1024
+    assert len(result.stderr) == 2048
+    assert result.stdout_truncated is True
+    assert result.stderr_truncated is True
+
+
+def test_bounded_process_closes_inherited_output_pipes_without_hanging(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class BlockingPipe:
+        def __init__(self) -> None:
+            self.released = threading.Event()
+            self.close_calls = 0
+
+        def read(self, _size):
+            self.released.wait(5)
+            return b""
+
+        def close(self) -> None:
+            self.close_calls += 1
+            self.released.set()
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = BlockingPipe()
+            self.stderr = BlockingPipe()
+
+        def wait(self, *, timeout):  # noqa: ARG002
+            return 0
+
+        def kill(self) -> None:
+            raise AssertionError("completed process must not be killed")
+
+    process = FakeProcess()
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(collector, "NFS_SHOWMOUNT_PIPE_DRAIN_GRACE_SECONDS", 0.02)
+
+    result = collector._run_bounded_process(
+        ["showmount", "-e", "nfs.example"],
+        timeout=1,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    assert result.returncode == 0
+    assert process.stdout.close_calls >= 1
+    assert process.stderr.close_calls >= 1
+
+
+def test_bounded_process_fails_closed_when_output_pipe_cannot_be_released(monkeypatch) -> None:
+    collector = _load_collector_module()
+
+    class StubbornPipe:
+        def __init__(self) -> None:
+            self.released = threading.Event()
+            self.close_calls = 0
+
+        def read(self, _size):
+            self.released.wait(5)
+            return b""
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = StubbornPipe()
+            self.stderr = StubbornPipe()
+
+        def wait(self, *, timeout):  # noqa: ARG002
+            return 0
+
+        def kill(self) -> None:
+            raise AssertionError("completed process must not be killed")
+
+    process = FakeProcess()
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(collector, "NFS_SHOWMOUNT_PIPE_DRAIN_GRACE_SECONDS", 0.02)
+    try:
+        with pytest.raises(collector._BoundedProcessDrainError, match="safety bound"):
+            collector._run_bounded_process(
+                ["showmount", "-e", "nfs.example"],
+                timeout=1,
+                stdout_limit=1024,
+                stderr_limit=1024,
+            )
+    finally:
+        process.stdout.released.set()
+        process.stderr.released.set()
+
+    assert process.stdout.close_calls >= 1
+    assert process.stderr.close_calls >= 1
+
+
+def test_showmount_output_drain_failure_is_explicit_partial_evidence(monkeypatch) -> None:
+    collector = _load_collector_module()
+    monkeypatch.setattr(
+        collector,
+        "_run_bounded_process",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(collector._BoundedProcessDrainError("sensitive")),
+    )
+
+    discovery = collector._discover_nfs_exports("nfs.example", 1.0)
+
+    assert discovery.exports == ()
+    assert discovery.status == "output_drain_failed"
+    assert discovery.limitations == ("showmount_output_drain_failed",)
+    assert "sensitive" not in (discovery.detail or "")
+
+
+def test_showmount_output_truncation_is_explicit_partial_evidence(monkeypatch) -> None:
+    collector = _load_collector_module()
+    monkeypatch.setattr(
+        collector,
+        "_run_bounded_process",
+        lambda *_args, **_kwargs: collector._BoundedProcessResult(0, b"/srv/public host\n", b"", True, False),
+    )
+
+    discovery = collector._discover_nfs_exports("nfs.example", 1.0)
+
+    assert discovery.exports == ("/srv/public",)
+    assert discovery.status == "truncated"
+    assert discovery.stdout_truncated is True
+    assert "showmount_stdout_limit_reached" in discovery.limitations
+
+
 def test_nfs_v4_null_reply_confirms_protocol_without_claiming_authentication() -> None:
     collector = _load_collector_module()
     xid = 0x12345678
@@ -1331,6 +1484,78 @@ def test_scan_host_nfs_reports_v4_only_namespace_as_partial_without_overclaim(mo
     assert endpoint["auth"]["success"] is None
     assert stats.structural_coverage_gaps == 1
     assert stats.error_codes["NFS_V4_NAMESPACE_NOT_ENUMERATED"] == 1
+
+
+def test_scan_host_nfs_keeps_indeterminate_v4_probe_structurally_partial(monkeypatch) -> None:
+    collector = _load_collector_module()
+    records = []
+    monkeypatch.setattr(
+        collector,
+        "_probe_nfs_v4_null",
+        lambda *_args, **_kwargs: collector.NFSV4NullProbe("reachable", "indeterminate", "response_timeout"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_discover_nfs_exports",
+        lambda *_args, **_kwargs: collector.NFSExportDiscovery(("/legacy",), "complete", observed_export_lines=1),
+    )
+    stats = collector.Stats()
+
+    assert collector.scan_host_nfs(
+        "nfs-unknown.example",
+        SimpleNamespace(timeout=1.0, domain=""),
+        "run-nfs-unknown",
+        SimpleNamespace(emit=records.append),
+        stats,
+        threading.Lock(),
+    )
+
+    endpoint = next(record for record in records if record["type"] == "endpoint")
+    assert endpoint["nfs"]["structural_coverage"] == "partial"
+    assert endpoint["auth"]["success"] is None
+    assert stats.structural_coverage_gaps == 1
+    assert stats.error_codes["NFS_V4_PROBE_INDETERMINATE"] == 1
+    assert stats.error_codes["NFS_V4_NAMESPACE_NOT_ENUMERATED"] == 1
+
+
+def test_scan_host_nfs_marks_bounded_export_truncation_as_structural_gap(monkeypatch) -> None:
+    collector = _load_collector_module()
+    records = []
+    monkeypatch.setattr(
+        collector,
+        "_probe_nfs_v4_null",
+        lambda *_args, **_kwargs: collector.NFSV4NullProbe(
+            "reachable", "nfs_service_confirmed", "version_not_supported"
+        ),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_discover_nfs_exports",
+        lambda *_args, **_kwargs: collector.NFSExportDiscovery(
+            ("/retained",),
+            "truncated",
+            "bounded",
+            observed_export_lines=10_001,
+            exports_truncated=True,
+            limitations=("nfs_export_count_limit_reached",),
+        ),
+    )
+    stats = collector.Stats()
+
+    assert collector.scan_host_nfs(
+        "nfs-large.example",
+        SimpleNamespace(timeout=1.0, domain=""),
+        "run-nfs-large",
+        SimpleNamespace(emit=records.append),
+        stats,
+        threading.Lock(),
+    )
+
+    endpoint = next(record for record in records if record["type"] == "endpoint")
+    assert endpoint["nfs"]["export_discovery"]["exports_truncated"] is True
+    assert endpoint["nfs"]["structural_coverage"] == "partial"
+    assert stats.structural_coverage_gaps == 1
+    assert stats.error_codes["NFS_EXPORT_ENUM_TRUNCATED"] == 1
 
 
 def test_scan_host_smb_auth_failure_includes_actionable_hint(monkeypatch) -> None:

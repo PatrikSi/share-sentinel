@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import threading
 import time
 from contextlib import contextmanager
@@ -88,7 +89,9 @@ class SharePointStateStore:
     """SQLite-backed materialized metadata snapshots and staged delta checkpoints."""
 
     def __init__(self, path: str | Path, *, busy_timeout_seconds: float = 15.0) -> None:
-        self.path = Path(path).expanduser()
+        # Freeze the lexical location without resolving symlinks. A later
+        # component-by-component lstat can then reject redirected ancestors.
+        self.path = Path(os.path.abspath(Path(path).expanduser()))
         self.busy_timeout_seconds = max(0.1, float(busy_timeout_seconds))
         self._initialize_lock = threading.Lock()
         self._initialized = False
@@ -98,13 +101,7 @@ class SharePointStateStore:
             if self._initialized:
                 return
             try:
-                parent_existed = self.path.parent.exists()
-                self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                if os.name != "nt" and not parent_existed:
-                    os.chmod(self.path.parent, 0o700)
-                if not self.path.exists():
-                    descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                    os.close(descriptor)
+                self._prepare_state_path()
                 with self._connection() as conn:
                     conn.executescript(
                         """
@@ -237,8 +234,81 @@ class SharePointStateStore:
                 raise StateStoreError("unable to initialize SharePoint state database") from exc
             self._initialized = True
 
+    @staticmethod
+    def _validate_real_parent_chain(parent: Path) -> None:
+        absolute_parent = Path(os.path.abspath(parent))
+        current = Path(absolute_parent.anchor)
+        for component in absolute_parent.parts[1:]:
+            current /= component
+            try:
+                component_stat = os.lstat(current)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(component_stat.st_mode):
+                raise StateStoreError(
+                    "SharePoint state parent must be a real directory; existing ancestors must not be symlinks"
+                )
+            if not stat.S_ISDIR(component_stat.st_mode):
+                raise StateStoreError("SharePoint state parent chain must contain only directories")
+
+    def _prepare_state_path(self) -> None:
+        parent = self.path.parent
+        self._validate_real_parent_chain(parent)
+        try:
+            parent_stat = os.lstat(parent)
+        except FileNotFoundError:
+            parent.mkdir(parents=True, exist_ok=False, mode=0o700)
+            # Re-check the complete chain after creation so a symlink followed
+            # by mkdir cannot be accepted as a newly created private parent.
+            self._validate_real_parent_chain(parent)
+            parent_stat = os.lstat(parent)
+            if os.name != "nt":
+                os.chmod(parent, 0o700)
+                parent_stat = os.lstat(parent)
+        if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(parent_stat.st_mode):
+            raise StateStoreError("SharePoint state parent must be a real directory, not a symlink")
+        if os.name != "nt":
+            if parent_stat.st_uid != os.geteuid():
+                raise StateStoreError("SharePoint state parent must be owned by the current user")
+            if stat.S_IMODE(parent_stat.st_mode) & 0o022:
+                raise StateStoreError("SharePoint state parent must not be writable by group or other users")
+
+        try:
+            existing_stat = os.lstat(self.path)
+        except FileNotFoundError:
+            existing_stat = None
+        if existing_stat is not None:
+            if stat.S_ISLNK(existing_stat.st_mode):
+                raise StateStoreError("SharePoint state database must not be a symlink")
+            if not stat.S_ISREG(existing_stat.st_mode):
+                raise StateStoreError("SharePoint state database must be a regular file")
+            if os.name != "nt" and existing_stat.st_uid != os.geteuid():
+                raise StateStoreError("SharePoint state database must be owned by the current user")
+
+        flags = os.O_RDWR
+        if existing_stat is None:
+            flags |= os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self.path, flags, 0o600)
+        except OSError as exc:
+            raise StateStoreError("unable to open the protected SharePoint state database") from exc
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise StateStoreError("SharePoint state database must be a regular file")
+            if os.name != "nt":
+                if file_stat.st_uid != os.geteuid():
+                    raise StateStoreError("SharePoint state database must be owned by the current user")
+                if stat.S_IMODE(file_stat.st_mode) != 0o600:
+                    os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+
     @contextmanager
     def _connection(self):
+        self._validate_existing_state_files(require_database=True)
         conn = sqlite3.connect(
             self.path,
             timeout=self.busy_timeout_seconds,
@@ -257,17 +327,28 @@ class SharePointStateStore:
             self._protect_state_files()
 
     def _protect_state_files(self) -> None:
-        if os.name == "nt":
-            return
+        self._validate_existing_state_files(require_database=False, protect=True)
+
+    def _validate_existing_state_files(self, *, require_database: bool, protect: bool = False) -> None:
         for candidate in (
             self.path,
             Path(f"{self.path}-wal"),
             Path(f"{self.path}-shm"),
+            Path(f"{self.path}-journal"),
         ):
             try:
-                os.chmod(candidate, 0o600)
+                candidate_stat = os.lstat(candidate)
             except FileNotFoundError:
+                if require_database and candidate == self.path:
+                    raise StateStoreError("SharePoint state database disappeared before it could be opened")
                 continue
+            if stat.S_ISLNK(candidate_stat.st_mode) or not stat.S_ISREG(candidate_stat.st_mode):
+                raise StateStoreError("SharePoint state database and sidecars must be regular files, not symlinks")
+            if os.name != "nt":
+                if candidate_stat.st_uid != os.geteuid():
+                    raise StateStoreError("SharePoint state database and sidecars must be owned by the current user")
+                if protect and stat.S_IMODE(candidate_stat.st_mode) != 0o600:
+                    os.chmod(candidate, 0o600, follow_symlinks=False)
 
     def cleanup_stale_sessions(self, *, now: float | None = None) -> int:
         self.initialize()
@@ -676,12 +757,13 @@ class SharePointStateStore:
         tenant_id: str,
         site_id: str,
         drive_id: str,
+        require_complete: bool = True,
     ) -> int:
         self.initialize()
         key = (session_id, scope_key, tenant_id, site_id, drive_id)
         try:
             with self._connection() as conn:
-                pending = self._pending_row(conn, key)
+                pending = self._pending_row(conn, key, require_complete=require_complete)
                 if pending[1] == "full":
                     row = conn.execute(
                         """
@@ -857,13 +939,19 @@ class SharePointStateStore:
             raise StateStoreError("unable to stream SharePoint snapshot items") from exc
 
     @staticmethod
-    def _pending_row(conn: sqlite3.Connection, key: tuple[str, ...]) -> tuple[int, str, str, str]:
+    def _pending_row(
+        conn: sqlite3.Connection,
+        key: tuple[str, ...],
+        *,
+        require_complete: bool = True,
+    ) -> tuple[int, str, str, str]:
+        completion_clause = " AND complete = 1" if require_complete else ""
         row = conn.execute(
-            """
+            f"""
             SELECT base_version, sync_mode, delta_link, item_governance_observation
             FROM pending_syncs
             WHERE session_id = ? AND scope_key = ? AND tenant_id = ?
-              AND site_id = ? AND drive_id = ? AND complete = 1
+              AND site_id = ? AND drive_id = ?{completion_clause}
             """,
             key,
         ).fetchone()

@@ -4,6 +4,7 @@ import stat
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from sharepoint.auth import GraphTokenContext
@@ -173,6 +174,86 @@ def test_graph_cloud_partitions_delta_state() -> None:
     government_context = replace(global_context, cloud="gcc-high")
 
     assert state_scope_key(global_context) != state_scope_key(government_context)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX state ownership and mode contract")
+def test_state_rejects_symlink_database_without_chmodding_target(tmp_path) -> None:
+    target = tmp_path / "target.sqlite3"
+    target.write_bytes(b"not collector state")
+    target.chmod(0o640)
+    state_path = tmp_path / "state.sqlite3"
+    state_path.symlink_to(target)
+
+    with pytest.raises(StateStoreError, match="must not be a symlink"):
+        SharePointStateStore(state_path).initialize()
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+def test_state_rejects_symlink_parent(tmp_path) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked"
+    try:
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("directory symlinks are unavailable")
+
+    with pytest.raises(StateStoreError, match="parent must be a real directory"):
+        SharePointStateStore(linked_parent / "state.sqlite3").initialize()
+
+
+def test_state_rejects_symlink_in_existing_parent_ancestor(tmp_path) -> None:
+    real_ancestor = tmp_path / "real"
+    nested_parent = real_ancestor / "nested"
+    nested_parent.mkdir(parents=True)
+    linked_ancestor = tmp_path / "linked"
+    try:
+        linked_ancestor.symlink_to(real_ancestor, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("directory symlinks are unavailable")
+
+    with pytest.raises(StateStoreError, match="ancestors must not be symlinks"):
+        SharePointStateStore(linked_ancestor / "nested" / "state.sqlite3").initialize()
+
+    assert not (nested_parent / "state.sqlite3").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX state ownership and mode contract")
+def test_state_rejects_symlink_sidecar_without_touching_target(tmp_path) -> None:
+    state_path = tmp_path / "state.sqlite3"
+    state_path.touch(mode=0o600)
+    target = tmp_path / "unrelated"
+    target.write_text("leave me alone", encoding="utf-8")
+    target.chmod(0o640)
+    Path(f"{state_path}-wal").symlink_to(target)
+
+    with pytest.raises(StateStoreError, match="sidecars must be regular files"):
+        SharePointStateStore(state_path).initialize()
+
+    assert target.read_text(encoding="utf-8") == "leave me alone"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX state ownership and mode contract")
+def test_state_rejects_other_writable_parent_and_hardens_existing_database_mode(tmp_path) -> None:
+    protected_parent = tmp_path / "protected"
+    protected_parent.mkdir(mode=0o700)
+    state_path = protected_parent / "state.sqlite3"
+    state_path.touch(mode=0o644)
+
+    SharePointStateStore(state_path).initialize()
+
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+
+    unsafe_parent = tmp_path / "unsafe"
+    unsafe_parent.mkdir(mode=0o777)
+    unsafe_parent.chmod(0o777)
+    try:
+        with pytest.raises(StateStoreError, match="must not be writable by group or other users"):
+            SharePointStateStore(unsafe_parent / "state.sqlite3").initialize()
+    finally:
+        unsafe_parent.chmod(0o700)
 
 
 def test_version_one_state_is_invalidated_for_hierarchy_safe_full_resync(tmp_path) -> None:

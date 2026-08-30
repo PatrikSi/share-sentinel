@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from typing import Callable, Iterable, Protocol
 from urllib.parse import quote
 
-from .graph import GraphAPIError, GraphProtocolError
+from .graph import GraphAPIError, GraphAttemptBudget, GraphProtocolError
 
 PERMISSION_SEMANTICS = "sharepoint_graph_permission_v1"
 PERMISSION_SURFACE = "sharepoint_graph_permissions"
@@ -512,6 +512,7 @@ class DirectPermissionCollector:
         max_http_attempts: int,
         max_entries: int,
         concurrency: int,
+        attempt_budget: GraphAttemptBudget | None = None,
         on_error: Callable[[str, BaseException, PermissionSubject], None] | None = None,
     ) -> None:
         self.client = client
@@ -522,6 +523,7 @@ class DirectPermissionCollector:
         self.max_http_attempts = max(1, int(max_http_attempts))
         self.max_entries = max(1, int(max_entries))
         self.concurrency = max(1, int(concurrency))
+        self.attempt_budget = attempt_budget
         self.on_error = on_error
         self._lock = threading.Lock()
         self._counters = {
@@ -544,7 +546,14 @@ class DirectPermissionCollector:
         self._selection_partial_reasons: set[str] = set()
 
     def reserve_attempt(self) -> bool:
+        if self.attempt_budget is not None and not self.attempt_budget.reserve_attempt():
+            with self._lock:
+                self._circuit_reason = "budget_exhausted"
+            return False
         with self._lock:
+            # Standalone/test use retains the original local cap. Production
+            # supplies a scoped view of the single run-wide Graph budget, whose
+            # surface limit is configured to this same maximum.
             if self._counters["http_attempts"] >= self.max_http_attempts:
                 self._circuit_reason = "budget_exhausted"
                 return False

@@ -1,11 +1,12 @@
 import json
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 import requests
 from sharepoint.auth import ExistingTokenAuthProvider, GraphTokenContext
-from sharepoint.graph import GraphAPIError, GraphClient, GraphProtocolError, iter_values
+from sharepoint.graph import GraphAPIError, GraphClient, GraphProtocolError, GraphRunAttemptBudget, iter_values
 
 
 class StaticProvider:
@@ -167,6 +168,13 @@ def test_national_cloud_client_rejects_cross_cloud_continuation_and_token_contex
         ("https://attacker.example/collect", "unsafe_continuation_url"),
         ("http://graph.microsoft.com/v1.0/sites", "unsafe_continuation_url"),
         ("https://graph.microsoft.com/beta/sites", "unsafe_continuation_path"),
+        ("https://graph.microsoft.com/v1.0/../beta/sites", "unsafe_continuation_path"),
+        ("https://graph.microsoft.com/v1.0/%2e%2e/beta/sites", "unsafe_continuation_path"),
+        ("https://graph.microsoft.com/v1.0/%252e%252e/beta/sites", "unsafe_continuation_path"),
+        (
+            "https://graph.microsoft.com/v1.0/%252525252e%252525252e/beta/sites",
+            "unsafe_continuation_path",
+        ),
         ("https://graph.microsoft.com:444/v1.0/sites", "unsafe_continuation_url"),
     ],
 )
@@ -179,6 +187,16 @@ def test_continuation_links_cannot_exfiltrate_authorization(next_link: str, code
 
     assert exc.value.code == code
     assert len(session.calls) == 1
+
+
+def test_continuation_path_with_ambiguous_decode_depth_fails_closed() -> None:
+    client = _client(FakeSession([]))
+    deeply_encoded = "%" + ("25" * 16) + "41"
+
+    with pytest.raises(GraphProtocolError) as exc:
+        client.validate_continuation_url(f"https://graph.microsoft.com/v1.0/sites/{deeply_encoded}")
+
+    assert exc.value.code == "unsafe_continuation_path"
 
 
 def test_graph_429_respects_retry_after_then_succeeds() -> None:
@@ -244,6 +262,50 @@ def test_attempt_budget_counts_retries_and_pages_before_sending_http() -> None:
     assert page_error.value.code == "request_budget_exhausted"
     assert page_budget.used == 1
     assert len(page_session.calls) == 1
+
+
+def test_run_attempt_budget_is_thread_safe_and_enforces_atomic_surface_limits() -> None:
+    budget = GraphRunAttemptBudget(20)
+    permission_budget = budget.scoped("permissions", 7)
+    outcomes: list[bool] = []
+    lock = threading.Lock()
+
+    def reserve() -> None:
+        outcome = permission_budget.reserve_attempt()
+        with lock:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=reserve) for _ in range(30)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    snapshot = budget.snapshot()
+    assert outcomes.count(True) == 7
+    assert outcomes.count(False) == 23
+    assert snapshot.used == 7
+    assert snapshot.attempts_by_surface == {"permissions": 7}
+    assert snapshot.exhausted is True
+    assert snapshot.exhausted_surfaces == ("permissions",)
+
+
+def test_default_run_budget_counts_retries_and_stops_before_the_next_http_attempt() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(429, {"error": {"code": "tooManyRequests"}}, headers={"Retry-After": "0"}),
+            FakeResponse(200, {"value": []}),
+        ]
+    )
+    budget = GraphRunAttemptBudget(1)
+    client = _client(session, attempt_budget=budget)
+
+    with pytest.raises(GraphAPIError) as exc:
+        client.get("sites")
+
+    assert exc.value.code == "request_budget_exhausted"
+    assert len(session.calls) == 1
+    assert budget.snapshot().public_metadata()["exhausted"] is True
 
 
 def test_retry_after_beyond_operator_budget_fails_without_early_retry() -> None:

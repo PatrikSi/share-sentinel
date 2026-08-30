@@ -6,6 +6,7 @@ import collections
 import concurrent.futures
 import gzip
 import hashlib
+import io
 import ipaddress
 import itertools
 import json
@@ -3757,20 +3758,63 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def _parse_showmount_exports(output: str) -> list[str]:
+    return list(_parse_showmount_exports_bounded(output).exports)
+
+
+@dataclass(frozen=True)
+class _NFSExportParseResult:
+    exports: tuple[str, ...]
+    observed_export_lines: int
+    truncated: bool
+    limitations: tuple[str, ...]
+
+
+NFS_SHOWMOUNT_MAX_STDOUT_BYTES = 4 * 1024 * 1024
+NFS_SHOWMOUNT_MAX_STDERR_BYTES = 64 * 1024
+NFS_SHOWMOUNT_MAX_EXPORTS = 10_000
+NFS_SHOWMOUNT_MAX_EXPORT_PATH_BYTES = 4096
+NFS_SHOWMOUNT_MAX_ERROR_CHARACTERS = 4096
+NFS_SHOWMOUNT_PROCESS_EXIT_GRACE_SECONDS = 1.0
+NFS_SHOWMOUNT_PIPE_DRAIN_GRACE_SECONDS = 1.0
+
+
+def _parse_showmount_exports_bounded(
+    output: str,
+    *,
+    max_exports: int = NFS_SHOWMOUNT_MAX_EXPORTS,
+    max_path_bytes: int = NFS_SHOWMOUNT_MAX_EXPORT_PATH_BYTES,
+) -> _NFSExportParseResult:
     exports: list[str] = []
     seen: set[str] = set()
-    for raw_line in output.splitlines():
+    observed_export_lines = 0
+    truncated = False
+    limitations: set[str] = set()
+    for raw_line in io.StringIO(output):
         line = raw_line.strip()
         if not line or line.lower().startswith("exports list"):
             continue
         if not line.startswith("/"):
             continue
-        export_path = line.split()[0]
+        export_path = line.split(maxsplit=1)[0]
+        observed_export_lines += 1
+        if len(export_path.encode("utf-8", errors="replace")) > max_path_bytes:
+            truncated = True
+            limitations.add("nfs_export_path_limit_reached")
+            continue
         if export_path in seen:
+            continue
+        if len(exports) >= max_exports:
+            truncated = True
+            limitations.add("nfs_export_count_limit_reached")
             continue
         seen.add(export_path)
         exports.append(export_path)
-    return exports
+    return _NFSExportParseResult(
+        tuple(exports),
+        observed_export_lines,
+        truncated,
+        tuple(sorted(limitations)),
+    )
 
 
 @dataclass(frozen=True)
@@ -3778,6 +3822,24 @@ class NFSExportDiscovery:
     exports: tuple[str, ...]
     status: str
     detail: str | None = None
+    observed_export_lines: int = 0
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    exports_truncated: bool = False
+    limitations: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _BoundedProcessResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    stdout_truncated: bool
+    stderr_truncated: bool
+
+
+class _BoundedProcessDrainError(RuntimeError):
+    """Raised when child output pipes cannot be closed within the safety bound."""
 
 
 @dataclass(frozen=True)
@@ -3950,29 +4012,189 @@ def _classify_showmount_failure(detail: str) -> str:
     return "failed"
 
 
+def _run_bounded_process(
+    argv: list[str],
+    *,
+    timeout: float,
+    stdout_limit: int,
+    stderr_limit: int,
+) -> _BoundedProcessResult:
+    """Drain both child pipes concurrently while retaining only bounded bytes."""
+
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    results: dict[str, tuple[bytes, bool]] = {}
+
+    def drain(name: str, stream: object, limit: int) -> None:
+        retained = bytearray()
+        truncated = False
+        try:
+            while True:
+                chunk = stream.read(64 * 1024)  # type: ignore[attr-defined]
+                if not chunk:
+                    break
+                remaining = max(0, limit - len(retained))
+                if remaining:
+                    retained.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    truncated = True
+        except (OSError, ValueError):
+            truncated = True
+        finally:
+            try:
+                stream.close()  # type: ignore[attr-defined]
+            except (AttributeError, OSError, ValueError):
+                pass
+            results[name] = (bytes(retained), truncated)
+
+    stdout_thread = threading.Thread(
+        target=drain,
+        args=("stdout", process.stdout, max(0, int(stdout_limit))),
+        name="showmount-stdout",
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=drain,
+        args=("stderr", process.stderr, max(0, int(stderr_limit))),
+        name="showmount-stderr",
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    timed_out = False
+    termination_failed = False
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            returncode = process.wait(timeout=NFS_SHOWMOUNT_PROCESS_EXIT_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            termination_failed = True
+            returncode = -1
+
+    drain_threads = (stdout_thread, stderr_thread)
+    drain_deadline = time.monotonic() + NFS_SHOWMOUNT_PIPE_DRAIN_GRACE_SECONDS
+    for thread in drain_threads:
+        thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+
+    if any(thread.is_alive() for thread in drain_threads):
+        # A grandchild can inherit the pipe writer after showmount exits. Close
+        # our read handles to release blocked readers, but perform close in
+        # daemon helpers because BufferedReader.close() can itself wait on a
+        # read lock held by the drain thread.
+        close_threads: list[threading.Thread] = []
+
+        def close_stream(stream: object) -> None:
+            try:
+                stream.close()  # type: ignore[attr-defined]
+            except (AttributeError, OSError, ValueError):
+                pass
+
+        for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+            close_thread = threading.Thread(
+                target=close_stream,
+                args=(stream,),
+                name=f"showmount-{name}-closer",
+                daemon=True,
+            )
+            close_thread.start()
+            close_threads.append(close_thread)
+
+        close_deadline = time.monotonic() + NFS_SHOWMOUNT_PIPE_DRAIN_GRACE_SECONDS
+        for thread in (*close_threads, *drain_threads):
+            thread.join(timeout=max(0.0, close_deadline - time.monotonic()))
+
+    if any(thread.is_alive() for thread in drain_threads):
+        raise _BoundedProcessDrainError("showmount output pipes did not close within the safety bound")
+    if termination_failed:
+        raise _BoundedProcessDrainError("showmount did not exit after termination")
+    if timed_out:
+        raise subprocess.TimeoutExpired(argv, timeout)
+    stdout, stdout_truncated = results.get("stdout", (b"", True))
+    stderr, stderr_truncated = results.get("stderr", (b"", True))
+    return _BoundedProcessResult(
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+        stdout_truncated=stdout_truncated,
+        stderr_truncated=stderr_truncated,
+    )
+
+
+def _bounded_showmount_detail(raw: bytes, *, truncated: bool) -> str:
+    detail = raw.decode("utf-8", errors="replace").strip()
+    if len(detail) > NFS_SHOWMOUNT_MAX_ERROR_CHARACTERS:
+        detail = detail[: NFS_SHOWMOUNT_MAX_ERROR_CHARACTERS - 1] + "…"
+        truncated = True
+    if truncated:
+        suffix = " [output truncated by collector safety limit]"
+        detail = f"{detail}{suffix}" if detail else suffix.strip()
+    return detail
+
+
 def _discover_nfs_exports(host: str, timeout_seconds: float) -> NFSExportDiscovery:
     timeout = max(1.0, timeout_seconds * 4)
     try:
-        completed = subprocess.run(
+        completed = _run_bounded_process(
             ["showmount", "-e", host],
-            check=False,
-            capture_output=True,
-            text=True,
             timeout=timeout,
+            stdout_limit=NFS_SHOWMOUNT_MAX_STDOUT_BYTES,
+            stderr_limit=NFS_SHOWMOUNT_MAX_STDERR_BYTES,
         )
     except FileNotFoundError:
         return NFSExportDiscovery((), "tool_unavailable", "showmount is not available")
     except subprocess.TimeoutExpired:
         return NFSExportDiscovery((), "timed_out", "showmount timed out")
+    except _BoundedProcessDrainError:
+        return NFSExportDiscovery(
+            (),
+            "output_drain_failed",
+            "showmount output pipes did not close within the collector safety bound",
+            limitations=("showmount_output_drain_failed",),
+        )
     except OSError as exc:
         detail = _error_detail(exc)
         return NFSExportDiscovery((), _classify_showmount_failure(detail), detail)
 
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or f"showmount exit code {completed.returncode}"
+        detail = (
+            _bounded_showmount_detail(
+                completed.stderr or completed.stdout,
+                truncated=completed.stderr_truncated if completed.stderr else completed.stdout_truncated,
+            )
+            or f"showmount exit code {completed.returncode}"
+        )
         return NFSExportDiscovery((), _classify_showmount_failure(detail), detail)
 
-    return NFSExportDiscovery(tuple(_parse_showmount_exports(completed.stdout)), "complete")
+    stdout = completed.stdout.decode("utf-8", errors="replace")
+    parsed = _parse_showmount_exports_bounded(stdout)
+    limitations = set(parsed.limitations)
+    if completed.stdout_truncated:
+        limitations.add("showmount_stdout_limit_reached")
+    if completed.stderr_truncated:
+        limitations.add("showmount_stderr_limit_reached")
+    truncated = bool(parsed.truncated or completed.stdout_truncated or completed.stderr_truncated)
+    return NFSExportDiscovery(
+        parsed.exports,
+        "truncated" if truncated else "complete",
+        "showmount export evidence exceeded a collector safety limit" if truncated else None,
+        observed_export_lines=parsed.observed_export_lines,
+        stdout_truncated=completed.stdout_truncated,
+        stderr_truncated=completed.stderr_truncated,
+        exports_truncated=parsed.truncated,
+        limitations=tuple(sorted(limitations)),
+    )
 
 
 def _error_detail(exc: BaseException) -> str:
@@ -5190,12 +5412,17 @@ def scan_host_nfs(
     if discovery.status == "complete" and service_status != "nfs_v4_confirmed":
         service_status = "nfs_advertisement_confirmed"
 
-    v4_namespace_unassessed = protocol_probe.status == "supported"
+    # Only an authoritative NFS program version range that excludes v4 lets
+    # legacy export enumeration stand as the available namespace view. Every
+    # supported or indeterminate v4 response leaves its pseudo-filesystem
+    # unenumerated and must keep structural comparison partial.
+    v4_namespace_unassessed = protocol_probe.status != "version_not_supported"
     structural_coverage = "advertised_exports_only" if discovery.status == "complete" else "partial"
     limitations = ["access_not_assessed", "content_not_enumerated", "exports_are_advertisements_only"]
     if v4_namespace_unassessed:
         structural_coverage = "partial"
         limitations.append("nfs_v4_pseudofilesystem_not_enumerated")
+    limitations.extend(discovery.limitations)
 
     writer.emit(
         {
@@ -5214,9 +5441,19 @@ def scan_host_nfs(
                     "method": "showmount_exports",
                     "status": discovery.status,
                     "export_count": len(discovery.exports),
+                    "observed_export_lines": discovery.observed_export_lines,
+                    "stdout_truncated": discovery.stdout_truncated,
+                    "stderr_truncated": discovery.stderr_truncated,
+                    "exports_truncated": discovery.exports_truncated,
+                    "limits": {
+                        "stdout_bytes": NFS_SHOWMOUNT_MAX_STDOUT_BYTES,
+                        "stderr_bytes": NFS_SHOWMOUNT_MAX_STDERR_BYTES,
+                        "exports": NFS_SHOWMOUNT_MAX_EXPORTS,
+                        "export_path_bytes": NFS_SHOWMOUNT_MAX_EXPORT_PATH_BYTES,
+                    },
                 },
                 "structural_coverage": structural_coverage,
-                "limitations": limitations,
+                "limitations": list(dict.fromkeys(limitations)),
             },
             "auth": {
                 "method": "not_assessed",
@@ -5252,6 +5489,13 @@ def scan_host_nfs(
                 "the NFSv4 pseudo-filesystem remains unenumerated."
             )
             hint = "Supply known export paths to a separate read-only mount assessment; showmount cannot enumerate NFSv4-only namespaces."
+        elif discovery.status == "truncated":
+            code = "NFS_EXPORT_ENUM_TRUNCATED"
+            message = (
+                f"Advertised NFS export enumeration on {host} exceeded a collector safety limit; "
+                f"{len(discovery.exports)} bounded export record(s) were retained."
+            )
+            hint = "Split assessment scope or review the reported showmount/export limits before raising them in code."
         else:
             code = "NFS_EXPORT_ENUM_FAILED"
             detail = discovery.detail or discovery.status
@@ -5270,10 +5514,16 @@ def scan_host_nfs(
         with lock:
             stats.structural_coverage_gaps += 1
     elif v4_namespace_unassessed:
-        message = (
-            f"NFSv4 is available on {host}:2049; showmount covers only advertised legacy exports and "
-            "cannot prove the NFSv4 namespace is complete."
-        )
+        if protocol_probe.status == "supported":
+            message = (
+                f"NFSv4 is available on {host}:2049; showmount covers only advertised legacy exports and "
+                "cannot prove the NFSv4 namespace is complete."
+            )
+        else:
+            message = (
+                f"The NFSv4 probe on {host}:2049 was indeterminate; successful legacy export discovery "
+                "cannot rule out an unenumerated NFSv4 pseudo-filesystem."
+            )
         _emit_error(
             writer,
             run_id,

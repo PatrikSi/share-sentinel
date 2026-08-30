@@ -31,6 +31,10 @@ from sharepoint.auth import (
     token_reader_from_stdin,
 )
 from sharepoint.collection import (
+    DEFAULT_MAX_GRAPH_HTTP_ATTEMPTS,
+    DEFAULT_MAX_ITEMS,
+    DEFAULT_MAX_LIBRARIES,
+    DEFAULT_MAX_SITES,
     SITE_TARGET_MAX_BYTES,
     SharePointCollectionConfig,
     SharePointCollector,
@@ -39,7 +43,7 @@ from sharepoint.collection import (
     collection_context_record,
     collection_dimension_completeness,
 )
-from sharepoint.graph import GraphAPIError, GraphClient
+from sharepoint.graph import GraphAPIError, GraphClient, GraphRunAttemptBudget
 from sharepoint.state import (
     SharePointStateStore,
     StateConflictError,
@@ -61,6 +65,7 @@ MAX_TARGETED_SITE_BYTES = 24 * 1024
 MAX_PERMISSION_OBJECTS_HARD_LIMIT = 1_000_000
 MAX_PERMISSION_HTTP_ATTEMPTS_HARD_LIMIT = 5_000_000
 MAX_PERMISSION_ENTRIES_HARD_LIMIT = 5_000_000
+MAX_GRAPH_HTTP_ATTEMPTS_HARD_LIMIT = 10_000_000
 
 
 def _terminal_safe(value: object, maximum: int = 4096) -> str:
@@ -220,23 +225,50 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="perform a safe replacement full sync without deleting working state up front",
     )
-    parser.add_argument(
+    site_limit_group = parser.add_mutually_exclusive_group()
+    site_limit_group.add_argument(
         "--max-sites",
-        type=_non_negative_int,
-        default=0,
-        help="maximum discovered sites (0 means unlimited; default: 0)",
+        type=_positive_int,
+        default=DEFAULT_MAX_SITES,
+        help=f"maximum discovered sites (default: {DEFAULT_MAX_SITES})",
     )
-    parser.add_argument(
+    site_limit_group.add_argument(
+        "--unlimited-sites",
+        action="store_const",
+        const=0,
+        default=DEFAULT_MAX_SITES,
+        dest="max_sites",
+        help="explicitly disable the site-count guard; the Graph request budget still applies",
+    )
+    library_limit_group = parser.add_mutually_exclusive_group()
+    library_limit_group.add_argument(
         "--max-libraries",
-        type=_non_negative_int,
-        default=0,
-        help="maximum discovered document libraries (0 means unlimited; default: 0)",
+        type=_positive_int,
+        default=DEFAULT_MAX_LIBRARIES,
+        help=f"maximum discovered document libraries (default: {DEFAULT_MAX_LIBRARIES})",
     )
-    parser.add_argument(
+    library_limit_group.add_argument(
+        "--unlimited-libraries",
+        action="store_const",
+        const=0,
+        default=DEFAULT_MAX_LIBRARIES,
+        dest="max_libraries",
+        help="explicitly disable the library-count guard; the Graph request budget still applies",
+    )
+    item_limit_group = parser.add_mutually_exclusive_group()
+    item_limit_group.add_argument(
         "--max-items",
-        type=_non_negative_int,
-        default=0,
-        help="maximum materialized items per run (0 means unlimited; default: 0)",
+        type=_positive_int,
+        default=DEFAULT_MAX_ITEMS,
+        help=f"maximum materialized items per run (default: {DEFAULT_MAX_ITEMS})",
+    )
+    item_limit_group.add_argument(
+        "--unlimited-items",
+        action="store_const",
+        const=0,
+        default=DEFAULT_MAX_ITEMS,
+        dest="max_items",
+        help="explicitly disable the item-count guard; artifact and Graph request guards still apply",
     )
     parser.add_argument(
         "--permissions",
@@ -276,6 +308,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=100_000,
         help="maximum pages in each Microsoft Graph paging sequence (default: 100000)",
+    )
+    parser.add_argument(
+        "--max-graph-http-attempts",
+        type=_positive_int,
+        default=DEFAULT_MAX_GRAPH_HTTP_ATTEMPTS,
+        help=(
+            "run-wide Graph HTTP-attempt budget including retries and permission requests "
+            f"(default: {DEFAULT_MAX_GRAPH_HTTP_ATTEMPTS})"
+        ),
     )
     parser.add_argument(
         "--graph-concurrency",
@@ -380,6 +421,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     if args.max_permission_entries > MAX_PERMISSION_ENTRIES_HARD_LIMIT:
         raise TokenAcquisitionError(f"--max-permission-entries cannot exceed {MAX_PERMISSION_ENTRIES_HARD_LIMIT}")
+    if args.max_graph_http_attempts > MAX_GRAPH_HTTP_ATTEMPTS_HARD_LIMIT:
+        raise TokenAcquisitionError(f"--max-graph-http-attempts cannot exceed {MAX_GRAPH_HTTP_ATTEMPTS_HARD_LIMIT}")
     if args.no_files and args.permissions == "all_items":
         raise TokenAcquisitionError("--permissions all_items cannot be combined with --no-files")
     if len(args.site) > MAX_TARGETED_SITES:
@@ -602,6 +645,7 @@ def run(args: argparse.Namespace) -> int:
         max_sites=args.max_sites,
         max_libraries=args.max_libraries,
         max_items=args.max_items,
+        max_graph_http_attempts=args.max_graph_http_attempts,
         concurrency=args.graph_concurrency,
         permissions=args.permissions,
         max_permission_objects=args.max_permission_objects,
@@ -611,6 +655,12 @@ def run(args: argparse.Namespace) -> int:
         quiet=args.quiet,
         verbosity=args.verbose,
         progress_interval=args.progress_interval,
+    )
+    graph_attempt_budget = GraphRunAttemptBudget(args.max_graph_http_attempts)
+    permission_attempt_budget = (
+        graph_attempt_budget.scoped("permissions", args.max_permission_http_attempts)
+        if args.permissions != "none"
+        else None
     )
     client = GraphClient(
         provider,
@@ -622,6 +672,7 @@ def run(args: argparse.Namespace) -> int:
         max_response_bytes=args.max_response_bytes,
         max_pages=args.max_pages,
         initial_token_context=context,
+        attempt_budget=graph_attempt_budget,
     )
     state = SharePointStateStore(args.state_path)
     state.initialize()
@@ -655,6 +706,7 @@ def run(args: argparse.Namespace) -> int:
         status="running",
         sync_mode="none",
         partial=False,
+        graph_attempt_summary=graph_attempt_budget.snapshot().public_metadata(),
     )
     collection_details = {
         "target_scope": {
@@ -664,6 +716,7 @@ def run(args: argparse.Namespace) -> int:
             "max_sites": args.max_sites,
             "max_libraries": args.max_libraries,
             "max_items": args.max_items,
+            "max_graph_http_attempts": args.max_graph_http_attempts,
         },
         "enumeration": {
             "graph_concurrency": args.graph_concurrency,
@@ -719,6 +772,7 @@ def run(args: argparse.Namespace) -> int:
         config=config,
         stats=stats,
         progress=progress,
+        permission_attempt_budget=permission_attempt_budget,
     )
     finalized = False
     staging_resolved = False
@@ -726,6 +780,9 @@ def run(args: argparse.Namespace) -> int:
     try:
         pending_drives, status = collector.collect()
         final_stats = stats.snapshot()
+        graph_attempt_summary = graph_attempt_budget.snapshot().public_metadata()
+        final_stats["graph_http_attempts"] = graph_attempt_summary["http_attempts"]
+        final_stats["graph_attempt_budget_exhausted"] = graph_attempt_summary["exhausted"]
         structural_complete, content_complete = collection_dimension_completeness(
             final_stats,
             config,
@@ -738,6 +795,7 @@ def run(args: argparse.Namespace) -> int:
             sync_mode=collector.sync_mode,
             partial=status == "partial",
             permission_summary=getattr(collector, "permission_run_summary", None),
+            graph_attempt_summary=graph_attempt_summary,
             structural_complete=structural_complete,
             content_complete=content_complete,
         )

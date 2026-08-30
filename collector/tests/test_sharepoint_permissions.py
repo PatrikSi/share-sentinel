@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from sharepoint.graph import GraphAPIError
+from sharepoint.graph import GraphAPIError, GraphRunAttemptBudget
 from sharepoint.permissions import DirectPermissionCollector, PermissionSubject
 
 
@@ -479,6 +479,30 @@ def test_object_and_http_attempt_budgets_stop_new_graph_work() -> None:
     assert root.permission_summary["error_code"] == "PERMISSION_HTTP_BUDGET_EXHAUSTED"
     assert http_collector.snapshot()["http_attempts"] == 1
     assert http_collector.snapshot()["request_coverage"] == "partial"
+
+
+def test_permission_attempts_charge_the_shared_run_budget_and_surface_sub_limit() -> None:
+    run_budget = GraphRunAttemptBudget(10)
+    permission_budget = run_budget.scoped("permissions", 1)
+    collector = _collector(
+        FakePermissionClient(pages=[{"value": []}, {"value": []}]),
+        max_http_attempts=1,
+        attempt_budget=permission_budget,
+    )
+
+    result = collector.assess_item(
+        _subject(),
+        base_exposure="UNKNOWN",
+        base_evidence={},
+    )
+
+    assert result.assessment_state == "partial"
+    assert result.permission_summary["failure_reason"] == "budget_exhausted"
+    assert collector.snapshot()["http_attempts"] == 1
+    budget_snapshot = run_budget.snapshot()
+    assert budget_snapshot.used == 1
+    assert budget_snapshot.attempts_by_surface == {"permissions": 1}
+    assert budget_snapshot.exhausted_surfaces == ("permissions",)
 
 
 def test_upstream_selection_failure_makes_run_coverage_partial_without_fabricated_objects() -> None:

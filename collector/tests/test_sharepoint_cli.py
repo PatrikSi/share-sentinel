@@ -152,10 +152,16 @@ def test_cli_builds_certificate_provider_without_exposing_passphrase(monkeypatch
     assert "conflicting-secret" not in str(exc.value)
 
 
-def test_cli_help_describes_unlimited_safety_limits_and_page_default() -> None:
+def test_cli_help_describes_finite_defaults_explicit_unlimited_flags_and_request_budget() -> None:
     help_text = " ".join(cli.build_parser().format_help().split())
 
-    assert help_text.count("0 means unlimited") == 3
+    assert "maximum discovered sites (default: 10000)" in help_text
+    assert "maximum discovered document libraries (default: 50000)" in help_text
+    assert "maximum materialized items per run (default: 2000000)" in help_text
+    assert "--unlimited-sites" in help_text
+    assert "--unlimited-libraries" in help_text
+    assert "--unlimited-items" in help_text
+    assert "run-wide Graph HTTP-attempt budget including retries and permission requests (default: 250000)" in help_text
     assert "maximum pages in each Microsoft Graph paging sequence (default: 100000)" in help_text
     assert "concurrent document-library scans (1-16; default: 4)" in help_text
     assert "connection timeout in seconds (default: 10)" in help_text
@@ -166,6 +172,18 @@ def test_cli_help_describes_unlimited_safety_limits_and_page_default() -> None:
     assert "repeat for additional diagnostics" in help_text
     assert "suppress authentication, progress, and final summary output" in help_text
     assert "minimum seconds between progress reports (0 disables; default: 5)" in help_text
+
+
+def test_cli_defaults_are_finite_and_unlimited_inventory_requires_explicit_flags() -> None:
+    defaults = cli.parse_args(["--auth", "token"])
+    unlimited = cli.parse_args(["--auth", "token", "--unlimited-sites", "--unlimited-libraries", "--unlimited-items"])
+
+    assert (defaults.max_sites, defaults.max_libraries, defaults.max_items) == (10_000, 50_000, 2_000_000)
+    assert defaults.max_graph_http_attempts == 250_000
+    assert (unlimited.max_sites, unlimited.max_libraries, unlimited.max_items) == (0, 0, 0)
+
+    with pytest.raises(TokenAcquisitionError, match="--max-graph-http-attempts cannot exceed"):
+        cli.parse_args(["--auth", "token", "--max-graph-http-attempts", "10000001"])
 
 
 def test_sharepoint_cli_requires_explicit_gzip_flag_for_gzip_suffix() -> None:

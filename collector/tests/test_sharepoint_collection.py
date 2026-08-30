@@ -31,7 +31,7 @@ from sharepoint.collection import (
     normalize_drive_item,
     resolve_target_site,
 )
-from sharepoint.graph import GraphAPIError, GraphProtocolError
+from sharepoint.graph import GraphAPIError, GraphProtocolError, GraphRunAttemptBudget
 from sharepoint.permissions import PERMISSION_SELECT
 from sharepoint.state import SharePointStateStore
 
@@ -316,6 +316,23 @@ def test_dimension_completeness_keeps_permission_failures_independent() -> None:
     }
 
 
+def test_permission_completeness_never_overrides_partial_structural_coverage() -> None:
+    context = collection_context_record(
+        _context(delegated=False),
+        SharePointCollectionConfig(permissions="library_roots"),
+        status="partial",
+        sync_mode="full",
+        partial=True,
+        structural_complete=False,
+        content_complete=False,
+        permission_summary={"request_coverage": "complete", "completed_objects": 1},
+    )
+
+    assert context["metadata"]["structural_complete"] is False
+    assert context["metadata"]["permissions_assessed"] is True
+    assert context["metadata"]["permissions_complete"] is False
+
+
 @pytest.mark.parametrize(
     ("stats", "expected"),
     [
@@ -411,6 +428,11 @@ def test_target_site_uses_authoritative_graph_archive_status() -> None:
         "https://contoso.sharepoint.com/sites/Finance#section",
         "https://example.com/sites/Finance",
         "https://contoso.sharepoint.com/sites/Bad%ZZ",
+        "https://contoso.sharepoint.com/sites/../Admin",
+        "https://contoso.sharepoint.com/sites/%2e%2e/Admin",
+        "https://contoso.sharepoint.com/sites/%252e%252e/Admin",
+        "https://contoso.sharepoint.com/sites/%252525252e%252525252e/Admin",
+        "https://contoso.sharepoint.com/sites/%25252e%25252e%25252fAdmin",
         "https://contoso.sharepoint.com/" + ("x" * 8192),
     ],
 )
@@ -697,7 +719,7 @@ def test_drive_search_reports_document_library_without_site_identity() -> None:
     assert errors[0].code == "search_hit_missing_site_identity"
 
 
-def test_drive_search_stops_immediately_at_site_limit() -> None:
+def test_drive_search_exact_site_limit_is_not_falsely_marked_truncated() -> None:
     site_id = "contoso.sharepoint.com,site-one,web-one"
     client = FakeClient(
         {
@@ -706,7 +728,7 @@ def test_drive_search_stops_immediately_at_site_limit() -> None:
                     {
                         "hitsContainers": [
                             {
-                                "moreResultsAvailable": True,
+                                "moreResultsAvailable": False,
                                 "hits": [
                                     {
                                         "resource": {
@@ -731,8 +753,53 @@ def test_drive_search_stops_immediately_at_site_limit() -> None:
     )
 
     assert [site.site_id for site in sites] == [site_id]
-    assert truncated is True
+    assert truncated is False
     assert [method for method, _url in client.calls].count("post") == 1
+
+
+def test_drive_search_marks_truncated_only_after_observing_an_additional_unique_site() -> None:
+    first_site_id = "contoso.sharepoint.com,site-one,web-one"
+    omitted_site_id = "contoso.sharepoint.com,site-two,web-two"
+    client = FakeClient(
+        {
+            "search/query": {
+                "value": [
+                    {
+                        "hitsContainers": [
+                            {
+                                "moreResultsAvailable": False,
+                                "hits": [
+                                    {
+                                        "resource": {
+                                            "driveType": "documentLibrary",
+                                            "parentReference": {"siteId": first_site_id},
+                                        }
+                                    },
+                                    {
+                                        "resource": {
+                                            "driveType": "documentLibrary",
+                                            "parentReference": {"siteId": omitted_site_id},
+                                        }
+                                    },
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            },
+            f"sites/{first_site_id}?$select={SITE_SELECT}": {**_site(), "id": first_site_id},
+        }
+    )
+
+    sites, truncated = discover_sites(
+        client,
+        _context(),
+        SharePointCollectionConfig(discovery="drive-search", max_sites=1),
+    )
+
+    assert [site.site_id for site in sites] == [first_site_id]
+    assert truncated is True
+    assert not any(omitted_site_id in url for _method, url in client.calls)
 
 
 def test_malformed_site_identity_is_skipped_without_inventing_one() -> None:
@@ -1360,6 +1427,8 @@ def test_drive_and_item_governance_selects_fall_back_without_losing_core_invento
     item = next(record for record in writer.records if record["type"] == "item")
     assert resource["metadata"]["governance_observation"] == "unavailable_unsupported_select"
     assert resource["metadata"]["owner_observation"] == "unavailable_unsupported_select"
+    assert resource["metadata"]["system_managed"] is None
+    assert resource["metadata"]["system_observation"] == "unavailable_unsupported_select"
     assert resource["metadata"]["item_governance_observation"] == "unavailable_unsupported_select"
     assert resource["metadata"]["item_governance_limitations"] == ["optional_graph_governance_select_rejected"]
     assert item["name"] == "a.txt"
@@ -1622,6 +1691,89 @@ def test_rejected_library_does_not_consume_run_item_budget(tmp_path) -> None:
     assert final_resources["Malformed"]["metadata"]["collection_complete"] is False
     assert final_resources["Healthy"]["metadata"]["collection_complete"] is True
     assert collector.stats.truncated is False
+
+
+def test_run_graph_budget_exhaustion_is_partial_and_withholds_affected_checkpoint(tmp_path) -> None:
+    budget = GraphRunAttemptBudget(3)
+
+    class RunBudgetClient(FakeClient):
+        def iter_pages(self, url: str, *, attempt_budget=None):
+            yield from super().iter_pages(url, attempt_budget=attempt_budget or budget)
+
+        def get(self, url: str, *, attempt_budget=None):
+            return super().get(url, attempt_budget=attempt_budget or budget)
+
+    routes = _routes([{"value": [_file("a", "a.txt")], "@odata.deltaLink": DELTA_1}])
+    state = SharePointStateStore(tmp_path / "state.sqlite3")
+    writer = MemoryWriter()
+    collector = SharePointCollector(
+        client=RunBudgetClient(routes),
+        state=state,
+        writer=writer,
+        run_id="run-budget-exhausted",
+        context=_context(),
+        config=SharePointCollectionConfig(concurrency=2, quiet=True, max_graph_http_attempts=3),
+    )
+
+    pending, status = collector.collect()
+
+    assert status == "partial"
+    assert pending == []
+    assert budget.snapshot().exhausted is True
+    assert any(record.get("code") == "LIBRARY_REQUEST_BUDGET_EXHAUSTED" for record in writer.records)
+    assert state.get_drive_state(collector.scope_key, "tenant-1", SITE_ID, "drive-1").delta_link is None
+
+
+def test_finite_item_budget_preserves_parallel_library_collection(tmp_path) -> None:
+    drives = [_drive("drive-1", "One"), _drive("drive-2", "Two")]
+    routes = _routes([], drives=drives)
+    for drive in drives:
+        drive_id = drive["id"]
+        routes[f"drives/{drive_id}/root/delta?$select={ITEM_SELECT}"] = [
+            {
+                "value": [_file(f"item-{drive_id}", f"{drive_id}.txt")],
+                "@odata.deltaLink": f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/delta?token=1",
+            }
+        ]
+
+    class ConcurrentDriveClient(FakeClient):
+        def __init__(self, configured_routes):
+            super().__init__(configured_routes)
+            self.barrier = threading.Barrier(2)
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def iter_pages(self, url: str, *, attempt_budget=None):
+            if not url.startswith("drives/"):
+                yield from super().iter_pages(url, attempt_budget=attempt_budget)
+                return
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                self.barrier.wait(timeout=3)
+                yield from super().iter_pages(url, attempt_budget=attempt_budget)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    client = ConcurrentDriveClient(routes)
+    state = SharePointStateStore(tmp_path / "state.sqlite3")
+    collector = SharePointCollector(
+        client=client,
+        state=state,
+        writer=MemoryWriter(),
+        run_id="run-concurrent-budget",
+        context=_context(),
+        config=SharePointCollectionConfig(max_items=10, concurrency=2, quiet=True),
+    )
+
+    pending, status = collector.collect()
+
+    assert status == "success"
+    assert len(pending) == 2
+    assert client.max_active == 2
 
 
 def test_site_limit_marks_app_discovery_non_authoritative() -> None:

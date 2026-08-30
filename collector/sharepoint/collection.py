@@ -12,7 +12,7 @@ from typing import Iterable, Iterator, Protocol
 from urllib.parse import quote, unquote, urlparse
 
 from .auth import GraphTokenContext
-from .graph import GraphAPIError, GraphClient, GraphProtocolError
+from .graph import GraphAPIError, GraphAttemptBudget, GraphClient, GraphProtocolError
 from .permissions import (
     DirectPermissionCollector,
     PermissionAssessmentResult,
@@ -40,6 +40,7 @@ PROVIDER_ID_MAX_CHARACTERS = 512
 METADATA_TEXT_MAX_CHARACTERS = 4096
 SHAREPOINT_HOST_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.sharepoint\.com$")
 INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+MAX_PATH_DECODE_PASSES = 16
 GRAPH_ARCHIVE_STATUS = {
     "recentlyArchived": "recently_archived",
     "fullyArchived": "fully_archived",
@@ -52,6 +53,10 @@ GRAPH_FILE_ARCHIVE_STATUS = {
 }
 SHAREPOINT_STRUCTURAL_COMPARISON_CONTRACT = "sharepoint_resource_inventory_v1"
 SHAREPOINT_CONTENT_COMPARISON_CONTRACT = "sharepoint_drive_inventory_v1"
+DEFAULT_MAX_SITES = 10_000
+DEFAULT_MAX_LIBRARIES = 50_000
+DEFAULT_MAX_ITEMS = 2_000_000
+DEFAULT_MAX_GRAPH_HTTP_ATTEMPTS = 250_000
 
 
 def _terminal_safe(value: object, maximum: int = 4096) -> str:
@@ -125,7 +130,7 @@ class Drive:
     last_modified_by_observation: str = "not_returned"
     quota: dict[str, object] | None = None
     quota_observation: str = "not_returned"
-    system_managed: bool = False
+    system_managed: bool | None = None
     system_observation: str = "not_returned"
     governance_observation: str = "selected"
     governance_limitations: tuple[str, ...] = ()
@@ -250,9 +255,10 @@ class SharePointCollectionConfig:
     include_files: bool = True
     full_sync: bool = False
     reset_delta: bool = False
-    max_sites: int = 0
-    max_libraries: int = 0
-    max_items: int = 0
+    max_sites: int = DEFAULT_MAX_SITES
+    max_libraries: int = DEFAULT_MAX_LIBRARIES
+    max_items: int = DEFAULT_MAX_ITEMS
+    max_graph_http_attempts: int = DEFAULT_MAX_GRAPH_HTTP_ATTEMPTS
     concurrency: int = 4
     permissions: str = "none"
     max_permission_objects: int = 10_000
@@ -267,19 +273,24 @@ class SharePointCollectionConfig:
 class _ItemBudget:
     def __init__(self, maximum: int) -> None:
         self.maximum = max(0, int(maximum))
-        self.used = 0
+        self._reservations: dict[str, int] = {}
+        self._used = 0
         self._lock = threading.Lock()
 
-    def remaining(self) -> int | None:
+    def resize(self, key: str, count: int) -> bool:
+        requested = max(0, int(count))
         with self._lock:
-            return None if self.maximum == 0 else max(0, self.maximum - self.used)
-
-    def reserve(self, count: int) -> bool:
-        with self._lock:
-            if self.maximum and self.used + count > self.maximum:
+            previous = self._reservations.get(key, 0)
+            new_total = self._used - previous + requested
+            if self.maximum and new_total > self.maximum:
                 return False
-            self.used += count
+            self._reservations[key] = requested
+            self._used = new_total
             return True
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            self._used -= self._reservations.pop(key, 0)
 
 
 class SharePointProgress:
@@ -596,14 +607,16 @@ def _drive_from_graph(site: Site, raw: dict[str, object], *, governance_availabl
         last_modified_by, last_modified_by_observation = _identity_set_metadata(raw.get("lastModifiedBy"))
         quota, quota_observation = _quota_metadata(raw.get("quota"))
         raw_system = raw.get("system")
-        system_managed = isinstance(raw_system, dict)
-        system_observation = "observed" if system_managed else "not_returned" if raw_system is None else "invalid"
+        system_managed = True if isinstance(raw_system, dict) else None
+        system_observation = (
+            "observed" if system_managed is True else "not_returned" if raw_system is None else "invalid"
+        )
     else:
         owner = created_by = last_modified_by = quota = None
         owner_observation = created_by_observation = last_modified_by_observation = quota_observation = (
             "unavailable_unsupported_select"
         )
-        system_managed = False
+        system_managed = None
         system_observation = "unavailable_unsupported_select"
     return Drive(
         site=site,
@@ -641,7 +654,18 @@ def _encoded_site_path(raw_path: str) -> str:
     try:
         for raw_segment in path.split("/"):
             decoded = unquote(raw_segment, encoding="utf-8", errors="strict")
-            if any(ord(character) < 32 or ord(character) == 127 for character in decoded):
+            safety_candidate = raw_segment
+            for _ in range(MAX_PATH_DECODE_PASSES):
+                safety_decoded = unquote(safety_candidate, encoding="utf-8", errors="strict")
+                normalized = safety_decoded.replace("\\", "/")
+                if any(segment in {".", ".."} for segment in normalized.split("/")) or any(
+                    ord(character) < 32 or ord(character) == 127 for character in safety_decoded
+                ):
+                    raise GraphProtocolError(status_code=None, code="invalid_site_url")
+                if safety_decoded == safety_candidate:
+                    break
+                safety_candidate = safety_decoded
+            else:
                 raise GraphProtocolError(status_code=None, code="invalid_site_url")
             # Encode each segment independently so an escaped reserved slash
             # remains data (%2F), while literal path separators stay slashes.
@@ -846,10 +870,6 @@ def _discover_drive_search_sites(
                     break
                 seen.add(site_target)
                 site_targets.append(site_target)
-                if max_sites and len(site_targets) >= max_sites:
-                    truncated = True
-                    more = False
-                    break
             if truncated:
                 break
         if truncated:
@@ -1287,6 +1307,7 @@ class SharePointCollector:
         config: SharePointCollectionConfig,
         stats: SharePointStats | None = None,
         progress: SharePointProgress | None = None,
+        permission_attempt_budget: GraphAttemptBudget | None = None,
     ) -> None:
         self.client = client
         self.state = state
@@ -1305,7 +1326,6 @@ class SharePointCollector:
         self.collection_mode = "tenant_inventory" if context.auth_type == "application" else "delegated_user_view"
         self._item_budget = _ItemBudget(config.max_items)
         self._pending_lock = threading.Lock()
-        self._limited_collection_lock = threading.Lock()
         self.pending_drives: list[PendingDrive] = []
         self._sync_modes: set[str] = set()
         self._root_permission_results: dict[tuple[str, str], PermissionAssessmentResult] = {}
@@ -1321,6 +1341,7 @@ class SharePointCollector:
                 max_http_attempts=config.max_permission_http_attempts,
                 max_entries=config.max_permission_entries,
                 concurrency=config.permission_concurrency,
+                attempt_budget=permission_attempt_budget,
                 on_error=self._permission_error,
             )
             if config.permissions != "none"
@@ -2102,12 +2123,9 @@ class SharePointCollector:
 
     def _process_drive_safely(self, drive: Drive) -> None:
         permission_result = self._root_permission_results.get((drive.site.site_id, drive.drive_id))
+        budget_key = f"{drive.site.site_id}\x00{drive.drive_id}"
         try:
-            if self.config.max_items:
-                with self._limited_collection_lock:
-                    pending = self._process_drive(drive)
-            else:
-                pending = self._process_drive(drive)
+            pending = self._process_drive(drive, budget_key=budget_key)
             self._emit_resource(
                 drive,
                 LibraryObservation(
@@ -2135,6 +2153,7 @@ class SharePointCollector:
             self.stats.increment("delta_drives" if pending.sync_mode == "delta" else "full_drives")
             self.progress.library_finished(drive, succeeded=True)
         except (GraphAPIError, StateStoreError) as exc:
+            self._item_budget.release(budget_key)
             if self._permissions is not None and self.config.permissions == "all_items":
                 self._permissions.mark_selection_incomplete("content_enumeration_failed")
             try:
@@ -2183,7 +2202,7 @@ class SharePointCollector:
             )
             self.progress.library_finished(drive, succeeded=False)
 
-    def _process_drive(self, drive: Drive) -> PendingDrive:
+    def _process_drive(self, drive: Drive, *, budget_key: str) -> PendingDrive:
         state = self.state.get_drive_state(
             self.scope_key,
             self.context.tenant_id,
@@ -2193,15 +2212,18 @@ class SharePointCollector:
         force_full = self.config.full_sync or self.config.reset_delta
         sync_mode = "delta" if state.delta_link and state.status == "ok" and not force_full else "full"
         if sync_mode == "delta":
-            remaining = self._item_budget.remaining()
             current_count = self.state.count_current_items(
                 self.scope_key,
                 self.context.tenant_id,
                 drive.site.site_id,
                 drive.drive_id,
             )
-            if remaining is not None and current_count > remaining:
+            if not self._item_budget.resize(budget_key, current_count):
+                self.stats.mark_truncated()
                 raise StateStoreError("materialized library snapshot exceeds the remaining --max-items safety limit")
+        elif not self._item_budget.resize(budget_key, 0):
+            self.stats.mark_truncated()
+            raise StateStoreError("materialized library snapshot exceeds the remaining --max-items safety limit")
 
         reset_happened = False
         try:
@@ -2209,6 +2231,7 @@ class SharePointCollector:
                 drive,
                 state,
                 sync_mode=sync_mode,
+                budget_key=budget_key,
             )
         except GraphAPIError as exc:
             if sync_mode != "delta" or exc.status_code != 410:
@@ -2236,6 +2259,7 @@ class SharePointCollector:
                 state,
                 sync_mode="full",
                 initial_url=exc.reset_url,
+                budget_key=budget_key,
             )
             sync_mode = "full"
 
@@ -2259,7 +2283,7 @@ class SharePointCollector:
             site_id=drive.site.site_id,
             drive_id=drive.drive_id,
         )
-        if not self._item_budget.reserve(count):
+        if not self._item_budget.resize(budget_key, count):
             self.stats.mark_truncated()
             raise StateStoreError("materialized library snapshot exceeds the configured --max-items safety limit")
 
@@ -2428,6 +2452,7 @@ class SharePointCollector:
         state: DriveState,
         *,
         sync_mode: str,
+        budget_key: str,
         initial_url: str | None = None,
     ) -> tuple[int, int, int, str]:
         self.state.begin_drive_stage(
@@ -2535,18 +2560,27 @@ class SharePointCollector:
                 items=normalized_items,
             )
             self.progress.report()
-            remaining = self._item_budget.remaining()
-            if sync_mode == "full" and remaining is not None:
-                staged_count = self.state.count_staged_items(
-                    session_id=self.run_id,
-                    scope_key=self.scope_key,
-                    tenant_id=self.context.tenant_id,
-                    site_id=drive.site.site_id,
-                    drive_id=drive.drive_id,
-                )
-                if staged_count > remaining:
+            if self.config.max_items:
+                if sync_mode == "full":
+                    staged_count = self.state.count_staged_items(
+                        session_id=self.run_id,
+                        scope_key=self.scope_key,
+                        tenant_id=self.context.tenant_id,
+                        site_id=drive.site.site_id,
+                        drive_id=drive.drive_id,
+                    )
+                else:
+                    staged_count = self.state.count_materialized_items(
+                        session_id=self.run_id,
+                        scope_key=self.scope_key,
+                        tenant_id=self.context.tenant_id,
+                        site_id=drive.site.site_id,
+                        drive_id=drive.drive_id,
+                        require_complete=False,
+                    )
+                if not self._item_budget.resize(budget_key, staged_count):
                     self.stats.mark_truncated()
-                    raise StateStoreError("full library snapshot exceeds the remaining --max-items safety limit")
+                    raise StateStoreError("library snapshot exceeds the configured --max-items safety limit")
             raw_delta_link = page.get("@odata.deltaLink")
             if raw_delta_link is not None:
                 if not isinstance(raw_delta_link, str) or not raw_delta_link:
@@ -2595,6 +2629,7 @@ def collection_context_record(
     sync_mode: str,
     partial: bool,
     permission_summary: dict[str, object] | None = None,
+    graph_attempt_summary: dict[str, object] | None = None,
     structural_complete: bool | None = None,
     content_complete: bool | None = None,
 ) -> dict[str, object]:
@@ -2629,6 +2664,18 @@ def collection_context_record(
         "permissions_assessed": False,
         "content_downloaded": False,
         "delta_checkpoint_policy": "after_artifact_finalization_and_upload",
+        "graph_attempt_budget": graph_attempt_summary
+        or {
+            "max_http_attempts": config.max_graph_http_attempts,
+            "http_attempts": 0,
+            "remaining_http_attempts": config.max_graph_http_attempts,
+            "exhausted": False,
+            "attempts_by_surface": {},
+            "exhausted_surfaces": [],
+            "surface_limits": (
+                {"permissions": config.max_permission_http_attempts} if config.permissions != "none" else {}
+            ),
+        },
     }
     if structural_complete is not None:
         metadata["structural_complete"] = structural_complete
@@ -2667,7 +2714,9 @@ def collection_context_record(
         metadata["permissions_assessed"] = (
             isinstance(completed_objects, int) and not isinstance(completed_objects, bool) and completed_objects > 0
         )
-        metadata["permissions_complete"] = effective_permission_summary.get("request_coverage") == "complete"
+        metadata["permissions_complete"] = bool(
+            structural_complete is True and effective_permission_summary.get("request_coverage") == "complete"
+        )
         metadata["permission_assessment"] = effective_permission_summary
     return {
         "source": "sharepoint",

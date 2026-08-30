@@ -5,10 +5,11 @@ import json
 import random
 import threading
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Callable, Iterator, Protocol
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 
@@ -17,12 +18,122 @@ from .auth import GraphAuthProvider, GraphCloudProfile, GraphTokenContext, resol
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0/"
 RETRIABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 SAFE_ERROR_CODE = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+MAX_PATH_DECODE_PASSES = 16
+
+
+def _validate_decoded_path(path: str) -> None:
+    """Reject traversal/control segments through every bounded decode layer."""
+
+    candidate = path
+    for _ in range(MAX_PATH_DECODE_PASSES):
+        try:
+            decoded = unquote(candidate, encoding="utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise GraphProtocolError(status_code=None, code="invalid_continuation_url") from exc
+        normalized = decoded.replace("\\", "/")
+        if any(segment in {".", ".."} for segment in normalized.split("/")):
+            raise GraphProtocolError(status_code=None, code="unsafe_continuation_path")
+        if any(ord(character) < 32 or ord(character) == 127 for character in decoded):
+            raise GraphProtocolError(status_code=None, code="invalid_continuation_url")
+        if decoded == candidate:
+            return
+        candidate = decoded
+    # A path that is still changing after the finite decode bound is
+    # ambiguous across intermediaries. Refuse it instead of guessing how the
+    # Graph endpoint or proxy will canonicalize it.
+    raise GraphProtocolError(status_code=None, code="unsafe_continuation_path")
 
 
 class GraphAttemptBudget(Protocol):
     """Thread-safe budget charged immediately before each HTTP attempt."""
 
     def reserve_attempt(self) -> bool: ...
+
+
+@dataclass(frozen=True)
+class GraphAttemptBudgetSnapshot:
+    maximum: int
+    used: int
+    remaining: int
+    exhausted: bool
+    attempts_by_surface: dict[str, int]
+    exhausted_surfaces: tuple[str, ...]
+    surface_limits: dict[str, int]
+
+    def public_metadata(self) -> dict[str, object]:
+        return {
+            "max_http_attempts": self.maximum,
+            "http_attempts": self.used,
+            "remaining_http_attempts": self.remaining,
+            "exhausted": self.exhausted,
+            "attempts_by_surface": dict(sorted(self.attempts_by_surface.items())),
+            "exhausted_surfaces": list(self.exhausted_surfaces),
+            "surface_limits": dict(sorted(self.surface_limits.items())),
+        }
+
+
+class GraphRunAttemptBudget:
+    """One run-wide HTTP-attempt budget with atomic optional surface sub-limits."""
+
+    def __init__(self, maximum: int, *, default_surface: str = "inventory") -> None:
+        self.maximum = max(1, int(maximum))
+        self.default_surface = str(default_surface or "inventory")[:64]
+        self._used = 0
+        self._attempts_by_surface: dict[str, int] = {}
+        self._surface_limits: dict[str, int] = {}
+        self._exhausted_surfaces: set[str] = set()
+        self._exhausted = False
+        self._lock = threading.Lock()
+
+    def reserve_attempt(self) -> bool:
+        return self._reserve(self.default_surface, None)
+
+    def scoped(self, surface: str, maximum: int | None = None) -> GraphAttemptBudget:
+        normalized = str(surface or "other")[:64]
+        limit = max(1, int(maximum)) if maximum is not None else None
+        if limit is not None:
+            with self._lock:
+                existing = self._surface_limits.get(normalized)
+                if existing is not None and existing != limit:
+                    raise ValueError(f"Graph attempt-budget surface {normalized!r} already has a different limit")
+                self._surface_limits[normalized] = limit
+        return _ScopedGraphAttemptBudget(self, normalized, limit)
+
+    def _reserve(self, surface: str, surface_limit: int | None) -> bool:
+        with self._lock:
+            surface_used = self._attempts_by_surface.get(surface, 0)
+            if surface_limit is not None and surface_used >= surface_limit:
+                self._exhausted_surfaces.add(surface)
+                return False
+            if self._used >= self.maximum:
+                self._exhausted = True
+                self._exhausted_surfaces.add(surface)
+                return False
+            self._used += 1
+            self._attempts_by_surface[surface] = surface_used + 1
+            return True
+
+    def snapshot(self) -> GraphAttemptBudgetSnapshot:
+        with self._lock:
+            return GraphAttemptBudgetSnapshot(
+                maximum=self.maximum,
+                used=self._used,
+                remaining=max(0, self.maximum - self._used),
+                exhausted=self._exhausted or bool(self._exhausted_surfaces),
+                attempts_by_surface=dict(self._attempts_by_surface),
+                exhausted_surfaces=tuple(sorted(self._exhausted_surfaces)),
+                surface_limits=dict(self._surface_limits),
+            )
+
+
+class _ScopedGraphAttemptBudget:
+    def __init__(self, parent: GraphRunAttemptBudget, surface: str, maximum: int | None) -> None:
+        self._parent = parent
+        self._surface = surface
+        self._maximum = maximum
+
+    def reserve_attempt(self) -> bool:
+        return self._parent._reserve(self._surface, self._maximum)
 
 
 class GraphAPIError(RuntimeError):
@@ -136,6 +247,7 @@ class GraphClient:
         random_source: Callable[[], float] = random.random,
         now: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
         cloud: str | GraphCloudProfile | None = None,
+        attempt_budget: GraphAttemptBudget | None = None,
     ) -> None:
         self.cloud_profile = resolve_graph_cloud(cloud)
         effective_base_url = base_url or self.cloud_profile.graph_base_url
@@ -159,6 +271,7 @@ class GraphClient:
         self._sleep = sleep
         self._random = random_source
         self._now = now
+        self._attempt_budget = attempt_budget
         self._token_lock = threading.Lock()
         if initial_token_context is not None and initial_token_context.cloud != self.cloud_profile.name:
             raise ValueError("initial Microsoft Graph token context does not match the selected cloud")
@@ -258,13 +371,40 @@ class GraphClient:
             )
         if parsed.username or parsed.password or parsed.fragment:
             raise GraphProtocolError(status_code=None, code="invalid_continuation_url")
-        normalized_path = parsed.path.rstrip("/") + "/"
+
+        # Requests normalizes literal dot segments while preparing a request,
+        # and Graph/server routing may decode escaped variants. Reject both the
+        # supplied and prepared representations so a persisted opaque link can
+        # never escape the selected `/v1.0/` API boundary.
+        _validate_decoded_path(parsed.path)
+        try:
+            prepared_url = requests.Request("GET", absolute).prepare().url
+        except (requests.RequestException, ValueError) as exc:
+            raise GraphProtocolError(status_code=None, code="invalid_continuation_url") from exc
+        if not prepared_url:
+            raise GraphProtocolError(status_code=None, code="invalid_continuation_url")
+        prepared = urlparse(prepared_url)
+        try:
+            prepared_port = prepared.port or 443
+        except ValueError as exc:
+            raise GraphProtocolError(status_code=None, code="invalid_continuation_url") from exc
+        if (
+            prepared.scheme != "https"
+            or (prepared.hostname or "").casefold() != self._allowed_host
+            or prepared_port != self._allowed_port
+            or prepared.username
+            or prepared.password
+            or prepared.fragment
+        ):
+            raise GraphProtocolError(status_code=None, code="unsafe_continuation_url")
+        _validate_decoded_path(prepared.path)
+        normalized_path = prepared.path.rstrip("/") + "/"
         if not normalized_path.startswith(self._allowed_path_prefix):
             raise GraphProtocolError(status_code=None, code="unsafe_continuation_path")
-        return absolute
+        return prepared_url
 
     def validate_continuation_url(self, url: str) -> str:
-        """Validate an opaque next/delta link without logging or modifying it."""
+        """Validate and safely prepare an opaque next/delta link without logging it."""
 
         return self._validated_url(url)
 
@@ -285,8 +425,9 @@ class GraphClient:
         absolute_url = self._validated_url(url)
         last_transport_error = False
         refreshed_after_401 = False
+        effective_attempt_budget = attempt_budget if attempt_budget is not None else self._attempt_budget
         for attempt in range(1, self.max_attempts + 1):
-            if attempt_budget is not None and not attempt_budget.reserve_attempt():
+            if effective_attempt_budget is not None and not effective_attempt_budget.reserve_attempt():
                 raise GraphAPIError(
                     status_code=None,
                     code="request_budget_exhausted",
