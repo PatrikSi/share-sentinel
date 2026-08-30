@@ -35,9 +35,7 @@ def _family(name: str, help_text: str, values: Iterable[tuple[dict[str, str], ob
 
 def _database_metrics(db: Session) -> list[str]:
     run_rows = db.execute(text("SELECT status::text, COUNT(*) FROM scan_runs GROUP BY status")).all()
-    comparison_rows = db.execute(
-        text("SELECT state::text, COUNT(*) FROM run_comparisons GROUP BY state")
-    ).all()
+    comparison_rows = db.execute(text("SELECT state::text, COUNT(*) FROM run_comparisons GROUP BY state")).all()
     oldest_run_age = db.execute(
         text(
             """
@@ -53,6 +51,47 @@ def _database_metrics(db: Session) -> list[str]:
             SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at))), 0)
             FROM run_comparisons
             WHERE state::text IN ('queued', 'running')
+            """
+        )
+    ).scalar()
+    source_rows = db.execute(
+        text(
+            """
+            SELECT
+                CASE
+                    WHEN NOT enabled THEN 'disabled'
+                    WHEN last_success_at IS NULL THEN 'never_collected'
+                    WHEN expected_interval_seconds IS NOT NULL
+                         AND EXTRACT(EPOCH FROM (NOW() - last_success_at))
+                             > GREATEST(900, expected_interval_seconds * 2) THEN 'stale'
+                    WHEN last_failure_at IS NOT NULL AND last_failure_at > last_success_at
+                        THEN 'degraded'
+                    WHEN COALESCE(coverage ->> 'state', 'unknown') <> 'complete'
+                        THEN 'degraded'
+                    ELSE 'healthy'
+                END AS health,
+                COUNT(*)
+            FROM collection_sources
+            GROUP BY health
+            """
+        )
+    ).all()
+    finding_rows = db.execute(
+        text(
+            """
+            SELECT status, severity, COUNT(*)
+            FROM findings
+            GROUP BY status, severity
+            """
+        )
+    ).all()
+    expired_accepted_risk = db.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM findings
+            WHERE status = 'accepted_risk'
+              AND accepted_risk_expires_at <= NOW()
             """
         )
     ).scalar()
@@ -76,6 +115,27 @@ def _database_metrics(db: Session) -> list[str]:
                 ({"job_type": "ingest"}, oldest_run_age),
                 ({"job_type": "comparison"}, oldest_comparison_age),
             ],
+        )
+    )
+    lines.extend(
+        _family(
+            "share_sentinel_collection_sources",
+            "Configured collection sources by derived health state.",
+            (({"health": str(health)}, count) for health, count in source_rows),
+        )
+    )
+    lines.extend(
+        _family(
+            "share_sentinel_findings",
+            "Actionable findings by workflow status and severity.",
+            (({"status": str(status), "severity": str(severity)}, count) for status, severity, count in finding_rows),
+        )
+    )
+    lines.extend(
+        _family(
+            "share_sentinel_expired_accepted_risk_findings",
+            "Accepted-risk findings whose review deadline has elapsed.",
+            [({}, expired_accepted_risk)],
         )
     )
     return lines

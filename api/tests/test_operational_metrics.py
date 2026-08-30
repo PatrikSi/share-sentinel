@@ -15,18 +15,23 @@ class _Result:
 
 
 class _Db:
-    def __init__(self):
-        self.calls = 0
-
-    def execute(self, _query):
-        self.calls += 1
-        if self.calls == 1:
+    def execute(self, query):
+        sql = str(query)
+        if "FROM scan_runs GROUP BY status" in sql:
             return _Result(rows=[("COMPLETE", 4), ("UPLOADED", 2)])
-        if self.calls == 2:
+        if "FROM run_comparisons GROUP BY state" in sql:
             return _Result(rows=[("complete", 3), ("queued", 1)])
-        if self.calls == 3:
+        if "MIN(created_at)" in sql and "FROM scan_runs" in sql:
             return _Result(scalar_value=12.5)
-        return _Result(scalar_value=7)
+        if "MIN(created_at)" in sql and "FROM run_comparisons" in sql:
+            return _Result(scalar_value=7)
+        if "FROM collection_sources" in sql:
+            return _Result(rows=[("healthy", 6), ("stale", 2), ("degraded", 1)])
+        if "GROUP BY status, severity" in sql:
+            return _Result(rows=[("open", "high", 3), ("accepted_risk", "low", 2)])
+        if "accepted_risk_expires_at <= NOW()" in sql:
+            return _Result(scalar_value=1)
+        raise AssertionError(f"unexpected operational metric query: {sql}")
 
 
 class _Redis:
@@ -59,6 +64,10 @@ def test_render_operational_metrics_covers_jobs_queue_and_storage(monkeypatch) -
     assert 'share_sentinel_worker_stream_messages{state="pending"} 3' in payload
     assert 'share_sentinel_worker_stream_messages{state="lag"} 3' in payload
     assert 'share_sentinel_artifact_storage_bytes{state="free"} 60' in payload
+    assert 'share_sentinel_collection_sources{health="healthy"} 6' in payload
+    assert 'share_sentinel_collection_sources{health="stale"} 2' in payload
+    assert 'share_sentinel_findings{status="open",severity="high"} 3' in payload
+    assert "share_sentinel_expired_accepted_risk_findings{} 1" in payload
     assert 'share_sentinel_operational_metrics_collection_success{component="database"} 1' in payload
 
 
@@ -80,7 +89,4 @@ def test_render_operational_metrics_degrades_without_failing_scrape(monkeypatch)
     payload = operational_metrics.render_operational_metrics(_BrokenDb(), _BrokenRedis())
 
     for component in ("database", "redis", "artifact_storage"):
-        assert (
-            f'share_sentinel_operational_metrics_collection_success{{component="{component}"}} 0'
-            in payload
-        )
+        assert f'share_sentinel_operational_metrics_collection_success{{component="{component}"}} 0' in payload
