@@ -2,16 +2,16 @@
 
 [![CI](https://github.com/PatrikSi/share-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/PatrikSi/share-sentinel/actions/workflows/ci.yml)
 
-Share Sentinel is a self-hostable workspace for ingesting SMB, NFS, and SharePoint Online collection artifacts, tracking project-scoped inventory, and reviewing run-to-run changes without losing analyst context.
+Share Sentinel is a self-hostable workspace for ingesting SMB, NFS, and SharePoint Online collection artifacts, tracking project-scoped inventory, monitoring recurring sources, and turning evidence-backed changes into an analyst findings workflow.
 
-Version 1.3.0 adds normalized SMB and SharePoint permission evidence, asynchronous resource comparisons across runs, evidence-backed SharePoint lifecycle and library assessment, clearer non-mutating SMB access checks, and expanded enterprise inventory workflows. HA operation, application MFA/SSO, and turnkey internet-facing deployment remain intentionally outside the current support boundary.
+The current development line builds on 1.3.0 with normalized SMB and SharePoint permission evidence, recurring-source monitoring, actionable findings, durable resource/item history, evidence-bounded effective-access explanations, and expanded collector hardening. HA operation, application MFA/SSO, and turnkey internet-facing deployment remain intentionally outside the current support boundary.
 
-It is built around one loop:
+It is built around one repeatable loop:
 
 1. collect data with the bundled collector or another compatible producer
 2. upload the artifact into a project
 3. let the worker ingest it into Postgres
-4. review inventory, issues, diffs, and saved investigations in the UI
+4. review source health, findings, inventory, and durable resource or item history in the UI
 
 ## What is included
 
@@ -76,6 +76,14 @@ The default gateway also mounts the host Docker socket read-only so Traefik can 
 
 The dashboard stays project-scoped. It surfaces recent runs, project inventory totals, and shortcuts into inventory, import, and run review.
 
+Every project also has stable `Overview`, `Findings`, `Inventory`, `Changes`, and `Sources` workspaces. Filters and cursors are URL-backed so an investigation can be resumed or handed to another authorized analyst.
+
+### Findings and sources
+
+Complete recurring collections are registered as credential-free sources from normalized provider, target-scope, collection-mode, and assessed-identity context. Sources expose freshness and coverage without storing collector secrets or scheduling collectors from the server.
+
+Enabled sources can compare a new complete run with the newest compatible baseline. Versioned built-in policies create deduplicated findings for explicit SharePoint exposure, observed SMB write capabilities, definitive resource changes, permission-evidence changes, and indeterminate coverage. Analysts can acknowledge, resolve, assign, or accept risk until a required expiry; every occurrence and lifecycle action remains separately reviewable. Partial or failed scans never clear an earlier state finding.
+
 ### Import
 
 Operators and admins can create a run, upload a JSON, NDJSON, JSONL, or gzip-compressed artifact, and land directly in the run explorer while ingest starts.
@@ -104,7 +112,7 @@ Each run is split into five focused tabs:
 
 Run-scoped saved searches remain browser-local. Project-wide shared investigations live on the project inventory page.
 
-The Diff tab can start a server-materialized comparison between any two recent complete runs. The comparison workspace reports resources that appeared, disappeared, or changed, separates structural, access, and content interpretations, and marks absence as indeterminate when tenant, identity, scope, or collection coverage is not comparable. Resource results are processed asynchronously and paginated; item-level path churn remains available only through the explicitly bounded preview.
+The Diff tab can start a server-materialized comparison between any two recent complete runs. The comparison workspace reports resources that appeared, disappeared, or changed, separates structural, access, and content interpretations, and marks absence as indeterminate when tenant, identity, scope, or collection coverage is not comparable. Resource and item results are processed asynchronously and paginated. Stable provider item IDs distinguish additions, removals, moves, renames, metadata changes, and comparable permission-evidence changes; path-only identities remain explicitly bounded.
 
 ### Settings
 
@@ -121,7 +129,7 @@ Sysadmins get five settings areas:
 - The API stores uploaded artifacts on the shared `/artifacts` volume.
 - The API enqueues ingest work into the `ingest_jobs` Redis stream.
 - The worker reads the artifact from the same shared storage and writes normalized inventory and permission evidence into Postgres.
-- The same worker materializes asynchronous resource comparisons and persists their progress and terminal result rows.
+- The same worker registers recurring sources, evaluates built-in findings, and materializes asynchronous resource and item comparisons with durable progress.
 - The UI reads only through the API.
 - The bootstrap container applies Alembic migrations and seeds the initial admin account.
 
@@ -156,11 +164,14 @@ See the [deployment guide](./docs/deployment.md) for the production configuratio
 - Retryable ingest failures are rescheduled with backoff, but terminal parser or data-shape failures still land the run in `FAILED`.
 - MFA, SSO, and SCIM are not implemented.
 - SMB capability checks are bounded observations made with the scan identity, not a guarantee for every object or for future writes. They request rights on existing handles without creating or modifying content; quotas, read-only storage, security products, and object-specific ACLs can still affect a later operation.
-- NFS collection currently discovers advertised exports but does not mount them, so NFS access remains `unknown` unless a richer external artifact supplies evidence.
+- NFS collection discovers advertised exports and performs a bounded NFSv4 NULL RPC reachability probe, but does not mount or enumerate exports. Authentication and content access therefore remain `unknown` unless a richer external artifact supplies evidence.
+- DFS evidence is limited to SMB tree-connect capability and `STATUS_PATH_NOT_COVERED` observations. Logical namespace identity is retained, but referral targets are not followed and credentials are never forwarded without an operator-defined trust policy.
 - SharePoint Online collection is metadata-only and does not download document content. Application mode supports tenant-wide scheduled inventory; delegated modes are security-trimmed quick checks and are explicitly non-authoritative for tenant completeness.
 - SharePoint direct permission collection is opt-in (`library_roots` or `all_items`), GET-only, caller-dependent, and bounded by object, request, entry, and concurrency budgets. It records Graph sharing/permission entries but does not expand groups or compute effective access. Empty or partial responses never become a negative exposure conclusion.
 - Optional SMB permission collection records the filesystem security descriptor on the share root. It is distinct from SMB share-level permissions and from the bounded non-mutating capability probes, and it does not expand group membership or compute a user's effective access.
-- Scalable comparisons currently materialize resource-level appearance, disappearance, structural changes, access evidence changes, and aggregate item-count changes. They do not materialize per-item added/removed/moved rows; the bounded legacy preview remains the only exact item-path comparison.
+- Effective-access analysis explains direct provider entries and assessed-identity capability observations separately. It remains `unknown` unless complete, provenance-bearing identity, group, inheritance, and provider semantics support a computed result.
+- Continuous monitoring provides source health, automatic compatible comparisons, and built-in findings; it does not run collectors, store collector credentials, send notifications, or provide a custom policy language in this release.
+- The bundled topology is still single-region and does not automate backups, run/comparison retention, SSO, or high availability. Artifact reconciliation is a bounded operator command and defaults to dry-run.
 - The project is best treated as actively evolving rather than as a locked compatibility surface.
 
 ## Documentation

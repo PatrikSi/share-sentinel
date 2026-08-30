@@ -13,6 +13,7 @@ This folder is the long-form companion to the top-level [README](../README.md). 
 - [Settings guide](./pages/settings.md)
 - [SharePoint Online collection](./sharepoint.md)
 - [Permission evidence and run comparisons](./permission-evidence-and-comparisons.md)
+- [Continuous monitoring and findings](./monitoring-and-findings.md)
 
 ## Reference
 
@@ -20,6 +21,15 @@ This folder is the long-form companion to the top-level [README](../README.md). 
 - [Auth and RBAC](./reference/auth-rbac.md)
 - [Frontend reference](./reference/frontend.md)
 - [Testing and validation](./reference/testing.md)
+
+## Architecture decisions
+
+- [Continuous monitoring and findings](./adr/0007-continuous-monitoring-and-findings.md)
+- [Effective-access evidence boundary](./adr/0008-effective-access-evidence-boundary.md)
+- [Durable item history](./adr/0009-durable-item-history.md)
+- [Artifact storage operating contract](./adr/0010-artifact-storage-operating-contract.md)
+- [Collector trust boundaries](./adr/0011-collector-trust-boundaries.md)
+- [Durable audit attribution](./adr/0012-durable-audit-attribution.md)
 
 ## Subsystem notes
 

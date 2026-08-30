@@ -10,7 +10,37 @@ The project follows a simple release-first workflow:
 
 ## Unreleased
 
-No user-visible changes yet.
+### Added
+
+- Project monitoring sources now connect recurring runs into a durable timeline with source health, expected collection cadence, compatible automatic baselines, and an explicit enable/disable control.
+- A project findings queue turns comparison and permission evidence into deduplicated, severity-ranked work. Findings support assignment, status/revision safeguards, accepted-risk expiry, evidence snapshots, occurrence history, activity, and bounded bulk updates.
+- Materialized comparisons now retain keyset-paginated item additions, removals, moves, and permission-evidence changes, with explicit indeterminate rows when identity or collection coverage cannot support a definitive conclusion.
+- Effective-access views separate provider-reported grants, the collector's observed capabilities for its assessed identity, and conservative computed conclusions. Incomplete group, inheritance, or collection evidence remains unknown rather than being inferred.
+- SharePoint collection supports Microsoft national-cloud endpoint profiles, certificate credentials, bounded governance metadata, and safer state partitioning/backfill. SMB collection reports bounded DFS detection, and NFS discovery distinguishes RPC/export evidence from unassessed authentication.
+- Operational metrics now expose source/finding/comparison age and backlog signals, Redis delivery state, per-component collection outcomes, and artifact-volume capacity. A bounded artifact reconciliation command audits stale multipart files, missing references, and safe orphan cleanup.
+- New audit history retains immutable project, user, and exact API-token references with event-time labels across supported rename and deletion workflows. Legacy rows whose parents still exist receive the parent's label at upgrade time in bounded restart-safe batches; a historical label changed or deleted before upgrade cannot be recovered.
+- Audit exports stream bounded CSV or JSON from an ID high-watermark, expose row-limit metadata, and warn administrators after a downloaded file was capped.
+
+### Fixed
+
+- SMB timestamps now distinguish last-write from metadata-change time, and incomplete network discovery can no longer claim complete permission coverage.
+- NFS reachability no longer appears as authenticated access; DFS observations no longer imply referral enumeration or credential forwarding.
+- Finding auto-resolution requires authoritative structural or capability coverage, accepted-risk expiry is reopened by a bounded worker sweep, and disabled sources continue recording observations without silently running automation.
+- Artifact publication is immutable and atomic, storage checks fail closed at configured headroom with explicit retryable errors, cancelled requests cannot race an in-flight part/publication, and deep health verifies the write/fsync/rename contract used by API and worker.
+- Finding and run workflow activity now withholds request/network and token audit context from ordinary viewers; finding queue polling exposes only evidence state and the full evidence read remains separately audited.
+- Monitoring mutations use revision checks and bounded, redacted audit metadata; bulk workflows retain per-finding accountability.
+- Source configuration uses explicit value preconditions for name, enabled state, and cadence, so cadence-only edits and nullable cadence clears remain safe while background health updates continue.
+- Monitoring recovery now commits terminal run state, current-source coverage, and audit evidence atomically; superseded runs cannot republish stale coverage, and missing derived-evaluation state remains degraded rather than failing open to healthy.
+- SharePoint count guards no longer overload `0` as an implicit unlimited value. Existing automation using `--max-sites 0`, `--max-libraries 0`, or `--max-items 0` must migrate to the corresponding explicit `--unlimited-*` switch.
+- Audit export batching now records distinct completed, failed, and interrupted terminal outcomes; CI and tag releases exercise the attribution DDL, triggers, rename/delete retention, and restart-safe backfill against PostgreSQL 16.
+
+### Operator notes
+
+- Back up Postgres and apply migrations `0014` through `0018` before starting the updated API and worker. `0014` adds monitoring, findings, and item-history state using online-safe foreign-key staging; `0015` validates those constraints and builds large-table indexes concurrently. `0016` adds nullable audit snapshots and the new-event trigger, `0017` builds audit lookup indexes concurrently, and restart-safe `0018` installs idempotent parent triggers before backfilling live-parent legacy rows in committed batches of at most 5,000. Pause user, token, and project rename/deletion during the upgrade; a legacy label already renamed or orphaned is not historically reconstructable.
+- Existing narrowly scoped API tokens do not gain the new `read:findings`, `write:findings`, `read:sources`, or `write:sources` scopes automatically. Add only the scopes the integration needs; newly created role-default tokens include the appropriate monitoring scopes.
+- Findings and effective-access output are evidence, not a directory-service entitlement simulation. Group expansion and inherited-permission resolution remain unknown unless a future collector supplies complete, ordered, and provenance-backed membership/inheritance snapshots.
+- Recurring comparisons are time-sliced and recovered from Postgres. Size worker replicas, database capacity, retention, and collection cadence from representative tenant skew; a schedule must not create an unbounded backlog.
+- Raw artifacts, item history, permission evidence, findings, and audit records can contain sensitive infrastructure and identity metadata. Define deployment-specific access, backup, retention, and deletion policies.
 
 ## [1.3.0] - 2026-08-27
 

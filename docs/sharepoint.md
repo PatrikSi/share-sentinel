@@ -163,7 +163,7 @@ python collector/share_sentinel_sharepoint.py \
   --gzip
 ```
 
-Safety limits bound sites, libraries, items, pages, response sizes, request timeouts, retries, and Graph concurrency. The default run envelope is 10,000 sites, 50,000 libraries, 2,000,000 items, and 250,000 actual Graph HTTP attempts including pages and retries. Use the explicit `--unlimited-sites`, `--unlimited-libraries`, or `--unlimited-items` switch only after capacity review; those switches remove one count guard and do not disable the run-wide HTTP, page, response, artifact, or permission limits. Start with conservative concurrency for large or heavily used tenants.
+Safety limits bound sites, libraries, items, pages, response sizes, request timeouts, retries, and Graph concurrency. The default run envelope is 10,000 sites, 50,000 libraries, 2,000,000 items, and 250,000 actual Graph HTTP attempts including pages and retries. Explicit `--site` scope is separately capped at 128 references and 24 KiB of target metadata so a collector cannot create an artifact its bundled consumer cannot safely normalize. Use the explicit `--unlimited-sites`, `--unlimited-libraries`, or `--unlimited-items` switch only after capacity review; those switches remove one discovery/materialization count guard and do not disable the explicit-target, run-wide HTTP, page, response, artifact, or permission limits. Start with conservative concurrency for large or heavily used tenants.
 
 Progress is written to stderr so NDJSON on stdout stays machine-readable. By default the collector prints a start line, periodic site/library/item counters, and one final status line. Use `-v` for per-library detail, repeat it for more request-level context, use `--progress-interval <seconds>` to tune periodic reporting, or set the interval to `0` to disable only periodic reports. `--quiet` suppresses progress output; terminal errors still remain actionable.
 
@@ -297,6 +297,19 @@ unset SHARE_SENTINEL_GRAPH_CLIENT_SECRET
 ```
 
 Tenant and client IDs can be placed in the generated owner-only `.env`; the client secret should be supplied at run time. The named `collector_output` volume keeps both the artifact and `/data/sharepoint-state.sqlite3` across one-off collector containers. With the main stack running, set `SHARE_SENTINEL_PROJECT_ID` and `SHARE_SENTINEL_API_TOKEN` and add `--upload` to send the same durable artifact directly to Share Sentinel.
+
+Certificate paths in `.env` are paths **inside** the collector container. The reference Compose service intentionally does not bind arbitrary host paths. Provision an owner-only PEM bundle into the persistent collector volume, then point the generated `.env` at `/data/graph-collector.pem`:
+
+```bash
+docker compose --profile tools run --rm --user 0 \
+  --volume "$PWD/graph-collector.pem:/tmp/graph-collector.pem:ro" \
+  --entrypoint sh collector \
+  -c 'install -o 10001 -g 10001 -m 0600 /tmp/graph-collector.pem /data/graph-collector.pem'
+
+sed -i 's|^SHARE_SENTINEL_GRAPH_CERTIFICATE_PATH=.*|SHARE_SENTINEL_GRAPH_CERTIFICATE_PATH=/data/graph-collector.pem|' .env
+```
+
+Keep the host bundle protected as well, do not commit either copy, and remove the volume copy during credential rotation only after the replacement has been tested. Supplying a host path directly in `.env` does not mount it and will fail closed as a missing certificate.
 
 ## Authentication and capability matrix
 

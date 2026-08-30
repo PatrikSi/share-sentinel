@@ -10,7 +10,7 @@ In scope:
 - project and membership management
 - run creation and artifact upload
 - asynchronous ingest into normalized tables
-- inventory review, normalized permission evidence, bounded and materialized run comparisons, search, saved investigations, and audit
+- inventory review, normalized permission evidence, recurring-source health, findings lifecycle, materialized resource/item history, search, saved investigations, and audit
 
 Out of scope:
 
@@ -34,12 +34,12 @@ The FastAPI service is the control plane. It owns:
 - user auth and browser session cookies
 - API token issuance and revocation
 - sysadmin settings and audit APIs
-- project, membership, run, inventory, access-evidence, and comparison APIs
+- project, membership, run, inventory, source, finding, access-evidence, and comparison APIs
 - artifact upload validation and queue handoff
 
 ### Worker
 
-The worker consumes `ingest_jobs` from Redis Streams, reads uploaded artifacts from shared storage, writes normalized inventory and permission evidence into Postgres, and materializes asynchronous resource comparisons. Postgres recovery scans make the queue a delivery accelerator rather than the authority for accepted work.
+The worker consumes `ingest_jobs` from Redis Streams, reads uploaded artifacts from shared storage, writes normalized inventory and permission evidence into Postgres, registers recurring collection sources, evaluates built-in findings, and materializes asynchronous resource and item comparisons. Postgres recovery scans make the queue a delivery accelerator rather than the authority for accepted work.
 
 ### Postgres
 
@@ -50,7 +50,9 @@ Postgres stores the durable application state:
 - runs and ingest progress
 - endpoints, resources, items, and ingest errors
 - normalized permission assessments, principals, and entries
-- materialized run-comparison state and resource-change rows
+- credential-free collection sources and their freshness/coverage state
+- findings, immutable occurrences, and analyst lifecycle state
+- materialized run-comparison state plus resource- and item-change rows
 - audit events
 - saved investigations
 
@@ -63,7 +65,7 @@ Redis is used for:
 
 ### Shared artifact storage
 
-The default deployment uses a shared `/artifacts` volume mounted into the API and worker. The API writes raw uploads there; the worker reads from the same location during ingest.
+The default deployment uses a shared `/artifacts` volume mounted into the API and worker. The API writes immutable raw uploads there; the worker reads from the same location during ingest. Readiness enforces configured capacity headroom, and deep health verifies a bounded write/fsync/rename cycle.
 
 This is a hard deployment invariant: both services must share the same durable filesystem path, not just similar local directories.
 
@@ -111,24 +113,35 @@ The worker consumes the queued job, opens the artifact, parses the records, and 
 - permission assessments, principals, entries, integrity hashes, and bounded evidence summaries when schema-v2 evidence is present
 - ingest errors
 
-The worker updates `scan_runs.summary` and `scan_runs.ingest_progress` as it goes.
+The worker updates `scan_runs.summary` and `scan_runs.ingest_progress` as it goes. Once a run is complete, it derives a stable source from credential-free collection context. A disabled source still accepts inventory, but does not claim new automatic comparison or policy work; a bounded unit already claimed before the switch may finish and remains visible in coverage/audit state.
 
 If Redis queue handoff falls back, the run can remain `UPLOADED` until the worker discovers it through its recovery scan.
 
 Permission entries are normalized under consumer-owned identity keys and written in bounded set-based batches. The final reconciliation verifies persisted cardinality, derives comparison hashes from stored rows, and removes unsupported negative conclusions.
 
-### 4. Materialized comparison
+### 4. Monitoring and findings
 
-For large resource histories, the API stores an idempotent queued comparison instead of loading both inventories into an HTTP process. The worker validates run state and collection compatibility, derives tenant/provider-aware resource identities, and inserts changed or indeterminate resource rows in bounded batches. Retryable dependency failures use delayed jittered retries; stale work is recoverable from Postgres. Per-item change rows are intentionally not materialized in this release.
+An enabled recurring source searches the newest 20 earlier complete runs for an equivalent provider, target, assessment identity, collection mode, and comparison contract. The worker creates one idempotent automatic comparison for the selected baseline/current pair. No compatible candidate is recorded as unavailable/degraded coverage; a first run therefore does not pretend it was compared. Source freshness is an operator expectation, not a server-side schedule.
 
-### 5. Query and review
+Versioned built-in policies consume explicit positive run evidence and materialized comparison rows. A finding has one stable deduplication identity, immutable occurrences, and mutable assignment/status/risk-expiry state. State findings are cleared only by an authoritative replacement observation; incomplete scans preserve the previous finding. Analyst and system transitions are audit events.
+
+### 5. Materialized comparison
+
+For large histories, the API stores an idempotent queued comparison instead of loading both inventories into an HTTP process. The worker validates run state and collection compatibility, derives tenant/provider-aware resource and item identities, and inserts changed or indeterminate rows in bounded batches. Results and progress checkpoints commit together; recoverable work resumes from Postgres and remains hidden from readers until complete.
+
+Provider item IDs can support move and rename classification. Path-derived identities support bounded add/remove and metadata history but cannot prove a move. Incompatible structural, content, identity, or permission evidence produces explicit limitations or indeterminate rows.
+
+### 6. Query and review
 
 The UI and API clients query Postgres-backed endpoints for:
 
 - project inventory
 - run detail and issues
+- source health and coverage
+- findings queue, occurrences, assignment, risk expiry, and analyst activity
 - run-to-run diff
-- paginated resource comparisons and before/after evidence
+- paginated resource/item comparisons and before/after evidence
+- bounded direct/observed/computed access explanations
 - audit history
 - user and token administration
 
@@ -190,12 +203,15 @@ Current caveats:
 
 - retryable ingest failures are rescheduled with bounded backoff before the run is marked `FAILED`
 - Redis stream loss or unavailability does not remove the durable `UPLOADED` state; the worker periodically discovers due runs from Postgres
+- automatic monitoring never stores collector credentials and does not infer a source when normalized collection context is unavailable
+- partial or failed collection cannot auto-resolve a state finding; expired risk acceptance is reopened by bounded worker maintenance and audited
+- comparison APIs reject reads until terminal completion, so a recovered job cannot expose an internally consistent-looking partial result
 - NDJSON records and compact JSON compatibility documents have explicit parser/materialization limits; large collections should use NDJSON
 - the default deployment uses a worker heartbeat file and container healthcheck instead of an HTTP health endpoint
 - the default Compose deployment is for local operation, not HA orchestration
 - inventory views can include data from `INGESTING` runs until ingest settles
 - delegated SharePoint discovery is security-trimmed and can be incomplete; its collection context is preserved with the run so it is not confused with an authoritative application inventory
-- synchronous diff has an explicit item envelope and bounded detail arrays; larger resource comparisons use the asynchronous materialized workflow, while exact item-path churn remains bounded
+- synchronous diff has an explicit item envelope and bounded detail arrays; larger resource and item histories use the asynchronous materialized workflow
 
 ## ADR-style decisions
 
@@ -222,3 +238,12 @@ Provider permission records, bounded capability observations, exposure evidence,
 ### ADR 6: Materialized resource comparison with explicit indeterminacy
 
 Large comparisons run in the worker and persist paginated resource results. Appearance or disappearance is definitive only under equivalent authoritative structural scope. Unmatched resources or suspected changes from incompatible collection planes are marked indeterminate rather than silently treated as change.
+
+Further decisions are recorded as standalone ADRs:
+
+- [ADR 0007: continuous monitoring and findings](./adr/0007-continuous-monitoring-and-findings.md)
+- [ADR 0008: effective-access evidence boundary](./adr/0008-effective-access-evidence-boundary.md)
+- [ADR 0009: durable item history](./adr/0009-durable-item-history.md)
+- [ADR 0010: artifact storage operating contract](./adr/0010-artifact-storage-operating-contract.md)
+- [ADR 0011: collector trust boundaries](./adr/0011-collector-trust-boundaries.md)
+- [ADR 0012: durable audit attribution](./adr/0012-durable-audit-attribution.md)

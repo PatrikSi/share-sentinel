@@ -16,7 +16,10 @@ dependency is unavailable.
 
 ### `GET /healthz/deep`
 
-Sysadmin-only readiness check for Postgres and Redis.
+Sysadmin-only dependency check for Postgres, Redis, and artifact storage. In
+addition to the normal capacity/access check, it performs a bounded
+create/write/fsync, no-overwrite hard-link, rename, directory-fsync, and cleanup
+probe against the artifact volume.
 
 ### `GET /metrics`
 
@@ -148,7 +151,7 @@ Removes a project member. Project admin required.
 
 ### `GET /projects/{project_id}/audit`
 
-Project-scoped audit log. Project admin required.
+Project-scoped audit log. Project admin required. Actor IDs and retained email/API-token labels remain available when a referenced user or token no longer exists. Labels on events created after migration `0016` are event-time snapshots; a live-parent legacy row backfilled by `0018` carries the label observed at upgrade time.
 
 ## Runs and ingest
 
@@ -158,7 +161,7 @@ Creates a run record. Requires `operator` or `admin`.
 
 ### `GET /projects/{project_id}/runs`
 
-Lists runs for a project with keyset pagination.
+Lists runs for a project with keyset pagination. Optional `q`, `status`, and `source_id` filters support recurring-source investigations without loading an unbounded run catalog.
 
 ### `GET /projects/{project_id}/runs/{run_id}`
 
@@ -221,6 +224,12 @@ Returns normalized provider permission assessments, bounded capability observati
 
 `assessment_limit`/`after_assessment_id` and `entry_limit`/`after_entry_id` form a two-level continuation contract: exhaust `next_entry_id` for the current assessment page before advancing `next_assessment_id`. An authoritative empty assessment, a response page with no entries, and an unassessed resource are separate states.
 
+### `GET /projects/{project_id}/runs/{run_id}/resources/{resource_id}/effective-access`
+
+Returns a conservative explanation of access evidence rather than an inferred directory entitlement. `principal_id` can select one observed principal; otherwise `limit` and `cursor` page through principals. Response planes keep direct provider entries, non-mutating capability observations for the collector's assessed identity, and any provider-computed result separate.
+
+The resource-wide `decision` remains `unknown` unless the unfiltered response has exactly one complete, untruncated resource assessment that explicitly declares effective-access semantics, complete principal resolution, no omitted/unknown entries, and a recognized provider-computed decision. A provider denial additionally requires explicit negative-conclusion support. The response also returns page-scoped direct decisions, per-principal limitations and bounded entries, truncation flags, collection context, and the identity to which capability observations apply. Missing group expansion, unresolved principals, incomplete provider retrieval, and non-effective ACL semantics are explicit limitations, not denials.
+
 ### `GET /projects/{project_id}/runs/{run_id}/search/items`
 
 Searches items within a run.
@@ -229,17 +238,85 @@ Searches items within a run.
 
 ### `POST /projects/{project_id}/comparisons`
 
-Creates or returns the idempotent materialized comparison for a complete baseline/current run pair and the active algorithm/options. Requires project operator or admin access plus `write:runs` and `read:inventory`. Creation is rate limited and active comparisons are capped per project. Resubmitting a failed comparison explicitly requeues it; a completed or active comparison is returned unchanged.
+Creates or returns the idempotent materialized comparison for a complete baseline/current run pair and the active algorithm/options. Requires project operator or admin access plus `write:runs` and `read:inventory`. Creation is rate limited and active comparisons are capped per project. A failed comparison remains failed until the explicit retry endpoint is used; a completed or active comparison is returned unchanged.
+
+### `GET /projects/{project_id}/comparisons`
+
+Lists comparison history in stable keyset order. Optional `state`, `source_id`, `current_run_id`, and `baseline_run_id` filters support monitoring timelines and run-specific drill-down.
 
 ### `GET /projects/{project_id}/comparisons/{comparison_id}`
 
 Returns queued/running progress, delayed retry time, dimension-specific compatibility, terminal summary, or a bounded public error. Requires project viewer access plus both `read:runs` and `read:inventory`.
 
+### `POST /projects/{project_id}/comparisons/{comparison_id}/retry`
+
+Explicitly resets a failed comparison for a fresh operator-authorized attempt. Active work is returned idempotently before mutation admission. A failed retry consumes the same rate-limit budget and per-project active-comparison capacity as creation; capacity exhaustion returns structured `429` detail with `Retry-After`. Mutation is serialized with the worker, source automation, project admission lane, and comparison row so concurrent retries cannot create duplicate work; a completed result returns `409`. Worker crash recovery, by contrast, preserves durable phase/cursor progress and does not erase already materialized rows.
+
 ### `GET /projects/{project_id}/comparisons/{comparison_id}/resource-changes`
 
 Returns a complete comparison's materialized resource changes using stable keyset pagination. Filters include `change_type`, `provider`, `category`, and `q`. Rows separate structural, access, and content states and include match provenance plus before/after snapshots. `appeared`, `disappeared`, `changed`, and `indeterminate` are distinct; a missing resource is definitive only when structural collection scope is comparable. The endpoint returns `409` until work completes. It requires project viewer access plus both `read:runs` and `read:inventory`.
 
-The summary's `resource_summary_exact` applies only to the published resource-level evidence scope. `exact` and `item_churn_computed` remain false because this workflow does not publish per-item added/removed/moved rows.
+The summary's `resource_summary_exact` applies to the published resource-level evidence scope. Item counts on each resource state whether history was computed and exact; null means not computed, never zero.
+
+### `GET /projects/{project_id}/comparisons/{comparison_id}/item-changes`
+
+Returns durable item-level changes after a comparison completes. Filters include `change_type`, `resource_change_id`, and `q`; `limit`/`cursor` use stable keyset pagination. Change types distinguish additions, removals, moves/renames, metadata changes, permission-evidence changes, and indeterminate correlations. Each row contains bounded before/after snapshots (including collected URL and file-attribute metadata), match basis/quality, evidence state, limitations, and impact rank. A definitive permission change requires comparable non-null permission-quality hashes; evidence-shape drift without that contract is indeterminate. The endpoint returns `409` until the complete result is published and writes a bounded read-audit event.
+
+## Continuous monitoring and findings
+
+Collection sources are registered from normalized, non-secret run context. A source identity includes provider, target scope, tenant/perspective, and assessed identity where applicable; changing credentials or semantic scope must not silently reuse an incompatible baseline.
+
+### `GET /projects/{project_id}/sources`
+
+Lists sources with `provider`, `health_status`, `q`, `limit`, and `cursor` filters. A single provider component such as `smb` or `nfs` includes mixed sources such as `nfs+smb`; pass the full compound value to match only that collector scope. Health combines enabled state, last success/failure, expected interval, current age, and collection coverage. Staleness begins only after the larger of 15 minutes or twice the configured interval.
+
+### `GET /projects/{project_id}/sources/{source_id}`
+
+Returns one source, including last observed/success/failure runs, freshness, coverage, and automation state.
+
+### `PATCH /projects/{project_id}/sources/{source_id}`
+
+Project-admin operation for `display_name`, `enabled`, and nullable `expected_interval_seconds` (300 through 31,536,000). Every request supplies the configuration it was edited from as `expected_display_name`, `expected_enabled`, and `expected_current_interval_seconds`, then includes only mutable fields that changed. A concurrent configuration change returns structured `409 SOURCE_REVISION_CONFLICT`; clients must reload and let the operator reconcile the draft. Disabling a source does not reject later observations; it skips new automatic baseline comparison and finding-policy evaluation while leaving manual comparisons available. A work unit already claimed by a worker can finish, so use its audit/coverage state to verify the boundary after changing the switch. Credentials and Graph/SMB/NFS connection configuration are not accepted here.
+
+### `POST /projects/{project_id}/runs/{run_id}/monitoring/retry`
+
+Operator/admin recovery for the newest complete monitored run when its built-in finding evaluation reached a terminal `degraded` state. Active/queued evaluation is returned idempotently. A disabled source, superseded run, or non-retryable state returns structured `409` detail; rate limiting returns structured `429` detail and `Retry-After`. It requires `write:findings`.
+
+### `POST /projects/{project_id}/comparisons/{comparison_id}/findings/retry`
+
+Operator/admin recovery for finding evaluation attached to a complete comparison when the nested `findings_evaluation.state` is terminal `degraded`. This does not reset or recompute the comparison itself. Active/queued evaluation is returned idempotently; non-retryable state returns structured `409`, and rate limiting returns structured `429` with `Retry-After`. It requires `write:findings`.
+
+### `GET /projects/{project_id}/finding-policies`
+
+Returns the versioned built-in policy catalog. The current rules cover SharePoint anonymous links, broad internal grants, observed SMB write capability, resource appearance/disappearance, permission-evidence change, and comparison indeterminacy. Policy evidence states and limitations remain part of every result.
+
+### `GET /projects/{project_id}/findings`
+
+Lists the deduplicated analyst queue with `status`, `severity`, `policy_id`, `source_id`, `q`, `limit`, and `cursor`. The response includes status counts for the same non-status filter scope. Findings reopen when authoritative evidence observes the condition again; incomplete collection cannot silently resolve a prior finding.
+
+### `GET /projects/{project_id}/findings/{finding_id}`
+
+Returns current lifecycle state, bounded evidence snapshot, source/resource/run/comparison references, assignee, first/last seen timestamps, occurrence count, accepted-risk expiry, and an optimistic `revision`.
+
+### `PATCH /projects/{project_id}/findings/{finding_id}`
+
+Operator mutation for lifecycle status, project-member assignment, accepted-risk expiry, and an optional audit note. The caller must send the last observed `revision`; stale writes return structured `409 FINDING_REVISION_CONFLICT` detail. `accepted_risk` requires a future timezone-aware expiry, and the worker reopens expired risks with an audit event.
+
+### `POST /projects/{project_id}/findings/bulk`
+
+Atomically updates at most 100 finding IDs after locking them in stable order. The request supplies the expected revision for every ID; a missing, cross-project, or stale finding rejects the complete request, with bounded structured conflict detail for stale revisions. The server writes a shared batch event plus a bounded per-finding audit event so each finding's activity stream remains accountable.
+
+### `GET /projects/{project_id}/findings/assignee-candidates`
+
+Returns up to 100 active, approved project members for the operator assignment picker, optionally filtered by email.
+
+### `GET /projects/{project_id}/findings/{finding_id}/occurrences`
+
+Keyset-paginated immutable observations showing the run/comparison, policy version, evidence state, bounded evidence, and observation time.
+
+### `GET /projects/{project_id}/findings/{finding_id}/activity`
+
+Keyset-paginated finding audit activity. This is distinct from occurrence evidence: occurrences record what the scanner observed; activity records automated and human workflow transitions.
 
 ## Inventory
 
@@ -501,11 +578,13 @@ Revokes a token.
 
 ### `GET /settings/audit`
 
-Lists the global audit stream.
+Lists the global audit stream. Results expose retained `actor_user_id`, `actor_email`, `actor_token_id`, `actor_token_name`, `project_id`, and `project_name` attribution. The IDs are immutable audit references and can remain populated after the corresponding parent row is deleted.
 
 ### `GET /settings/audit/export`
 
-Exports the global audit stream as CSV or JSON.
+Exports the filtered global audit stream as bounded-memory streaming CSV or JSON, including retained actor-token and project attribution. `max_rows` defaults to 5,000 and is capped at 20,000. The route captures an immutable audit-ID high-watermark before recording its own request event, then keyset-reads rows no newer than that watermark; it is stable against concurrent inserts but is not a database-wide repeatable-read snapshot. `X-Export-Row-Count`, `X-Export-Row-Limit`, `X-Export-Truncated`, and `X-Export-Snapshot-ID` describe the planned result. The administration UI reads those headers and displays a post-download warning when more matching events existed than the file could contain. CSV cells are neutralized against spreadsheet formula execution.
+
+The request is audited as `SETTINGS_AUDIT_EXPORT_REQUESTED`; a fully consumed stream records `SETTINGS_AUDIT_EXPORTED`, while generator failure or disconnect records `SETTINGS_AUDIT_EXPORT_FAILED` or `SETTINGS_AUDIT_EXPORT_INTERRUPTED` on a best-effort retained-attribution path. A dependency failure after response headers produces an incomplete file rather than a second HTTP error, so consumers must validate JSON closure or the expected CSV row count. Responses are non-cacheable and proxy buffering is disabled. A larger historical export should be divided with selective project/search scope or taken from the operator's database/log archival pipeline.
 
 ### `GET /settings/rbac/project-memberships`
 
@@ -528,5 +607,5 @@ Bulk-assigns a user across all projects.
 - Password policy is driven by environment variables and enforced for registration, admin-created users, password changes, and seeded admin validation.
 - Login and upload paths are rate-limited.
 - Browser session tokens are invalidated on logout, logout-all, password change, admin password reset, disable, and unapprove.
-- Audit events are written for both changes and many read operations.
+- Audit events are written for changes and sensitive evidence reads. Metadata is recursively redacted and bounded by depth, field count, and serialized size before storage. The application does not silently promise an audit-retention period; operators must set retention, backup, and export policy for their deployment.
 - Inventory and run listings use keyset pagination rather than offset pagination.

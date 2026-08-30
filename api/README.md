@@ -17,13 +17,18 @@ FastAPI service for auth, project management, run lifecycle, artifact upload, an
 - Backward-compatible structured error envelopes with stable codes and request IDs
 - Redis-backed fixed-window rate limits (auth + upload)
 - Atomic rate-limit counter expiry and bounded Redis connect/read timeouts
-- Deep health endpoint for database and Redis readiness (`/healthz/deep`)
+- Deep health endpoint for database, Redis, and artifact-storage durability (`/healthz/deep`)
 - Async ingestion queueing via Redis Streams
 - Trusted-host enforcement and explicit production configuration validation
 - Raw streaming artifact uploads with filename-aware JSON/NDJSON/gzip classification
 - Off-event-loop, short-lived database phases around long artifact streams
 - Bounded keyset collections and matching tenant/run pagination indexes
 - Provider-aware SharePoint inventory fields, stable resource/item identities, collection-context reporting, and evidence-based exposure filters
+- Recurring collection-source health, comparison history, a revision-safe findings workflow, occurrence/activity history, and bounded assignee lookup
+- Evidence-plane-separated effective-access explanations that preserve unknown group, inheritance, and collection states
+- Keyset-paginated materialized resource/item history with explicit operator retry and structured incomplete-state errors
+- Bounded, recursively redacted audit metadata and sensitive evidence-read events
+- Artifact capacity readiness, deep POSIX durability probes, immutable atomic publication, and dry-run-first bounded reconciliation
 
 ## Local run (without Docker)
 
@@ -63,6 +68,12 @@ Alembic bootstrap uses separate migration budgets: `MIGRATION_DATABASE_CONNECT_T
 Synchronous run diff is intentionally bounded. `API_RUN_DIFF_MAX_ITEMS` defaults to `250000` total items across both runs; larger comparisons return an actionable `422` instead of risking process exhaustion. Detail arrays default to 500 records each (request maximum 2000), preserve exact aggregate counts, and return explicit truncation metadata.
 
 Asynchronous resource comparisons are admitted separately. `API_COMPARISON_MAX_ACTIVE_PER_PROJECT` defaults to `3`, while `API_COMPARISON_RATE_LIMIT` and `API_COMPARISON_RATE_WINDOW_SECONDS` default to `12` starts per actor/project per `60` seconds. The API persists dimension-specific compatibility and a durable queued row; workers recover the job from Postgres if Redis handoff fails. Result reads are keyset-paginated and support indexed provider, category, and trigram text filters.
+
+Monitoring source and finding endpoints use dedicated project-token scopes. Source configuration requires project admin; finding lifecycle changes require operator or admin; all project members with viewer access can inspect evidence. Finding writes use an optimistic revision to prevent lost analyst decisions, accepted risk requires a future expiry, and bulk requests are atomic within their bounded ID set.
+
+The effective-access endpoint is intentionally explanatory, not a directory entitlement engine. It separates direct provider permission entries, non-mutating observations for the collector's assessed identity, and provider-computed evidence. If membership, inheritance, retrieval, or semantic coverage is incomplete, the API returns limitations and `unknown` instead of synthesizing an allow or denial.
+
+Artifact storage readiness checks configured byte/percentage headroom. Raw uploads with a valid `Content-Length` are rejected before streaming when they exceed the request limit or cannot preserve configured capacity; each part is rechecked under a cross-process POSIX advisory lock. Capacity exhaustion returns `507` and transient storage/lock failures return `503`, both with `Retry-After` and without filesystem details. The deep sysadmin health probe also exercises the create, fsync, no-overwrite publication/rename, directory-fsync, and cleanup behavior used by uploads. Operators can run `python -m app.maintenance.reconcile_artifacts` in dry-run mode to compare database references with the shared filesystem; deletion requires both `--apply` and a bounded `--max-delete`.
 
 Provider-backed run diffs correlate items by stable provider identity within a resource. A path change is reported as a move/rename rather than one removal plus one addition. Diff responses also report whether collection perspectives are comparable; callers should treat a missing, partial, differently scoped, cross-tenant, or differently assessed identity context as a semantic warning even when structural differences are still returned.
 

@@ -6,8 +6,13 @@ The UI is a single-page app built with React and Vite. It keeps most work center
 
 - `/` login and optional self-registration
 - `/projects` dashboard
+- `/projects/:projectId/overview` project overview
+- `/projects/:projectId/findings` monitoring findings queue
 - `/projects/:projectId/import` run creation and artifact upload
 - `/projects/:projectId/inventory` project inventory
+- `/projects/:projectId/changes` comparison history
+- `/projects/:projectId/comparisons/:comparisonId` resource and item change investigation
+- `/projects/:projectId/sources` collection-source health and configuration
 - `/projects/:projectId/runs/:runId` run explorer
 - `/account` current-user account settings
 - `/settings/general`
@@ -31,7 +36,7 @@ Legacy redirects that still exist:
 
 - The compact top bar keeps Projects, authorized Settings, account, theme, and sign-out actions available.
 - A condensed bottom navigation preserves the same primary destinations on narrow screens.
-- Project context stays visible across `/projects/*`; project creation and switching live in the top bar.
+- Project context stays visible across `/projects/*`; a stable `Overview`, `Findings`, `Inventory`, `Changes`, and `Sources` workspace navigation keeps investigation context available while project creation and switching remain in the top bar.
 - Switching projects preserves portable inventory filters but drops the old project's run IDs.
 - Settings uses a dedicated sidebar with `General`, `Users`, `Projects`, `API Tokens`, and `Audit Log`.
 
@@ -130,6 +135,30 @@ Run-scoped saved search presets are browser-local and separate from project-shar
 
 Run artifact provenance includes content type, size, and a copyable SHA-256 when supplied by the API. Provider-aware runs also show collection perspective, authentication type, assessed identity, discovery completeness, and snapshot semantics. The run explorer warns before comparing contexts that are not semantically equivalent and reports stable-ID path changes as moves/renames. It shows the same compact, expandable share-access and exposure evidence as project inventory. Item views format collected size and modification timestamps when present. Project inventory additionally exposes optional allocation size, creation, last-access, metadata-change, file-attribute, provider identity, canonical URL, and deletion columns.
 
+## Continuous monitoring
+
+The monitoring workspace is split by operator intent:
+
+- `Sources` shows registered collection identities, freshness against the configured interval, last success/failure, coverage, and whether automatic comparison and policy evaluation are enabled. Project admins can change only the display name, interval, and automation switch; collector credentials are never managed in the browser.
+- `Findings` is a server-filtered, keyset-paginated analyst queue. Severity, status, policy, source, and text filters are URL-backed. Operators can inspect bounded evidence and occurrence/activity history, assign a project member through a searchable keyboard-accessible picker, record lifecycle decisions with optimistic revision checks, and apply atomic updates to the selected page.
+- `Changes` lists durable comparisons without treating queued, running, retry-delayed, failed, or indeterminate work as complete. A comparison investigation separates resource changes from keyset-paginated item additions, removals, moves, metadata changes, permission-evidence changes, and explicitly indeterminate rows.
+
+Source and comparison investigations keep materialized inventory/change evidence separate from derived policy-evaluation state. Queued/retrying/evaluating work polls at a bounded interval. When evaluation reaches terminal `degraded`, operators/admins can request an idempotent retry; exact `409`/`429` guidance remains visible and the page reloads authoritative state. Missing or partial comparison summaries are shown as unpublished instead of being interpreted as zero or causing a render failure.
+
+Selection controls are hidden for viewers who cannot mutate findings. Bulk selection is deliberately limited to the currently loaded page, and the interface states that scope before an update. Structured revision conflicts preserve the server's actionable message so an analyst can reload instead of overwriting another decision.
+
+Finding queue rows include only the evidence trust state. Selecting a finding performs the separately audited detail read before rendering its bounded summary, limitations, and references. Project-level activity timelines expose only workflow fields needed by viewers; request IP, user-agent, correlation data, and token identifiers remain restricted to the admin audit surface.
+
+## Permission interpretation
+
+Resource evidence uses three separate planes:
+
+- provider-reported permission entries and their collection coverage
+- non-mutating capability observations for the collector's assessed identity
+- conservative computed conclusions supported by those inputs
+
+The UI does not turn missing group expansion, inheritance, identity, or collection evidence into a denial. Effective access, anonymous/external exposure, broad internal access, and the collector identity's observed ability are labelled independently. Large entry sets remain cursor-paginated, and raw snapshots are rendered as bounded structured evidence rather than inserted directly into the page.
+
 ## Settings
 
 Settings is sysadmin-only and split into five sections.
@@ -169,7 +198,7 @@ Global API token administration with:
 
 ### Audit Log
 
-Global audit search and export.
+Global audit search and bounded CSV/JSON export. When `X-Export-Truncated: true` is returned, the page keeps the completed download but shows a persistent warning with the planned row count and directs the administrator to narrow the active filters or use the archival pipeline.
 
 ## Shared UI patterns
 

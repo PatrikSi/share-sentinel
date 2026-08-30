@@ -63,6 +63,20 @@ Large evidence sets are paginated. Each response is bounded to 25 assessments an
 
 Reading detailed evidence requires project viewer access plus both `read:runs` and `read:inventory` token scopes. Evidence views are recorded in the project audit log.
 
+### Effective-access explanation
+
+The resource evidence panel can explicitly request a bounded effective-access explanation. The endpoint reads only persisted data and keeps three planes separate:
+
+- direct provider grants or ACL entries for each observed principal
+- collection-time capabilities for the assessed identity
+- a computed effective decision, only when the stored assessment explicitly supports one
+
+Principal pages and permission-entry detail are bounded independently. A truncated response discloses its limit and continuation state. The top-level response never derives a resource-wide decision from only the current principal page. Unresolved groups, incomplete membership, unknown inheritance, partial retrieval, unrecognized provider semantics, or mixed evidence keep effective access `unknown`; direct allow/deny rows remain evidence rather than a computed verdict.
+
+A provider-computed resource verdict is accepted only from one complete, untruncated assessment that explicitly declares effective-access semantics, complete principal resolution, no omitted or unknown entries, and a recognized decision. Provider denial additionally requires explicit negative-conclusion support. Filtering to one principal intentionally disables that resource-wide verdict because the filtered page is not the full assessment.
+
+The bundled collectors do not currently emit complete, provenance-bearing group membership snapshots. Share Sentinel therefore does not infer transitive group access. `Sites.Read.All` and `Files.Read.All` do not authorize directory membership expansion, and hidden memberships require additional privileges and still need explicit completeness handling.
+
 ## Materialized run comparisons
 
 The bounded `GET .../runs/{run_id}/diff` endpoint remains useful for exact item-path previews below its configured item ceiling. The materialized comparison workflow is designed for larger resource inventories:
@@ -70,8 +84,8 @@ The bounded `GET .../runs/{run_id}/diff` endpoint remains useful for exact item-
 1. open a complete current run and choose a complete baseline on its **Diff** tab
 2. start a scalable resource comparison
 3. the API validates both runs, records dimension-specific compatibility, and queues a durable comparison row
-4. a worker derives stable resource identities, processes resources in bounded batches, stores result rows, and heartbeats progress
-5. the comparison workspace polls the job and then provides server-side filters and keyset pagination
+4. a worker derives stable resource and item identities, processes bounded batches, stores result rows with durable cursors, and heartbeats progress
+5. the comparison workspace polls the job and then provides server-side filters and keyset pagination for resource or item history
 
 Comparison creation requires project `operator` or `admin` access plus `write:runs` and `read:inventory`; project viewers need both `read:runs` and `read:inventory` to read an existing result. Repeating the same baseline/current/algorithm/options request is idempotent. A failed comparison can be explicitly submitted again, which resets its terminal error and requeues it. Redis handoff is an optimization: database recovery can claim a committed queued comparison if enqueueing fails.
 
@@ -95,7 +109,7 @@ The API compares collection contexts before work begins. Structural appearance o
 
 Collectors declare provider-bound comparison contracts for structural identity/inventory, content inventory, and—where implemented—SMB capability semantics. Both runs must declare the same contract version recognized for that provider. Missing, unknown, cross-provider, or changed contracts make the corresponding dimension indeterminate, allowing collector behavior to evolve without silently reinterpreting historical runs. Direct permission evidence remains independently versioned and gated by normalized assessment semantics and consumer-derived quality hashes. Capability comparison is currently applicable only to SMB-only runs; the UI presents it as **not applicable** for SharePoint rather than as a failed check.
 
-A row can therefore be:
+A resource row can therefore be:
 
 - `appeared` or `disappeared` when equivalent authoritative structural scope supports absence
 - `changed` when comparable observations prove a structural or location change, a bounded capability or provider permission-evidence change, or an aggregate item-count change; this does not claim effective-access or item-level churn
@@ -103,25 +117,46 @@ A row can therefore be:
 
 The result keeps structural, access, and content states separate. Equal failed/partial permission evidence is not silently treated as “no change”; it remains indeterminate. Location changes are not promoted to definitive moves when structural collection is incomparable.
 
-Resource summary counts are exact only for the materialized resource result set and explicitly expose `resource_summary_exact`. Overall `exact` remains false because per-item churn is not computed. Item count snapshots are useful aggregate evidence, but null added/removed/moved values mean **not computed**, never zero.
+Resource summary counts are exact only for the materialized resource result set and explicitly expose `resource_summary_exact`.
+
+### Item-level history
+
+When both runs have compatible, complete content scope, the worker also materializes durable item rows:
+
+- `added` and `removed`
+- `moved` and `renamed` when a stable provider item ID survives the path change
+- `metadata_changed`, including type, size, timestamps, MIME type, collected web URL, file attributes, and supported provider metadata
+- `permission_changed` only when both consumer-derived permission-quality hashes are present and comparable
+- `indeterminate` when a possible permission difference or identity cannot support a definitive conclusion
+
+Provider item IDs are strong identities. A path-derived fallback is labeled weak and cannot distinguish a move or rename from remove plus add. Duplicate or missing identities are not paired arbitrarily; affected resources are skipped with bounded examples and an explicit comparison limitation.
+
+Observation timestamps are provenance, not permission-set content, and are excluded from the permission hash. Evidence-shape or quality drift without two comparable non-null hashes is published as `indeterminate`, never as a definitive permission change.
+
+The comparison summary exposes separate `resource_summary_exact`, `item_summary_exact`, and overall `exact` flags, item counts by change type, and `item_limitations`. An empty item page means zero published rows only when the summary says item history was computed; `not_computed` remains distinct from zero change.
 
 ## Failure and recovery behavior
 
 - queued and stale-running comparisons are recoverable from Postgres
 - workers claim a comparison under a PostgreSQL advisory lock
 - result materialization is idempotent and an unfinished attempt does not publish a terminal complete state
-- progress and heartbeats are persisted between batches
+- result rows and phase/cursor progress are committed together; recoverable work resumes from the last durable resource or item batch rather than replaying the full comparison
+- long comparisons yield between bounded work slices so ordinary ingest is not indefinitely starved by the default worker
 - retryable infrastructure errors return the job to recoverable work with bounded backoff; deterministic identity or evidence violations fail it with an operator-facing code and message
 - replacing an artifact deletes every materialized comparison involving that run before its normalized rows are cleared, preventing stale results
-- concurrent comparison admission is serialized per project and bounded by `API_COMPARISON_MAX_ACTIVE_PER_PROJECT`; create requests are rate limited
+- concurrent comparison admission is serialized per project and bounded by `API_COMPARISON_MAX_ACTIVE_PER_PROJECT`; create and explicit failed-comparison retry requests share the same rate-limit and active-capacity budget
 
-Comparison result rows can be large when many resources change. Monitor `run_comparisons` and `comparison_resource_changes` growth alongside ordinary inventory retention. The current release ties comparison lifetime to its project and source runs; deleting either cascades the comparison. It does not yet provide a separate comparison-retention policy or item-level materialization.
+Comparison result rows can be large when many resources or items change. Monitor `run_comparisons`, `comparison_resource_changes`, and `comparison_item_changes` growth alongside ordinary inventory retention. The current release ties comparison lifetime to its project and source runs; deleting either cascades the comparison. It does not yet provide a separate comparison-retention policy.
 
 ## API map
 
 - `GET /projects/{project_id}/runs/{run_id}/resources/{resource_id}/access-evidence`
+- `GET /projects/{project_id}/runs/{run_id}/resources/{resource_id}/effective-access`
 - `POST /projects/{project_id}/comparisons`
+- `GET /projects/{project_id}/comparisons`
 - `GET /projects/{project_id}/comparisons/{comparison_id}`
+- `POST /projects/{project_id}/comparisons/{comparison_id}/retry`
 - `GET /projects/{project_id}/comparisons/{comparison_id}/resource-changes`
+- `GET /projects/{project_id}/comparisons/{comparison_id}/item-changes`
 
-Resource changes accept `change_type`, `provider`, `category`, `q`, `limit`, and opaque `cursor` filters. A comparison returns `409` until it is complete. Clients should preserve the returned comparison ID and use exponential backoff while the state is `queued` or `running`.
+Resource changes accept `change_type`, `provider`, `category`, `q`, `limit`, and opaque `cursor` filters. Item changes accept `change_type`, `resource_change_id`, `q`, `limit`, and opaque `cursor`. A comparison returns `409` until it is complete. Clients should preserve the returned comparison ID and use exponential backoff while the state is `queued` or `running`.

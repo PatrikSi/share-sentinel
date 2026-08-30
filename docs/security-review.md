@@ -1,7 +1,7 @@
 # Security review
 
-Review date: 2026-08-27
-Target: Share Sentinel 1.3.0 open-source release
+Review date: 2026-08-30
+Target: Share Sentinel `dev` continuous-monitoring expansion
 Scope: API, worker, collector, UI, dependency manifests, containers, and reference Compose topology
 
 ## Outcome
@@ -103,12 +103,39 @@ This is a code and configuration review, not a penetration test or certification
 - Resolution: seed administrator addresses use the same validated email type during configuration loading, so startup fails before creating an unusable identity.
 - Regression control: production configuration tests.
 
+### SS-SEC-012 — Monitoring audit metadata growth and secret exposure
+
+- Severity: Medium
+- Status: Resolved
+- Affected: audit event service, finding/source mutations, worker automation, and artifact reconciliation
+- Resolution: recursive sensitive-key redaction now covers credentials, connection strings, assertions, keys, tokens, and token hashes; metadata depth, field count, collection length, text length, and serialized size are bounded before persistence. Atomic bulk finding changes retain a shared batch identifier and an event for every affected finding.
+- Resolution: immutable non-FK project, user, and API-token references plus event-time labels preserve supported forensic attribution for new events when mutable parents are renamed or deleted. Concurrent lookup indexes precede restart-safe bounded legacy backfill and parent-deletion triggers; legacy live-parent rows receive upgrade-time labels, while prior orphans remain unrecoverable. Token secrets and hashes are never snapshotted.
+- Remaining responsibility: the application does not choose an audit-retention period and Postgres is not an append-only/WORM sink. Audit backup, export, privacy review, external immutable forwarding, access review, and deletion policy remain deployment controls. Attribution orphaned before the snapshot schema existed cannot be reconstructed.
+
+### SS-SEC-013 — SharePoint certificate and national-cloud boundary
+
+- Severity: Medium
+- Status: Resolved
+- Affected: SharePoint collector authentication and Graph client configuration
+- Resolution: supported cloud profiles bind authority, Graph audience/host, and SharePoint hostname suffix together; state is partitioned by cloud. Certificate files must be bounded regular files and, on Unix, owner-readable only, with symlink traversal rejected. Secrets, certificate material, imported tokens, and delta links are excluded from artifacts and logs.
+- Remaining responsibility: protect collector state and process environment, use least-privileged application consent, and treat additional directory/group permissions as a separate reviewed opt-in.
+
+### SS-SEC-014 — Effective-access overstatement
+
+- Severity: High
+- Status: Resolved within the current evidence boundary
+- Affected: collector completeness, normalized permission evidence, comparison findings, and effective-access UI/API
+- Resolution: direct provider grants, assessed-identity capability probes, and provider-computed decisions are separate evidence planes. Group membership, inheritance, partial retrieval, unresolved identity, NFS authentication, DFS targets, and incompatible snapshots remain explicitly unknown or indeterminate. Finding resolution requires authoritative coverage.
+- Remaining risk: Share Sentinel is not a directory-service authorization simulator. A collector identity's observed access and an ACL entry do not by themselves prove every user's effective access.
+
 ## Accepted product limitations
 
 - No MFA, SSO, SCIM, or external identity-provider integration.
 - No turnkey TLS or HA topology; TLS termination and proxy policy are deployment responsibilities.
 - No malware/content scanner for uploaded artifacts.
 - No formal compatibility guarantee for multiple application versions running during migration.
-- No dedicated worker metrics endpoint or comprehensive queue-backlog dashboard.
+- No automatic notification connector, custom policy authoring, or retention scheduler.
+- No complete group-membership/inheritance expansion or cross-provider effective-entitlement engine.
+- No dedicated worker HTTP metrics endpoint or comprehensive per-stage tracing dashboard; the sysadmin API metrics endpoint exposes bounded durable backlog/age and dependency signals.
 
 These limitations do not block an initial source release, but they should be revisited before high-assurance or large multi-tenant use.

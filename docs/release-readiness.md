@@ -10,6 +10,9 @@ Use this checklist before publishing a public release of the current tree. It is
 - [x] Cookie-backed browser sessions with CSRF protection and session invalidation on logout and password resets
 - [x] Project-scoped API tokens with hashed storage, scoped authorization, and expiry defaults
 - [x] Worker retry scheduling, stale-run recovery, and Docker health checks backed by heartbeat files
+- [x] Durable collection-source registration, compatible automatic baselines, time-sliced comparison recovery, item-level history, and an evidence-backed findings lifecycle
+- [x] Bounded and recursively redacted audit metadata with per-finding bulk accountability and audited sensitive evidence reads
+- [x] Artifact headroom/deep-write health plus dry-run-first, bounded reconciliation of missing references, stale multipart files, and orphan candidates
 - [x] Automated tests for API, worker, and collector components
 - [x] Local Docker Compose deployment with bootstrap, API, worker, UI, Postgres, Redis, and gateway services
 - [x] CI with dependency audits, Linux and Windows SharePoint collector tests, UI production build, production/development Compose validation, all four application image builds, live generic and SharePoint diff ingests, and a production-style security smoke test
@@ -31,6 +34,9 @@ Use this checklist before publishing a public release of the current tree. It is
 - [ ] Run worker tests: `cd worker && pip install -r requirements-dev.txt && pytest -q`
 - [ ] Run collector tests: `cd collector && pip install -r requirements-dev.txt && pytest -q`
 - [ ] Run UI validation: `cd ui && npm ci && npm run typecheck && npm run build`
+- [ ] Exercise a recurring source through two compatible complete runs; verify automatic comparison, item-history rows, finding deduplication, and source freshness/coverage in the UI
+- [ ] Interrupt a materialized comparison after at least one committed batch; verify recovery resumes its durable cursor and publishes no partial result before `COMPLETE`
+- [ ] Exercise finding revision conflict, accepted-risk expiry/reopen, assignment, and atomic page-bulk behavior; inspect both occurrence and audit activity
 - [ ] Run `python scripts/check-release.py --tag vX.Y.Z`
 - [ ] Run Python and npm dependency audits
 - [ ] Run `./scripts/smoke-production.sh` against the production-style hostname and gateway
@@ -45,6 +51,11 @@ Use this checklist before publishing a public release of the current tree. It is
 - [ ] Confirm the artifact volume is durable and shared consistently between API and worker
 - [ ] Verify backup restore, worker interruption/recovery, and storage-headroom alerts on the intended production topology
 - [ ] Review audit logs after smoke testing to confirm auth, upload, and ingest events are recorded as expected
+- [ ] Review finding/source/comparison/effective-access/artifact-reconciliation events and confirm metadata is bounded and contains no collector secrets
+- [ ] On an upgraded PostgreSQL copy, verify the bounded audit-attribution backfill completes; confirm post-trigger events retain IDs and event-time labels after user/token/project rename or deletion, and confirm legacy live-parent rows are explicitly interpreted with upgrade-time labels
+- [ ] Confirm the non-skipped `audit-attribution-postgres` workflow job passed for the release commit and tag
+- [ ] Set documented retention and backup policies for raw artifacts, normalized inventory, item history, findings/occurrences, comparisons, and audit records
+- [ ] Confirm SharePoint authority/Graph/SharePoint hosts match the selected cloud and that certificate files meet the collector's ownership/mode checks
 
 ## Open source release checks
 

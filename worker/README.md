@@ -8,8 +8,10 @@ The worker consumes ingest jobs, reads raw artifacts from shared storage, and no
 - reopen raw artifacts from `ARTIFACT_STORAGE_PATH`
 - upsert endpoints, resources, items, normalized permission evidence, and ingest errors
 - materialize durable resource comparisons between complete runs
+- register recurring collection sources, choose compatible automatic baselines, and evaluate built-in finding policies
+- materialize durable item additions, removals, moves, metadata changes, permission-evidence changes, and indeterminate correlations
 - checkpoint `scan_runs.ingest_progress`
-- emit ingest audit events
+- emit ingest, source, comparison, finding, and accepted-risk-expiry audit events
 - recover some stranded `UPLOADED` or stale `INGESTING` runs
 
 ## Hard deployment invariant
@@ -45,6 +47,10 @@ That is not just a convenience setting. The API writes uploads to local filesyst
 - Endpoint and resource identity caches are bounded LRU maps rather than inventory-sized dictionaries.
 - Permission entries use bounded set-based inserts and a bounded principal cache; malformed key collisions fall back to isolated row validation so unrelated evidence can still ingest.
 - Comparison retries persist a due timestamp and use delayed deterministic jitter rather than consuming their retry budget in a tight loop.
+- Comparison phase and keyset cursors are durable. Recovery preserves committed resource/item batches, while only an explicit failed-comparison retry resets result state.
+- Long comparisons yield after the configured time or batch quantum and return to the Postgres recovery queue so one job cannot occupy a serial worker indefinitely.
+- Disabled sources still record successful/failed observations but skip automatic comparison and policy evaluation; incomplete scans never auto-resolve state findings.
+- Accepted-risk findings are reopened by a bounded expiry sweep and every automatic lifecycle transition is audited.
 - `SIGTERM` and `SIGINT` stop new claims and cooperatively checkpoint active work. A paused run returns to `UPLOADED`, records `INGEST_PAUSED`, and can be resumed by another worker.
 
 ## Important caveats
@@ -61,7 +67,7 @@ The API can accept large uploads, but the worker still enforces parser and decom
 
 ### Serial worker model
 
-One worker process handles jobs serially. If you need more throughput, scale by adding worker replicas and verify your shared artifact storage can support the concurrent read pattern.
+One worker process handles jobs serially. Comparison time slicing improves fairness but does not create parallelism inside a process. If you need more throughput, scale by adding worker replicas and verify that Postgres, Redis, and shared artifact storage can support the concurrent read/write pattern.
 
 ### Current operability limits
 
@@ -93,6 +99,11 @@ At minimum, the worker needs:
 - `INGEST_IDENTITY_CACHE_SIZE` (default `10000`, maximum `100000` entries per identity map)
 - `INGEST_PERMISSION_ENTRY_BATCH_SIZE` (default `500`, maximum `5000` normalized permission entries per set-based insert)
 - `INGEST_PERMISSION_ENTRY_BATCH_MAX_BYTES` (default `8388608`, maximum `67108864`; flushes entry batches by serialized size as well as count)
+- `COMPARISON_WORK_QUANTUM_SECONDS` (default `30`; range `5` through `300`)
+- `COMPARISON_WORK_QUANTUM_BATCHES` (default `20`; range `1` through `1000`)
+- `AUTOMATIC_COMPARISON_MAX_ACTIVE_PER_PROJECT` (default `3`; range `1` through `100`)
+- `FINDING_EVALUATION_BATCH_SIZE` (default `500`; range `50` through `5000`)
+- `FINDING_RESOLUTION_BATCH_SIZE` (default `250`; range `25` through `1000`)
 
 The Compose file exposes the routinely tuned settings above and uses worker defaults for the others. Invalid values and values above the documented memory-safety ceilings stop worker startup with a configuration error instead of being silently clamped.
 

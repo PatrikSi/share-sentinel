@@ -44,9 +44,9 @@ Project access is based on three roles:
 
 In practice:
 
-- `viewer` can read dashboard, inventory, and run data
-- `operator` can create runs and upload artifacts
-- `admin` can manage project membership and create self-service project tokens
+- `viewer` can read dashboard, inventory, runs, source health, comparison history, findings, and stored permission/effective-access evidence
+- `operator` adds run/upload/comparison actions plus finding assignment and lifecycle decisions
+- `admin` adds source monitoring configuration, project membership, audit, and self-service project-token management
 
 ## Sysadmin role
 
@@ -72,6 +72,8 @@ Important rules:
 - token role cannot exceed the owner's project role
 - non-sysadmin scope choices are constrained to the defaults allowed for that project role
 - token creation, rotation, and revocation are all audited
+
+Monitoring adds `read:findings`, `write:findings`, `read:sources`, and `write:sources`. Role-default tokens receive only the matching role level: viewers read both surfaces, operators also write findings, and admins also write source configuration. Existing explicit-scope tokens are not silently broadened during an upgrade.
 
 ## Safety rails
 
