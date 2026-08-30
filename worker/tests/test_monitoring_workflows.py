@@ -1,4 +1,5 @@
 import inspect
+import json
 import os
 import sys
 from datetime import UTC, datetime
@@ -199,6 +200,8 @@ def test_finding_resolution_clears_risk_expiry_and_is_bounded_to_source():
 
 
 def test_expired_risk_sweep_reopens_and_audits_atomically(monkeypatch):
+    expired_at = datetime(2026, 1, 1, tzinfo=UTC)
+
     class Conn:
         def __enter__(self):
             return self
@@ -209,13 +212,21 @@ def test_expired_risk_sweep_reopens_and_audits_atomically(monkeypatch):
         def execute(self, query, params=None):
             assert "FOR UPDATE SKIP LOCKED" in query
             assert "accepted_risk_expires_at = NULL" in query
-            return Result(rows=[("finding-1", "project-1")])
+            assert "candidates.old_status" in query
+            return Result(rows=[("finding-1", "project-1", "accepted_risk", expired_at)])
 
     audits = []
     monkeypatch.setattr(main, "connect_database", lambda: Conn())
     monkeypatch.setattr(main, "write_audit", lambda *args, **kwargs: audits.append(args))
     assert main.reopen_expired_accepted_risk_findings(limit=5) == 1
     assert audits[0][2] == "FINDING_ACCEPTED_RISK_EXPIRED"
+    assert audits[0][5] == {
+        "worker": main.CONSUMER_NAME,
+        "old_status": "accepted_risk",
+        "new_status": "open",
+        "old_accepted_risk_expires_at": expired_at,
+        "reason": "accepted_risk_expired",
+    }
 
 
 def test_automatic_baseline_insert_is_idempotent(monkeypatch):
@@ -227,6 +238,7 @@ def test_automatic_baseline_insert_is_idempotent(monkeypatch):
 
         def execute(self, query, params=None):
             if query.startswith("SELECT collection_context"):
+                assert "FOR UPDATE" in query
                 return Result((context, datetime.now(tz=UTC)))
             if "SELECT id::text, collection_context" in query:
                 assert "AND (created_at, id) < (%s, %s::uuid)" in query
@@ -255,6 +267,100 @@ def test_automatic_baseline_insert_is_idempotent(monkeypatch):
     )
     assert first is not None
     assert second == first
+
+
+def test_automatic_baseline_unavailable_is_audited_once_per_run(monkeypatch):
+    context = complete_context()
+    audits = []
+
+    class Conn:
+        def execute(self, query, params=None):
+            if query.startswith("SELECT collection_context"):
+                assert "FOR UPDATE" in query
+                return Result((context, datetime.now(tz=UTC)))
+            if "SELECT id::text, collection_context" in query:
+                return Result(rows=[])
+            if "SELECT source.coverage, run.collection_context" in query:
+                return Result(({}, context))
+            if query.startswith("UPDATE collection_sources SET coverage"):
+                return Result()
+            if "FROM audit_events" in query:
+                return Result((bool(audits),))
+            raise AssertionError(query)
+
+    monkeypatch.setattr(main, "write_audit", lambda *args, **_kwargs: audits.append(args))
+    conn = Conn()
+    for _ in range(2):
+        assert (
+            main.create_automatic_comparison(
+                conn,
+                project_id="project",
+                source_id="source",
+                current_run_id="current",
+            )
+            is None
+        )
+    assert len(audits) == 1
+    assert audits[0][2] == "AUTOMATIC_BASELINE_UNAVAILABLE"
+    assert audits[0][3:5] == ("scan_run", "current")
+    assert audits[0][5] == {
+        "worker": main.CONSUMER_NAME,
+        "source_id": "source",
+        "current_run_id": "current",
+        "state": "unavailable",
+        "reason": "no_prior_complete_run",
+        "candidates_considered": 0,
+        "candidate_window_limit": 20,
+        "candidate_window_exhausted": False,
+    }
+
+
+def test_authoritative_recurrence_audits_automatic_reopen_transition(monkeypatch):
+    expired_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+    class Conn:
+        def execute(self, query, params=None):
+            if "SELECT id::text, status, accepted_risk_expires_at" in query:
+                assert "FOR UPDATE" in query
+                return Result(("finding-1", "accepted_risk", expired_at))
+            if "INSERT INTO findings" in query:
+                return Result(("finding-1", "open"))
+            if "INSERT INTO finding_occurrences" in query:
+                return Result((1,))
+            raise AssertionError(query)
+
+    audits = []
+    monkeypatch.setattr(main, "write_audit", lambda *args, **_kwargs: audits.append(args))
+    assert main._upsert_finding(
+        Conn(),
+        project_id="project",
+        source_id="source",
+        policy_id="smb.write_observed",
+        subject_key="share-1",
+        resource_identity_key="resource-1",
+        resource_type="smb_share",
+        provider="smb",
+        resource_name="Finance",
+        run_id="run-2",
+        comparison_id=None,
+        evidence_state="exact",
+        evidence={"capability": "write"},
+    ) == ("finding-1", True, main._finding_dedupe_key("smb.write_observed", "source", "share-1"))
+    assert [audit[2] for audit in audits] == ["FINDING_OBSERVED", "FINDING_AUTO_REOPENED"]
+    assert audits[0][5]["old_status"] == "accepted_risk"
+    assert audits[0][5]["new_status"] == "open"
+    assert audits[1][5] == {
+        "worker": main.CONSUMER_NAME,
+        "policy_id": "smb.write_observed",
+        "policy_version": 1,
+        "source_id": "source",
+        "run_id": "run-2",
+        "comparison_id": None,
+        "old_status": "accepted_risk",
+        "new_status": "open",
+        "old_accepted_risk_expires_at": expired_at,
+        "reason": "authoritative_recurrence",
+    }
 
 
 def test_out_of_order_source_run_cannot_move_health_or_baseline_backward(monkeypatch):
@@ -437,6 +543,13 @@ def test_worker_audit_metadata_is_bounded_redacted_and_labels_are_validated():
     assert sanitized["items"][-1] == {"_truncated_item_count": 50}
     oversized = main.sanitize_audit_metadata({f"safe_{index}": "x" * 4096 for index in range(100)})
     assert oversized["_metadata_truncated"] is True
+    hostile = main.sanitize_audit_metadata(
+        {
+            "request_id": "\x00" * 4096,
+            **{f"{'k' * 4088}{index:08d}": "value" for index in range(100)},
+        }
+    )
+    assert len(json.dumps(hostile, ensure_ascii=False).encode("utf-8")) <= main.MAX_AUDIT_METADATA_BYTES
     for invalid in ("", "contains spaces", "x" * 121):
         try:
             main._validate_audit_label(invalid, name="action", max_length=120)

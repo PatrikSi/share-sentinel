@@ -889,6 +889,7 @@ MAX_AUDIT_METADATA_BYTES = 64 * 1024
 MAX_AUDIT_STRING_CHARS = 4096
 MAX_AUDIT_COLLECTION_ITEMS = 100
 MAX_AUDIT_DEPTH = 6
+MAX_AUDIT_FALLBACK_STRING_CHARS = 512
 AUDIT_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*$")
 SENSITIVE_AUDIT_KEY_FINGERPRINT_SUFFIXES = (
     "accesskey",
@@ -970,16 +971,30 @@ def sanitize_audit_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     encoded = json.dumps(sanitized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(encoded) <= MAX_AUDIT_METADATA_BYTES:
         return sanitized
-    preserved = {
-        key: value
-        for key, value in sanitized.items()
-        if key in {"request_id", "ip", "user_agent", "reason", "status"}
-    }
-    return {
+    preserved: dict[str, Any] = {}
+    for key in ("request_id", "ip", "user_agent", "reason", "status"):
+        if key not in sanitized:
+            continue
+        value = sanitized.get(key)
+        if value is None or isinstance(value, (bool, int, float)):
+            preserved[key] = value
+        elif isinstance(value, str):
+            preserved[key] = value[:MAX_AUDIT_FALLBACK_STRING_CHARS]
+        else:
+            preserved[key] = "[omitted: oversized audit metadata]"
+    fallback = {
         **preserved,
         "_metadata_truncated": True,
         "_encoded_bytes_before_truncation": len(encoded),
-        "_top_level_keys": list(sanitized)[:MAX_AUDIT_COLLECTION_ITEMS],
+        "_top_level_key_count": len(sanitized),
+    }
+    fallback_encoded = json.dumps(fallback, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(fallback_encoded) <= MAX_AUDIT_METADATA_BYTES:
+        return fallback
+    return {
+        "_metadata_truncated": True,
+        "_encoded_bytes_before_truncation": len(encoded),
+        "_top_level_key_count": len(sanitized),
     }
 
 
@@ -3350,7 +3365,7 @@ def create_automatic_comparison(
 ) -> str | None:
     current_row = conn.execute(
         "SELECT collection_context, created_at FROM scan_runs "
-        "WHERE id = %s AND project_id = %s AND status = 'COMPLETE'",
+        "WHERE id = %s AND project_id = %s AND status = 'COMPLETE' FOR UPDATE",
         (current_run_id, project_id),
     ).fetchone()
     if current_row is None:
@@ -3381,18 +3396,47 @@ def create_automatic_comparison(
             compatibility = candidate_compatibility
             break
     if baseline_run_id is None or compatibility is None:
+        unavailable_reason = "no_prior_complete_run" if not candidates else "no_compatible_prior_run"
+        baseline_coverage = {
+            "state": "unavailable",
+            "reason": unavailable_reason,
+            "candidates_considered": len(candidates),
+            "candidate_window_limit": 20,
+            "candidate_window_exhausted": len(candidates) >= 20,
+        }
         update_collection_source_monitoring_coverage(
             conn,
             source_id=source_id,
             run_id=current_run_id,
-            baseline={
-                "state": "unavailable",
-                "reason": "no_prior_complete_run" if not candidates else "no_compatible_prior_run",
-                "candidates_considered": len(candidates),
-                "candidate_window_limit": 20,
-                "candidate_window_exhausted": len(candidates) >= 20,
-            },
+            baseline=baseline_coverage,
         )
+        already_audited = conn.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM audit_events
+                WHERE project_id = %s
+                  AND action = 'AUTOMATIC_BASELINE_UNAVAILABLE'
+                  AND object_type = 'scan_run'
+                  AND object_id = %s
+            )
+            """,
+            (project_id, current_run_id),
+        ).fetchone()
+        if not already_audited or already_audited[0] is not True:
+            write_audit(
+                conn,
+                project_id,
+                "AUTOMATIC_BASELINE_UNAVAILABLE",
+                "scan_run",
+                current_run_id,
+                {
+                    "worker": CONSUMER_NAME,
+                    "source_id": source_id,
+                    "current_run_id": current_run_id,
+                    **baseline_coverage,
+                },
+            )
         return None
 
     comparison_id = str(uuid.uuid4())
@@ -6598,7 +6642,8 @@ def reopen_expired_accepted_risk_findings(limit: int = 100) -> int:
         rows = conn.execute(
             """
             WITH candidates AS (
-                SELECT id
+                SELECT id, status AS old_status,
+                       accepted_risk_expires_at AS old_accepted_risk_expires_at
                 FROM findings
                 WHERE status = 'accepted_risk'
                   AND accepted_risk_expires_at <= NOW()
@@ -6612,18 +6657,25 @@ def reopen_expired_accepted_risk_findings(limit: int = 100) -> int:
                 updated_at = NOW()
             FROM candidates
             WHERE finding.id = candidates.id
-            RETURNING finding.id::text, finding.project_id::text
+            RETURNING finding.id::text, finding.project_id::text,
+                      candidates.old_status, candidates.old_accepted_risk_expires_at
             """,
             (max(1, min(int(limit), 500)),),
         ).fetchall()
-        for finding_id, project_id in rows:
+        for finding_id, project_id, old_status, old_accepted_risk_expires_at in rows:
             write_audit(
                 conn,
                 str(project_id),
                 "FINDING_ACCEPTED_RISK_EXPIRED",
                 "finding",
                 str(finding_id),
-                {"worker": CONSUMER_NAME, "new_status": "open"},
+                {
+                    "worker": CONSUMER_NAME,
+                    "old_status": str(old_status),
+                    "new_status": "open",
+                    "old_accepted_risk_expires_at": old_accepted_risk_expires_at,
+                    "reason": "accepted_risk_expired",
+                },
             )
     return len(rows)
 
@@ -8004,6 +8056,17 @@ def _upsert_finding(
         )
         if value is not None and str(value).strip()
     ).casefold()
+    prior_row = conn.execute(
+        """
+        SELECT id::text, status, accepted_risk_expires_at
+        FROM findings
+        WHERE project_id = %s AND dedupe_key = %s
+        FOR UPDATE
+        """,
+        (project_id, dedupe_key),
+    ).fetchone()
+    prior_status = str(prior_row[1]) if prior_row is not None else None
+    prior_accepted_risk_expires_at = prior_row[2] if prior_row is not None else None
     row = conn.execute(
         """
         INSERT INTO findings (
@@ -8161,9 +8224,31 @@ def _upsert_finding(
                 "comparison_id": comparison_id,
                 "evidence_state": evidence_state,
                 "status": finding_status,
+                "old_status": prior_status,
+                "new_status": finding_status,
                 "authoritative_state": authoritative_state,
             },
         )
+        if prior_status is not None and prior_status != finding_status and finding_status == "open":
+            write_audit(
+                conn,
+                project_id,
+                "FINDING_AUTO_REOPENED",
+                "finding",
+                persisted_finding_id,
+                {
+                    "worker": CONSUMER_NAME,
+                    "policy_id": policy_id,
+                    "policy_version": policy["version"],
+                    "source_id": source_id,
+                    "run_id": run_id,
+                    "comparison_id": comparison_id,
+                    "old_status": prior_status,
+                    "new_status": finding_status,
+                    "old_accepted_risk_expires_at": prior_accepted_risk_expires_at,
+                    "reason": "authoritative_recurrence",
+                },
+            )
     return persisted_finding_id, inserted_occurrence is not None, dedupe_key
 
 
@@ -8179,7 +8264,7 @@ def _resolve_absent_state_findings(
     rows = conn.execute(
         """
         WITH candidates AS (
-            SELECT finding.id
+            SELECT finding.id, finding.status AS old_status
             FROM findings AS finding
             WHERE finding.project_id = %s
               AND finding.source_id = %s
@@ -8200,18 +8285,25 @@ def _resolve_absent_state_findings(
             updated_at = NOW(), revision = finding.revision + 1
         FROM candidates
         WHERE finding.id = candidates.id
-        RETURNING finding.id::text
+        RETURNING finding.id::text, candidates.old_status
         """,
         (project_id, source_id, policy_id, run_id, max(1, min(int(limit), 1000))),
     ).fetchall()
-    for row in rows:
+    for finding_id, old_status in rows:
         write_audit(
             conn,
             project_id,
             "FINDING_AUTO_RESOLVED",
             "finding",
-            str(row[0]),
-            {"worker": CONSUMER_NAME, "policy_id": policy_id, "source_id": source_id, "run_id": run_id},
+            str(finding_id),
+            {
+                "worker": CONSUMER_NAME,
+                "policy_id": policy_id,
+                "source_id": source_id,
+                "run_id": run_id,
+                "old_status": str(old_status),
+                "new_status": "resolved",
+            },
         )
     return len(rows), len(rows) >= max(1, min(int(limit), 1000))
 
