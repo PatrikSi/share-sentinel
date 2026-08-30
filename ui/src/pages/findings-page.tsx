@@ -11,6 +11,7 @@ import {
   evidenceTrustCopy,
   findingEvidenceFacts,
   findingExpectedRevisions,
+  findingOccurrenceRunReference,
   findingTone,
   formatMonitoringTimestamp,
   humanizeMonitoringValue,
@@ -164,7 +165,10 @@ function FindingHistory({ finding }: { finding: Finding }) {
           {occurrenceError ? <StatusBanner tone="error" title="Occurrence history unavailable"><p>{occurrenceError}</p><button className="mt-2 rounded-md border border-current px-3 py-1.5 text-xs font-semibold" onClick={() => setOccurrenceNonce((value) => value + 1)} type="button">Retry occurrences</button></StatusBanner> : null}
           {occurrenceLoading && occurrences.length === 0 ? <p className="finding-history-loading" role="status">Loading occurrences…</p> : null}
           {!occurrenceLoading && !occurrenceError && occurrences.length === 0 ? <p className="finding-history-empty">No occurrence rows are available. Do not infer that the finding was never observed.</p> : null}
-          {occurrences.length > 0 ? <ol className="finding-history-list">{occurrences.map((occurrence) => <li key={occurrence.id}><span className={`evidence-state is-${occurrence.evidence_state}`}>{humanizeMonitoringValue(occurrence.evidence_state)}</span><div><strong>{formatMonitoringTimestamp(occurrence.observed_at)}</strong><small>Policy {occurrence.policy_id} · v{occurrence.policy_version}</small><div className="monitoring-action-row"><Link to={`/projects/${finding.project_id}/runs/${occurrence.run_id}`}>Run evidence</Link>{occurrence.comparison_id ? <Link to={`/projects/${finding.project_id}/comparisons/${occurrence.comparison_id}`}>Comparison</Link> : null}</div></div></li>)}</ol> : null}
+          {occurrences.length > 0 ? <ol className="finding-history-list">{occurrences.map((occurrence) => {
+            const runReference = findingOccurrenceRunReference(finding.project_id, occurrence.run_id);
+            return <li key={occurrence.id}><span className={`evidence-state is-${occurrence.evidence_state}`}>{humanizeMonitoringValue(occurrence.evidence_state)}</span><div><strong>{formatMonitoringTimestamp(occurrence.observed_at)}</strong><small>Policy {occurrence.policy_id} · v{occurrence.policy_version}</small><div className="monitoring-action-row">{runReference.path ? <Link to={runReference.path}>{runReference.label}</Link> : <span>{runReference.label}</span>}{occurrence.comparison_id ? <Link to={`/projects/${finding.project_id}/comparisons/${occurrence.comparison_id}`}>Comparison</Link> : null}</div></div></li>;
+          })}</ol> : null}
           {occurrenceCursor ? <button className="inventory-button-secondary mt-2" disabled={occurrenceLoading} onClick={() => void loadMoreOccurrences()} type="button">{occurrenceLoading ? "Loading…" : "Load more occurrences"}</button> : null}
         </div>
         <div>

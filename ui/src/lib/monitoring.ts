@@ -64,7 +64,7 @@ export type FindingPolicy = {
 
 export type FindingOccurrence = {
   id: number;
-  run_id: string;
+  run_id: string | null;
   comparison_id?: string | null;
   policy_id: string;
   policy_version: number;
@@ -72,6 +72,17 @@ export type FindingOccurrence = {
   evidence?: FindingEvidence | Record<string, unknown> | null;
   observed_at: string;
 };
+
+export function findingOccurrenceRunReference(projectId: string, runId: string | null): {
+  label: string;
+  path: string | null;
+} {
+  if (!runId) return { label: "Run removed; retained evidence only", path: null };
+  return {
+    label: "Run evidence",
+    path: `/projects/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(runId)}`,
+  };
+}
 
 export type FindingActivity = {
   id: number;

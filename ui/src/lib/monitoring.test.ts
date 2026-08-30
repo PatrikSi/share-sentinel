@@ -6,6 +6,7 @@ import {
   evidenceTrustCopy,
   findingEvidenceFacts,
   findingExpectedRevisions,
+  findingOccurrenceRunReference,
   findingSeverityRank,
   formatDuration,
   humanizeMonitoringValue,
@@ -84,5 +85,16 @@ describe("monitoring presentation", () => {
     });
     expect(() => findingExpectedRevisions(rows, new Set(["missing-finding"]))).toThrow(/no longer match/i);
     expect(() => findingExpectedRevisions([{ id: "finding-a", revision: 0 }], new Set(["finding-a"]))).toThrow(/invalid revision/i);
+  });
+
+  it("does not create a run link for retained evidence after run deletion", () => {
+    expect(findingOccurrenceRunReference("project-a", null)).toEqual({
+      label: "Run removed; retained evidence only",
+      path: null,
+    });
+    expect(findingOccurrenceRunReference("project/a", "run/b")).toEqual({
+      label: "Run evidence",
+      path: "/projects/project%2Fa/runs/run%2Fb",
+    });
   });
 });
