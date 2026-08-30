@@ -24,6 +24,7 @@ from sharepoint.collection import (
     SharePointProgress,
     SharePointStats,
     Site,
+    _ItemBudget,
     collection_context_record,
     collection_dimension_completeness,
     discover_drives,
@@ -1774,6 +1775,30 @@ def test_finite_item_budget_preserves_parallel_library_collection(tmp_path) -> N
     assert status == "success"
     assert len(pending) == 2
     assert client.max_active == 2
+
+
+def test_concurrent_aggregate_item_budget_allows_exact_limit_and_rejects_one_over() -> None:
+    budget = _ItemBudget(100)
+    barrier = threading.Barrier(11)
+    outcomes: list[bool] = []
+    outcome_lock = threading.Lock()
+
+    def reserve(index: int) -> None:
+        barrier.wait(timeout=3)
+        accepted = budget.resize(f"drive-{index}", 10)
+        with outcome_lock:
+            outcomes.append(accepted)
+
+    threads = [threading.Thread(target=reserve, args=(index,)) for index in range(11)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert outcomes.count(True) == 10
+    assert outcomes.count(False) == 1
+    assert budget.resize("one-over", 1) is False
 
 
 def test_site_limit_marks_app_discovery_non_authoritative() -> None:

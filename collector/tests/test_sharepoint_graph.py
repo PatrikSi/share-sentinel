@@ -308,6 +308,29 @@ def test_default_run_budget_counts_retries_and_stops_before_the_next_http_attemp
     assert budget.snapshot().public_metadata()["exhausted"] is True
 
 
+def test_real_graph_request_path_allows_exact_budget_and_blocks_one_over_before_send() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(200, {"value": [{"id": "one"}]}),
+            FakeResponse(200, {"value": [{"id": "two"}]}),
+        ]
+    )
+    budget = GraphRunAttemptBudget(2)
+    client = _client(session, attempt_budget=budget)
+
+    assert client.get("sites/one")["value"] == [{"id": "one"}]
+    assert client.get("sites/two")["value"] == [{"id": "two"}]
+    with pytest.raises(GraphAPIError) as exc:
+        client.get("sites/three")
+
+    assert exc.value.code == "request_budget_exhausted"
+    assert len(session.calls) == 2
+    snapshot = budget.snapshot()
+    assert snapshot.used == 2
+    assert snapshot.remaining == 0
+    assert snapshot.exhausted is True
+
+
 def test_retry_after_beyond_operator_budget_fails_without_early_retry() -> None:
     session = FakeSession([FakeResponse(429, {}, headers={"Retry-After": "600", "request-id": "req-1"})])
     client = _client(session, max_retry_delay=30)

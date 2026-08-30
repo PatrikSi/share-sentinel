@@ -15,6 +15,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -3772,6 +3773,7 @@ class _NFSExportParseResult:
 NFS_SHOWMOUNT_MAX_STDOUT_BYTES = 4 * 1024 * 1024
 NFS_SHOWMOUNT_MAX_STDERR_BYTES = 64 * 1024
 NFS_SHOWMOUNT_MAX_EXPORTS = 10_000
+NFS_SHOWMOUNT_MAX_EXPORT_PATH_CHARACTERS = 255
 NFS_SHOWMOUNT_MAX_EXPORT_PATH_BYTES = 4096
 NFS_SHOWMOUNT_MAX_ERROR_CHARACTERS = 4096
 NFS_SHOWMOUNT_PROCESS_EXIT_GRACE_SECONDS = 1.0
@@ -3782,6 +3784,7 @@ def _parse_showmount_exports_bounded(
     output: str,
     *,
     max_exports: int = NFS_SHOWMOUNT_MAX_EXPORTS,
+    max_path_characters: int = NFS_SHOWMOUNT_MAX_EXPORT_PATH_CHARACTERS,
     max_path_bytes: int = NFS_SHOWMOUNT_MAX_EXPORT_PATH_BYTES,
 ) -> _NFSExportParseResult:
     exports: list[str] = []
@@ -3797,6 +3800,10 @@ def _parse_showmount_exports_bounded(
             continue
         export_path = line.split(maxsplit=1)[0]
         observed_export_lines += 1
+        if len(export_path) > max_path_characters:
+            truncated = True
+            limitations.add("nfs_export_path_character_limit_reached")
+            continue
         if len(export_path.encode("utf-8", errors="replace")) > max_path_bytes:
             truncated = True
             limitations.add("nfs_export_path_limit_reached")
@@ -4012,6 +4019,47 @@ def _classify_showmount_failure(detail: str) -> str:
     return "failed"
 
 
+def _signal_bounded_process(process: object, *, force: bool) -> None:
+    """Signal the isolated POSIX process group, or the child on other platforms."""
+
+    if os.name == "posix" and isinstance(getattr(process, "pid", None), int):
+        try:
+            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)  # type: ignore[attr-defined]
+        except OSError:
+            pass
+        return
+    try:
+        (process.kill if force else process.terminate)()  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        pass
+
+
+def _posix_process_group_exists(process: object) -> bool:
+    if os.name != "posix" or not isinstance(getattr(process, "pid", None), int):
+        return False
+    try:
+        os.killpg(process.pid, 0)  # type: ignore[attr-defined]
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _stop_inherited_pipe_processes(process: object) -> None:
+    """Bound cleanup of descendants retaining showmount output descriptors."""
+
+    if os.name != "posix" or not isinstance(getattr(process, "pid", None), int):
+        _signal_bounded_process(process, force=True)
+        return
+    _signal_bounded_process(process, force=False)
+    deadline = time.monotonic() + NFS_SHOWMOUNT_PROCESS_EXIT_GRACE_SECONDS
+    while _posix_process_group_exists(process) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if _posix_process_group_exists(process):
+        _signal_bounded_process(process, force=True)
+
+
 def _run_bounded_process(
     argv: list[str],
     *,
@@ -4021,12 +4069,16 @@ def _run_bounded_process(
 ) -> _BoundedProcessResult:
     """Drain both child pipes concurrently while retaining only bounded bytes."""
 
-    process = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    popen_options: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name == "posix":
+        # A separate session makes it safe to terminate every descendant that
+        # inherited an output descriptor without signaling the collector.
+        popen_options["start_new_session"] = True
+    process = subprocess.Popen(argv, **popen_options)
     assert process.stdout is not None
     assert process.stderr is not None
     results: dict[str, tuple[bytes, bool]] = {}
@@ -4073,15 +4125,25 @@ def _run_bounded_process(
         returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        try:
-            process.kill()
-        except OSError:
-            pass
+        if os.name == "posix":
+            _signal_bounded_process(process, force=False)
+        else:
+            _signal_bounded_process(process, force=True)
         try:
             returncode = process.wait(timeout=NFS_SHOWMOUNT_PROCESS_EXIT_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            termination_failed = True
-            returncode = -1
+            _signal_bounded_process(process, force=True)
+            try:
+                returncode = process.wait(timeout=NFS_SHOWMOUNT_PROCESS_EXIT_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                termination_failed = True
+                returncode = -1
+
+    if timed_out:
+        # The leader may have exited after SIGTERM while a descendant ignored
+        # it or closed the inherited pipes. Verify the entire isolated group
+        # is gone before considering timeout cleanup complete.
+        _stop_inherited_pipe_processes(process)
 
     drain_threads = (stdout_thread, stderr_thread)
     drain_deadline = time.monotonic() + NFS_SHOWMOUNT_PIPE_DRAIN_GRACE_SECONDS
@@ -4090,9 +4152,10 @@ def _run_bounded_process(
 
     if any(thread.is_alive() for thread in drain_threads):
         # A grandchild can inherit the pipe writer after showmount exits. Close
-        # our read handles to release blocked readers, but perform close in
-        # daemon helpers because BufferedReader.close() can itself wait on a
-        # read lock held by the drain thread.
+        # the isolated group before our read handles. Perform close in daemon
+        # helpers because BufferedReader.close() can itself wait on a read lock
+        # held by the drain thread.
+        _stop_inherited_pipe_processes(process)
         close_threads: list[threading.Thread] = []
 
         def close_stream(stream: object) -> None:
@@ -4143,6 +4206,17 @@ def _bounded_showmount_detail(raw: bytes, *, truncated: bool) -> str:
     return detail
 
 
+def _complete_showmount_stdout(raw: bytes, *, truncated: bool) -> tuple[bytes, bool]:
+    """Drop a possibly partial final record before any UTF-8 decoding."""
+
+    if not truncated or not raw or raw.endswith(b"\n"):
+        return raw, False
+    final_newline = raw.rfind(b"\n")
+    if final_newline < 0:
+        return b"", True
+    return raw[: final_newline + 1], True
+
+
 def _discover_nfs_exports(host: str, timeout_seconds: float) -> NFSExportDiscovery:
     timeout = max(1.0, timeout_seconds * 4)
     try:
@@ -4177,11 +4251,17 @@ def _discover_nfs_exports(host: str, timeout_seconds: float) -> NFSExportDiscove
         )
         return NFSExportDiscovery((), _classify_showmount_failure(detail), detail)
 
-    stdout = completed.stdout.decode("utf-8", errors="replace")
+    complete_stdout, trailing_line_discarded = _complete_showmount_stdout(
+        completed.stdout,
+        truncated=completed.stdout_truncated,
+    )
+    stdout = complete_stdout.decode("utf-8", errors="replace")
     parsed = _parse_showmount_exports_bounded(stdout)
     limitations = set(parsed.limitations)
     if completed.stdout_truncated:
         limitations.add("showmount_stdout_limit_reached")
+    if trailing_line_discarded:
+        limitations.add("showmount_unterminated_trailing_line_discarded")
     if completed.stderr_truncated:
         limitations.add("showmount_stderr_limit_reached")
     truncated = bool(parsed.truncated or completed.stdout_truncated or completed.stderr_truncated)
@@ -5449,6 +5529,7 @@ def scan_host_nfs(
                         "stdout_bytes": NFS_SHOWMOUNT_MAX_STDOUT_BYTES,
                         "stderr_bytes": NFS_SHOWMOUNT_MAX_STDERR_BYTES,
                         "exports": NFS_SHOWMOUNT_MAX_EXPORTS,
+                        "export_path_characters": NFS_SHOWMOUNT_MAX_EXPORT_PATH_CHARACTERS,
                         "export_path_bytes": NFS_SHOWMOUNT_MAX_EXPORT_PATH_BYTES,
                     },
                 },

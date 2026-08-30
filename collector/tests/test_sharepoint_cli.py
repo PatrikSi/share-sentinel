@@ -186,6 +186,17 @@ def test_cli_defaults_are_finite_and_unlimited_inventory_requires_explicit_flags
         cli.parse_args(["--auth", "token", "--max-graph-http-attempts", "10000001"])
 
 
+@pytest.mark.parametrize("flag", ["--max-sites", "--max-libraries", "--max-items"])
+def test_legacy_zero_inventory_limits_are_intentional_hard_failures(flag: str) -> None:
+    # Zero used to mean unlimited. It now fails closed so an omitted/mistyped
+    # safety bound cannot silently disable protection; use the named
+    # --unlimited-* flags when that operator decision is intentional.
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args(["--auth", "token", flag, "0"])
+
+    assert exc.value.code == 2
+
+
 def test_sharepoint_cli_requires_explicit_gzip_flag_for_gzip_suffix() -> None:
     with pytest.raises(TokenAcquisitionError, match=r"\.gz output requires --gzip"):
         cli.parse_args(["--auth", "token", "--output", "scan.ndjson.gz"])

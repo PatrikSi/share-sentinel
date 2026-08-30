@@ -3,6 +3,7 @@ import os
 import struct
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,6 +65,58 @@ def test_showmount_export_parser_bounds_count_and_path_size() -> None:
     assert set(result.limitations) == {"nfs_export_count_limit_reached", "nfs_export_path_limit_reached"}
 
 
+def test_showmount_export_parser_accepts_255_unicode_characters_and_rejects_256() -> None:
+    collector = _load_collector_module()
+    accepted = "/" + ("é" * 254)
+    rejected = "/" + ("é" * 255)
+
+    result = collector._parse_showmount_exports_bounded(f"{accepted} host\n{rejected} host\n")
+
+    assert result.exports == (accepted,)
+    assert result.observed_export_lines == 2
+    assert result.truncated is True
+    assert result.limitations == ("nfs_export_path_character_limit_reached",)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected", "discarded"),
+    [
+        (b"/complete host\n/partial", b"/complete host\n", True),
+        (b"/complete host\n", b"/complete host\n", False),
+        (b"/complete host\n/partial-\xe2\x82", b"/complete host\n", True),
+    ],
+)
+def test_truncated_showmount_stdout_retains_only_complete_utf8_safe_lines(raw, expected, discarded) -> None:
+    collector = _load_collector_module()
+
+    retained, was_discarded = collector._complete_showmount_stdout(raw, truncated=True)
+
+    assert retained == expected
+    assert was_discarded is discarded
+    retained.decode("utf-8", errors="strict")
+
+
+def test_showmount_truncated_mid_line_does_not_emit_partial_export(monkeypatch) -> None:
+    collector = _load_collector_module()
+    monkeypatch.setattr(
+        collector,
+        "_run_bounded_process",
+        lambda *_args, **_kwargs: collector._BoundedProcessResult(
+            0,
+            b"/srv/complete host\n/srv/partial-\xe2\x82",
+            b"",
+            True,
+            False,
+        ),
+    )
+
+    discovery = collector._discover_nfs_exports("nfs.example", 1.0)
+
+    assert discovery.exports == ("/srv/complete",)
+    assert discovery.status == "truncated"
+    assert "showmount_unterminated_trailing_line_discarded" in discovery.limitations
+
+
 def test_bounded_process_drains_stdout_and_stderr_without_unbounded_retention() -> None:
     collector = _load_collector_module()
 
@@ -105,12 +158,13 @@ def test_bounded_process_closes_inherited_output_pipes_without_hanging(monkeypat
         def __init__(self) -> None:
             self.stdout = BlockingPipe()
             self.stderr = BlockingPipe()
+            self.kill_calls = 0
 
         def wait(self, *, timeout):  # noqa: ARG002
             return 0
 
         def kill(self) -> None:
-            raise AssertionError("completed process must not be killed")
+            self.kill_calls += 1
 
     process = FakeProcess()
     monkeypatch.setattr(collector.subprocess, "Popen", lambda *_args, **_kwargs: process)
@@ -124,6 +178,7 @@ def test_bounded_process_closes_inherited_output_pipes_without_hanging(monkeypat
     )
 
     assert result.returncode == 0
+    assert process.kill_calls == 1
     assert process.stdout.close_calls >= 1
     assert process.stderr.close_calls >= 1
 
@@ -147,12 +202,13 @@ def test_bounded_process_fails_closed_when_output_pipe_cannot_be_released(monkey
         def __init__(self) -> None:
             self.stdout = StubbornPipe()
             self.stderr = StubbornPipe()
+            self.kill_calls = 0
 
         def wait(self, *, timeout):  # noqa: ARG002
             return 0
 
         def kill(self) -> None:
-            raise AssertionError("completed process must not be killed")
+            self.kill_calls += 1
 
     process = FakeProcess()
     monkeypatch.setattr(collector.subprocess, "Popen", lambda *_args, **_kwargs: process)
@@ -171,6 +227,132 @@ def test_bounded_process_fails_closed_when_output_pipe_cannot_be_released(monkey
 
     assert process.stdout.close_calls >= 1
     assert process.stderr.close_calls >= 1
+    assert process.kill_calls == 1
+
+
+@pytest.mark.skipif(os.name != "posix" or not hasattr(os, "fork"), reason="requires POSIX process groups")
+def test_bounded_process_reaps_pipe_inheriting_process_group(tmp_path) -> None:
+    collector = _load_collector_module()
+    pid_path = tmp_path / "descendant.pid"
+    existing_drain_threads = {
+        thread.ident for thread in threading.enumerate() if thread.name in {"showmount-stdout", "showmount-stderr"}
+    }
+    fd_directory = Path("/proc/self/fd")
+    initial_fd_count = len(list(fd_directory.iterdir())) if fd_directory.is_dir() else None
+    script = (
+        "import os, pathlib, time; "
+        "child=os.fork(); "
+        f"path={str(pid_path)!r}; "
+        "(pathlib.Path(path).write_text(str(os.getpid()), encoding='ascii'), time.sleep(60), os._exit(0)) "
+        "if child == 0 else os._exit(0)"
+    )
+    descendant_pid = None
+    started = time.monotonic()
+    try:
+        result = collector._run_bounded_process(
+            [sys.executable, "-c", script],
+            timeout=5,
+            stdout_limit=1024,
+            stderr_limit=1024,
+        )
+        for _ in range(100):
+            if pid_path.exists():
+                descendant_pid = int(pid_path.read_text(encoding="ascii"))
+                break
+            time.sleep(0.01)
+        assert descendant_pid is not None
+
+        def live_process(pid: int) -> bool:
+            proc_stat = Path(f"/proc/{pid}/stat")
+            if proc_stat.exists():
+                fields = proc_stat.read_text(encoding="ascii", errors="replace").split()
+                return len(fields) < 3 or fields[2] != "Z"
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            return True
+
+        for _ in range(200):
+            if not live_process(descendant_pid):
+                break
+            time.sleep(0.01)
+
+        assert result.returncode == 0
+        assert not live_process(descendant_pid)
+        assert time.monotonic() - started < 8
+        assert not any(
+            thread.ident not in existing_drain_threads
+            for thread in threading.enumerate()
+            if thread.name in {"showmount-stdout", "showmount-stderr"}
+        )
+        if initial_fd_count is not None:
+            assert len(list(fd_directory.iterdir())) <= initial_fd_count
+    finally:
+        if descendant_pid is not None:
+            try:
+                os.kill(descendant_pid, 9)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix" or not hasattr(os, "fork"), reason="requires POSIX process groups")
+def test_bounded_process_timeout_kills_entire_process_group(tmp_path) -> None:
+    collector = _load_collector_module()
+    pid_path = tmp_path / "timeout-descendant.pid"
+    script = f"""
+import os
+import pathlib
+import signal
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = os.fork()
+if child == 0:
+    pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding="ascii")
+    time.sleep(60)
+    os._exit(0)
+deadline = time.monotonic() + 2
+while not pathlib.Path({str(pid_path)!r}).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+time.sleep(60)
+"""
+    descendant_pid = None
+    started = time.monotonic()
+    try:
+        with pytest.raises(collector.subprocess.TimeoutExpired):
+            collector._run_bounded_process(
+                [sys.executable, "-c", script],
+                timeout=0.1,
+                stdout_limit=1024,
+                stderr_limit=1024,
+            )
+        descendant_pid = int(pid_path.read_text(encoding="ascii"))
+
+        def live_process(pid: int) -> bool:
+            proc_stat = Path(f"/proc/{pid}/stat")
+            if proc_stat.exists():
+                fields = proc_stat.read_text(encoding="ascii", errors="replace").split()
+                return len(fields) < 3 or fields[2] != "Z"
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            return True
+
+        for _ in range(200):
+            if not live_process(descendant_pid):
+                break
+            time.sleep(0.01)
+
+        assert not live_process(descendant_pid)
+        assert time.monotonic() - started < 8
+    finally:
+        if descendant_pid is not None:
+            try:
+                os.kill(descendant_pid, 9)
+            except ProcessLookupError:
+                pass
 
 
 def test_showmount_output_drain_failure_is_explicit_partial_evidence(monkeypatch) -> None:
@@ -1535,9 +1717,9 @@ def test_scan_host_nfs_marks_bounded_export_truncation_as_structural_gap(monkeyp
             ("/retained",),
             "truncated",
             "bounded",
-            observed_export_lines=10_001,
+            observed_export_lines=2,
             exports_truncated=True,
-            limitations=("nfs_export_count_limit_reached",),
+            limitations=("nfs_export_path_character_limit_reached",),
         ),
     )
     stats = collector.Stats()
@@ -1553,6 +1735,8 @@ def test_scan_host_nfs_marks_bounded_export_truncation_as_structural_gap(monkeyp
 
     endpoint = next(record for record in records if record["type"] == "endpoint")
     assert endpoint["nfs"]["export_discovery"]["exports_truncated"] is True
+    assert endpoint["nfs"]["export_discovery"]["limits"]["export_path_characters"] == 255
+    assert "nfs_export_path_character_limit_reached" in endpoint["nfs"]["limitations"]
     assert endpoint["nfs"]["structural_coverage"] == "partial"
     assert stats.structural_coverage_gaps == 1
     assert stats.error_codes["NFS_EXPORT_ENUM_TRUNCATED"] == 1
