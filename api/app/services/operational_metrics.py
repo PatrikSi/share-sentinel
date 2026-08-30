@@ -66,7 +66,7 @@ def _database_metrics(db: Session) -> list[str]:
                              > GREATEST(900, expected_interval_seconds * 2) THEN 'stale'
                     WHEN last_failure_at IS NOT NULL AND last_failure_at > last_success_at
                         THEN 'degraded'
-                    WHEN COALESCE(coverage ->> 'state', 'unknown') <> 'complete'
+                    WHEN LOWER(COALESCE(coverage ->> 'state', 'unknown')) <> 'complete'
                         THEN 'degraded'
                     ELSE 'healthy'
                 END AS health,
