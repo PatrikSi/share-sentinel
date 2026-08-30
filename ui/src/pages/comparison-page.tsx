@@ -11,11 +11,14 @@ import {
   changeSnapshot,
   changeTypeLabel,
   changeTypeTone,
+  canRetryComparisonFindings,
   comparisonCompatibilityTone,
   comparisonErrorText,
+  comparisonFindingsEvaluation,
   comparisonRunId,
   comparisonRunLabel,
   comparisonStateTone,
+  comparisonSummaryCounts,
   itemChangeCopy,
   normalizeChangeType,
   resourceChangeKey,
@@ -28,6 +31,13 @@ import {
   type ResourceComparisonChange,
   type ResourceComparisonSnapshot,
 } from "@/lib/comparisons";
+import {
+  formatMonitoringTimestamp,
+  monitoringEvaluationIsActive,
+  monitoringEvaluationState,
+  safeMonitoringCount,
+  safeMonitoringDiagnostic,
+} from "@/lib/monitoring";
 import { useModalPanel } from "@/lib/use-modal-panel";
 
 const PAGE_LIMIT = 100;
@@ -235,6 +245,12 @@ export function ComparisonPage() {
   const [reloadNonce, setReloadNonce] = useState(0);
   const [pollNonce, setPollNonce] = useState(0);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<Date | null>(null);
+  const [role, setRole] = useState<string | null>(null);
+  const [roleReady, setRoleReady] = useState(false);
+  const [roleError, setRoleError] = useState<string | null>(null);
+  const [findingsRetryBusy, setFindingsRetryBusy] = useState(false);
+  const [findingsRetryError, setFindingsRetryError] = useState<string | null>(null);
+  const [findingsRetryInfo, setFindingsRetryInfo] = useState<string | null>(null);
   const [resultLevel, setResultLevel] = useState<"resources" | "items">(() => readSearchParam("level") === "items" ? "items" : "resources");
 
   const [changeType, setChangeTypeState] = useState<ResourceChangeType | "all">(() => normalizeChangeType(readSearchParam("changeType")));
@@ -307,16 +323,45 @@ export function ComparisonPage() {
   }, [comparisonId, pollNonce, projectId, reloadNonce]);
 
   useEffect(() => {
+    const evaluation = comparisonFindingsEvaluation(comparison);
+    if (!projectId || monitoringEvaluationState(evaluation) !== "degraded") {
+      setRole(null);
+      setRoleReady(false);
+      setRoleError(null);
+      return;
+    }
+    const controller = new AbortController();
+    setRoleReady(false);
+    setRoleError(null);
+    apiFetch(`/projects/${encodeURIComponent(projectId)}/my-role`, { signal: controller.signal })
+      .then((data) => {
+        if (!controller.signal.aborted) setRole(typeof data?.role === "string" ? data.role.toLowerCase() : null);
+      })
+      .catch((caught) => {
+        if (!controller.signal.aborted && !isAbortError(caught)) {
+          setRole(null);
+          setRoleError(caught instanceof Error ? caught.message : "Recovery permission could not be verified.");
+        }
+      })
+      .finally(() => !controller.signal.aborted && setRoleReady(true));
+    return () => controller.abort();
+  }, [comparison?.id, comparison?.summary?.findings_evaluation?.state, projectId]);
+
+  useEffect(() => {
     if (
       comparisonRequestActive
-      || (comparison?.state !== "queued" && comparison?.state !== "running")
+      || (
+        comparison?.state !== "queued"
+        && comparison?.state !== "running"
+        && !monitoringEvaluationIsActive(comparisonFindingsEvaluation(comparison))
+      )
     ) return;
     const timer = window.setTimeout(
       () => setPollNonce((value) => value + 1),
       pollWarning ? 5000 : 2500,
     );
     return () => window.clearTimeout(timer);
-  }, [comparison?.state, comparisonRequestActive, pollNonce, pollWarning]);
+  }, [comparison?.state, comparison?.summary?.findings_evaluation?.state, comparisonRequestActive, pollNonce, pollWarning]);
 
   useEffect(() => {
     if (!filtersInitialized.current) {
@@ -389,12 +434,13 @@ export function ComparisonPage() {
     [changes, selectedChangeKey],
   );
   const summary = comparison?.summary;
+  const summaryCounts = comparisonSummaryCounts(summary);
   const countFilters: Array<{ key: ResourceChangeType | "all"; label: string; count: number }> = [
-    { key: "all", label: "All changes", count: summary?.total || 0 },
-    { key: "appeared", label: "Appeared", count: summary?.appeared || 0 },
-    { key: "disappeared", label: "Disappeared", count: summary?.disappeared || 0 },
-    { key: "changed", label: "Changed", count: summary?.changed || 0 },
-    { key: "indeterminate", label: "Indeterminate", count: summary?.indeterminate || 0 },
+    { key: "all", label: "All changes", count: summaryCounts.total },
+    { key: "appeared", label: "Appeared", count: summaryCounts.appeared },
+    { key: "disappeared", label: "Disappeared", count: summaryCounts.disappeared },
+    { key: "changed", label: "Changed", count: summaryCounts.changed },
+    { key: "indeterminate", label: "Indeterminate", count: summaryCounts.indeterminate },
   ];
   const currentRunId = comparison ? comparisonRunId(comparison, "current") : null;
   const baselineRunId = comparison ? comparisonRunId(comparison, "baseline") : null;
@@ -410,6 +456,37 @@ export function ComparisonPage() {
   const identitySatisfied = compatibility?.identity_applicable === false
     || compatibility?.identity_scope_exact !== false;
   const comparisonActive = comparison?.state === "queued" || comparison?.state === "running";
+  const findingsEvaluation = comparisonFindingsEvaluation(comparison);
+  const findingsState = monitoringEvaluationState(findingsEvaluation);
+  const findingsEvaluationActive = monitoringEvaluationIsActive(findingsEvaluation);
+  const findingsAttemptCount = safeMonitoringCount(findingsEvaluation?.attempt_count);
+  const findingsErrorCode = safeMonitoringDiagnostic(findingsEvaluation?.error_code);
+
+  async function retryComparisonFindings() {
+    if (!projectId || !comparisonId || !canRetryComparisonFindings(comparison, role)) return;
+    setFindingsRetryBusy(true);
+    setFindingsRetryError(null);
+    setFindingsRetryInfo(null);
+    try {
+      const response = await apiFetch(
+        `/projects/${encodeURIComponent(projectId)}/comparisons/${encodeURIComponent(comparisonId)}/findings/retry`,
+        { method: "POST" },
+      );
+      const nextEvaluation = response?.findings_evaluation;
+      if (nextEvaluation && typeof nextEvaluation === "object") {
+        setComparison((current) => current ? {
+          ...current,
+          summary: { ...(current.summary || {}), findings_evaluation: nextEvaluation },
+        } : current);
+      }
+      setFindingsRetryInfo("Finding evaluation recovery was queued. Materialized change results remain available while the derived workflow runs.");
+    } catch (caught) {
+      setFindingsRetryError(caught instanceof Error ? caught.message : "Finding evaluation recovery could not be requested.");
+    } finally {
+      setFindingsRetryBusy(false);
+      setPollNonce((value) => value + 1);
+    }
+  }
 
   function changeFilter(next: ResourceChangeType | "all") {
     setChangeTypeState(next);
@@ -493,11 +570,41 @@ export function ComparisonPage() {
         <StatusBanner tone="warning" title="Live comparison state may be stale"><p>{pollWarning}</p><button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={() => setPollNonce((value) => value + 1)} type="button">Retry status</button></StatusBanner>
       ) : null}
 
+      {findingsRetryError ? <StatusBanner tone="error" title="Finding recovery request failed"><p>{findingsRetryError} Comparison state is being reloaded before another attempt.</p></StatusBanner> : null}
+      {findingsRetryInfo ? <StatusBanner tone="success" title="Finding recovery requested"><p>{findingsRetryInfo}</p></StatusBanner> : null}
+
+      {comparison.state === "complete" && !findingsEvaluation ? (
+        <StatusBanner tone="warning" title="Finding evaluation state is not recorded">
+          <p>This comparison may predate continuous finding evaluation. Change evidence remains available, but do not infer that policies were evaluated.</p>
+        </StatusBanner>
+      ) : null}
+
+      {comparison.state === "complete" && findingsEvaluation ? (
+        <StatusBanner
+          tone={findingsState === "complete" ? "success" : findingsState === "degraded" ? "error" : "warning"}
+          title={findingsState === "complete" ? "Finding evaluation complete" : findingsState === "degraded" ? "Finding evaluation is degraded" : findingsEvaluationActive ? "Finding evaluation is in progress" : "Finding evaluation state is indeterminate"}
+        >
+          <p>The materialized comparison remains valid. This status describes the separate policy-evaluation workflow.</p>
+          <dl className="monitoring-evidence-facts">
+            <div><dt>State</dt><dd>{humanizeEvidenceValue(findingsState)}</dd></div>
+            <div><dt>Attempts</dt><dd>{findingsAttemptCount == null ? "Not recorded" : findingsAttemptCount.toLocaleString()}</dd></div>
+            <div><dt>Next retry</dt><dd>{formatMonitoringTimestamp(findingsEvaluation.next_retry_at)}</dd></div>
+            <div><dt>Authority</dt><dd>{findingsEvaluation.authoritative_state === true ? "Authoritative current baseline" : findingsEvaluation.authoritative_state === false ? "Positive evidence only" : "Not recorded"}</dd></div>
+            <div><dt>Partial evidence retained</dt><dd>{findingsEvaluation.partial_positive_evidence_retained === true ? "Yes" : findingsEvaluation.partial_positive_evidence_retained === false ? "No" : "Not recorded"}</dd></div>
+            <div><dt>Safe diagnostic</dt><dd>{findingsErrorCode || "None recorded"}</dd></div>
+          </dl>
+          {findingsState === "degraded" ? <p className="mt-2">New positive evidence may have been retained, but absence-based conclusions remain bounded until evaluation completes.</p> : null}
+          {canRetryComparisonFindings(comparison, role) ? <button className="inventory-button-primary mt-2" disabled={findingsRetryBusy} onClick={() => void retryComparisonFindings()} type="button">{findingsRetryBusy ? "Requesting retry…" : "Retry finding evaluation"}</button> : null}
+          {findingsState === "degraded" && roleError ? <p className="mt-2">{roleError} Recovery remains disabled until access can be verified.</p> : null}
+          {findingsState === "degraded" && !roleReady && !roleError ? <p className="mt-2">Checking recovery permission…</p> : null}
+        </StatusBanner>
+      ) : null}
+
       <section className="comparison-run-context">
         <div><span>Baseline</span><strong>{comparisonRunLabel(comparison, "baseline")}</strong><small>{runTimestamp(comparison.baseline_run) || baselineRunId || "Timestamp not recorded"}</small></div>
         <div><span>Current</span><strong>{comparisonRunLabel(comparison, "current")}</strong><small>{runTimestamp(comparison.current_run) || currentRunId || "Timestamp not recorded"}</small></div>
         <div><span>State</span><strong>{humanizeEvidenceValue(comparison.state)}</strong><small>{comparisonStateCopy(comparison)}</small></div>
-        <div><span>Freshness</span><strong>{lastUpdatedAt ? lastUpdatedAt.toLocaleTimeString() : "Not loaded"}</strong><small>{comparisonActive ? "Polling every few seconds" : "Terminal state"}</small></div>
+        <div><span>Freshness</span><strong>{lastUpdatedAt ? lastUpdatedAt.toLocaleTimeString() : "Not loaded"}</strong><small>{comparisonActive || findingsEvaluationActive ? "Polling every few seconds" : "Terminal state"}</small></div>
       </section>
 
       {comparisonActive ? (

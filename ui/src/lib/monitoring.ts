@@ -93,9 +93,51 @@ export type FindingActivity = {
   metadata?: Record<string, unknown> | null;
 };
 
+export type MonitoringEvaluationState =
+  | "pending"
+  | "not_evaluated"
+  | "queued"
+  | "retrying"
+  | "evaluating"
+  | "complete"
+  | "degraded"
+  | "skipped"
+  | "unknown";
+
+export type MonitoringEvaluation = {
+  state?: MonitoringEvaluationState | string | null;
+  phase?: string | null;
+  attempt_count?: number | null;
+  next_retry_at?: string | null;
+  error_code?: string | null;
+  reason?: string | null;
+  observed?: number | null;
+  resolved?: number | null;
+  run_id?: string | null;
+  retryable?: boolean | null;
+  authoritative_state?: boolean | null;
+  partial_positive_evidence_retained?: boolean | null;
+};
+
+export type AutomaticBaselineCoverage = {
+  state?: string | null;
+  comparison_id?: string | null;
+  baseline_run_id?: string | null;
+  findings_evaluation_state?: string | null;
+  findings_next_retry_at?: string | null;
+  error_code?: string | null;
+  reason?: string | null;
+  next_retry_at?: string | null;
+  candidate_count?: number | null;
+};
+
 export type SourceCoverage = {
   state: "complete" | "partial" | "unknown";
   reasons?: string[] | null;
+  monitoring_findings?: MonitoringEvaluation | null;
+  automatic_baseline?: AutomaticBaselineCoverage | null;
+  inventory?: Record<string, unknown> | null;
+  [key: string]: unknown;
 };
 
 export type SourceFreshness = {
@@ -188,6 +230,56 @@ export function canManageFindings(role: string | null | undefined): boolean {
 
 export function canManageSources(role: string | null | undefined): boolean {
   return role === "admin";
+}
+
+const MONITORING_ACTIVE_STATES = new Set(["queued", "retrying", "evaluating"]);
+const SAFE_MONITORING_DIAGNOSTIC = /^[a-z0-9][a-z0-9._:-]{0,95}$/i;
+
+export function monitoringEvaluationState(
+  evaluation: MonitoringEvaluation | null | undefined,
+): MonitoringEvaluationState {
+  const normalized = String(evaluation?.state || "unknown").trim().toLowerCase();
+  return [
+    "pending",
+    "not_evaluated",
+    "queued",
+    "retrying",
+    "evaluating",
+    "complete",
+    "degraded",
+    "skipped",
+  ].includes(normalized)
+    ? normalized as MonitoringEvaluationState
+    : "unknown";
+}
+
+export function monitoringEvaluationIsActive(
+  evaluation: MonitoringEvaluation | null | undefined,
+): boolean {
+  return MONITORING_ACTIVE_STATES.has(monitoringEvaluationState(evaluation));
+}
+
+export function canRetrySourceMonitoring(
+  source: MonitoringSource | null | undefined,
+  role: string | null | undefined,
+): boolean {
+  const evaluation = source?.coverage?.monitoring_findings;
+  return canManageFindings(role)
+    && source?.enabled === true
+    && monitoringEvaluationState(evaluation) === "degraded"
+    && evaluation?.retryable === true
+    && typeof evaluation.run_id === "string"
+    && evaluation.run_id.length > 0;
+}
+
+/** Render only backend-owned diagnostic identifiers, never arbitrary error text. */
+export function safeMonitoringDiagnostic(value: string | null | undefined): string | null {
+  const normalized = String(value || "").trim();
+  return SAFE_MONITORING_DIAGNOSTIC.test(normalized) ? normalized : null;
+}
+
+export function safeMonitoringCount(value: number | null | undefined): number | null {
+  return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : null;
 }
 
 export function findingExpectedRevisions(

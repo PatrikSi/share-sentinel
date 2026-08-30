@@ -30,4 +30,24 @@ describe("API problem detail presentation", () => {
     expect(message).toContain("FINDING_BULK_REVISION_CONFLICT");
     expect(message).not.toContain("finding-a");
   });
+
+  it.each([
+    [409, "MONITORING_RUN_SUPERSEDED", "newer successful snapshot"],
+    [429, "MONITORING_RETRY_RATE_LIMITED", "wait before retrying"],
+    [409, "COMPARISON_FINDINGS_NOT_RETRYABLE", "completed comparison"],
+  ])("preserves actionable monitoring recovery errors without serializing extra detail", (status, code, guidance) => {
+    const message = errorMessageFromBody(JSON.stringify({
+      detail: {
+        code,
+        message: `Recovery blocked: ${guidance}.`,
+        superseding_run_id: "run-safe-reference",
+        internal_error: "Bearer must-never-render",
+      },
+    }), status);
+
+    expect(message).toContain(code);
+    expect(message).toContain(guidance);
+    expect(message).not.toContain("run-safe-reference");
+    expect(message).not.toContain("must-never-render");
+  });
 });

@@ -7,9 +7,14 @@ import { StatusBanner } from "@/components/status-banner";
 import { apiFetch } from "@/lib/api";
 import {
   canManageSources,
+  canRetrySourceMonitoring,
   formatDuration,
   formatMonitoringTimestamp,
   humanizeMonitoringValue,
+  monitoringEvaluationIsActive,
+  monitoringEvaluationState,
+  safeMonitoringCount,
+  safeMonitoringDiagnostic,
   type MonitoringSource,
   type SourceHealth,
 } from "@/lib/monitoring";
@@ -31,15 +36,17 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
-function SourceDetail({ source, loading, error, canManage, permissionsReady, permissionError, busy, onReload, onUpdate }: {
+function SourceDetail({ source, loading, error, canManage, canRetryFindings, permissionsReady, permissionError, busy, onReload, onRetryFindings, onUpdate }: {
   source: MonitoringSource | null;
   loading: boolean;
   error: string | null;
   canManage: boolean;
+  canRetryFindings: boolean;
   permissionsReady: boolean;
   permissionError: string | null;
   busy: boolean;
   onReload: () => void;
+  onRetryFindings: () => Promise<void>;
   onUpdate: (payload: Record<string, unknown>) => Promise<void>;
 }) {
   const [displayName, setDisplayName] = useState("");
@@ -67,6 +74,18 @@ function SourceDetail({ source, loading, error, canManage, permissionsReady, per
 
   const coverageReasons = source.coverage?.reasons || [];
   const healthReasons = source.health_reasons || [];
+  const findingsEvaluation = source.coverage?.monitoring_findings;
+  const findingsState = monitoringEvaluationState(findingsEvaluation);
+  const findingsActive = monitoringEvaluationIsActive(findingsEvaluation);
+  const findingsAttemptCount = safeMonitoringCount(findingsEvaluation?.attempt_count);
+  const findingsObserved = safeMonitoringCount(findingsEvaluation?.observed);
+  const findingsResolved = safeMonitoringCount(findingsEvaluation?.resolved);
+  const findingsErrorCode = safeMonitoringDiagnostic(findingsEvaluation?.error_code);
+  const findingsReason = safeMonitoringDiagnostic(findingsEvaluation?.reason);
+  const baseline = source.coverage?.automatic_baseline;
+  const baselineState = safeMonitoringDiagnostic(baseline?.state);
+  const baselineFindingsState = safeMonitoringDiagnostic(baseline?.findings_evaluation_state);
+  const baselineErrorCode = safeMonitoringDiagnostic(baseline?.error_code);
   const nameInvalid = !displayName.trim();
   const intervalInvalid = interval.trim() !== "" && (!Number.isSafeInteger(Number(interval)) || Number(interval) < 300 || Number(interval) > 31_536_000);
   return (
@@ -90,6 +109,32 @@ function SourceDetail({ source, loading, error, canManage, permissionsReady, per
         <div><dt>Source ID</dt><dd className="font-mono" title={source.id}>{source.id}</dd></div>
       </dl>
 
+      <section aria-labelledby="source-evaluation-title" className="monitoring-detail-section">
+        <div className="monitoring-detail-heading">
+          <div>
+            <h3 id="source-evaluation-title">Automated security evaluation</h3>
+            <p>Inventory ingestion and derived finding evaluation are separate. A complete run can remain usable while this derived phase recovers.</p>
+          </div>
+          <span className={`evidence-state is-${findingsState === "complete" ? "exact" : findingsState === "degraded" ? "indeterminate" : "bounded"}`}>{humanizeMonitoringValue(findingsState)}</span>
+        </div>
+        <dl className="monitoring-evidence-facts">
+          <div><dt>Finding evaluation</dt><dd>{humanizeMonitoringValue(findingsState)}</dd></div>
+          <div><dt>Phase</dt><dd>{humanizeMonitoringValue(safeMonitoringDiagnostic(findingsEvaluation?.phase))}</dd></div>
+          <div><dt>Attempts</dt><dd>{findingsAttemptCount == null ? "Not recorded" : findingsAttemptCount.toLocaleString()}</dd></div>
+          <div><dt>Next retry</dt><dd>{formatMonitoringTimestamp(findingsEvaluation?.next_retry_at)}</dd></div>
+          <div><dt>Findings observed</dt><dd>{findingsObserved == null ? "Not recorded" : findingsObserved.toLocaleString()}</dd></div>
+          <div><dt>Findings resolved</dt><dd>{findingsResolved == null ? "Not recorded" : findingsResolved.toLocaleString()}</dd></div>
+          <div><dt>Automatic baseline</dt><dd>{humanizeMonitoringValue(baselineState)}</dd></div>
+          <div><dt>Baseline finding evaluation</dt><dd>{humanizeMonitoringValue(baselineFindingsState)}</dd></div>
+          <div><dt>Baseline next retry</dt><dd>{formatMonitoringTimestamp(baseline?.findings_next_retry_at || baseline?.next_retry_at)}</dd></div>
+          <div><dt>Baseline diagnostic</dt><dd>{baselineErrorCode || "None recorded"}</dd></div>
+        </dl>
+        {findingsErrorCode || findingsReason ? <p className="monitoring-trust-copy">Last safe diagnostic: <code>{findingsErrorCode || findingsReason}</code>. Raw exception text is not exposed here.</p> : null}
+        {findingsState === "degraded" ? <StatusBanner tone="error" title="Finding evaluation needs operator recovery"><p>The latest inventory remains available, but finding coverage is partial until this phase completes.</p>{canRetryFindings ? <button className="inventory-button-primary mt-2" disabled={busy} onClick={() => void onRetryFindings()} type="button">{busy ? "Working…" : "Retry finding evaluation"}</button> : null}{permissionError ? <p className="mt-2">{permissionError} Recovery remains disabled until access can be verified.</p> : !permissionsReady ? <p className="mt-2">Checking recovery permission…</p> : null}</StatusBanner> : null}
+        {findingsActive ? <StatusBanner tone="warning" title="Finding evaluation is in progress"><p>This view refreshes automatically. Attempts {findingsAttemptCount == null ? "are not yet recorded" : findingsAttemptCount.toLocaleString()}; next scheduled retry {formatMonitoringTimestamp(findingsEvaluation?.next_retry_at)}.</p></StatusBanner> : null}
+        {baseline?.comparison_id ? <div className="monitoring-action-row"><Link className="inventory-button-secondary" to={`/projects/${source.project_id}/comparisons/${encodeURIComponent(baseline.comparison_id)}`}>Inspect automatic comparison</Link></div> : null}
+      </section>
+
       <section aria-labelledby="source-actions-title" className="monitoring-detail-section">
         <div className="monitoring-detail-heading"><div><h3 id="source-actions-title">Investigation paths</h3><p>Use source-scoped history before treating a missing resource as a confirmed disappearance.</p></div></div>
         <div className="monitoring-action-row">
@@ -107,7 +152,7 @@ function SourceDetail({ source, loading, error, canManage, permissionsReady, per
 
       <section aria-labelledby="source-config-title" className="monitoring-detail-section">
         <div className="monitoring-detail-heading"><div><h3 id="source-config-title">Monitoring configuration</h3><p>Automatic monitoring controls freshness, automatic comparisons, and finding policy evaluation. Disabling it does not block manual ingestion or comparison. Cadence never remotely schedules a collector.</p></div></div>
-        {canManage ? <form className="monitoring-action-form" onSubmit={(event) => void submit(event)}><label>Display name<input aria-invalid={nameInvalid} disabled={busy} maxLength={255} onChange={(event) => setDisplayName(event.target.value)} required value={displayName} /></label><label>Expected interval (seconds)<input aria-invalid={intervalInvalid} disabled={busy} inputMode="numeric" max="31536000" min="300" onChange={(event) => setInterval(event.target.value)} placeholder="Unset" type="number" value={interval} /></label><label className="monitoring-checkbox"><input checked={enabled} disabled={busy} onChange={(event) => setEnabled(event.target.checked)} type="checkbox" />Enable automatic monitoring</label>{!enabled ? <p className="monitoring-validation monitoring-disabled-note">Automatic comparison and policy evaluation will be skipped for future ingested runs. Manual ingest and comparison remain available.</p> : null}{nameInvalid ? <p className="monitoring-validation" role="alert">Display name cannot be blank.</p> : null}{intervalInvalid ? <p className="monitoring-validation" role="alert">Expected interval must be a whole number from 300 to 31,536,000 seconds, or left unset.</p> : null}<div className="monitoring-action-row"><button className="inventory-button-primary" disabled={busy || intervalInvalid || nameInvalid} type="submit">{busy ? "Saving…" : "Save source settings"}</button></div></form> : permissionError ? <StatusBanner tone="warning" title="Action permissions unavailable"><p>{permissionError} Source configuration remains disabled until the project role can be verified.</p></StatusBanner> : permissionsReady ? <StatusBanner title="Admin permission required"><p>Project admins can rename sources, enable automatic monitoring, and set the expected collection interval. No credentials are managed here.</p></StatusBanner> : <StatePanel description="Checking whether this project role can configure collection monitoring." title="Loading action permissions" />}
+        {canManage ? <form className="monitoring-action-form" onSubmit={(event) => void submit(event)}><label>Display name<input aria-invalid={nameInvalid} disabled={busy} maxLength={255} onChange={(event) => setDisplayName(event.target.value)} required value={displayName} /></label><label>Expected interval (seconds)<input aria-invalid={intervalInvalid} disabled={busy} inputMode="numeric" max="31536000" min="300" onChange={(event) => setInterval(event.target.value)} placeholder="Unset" type="number" value={interval} /></label><label className="monitoring-checkbox"><input checked={enabled} disabled={busy} onChange={(event) => setEnabled(event.target.checked)} type="checkbox" />Enable automatic monitoring</label>{!enabled ? <p className="monitoring-validation monitoring-disabled-note">Automatic comparison and policy evaluation will be skipped for future ingested runs. Manual ingest and comparison remain available.</p> : null}{nameInvalid ? <p className="monitoring-validation" role="alert">Display name cannot be blank.</p> : null}{intervalInvalid ? <p className="monitoring-validation" role="alert">Expected interval must be a whole number from 300 to 31,536,000 seconds, or left unset.</p> : null}<div className="monitoring-action-row"><button className="inventory-button-primary" disabled={busy || intervalInvalid || nameInvalid} type="submit">{busy ? "Working…" : "Save source settings"}</button></div></form> : permissionError ? <StatusBanner tone="warning" title="Action permissions unavailable"><p>{permissionError} Source configuration remains disabled until the project role can be verified.</p></StatusBanner> : permissionsReady ? <StatusBanner title="Admin permission required"><p>Project admins can rename sources, enable automatic monitoring, and set the expected collection interval. No credentials are managed here.</p></StatusBanner> : <StatePanel description="Checking whether this project role can configure collection monitoring." title="Loading action permissions" />}
       </section>
     </article>
   );
@@ -189,6 +234,15 @@ export function SourcesPage() {
     return () => controller.abort();
   }, [detailNonce, projectId, selectedId]);
 
+  useEffect(() => {
+    if (!monitoringEvaluationIsActive(detail?.coverage?.monitoring_findings)) return;
+    const timer = window.setInterval(() => {
+      setDetailNonce((value) => value + 1);
+      setReloadNonce((value) => value + 1);
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [detail?.id, detail?.coverage?.monitoring_findings?.state]);
+
   function resetPage() { setCursor(null); setCursorHistory([]); }
 
   async function updateSource(payload: Record<string, unknown>) {
@@ -206,14 +260,34 @@ export function SourcesPage() {
     } finally { setMutationBusy(false); }
   }
 
+  async function retryFindingEvaluation() {
+    const runId = detail?.coverage?.monitoring_findings?.run_id;
+    if (!projectId || !detail || !runId || !canRetrySourceMonitoring(detail, role)) return;
+    setMutationBusy(true); setMutationError(null); setMutationInfo(null);
+    try {
+      const response = await apiFetch(
+        `/projects/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(runId)}/monitoring/retry`,
+        { method: "POST" },
+      );
+      const state = typeof response?.state === "string" ? humanizeMonitoringValue(response.state) : "Queued";
+      setMutationInfo(`Finding evaluation recovery is ${state.toLowerCase()}. Source health will refresh automatically.`);
+    } catch (caught) {
+      setMutationError(caught instanceof Error ? caught.message : "Finding evaluation recovery could not be requested.");
+    } finally {
+      setMutationBusy(false);
+      setDetailNonce((value) => value + 1);
+      setReloadNonce((value) => value + 1);
+    }
+  }
+
   return (
     <section className="monitoring-workspace">
       <header className="monitoring-page-header"><div><p>Collection operations</p><h1>Sources</h1><span>Verify which scopes are monitored, whether their evidence is fresh, and why collection confidence is degraded.</span></div><div className="monitoring-freshness"><strong>{lastLoadedAt ? `Updated ${lastLoadedAt.toLocaleTimeString()}` : "Not loaded"}</strong><span>Metadata only · no credentials stored</span></div></header>
 
       <section aria-label="Source filters" className="monitoring-filter-bar"><label>Search<input onChange={(event) => { setQuery(event.target.value); resetPage(); }} placeholder="Name, provider, identity, or scope" type="search" value={query} /></label><label>Provider<select onChange={(event) => { setProvider(event.target.value); resetPage(); }} value={provider}><option value="">All providers</option>{PROVIDERS.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label><label>Health<select onChange={(event) => { setHealth(normalizeHealth(event.target.value)); resetPage(); }} value={health}><option value="">All health states</option>{SOURCE_HEALTH.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label>{(provider || health || query) ? <button className="inventory-button-secondary" onClick={() => { setProvider(""); setHealth(""); setQuery(""); resetPage(); }} type="button">Clear filters</button> : null}</section>
 
-      {mutationError ? <StatusBanner tone="error" title="Source update failed"><p>{mutationError} The last confirmed configuration remains visible.</p></StatusBanner> : null}
-      {mutationInfo ? <StatusBanner tone="success" title="Source updated"><p>{mutationInfo}</p></StatusBanner> : null}
+      {mutationError ? <StatusBanner tone="error" title="Source action failed"><p>{mutationError} Current source state is being reloaded before another action is attempted.</p></StatusBanner> : null}
+      {mutationInfo ? <StatusBanner tone="success" title="Source monitoring updated"><p>{mutationInfo}</p></StatusBanner> : null}
 
       <div className="monitoring-split-layout">
         <section aria-busy={loading} aria-labelledby="source-list-title" className="monitoring-queue"><header className="monitoring-queue-header"><div><h2 id="source-list-title">Registered sources</h2><p>Source identity is derived from normalized provider, target scope, and assessed identity context.</p></div><span>Page {cursorHistory.length + 1}</span></header>
@@ -223,7 +297,7 @@ export function SourcesPage() {
           {!loading && !error && sources.length > 0 ? <div className="monitoring-table-scroll"><table className="monitoring-table"><caption className="sr-only">Registered collection sources</caption><thead><tr><th>Health</th><th>Source</th><th>Provider</th><th>Coverage</th><th>Freshness</th><th>Last success</th></tr></thead><tbody>{sources.map((source) => <tr className={selectedId === source.id ? "is-selected" : ""} key={source.id}><td><span className={`source-health is-${source.health_status}`}>{humanizeMonitoringValue(source.health_status)}</span></td><td><button className="monitoring-row-title" onClick={() => setSelectedId(source.id)} type="button"><strong>{source.display_name}</strong><span title={source.source_key}>{source.assessed_identity || source.source_key}</span></button></td><td><ProviderBadge provider={source.provider} /></td><td><span className={`evidence-state is-${source.coverage?.state === "complete" ? "exact" : source.coverage?.state === "partial" ? "bounded" : "indeterminate"}`}>{humanizeMonitoringValue(source.coverage?.state)}</span></td><td><span className={`source-freshness is-${source.freshness?.state}`}>{humanizeMonitoringValue(source.freshness?.state)}</span><small>Age {formatDuration(source.freshness?.age_seconds)}</small></td><td>{formatMonitoringTimestamp(source.last_success_at)}</td></tr>)}</tbody></table></div> : null}
           <footer className="monitoring-pagination"><span>{sources.length.toLocaleString()} source{sources.length === 1 ? "" : "s"} loaded on this page.</span><nav aria-label="Source pages"><button disabled={cursorHistory.length === 0 || loading} onClick={() => { const previous = cursorHistory[cursorHistory.length - 1] ?? null; setCursorHistory((values) => values.slice(0, -1)); setCursor(previous); }} type="button">Previous</button><strong aria-current="page">{cursorHistory.length + 1}</strong><button disabled={!nextCursor || loading} onClick={() => { setCursorHistory((values) => [...values, cursor]); setCursor(nextCursor); }} type="button">Next</button></nav></footer>
         </section>
-        <aside aria-label="Selected source details" className="monitoring-detail-pane"><SourceDetail busy={mutationBusy} canManage={canManageSources(role)} error={detailError} loading={detailLoading} onReload={() => setDetailNonce((value) => value + 1)} onUpdate={updateSource} permissionError={roleError} permissionsReady={roleReady} source={detail} /></aside>
+        <aside aria-label="Selected source details" className="monitoring-detail-pane"><SourceDetail busy={mutationBusy} canManage={canManageSources(role)} canRetryFindings={canRetrySourceMonitoring(detail, role)} error={detailError} loading={detailLoading} onReload={() => setDetailNonce((value) => value + 1)} onRetryFindings={retryFindingEvaluation} onUpdate={updateSource} permissionError={roleError} permissionsReady={roleReady} source={detail} /></aside>
       </div>
     </section>
   );

@@ -1,4 +1,9 @@
 import type { AccessEvidenceSummary } from "@/lib/access-evidence";
+import {
+  canManageFindings,
+  monitoringEvaluationState,
+  type MonitoringEvaluation,
+} from "@/lib/monitoring";
 
 export type ComparisonState = "queued" | "running" | "complete" | "failed";
 export type ResourceChangeType = "appeared" | "disappeared" | "changed" | "indeterminate";
@@ -29,14 +34,25 @@ export type ComparisonCompatibility = {
 };
 
 export type ComparisonSummary = {
+  appeared?: number | null;
+  disappeared?: number | null;
+  changed?: number | null;
+  indeterminate?: number | null;
+  total?: number | null;
+  exact?: boolean;
+  resource_summary_exact?: boolean;
+  item_churn_computed?: boolean;
+  findings_evaluation?: MonitoringEvaluation | null;
+  [key: string]: unknown;
+};
+
+export type ComparisonSummaryCounts = {
   appeared: number;
   disappeared: number;
   changed: number;
   indeterminate: number;
   total: number;
-  exact: boolean;
-  resource_summary_exact?: boolean;
-  item_churn_computed?: boolean;
+  published: boolean;
 };
 
 export type ProjectComparison = {
@@ -162,6 +178,45 @@ export type ComparisonTone = "success" | "warning" | "error" | "info";
 export function canCreateMaterializedComparison(role: string | null | undefined, roleStatus: string): boolean {
   const normalizedRole = role?.trim().toLowerCase();
   return roleStatus === "ready" && (normalizedRole === "operator" || normalizedRole === "admin");
+}
+
+function safeSummaryCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+export function comparisonSummaryCounts(
+  summary: ComparisonSummary | null | undefined,
+): ComparisonSummaryCounts {
+  const appeared = safeSummaryCount(summary?.appeared);
+  const disappeared = safeSummaryCount(summary?.disappeared);
+  const changed = safeSummaryCount(summary?.changed);
+  const indeterminate = safeSummaryCount(summary?.indeterminate);
+  const total = safeSummaryCount(summary?.total);
+  const published = [appeared, disappeared, changed, indeterminate, total].every((value) => value !== null);
+  return {
+    appeared: appeared ?? 0,
+    disappeared: disappeared ?? 0,
+    changed: changed ?? 0,
+    indeterminate: indeterminate ?? 0,
+    total: total ?? 0,
+    published,
+  };
+}
+
+export function comparisonFindingsEvaluation(
+  comparison: ProjectComparison | null | undefined,
+): MonitoringEvaluation | null {
+  const evaluation = comparison?.summary?.findings_evaluation;
+  return evaluation && typeof evaluation === "object" ? evaluation : null;
+}
+
+export function canRetryComparisonFindings(
+  comparison: ProjectComparison | null | undefined,
+  role: string | null | undefined,
+): boolean {
+  return canManageFindings(role)
+    && comparison?.state === "complete"
+    && monitoringEvaluationState(comparisonFindingsEvaluation(comparison)) === "degraded";
 }
 
 export function comparisonRunId(comparison: ProjectComparison, side: "current" | "baseline"): string | null {

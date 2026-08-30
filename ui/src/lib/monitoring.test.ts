@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   canManageFindings,
   canManageSources,
+  canRetrySourceMonitoring,
   evidenceTrustCopy,
   findingEvidenceFacts,
   findingExpectedRevisions,
@@ -10,6 +11,10 @@ import {
   findingSeverityRank,
   formatDuration,
   humanizeMonitoringValue,
+  monitoringEvaluationIsActive,
+  monitoringEvaluationState,
+  safeMonitoringDiagnostic,
+  type MonitoringSource,
 } from "@/lib/monitoring";
 
 describe("monitoring presentation", () => {
@@ -96,5 +101,44 @@ describe("monitoring presentation", () => {
       label: "Run evidence",
       path: "/projects/project%2Fa/runs/run%2Fb",
     });
+  });
+
+  it("offers source finding recovery only for an enabled retryable degraded latest run", () => {
+    const source = {
+      id: "source-a",
+      project_id: "project-a",
+      source_key: "source-key",
+      display_name: "Source A",
+      provider: "smb",
+      enabled: true,
+      coverage: {
+        state: "partial",
+        monitoring_findings: {
+          state: "degraded",
+          retryable: true,
+          run_id: "run-a",
+        },
+      },
+      freshness: { state: "fresh" },
+      health_status: "degraded",
+      created_at: "2026-08-30T00:00:00Z",
+      updated_at: "2026-08-30T00:00:00Z",
+    } satisfies MonitoringSource;
+
+    expect(canRetrySourceMonitoring(source, "operator")).toBe(true);
+    expect(canRetrySourceMonitoring(source, "admin")).toBe(true);
+    expect(canRetrySourceMonitoring(source, "viewer")).toBe(false);
+    expect(canRetrySourceMonitoring({ ...source, enabled: false }, "admin")).toBe(false);
+    expect(canRetrySourceMonitoring({
+      ...source,
+      coverage: { ...source.coverage, monitoring_findings: { state: "degraded", retryable: false, run_id: "run-a" } },
+    }, "operator")).toBe(false);
+  });
+
+  it("normalizes recovery state and withholds arbitrary diagnostics", () => {
+    expect(monitoringEvaluationIsActive({ state: "retrying" })).toBe(true);
+    expect(monitoringEvaluationState({ state: "unexpected-worker-state" })).toBe("unknown");
+    expect(safeMonitoringDiagnostic("FINDING_EVALUATION_FAILED")).toBe("FINDING_EVALUATION_FAILED");
+    expect(safeMonitoringDiagnostic("Bearer must-never-render")).toBeNull();
   });
 });

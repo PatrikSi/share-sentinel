@@ -7,11 +7,12 @@ import { apiFetch } from "@/lib/api";
 import {
   comparisonErrorText,
   comparisonRunLabel,
+  comparisonSummaryCounts,
   comparisonStateTone,
   type ComparisonState,
   type ProjectComparison,
 } from "@/lib/comparisons";
-import { formatMonitoringTimestamp, humanizeMonitoringValue } from "@/lib/monitoring";
+import { formatMonitoringTimestamp, humanizeMonitoringValue, monitoringEvaluationState } from "@/lib/monitoring";
 
 const PAGE_LIMIT = 50;
 const COMPARISON_STATES: ComparisonState[] = ["queued", "running", "complete", "failed"];
@@ -34,6 +35,11 @@ function interpretationCopy(comparison: ProjectComparison): string {
   if (comparison.state === "queued") return "Waiting for comparison capacity";
   if (comparison.state === "running") return comparison.progress?.message || "Materializing resource and item changes";
   if (comparison.state === "failed") return comparisonErrorText(comparison.error) || "Comparison failed";
+  const findingsState = monitoringEvaluationState(comparison.summary?.findings_evaluation);
+  if (findingsState === "degraded") return "Changes published; finding evaluation is degraded";
+  if (findingsState === "queued" || findingsState === "retrying" || findingsState === "evaluating") {
+    return "Changes published; finding evaluation is still running";
+  }
   const compatibility = comparison.compatibility;
   if (!compatibility?.structural_interpretable) return "Structural conclusions are indeterminate";
   if (!compatibility.content_interpretable || !compatibility.access_interpretable) return "Some evidence dimensions are limited";
@@ -124,8 +130,8 @@ export function ChangesPage() {
               <caption className="sr-only">Materialized project comparisons</caption>
               <thead><tr><th>State</th><th>Baseline</th><th>Current</th><th>Resource changes</th><th>Interpretation</th><th>Created</th><th><span className="sr-only">Action</span></th></tr></thead>
               <tbody>{comparisons.map((comparison) => {
-                const summary = comparison.summary;
-                return <tr key={comparison.id}><td><span className={`comparison-state is-${comparisonStateTone(comparison.state)}`}>{humanizeMonitoringValue(comparison.state)}</span></td><td><strong>{comparisonRunLabel(comparison, "baseline")}</strong><small>{formatMonitoringTimestamp(comparison.baseline_run?.created_at)}</small></td><td><strong>{comparisonRunLabel(comparison, "current")}</strong><small>{formatMonitoringTimestamp(comparison.current_run?.created_at)}</small></td><td>{summary ? <div className="monitoring-change-counts"><span><strong>{summary.appeared.toLocaleString()}</strong> appeared</span><span><strong>{summary.disappeared.toLocaleString()}</strong> disappeared</span><span><strong>{summary.changed.toLocaleString()}</strong> changed</span><span><strong>{summary.indeterminate.toLocaleString()}</strong> indeterminate</span></div> : <span>Not published</span>}</td><td><p className="monitoring-interpretation">{interpretationCopy(comparison)}</p>{comparison.compatibility?.reasons?.length ? <small>{comparison.compatibility.reasons.length.toLocaleString()} recorded limitation{comparison.compatibility.reasons.length === 1 ? "" : "s"}</small> : null}</td><td>{formatMonitoringTimestamp(comparison.created_at)}</td><td><Link className="inventory-button-primary" to={`/projects/${projectId}/comparisons/${comparison.id}`}>{comparison.state === "complete" ? "Inspect changes" : "Open status"}</Link></td></tr>;
+                const counts = comparisonSummaryCounts(comparison.summary);
+                return <tr key={comparison.id}><td><span className={`comparison-state is-${comparisonStateTone(comparison.state)}`}>{humanizeMonitoringValue(comparison.state)}</span></td><td><strong>{comparisonRunLabel(comparison, "baseline")}</strong><small>{formatMonitoringTimestamp(comparison.baseline_run?.created_at)}</small></td><td><strong>{comparisonRunLabel(comparison, "current")}</strong><small>{formatMonitoringTimestamp(comparison.current_run?.created_at)}</small></td><td>{comparison.state === "complete" && counts.published ? <div className="monitoring-change-counts"><span><strong>{counts.appeared.toLocaleString()}</strong> appeared</span><span><strong>{counts.disappeared.toLocaleString()}</strong> disappeared</span><span><strong>{counts.changed.toLocaleString()}</strong> changed</span><span><strong>{counts.indeterminate.toLocaleString()}</strong> indeterminate</span></div> : <span>Not published</span>}</td><td><p className="monitoring-interpretation">{interpretationCopy(comparison)}</p>{comparison.compatibility?.reasons?.length ? <small>{comparison.compatibility.reasons.length.toLocaleString()} recorded limitation{comparison.compatibility.reasons.length === 1 ? "" : "s"}</small> : null}</td><td>{formatMonitoringTimestamp(comparison.created_at)}</td><td><Link className="inventory-button-primary" to={`/projects/${projectId}/comparisons/${comparison.id}`}>{comparison.state === "complete" ? "Inspect changes" : "Open status"}</Link></td></tr>;
               })}</tbody>
             </table>
           </div>

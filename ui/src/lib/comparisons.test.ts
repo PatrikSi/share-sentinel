@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  canRetryComparisonFindings,
   canCreateMaterializedComparison,
   comparisonCompatibilityTone,
   comparisonRunId,
+  comparisonSummaryCounts,
   itemChangeCopy,
   resourceChangeKey,
   type ProjectComparison,
@@ -110,5 +112,35 @@ describe("comparison truthfulness helpers", () => {
     } satisfies ResourceComparisonChange;
     expect(resourceChangeKey(change, 0)).toBe(resourceChangeKey(change, 0));
     expect(resourceChangeKey(change, 0)).toContain("share-id");
+  });
+
+  it("tolerates queued and legacy comparisons with an empty or partial summary", () => {
+    expect(comparisonSummaryCounts({})).toEqual({
+      appeared: 0,
+      disappeared: 0,
+      changed: 0,
+      indeterminate: 0,
+      total: 0,
+      published: false,
+    });
+    expect(comparisonSummaryCounts({ appeared: 1, disappeared: 2 })).toMatchObject({
+      appeared: 1,
+      disappeared: 2,
+      published: false,
+    });
+    expect(comparisonSummaryCounts({ appeared: 1, disappeared: 2, changed: 3, indeterminate: 4, total: 10 }).published).toBe(true);
+  });
+
+  it("exposes comparison finding recovery only for degraded complete comparisons and write roles", () => {
+    const comparison = {
+      id: "comparison-a",
+      state: "complete",
+      summary: { findings_evaluation: { state: "degraded", attempt_count: 3 } },
+    } as ProjectComparison;
+    expect(canRetryComparisonFindings(comparison, "operator")).toBe(true);
+    expect(canRetryComparisonFindings(comparison, "admin")).toBe(true);
+    expect(canRetryComparisonFindings(comparison, "viewer")).toBe(false);
+    expect(canRetryComparisonFindings({ ...comparison, state: "running" }, "admin")).toBe(false);
+    expect(canRetryComparisonFindings({ ...comparison, summary: { findings_evaluation: { state: "retrying" } } }, "admin")).toBe(false);
   });
 });
