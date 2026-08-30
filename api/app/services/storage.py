@@ -330,6 +330,7 @@ def complete_multipart_upload(key: str, upload_id: str, parts: list[dict]) -> No
     # to replace an already referenced object when two completions race.
     multipart_parent_fd = _open_storage_parent(multipart_parts[:-1], create=False)
     target_parent_fd = _open_storage_parent(target_parts[:-1], create=True)
+    linked_by_this_call = False
     try:
         os.link(
             multipart_parts[-1],
@@ -338,9 +339,27 @@ def complete_multipart_upload(key: str, upload_id: str, parts: list[dict]) -> No
             dst_dir_fd=target_parent_fd,
             follow_symlinks=False,
         )
+        linked_by_this_call = True
         os.unlink(multipart_parts[-1], dir_fd=multipart_parent_fd)
         os.fsync(target_parent_fd)
         os.fsync(multipart_parent_fd)
+    except BaseException:
+        # Publishing is complete only after both directory entries are
+        # durable. If a later unlink/fsync step fails, remove only the target
+        # created by this invocation so a retry cannot mistake a partially
+        # durable object for a committed artifact. In particular, never
+        # remove a pre-existing immutable target after FileExistsError.
+        if linked_by_this_call:
+            try:
+                os.unlink(target_parts[-1], dir_fd=target_parent_fd)
+                os.fsync(target_parent_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Preserve the publication failure. Reconciliation will find
+                # any target that the filesystem would not let us remove.
+                pass
+        raise
     finally:
         os.close(target_parent_fd)
         os.close(multipart_parent_fd)

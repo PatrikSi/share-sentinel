@@ -301,3 +301,28 @@ def test_complete_multipart_upload_does_not_replace_immutable_artifact(tmp_path,
     storage.abort_multipart_upload(key, second_id)
     with storage.get_object_stream(key) as artifact:
         assert artifact.read() == b"first"
+
+
+def test_complete_multipart_upload_removes_target_after_partial_publication_failure(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+    key = "projects/p/artifact.ndjson"
+    upload_id = storage.create_multipart_upload(key)
+    storage.upload_part(key, upload_id, 1, b"pending")
+    real_unlink = storage.os.unlink
+    failed_pending_unlink = False
+
+    def fail_first_pending_unlink(path, *args, **kwargs):
+        nonlocal failed_pending_unlink
+        if str(path).endswith(".part") and not failed_pending_unlink:
+            failed_pending_unlink = True
+            raise OSError("simulated pending-entry failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage.os, "unlink", fail_first_pending_unlink)
+
+    with pytest.raises(OSError, match="simulated pending-entry failure"):
+        storage.complete_multipart_upload(key, upload_id, [])
+
+    assert not storage._artifact_path(key).exists()
+    assert storage._multipart_path(key, upload_id).read_bytes() == b"pending"
+    storage.abort_multipart_upload(key, upload_id)
