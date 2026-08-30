@@ -16,4 +16,18 @@ describe("API problem detail presentation", () => {
     expect(message).toContain("FINDING_REVISION_CONFLICT");
     expect(message).toContain("request-123");
   });
+
+  it("preserves atomic bulk revision conflict guidance", () => {
+    const message = errorMessageFromBody(JSON.stringify({
+      detail: {
+        code: "FINDING_BULK_REVISION_CONFLICT",
+        message: "One or more findings changed after they were loaded; refresh and retry.",
+        conflicts: [{ finding_id: "finding-a", current_revision: 4 }],
+      },
+    }), 409);
+
+    expect(message).toContain("changed after they were loaded");
+    expect(message).toContain("FINDING_BULK_REVISION_CONFLICT");
+    expect(message).not.toContain("finding-a");
+  });
 });

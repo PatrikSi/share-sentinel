@@ -179,6 +179,24 @@ export function canManageSources(role: string | null | undefined): boolean {
   return role === "admin";
 }
 
+export function findingExpectedRevisions(
+  findings: ReadonlyArray<Pick<Finding, "id" | "revision">>,
+  selectedIds: ReadonlySet<string>,
+): Record<string, number> {
+  const expectedRevisions: Record<string, number> = {};
+  findings.forEach((finding) => {
+    if (!selectedIds.has(finding.id)) return;
+    if (!Number.isSafeInteger(finding.revision) || finding.revision < 1) {
+      throw new Error("A selected finding has an invalid revision and cannot be updated safely.");
+    }
+    expectedRevisions[finding.id] = finding.revision;
+  });
+  if (Object.keys(expectedRevisions).length !== selectedIds.size) {
+    throw new Error("The selected findings no longer match the loaded page. Refresh and select them again.");
+  }
+  return expectedRevisions;
+}
+
 export function evidenceTrustCopy(state: EvidenceState): string {
   if (state === "exact") return "Exact within the declared collection scope.";
   if (state === "bounded") return "Based on bounded observations; review limitations before acting.";

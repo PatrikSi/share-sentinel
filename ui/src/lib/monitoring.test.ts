@@ -5,6 +5,7 @@ import {
   canManageSources,
   evidenceTrustCopy,
   findingEvidenceFacts,
+  findingExpectedRevisions,
   findingSeverityRank,
   formatDuration,
   humanizeMonitoringValue,
@@ -68,5 +69,20 @@ describe("monitoring presentation", () => {
     expect(facts.find((fact) => fact.key === "change_type")?.value).toBe("permission_changed");
     expect(facts.find((fact) => fact.key === "after")?.value).toContain("raw values withheld");
     expect(JSON.stringify(facts)).not.toContain("must-never-render");
+  });
+
+  it("binds atomic bulk updates to every selected loaded revision", () => {
+    const rows = [
+      { id: "finding-a", revision: 3 },
+      { id: "finding-b", revision: 9 },
+      { id: "finding-c", revision: 2 },
+    ];
+
+    expect(findingExpectedRevisions(rows, new Set(["finding-a", "finding-c"]))).toEqual({
+      "finding-a": 3,
+      "finding-c": 2,
+    });
+    expect(() => findingExpectedRevisions(rows, new Set(["missing-finding"]))).toThrow(/no longer match/i);
+    expect(() => findingExpectedRevisions([{ id: "finding-a", revision: 0 }], new Set(["finding-a"]))).toThrow(/invalid revision/i);
   });
 });

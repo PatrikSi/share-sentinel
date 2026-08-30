@@ -10,6 +10,7 @@ import {
   canManageFindings,
   evidenceTrustCopy,
   findingEvidenceFacts,
+  findingExpectedRevisions,
   findingTone,
   formatMonitoringTimestamp,
   humanizeMonitoringValue,
@@ -463,11 +464,20 @@ export function FindingsPage() {
 
   async function bulkUpdate() {
     if (!projectId || selectedIds.size === 0 || (bulkStatus === KEEP_ASSIGNEE_VALUE && bulkAssignee === KEEP_ASSIGNEE_VALUE)) return;
-    setMutationBusy(true);
     setMutationError(null);
     setMutationInfo(null);
+    let expectedRevisions: Record<string, number>;
     try {
-      const payload: Record<string, unknown> = { finding_ids: [...selectedIds] };
+      expectedRevisions = findingExpectedRevisions(findings, selectedIds);
+    } catch (caught) {
+      setMutationError(caught instanceof Error ? caught.message : "The selected findings could not be matched to their loaded revisions.");
+      setSelectedIds(new Set());
+      setReloadNonce((value) => value + 1);
+      return;
+    }
+    setMutationBusy(true);
+    try {
+      const payload: Record<string, unknown> = { finding_ids: [...selectedIds], expected_revisions: expectedRevisions };
       if (bulkStatus !== KEEP_ASSIGNEE_VALUE) payload.status = bulkStatus;
       if (bulkAssignee !== KEEP_ASSIGNEE_VALUE) payload.assignee_user_id = bulkAssignee || null;
       const data = await apiFetch(`/projects/${encodeURIComponent(projectId)}/findings/bulk`, {
@@ -481,7 +491,10 @@ export function FindingsPage() {
       setReloadNonce((value) => value + 1);
       if (selectedId) setDetailNonce((value) => value + 1);
     } catch (caught) {
-      setMutationError(`${caught instanceof Error ? caught.message : "Bulk finding update failed."} The operation is atomic; no selected finding was intentionally left half-updated.`);
+      setMutationError(`${caught instanceof Error ? caught.message : "Bulk finding update failed."} The operation is atomic. The queue has been refreshed; review current revisions before selecting findings again.`);
+      setSelectedIds(new Set());
+      setReloadNonce((value) => value + 1);
+      if (selectedId) setDetailNonce((value) => value + 1);
     } finally {
       setMutationBusy(false);
     }
