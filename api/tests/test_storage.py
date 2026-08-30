@@ -188,6 +188,25 @@ def test_multipart_upload_rejects_symlinked_parent_component(tmp_path, monkeypat
     assert list(outside.iterdir()) == []
 
 
+def test_multipart_upload_syncs_each_new_parent_entry(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
+    real_fsync = storage.os.fsync
+    fsync_calls: list[int] = []
+
+    def recording_fsync(descriptor: int) -> None:
+        fsync_calls.append(descriptor)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(storage.os, "fsync", recording_fsync)
+    key = "projects/p/runs/r/artifact.ndjson"
+    upload_id = storage.create_multipart_upload(key)
+
+    # One parent-directory sync is required for every directory component
+    # created beneath the already-existing artifact root.
+    assert len(fsync_calls) >= len(storage._multipart_parts(key, upload_id)) - 1
+    storage.abort_multipart_upload(key, upload_id)
+
+
 def test_get_object_stream_rejects_symlink(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(storage, "get_settings", lambda: SimpleNamespace(artifact_storage_path=str(tmp_path)))
     key = "projects/p/artifact.ndjson"

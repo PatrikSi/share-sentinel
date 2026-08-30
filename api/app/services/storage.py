@@ -177,11 +177,20 @@ def _open_storage_parent(parts: tuple[str, ...], *, create: bool) -> int:
         if not stat.S_ISDIR(os.fstat(current_fd).st_mode):
             raise OSError("artifact storage root is not a directory")
         for part in parts:
+            created = False
             if create:
                 try:
                     os.mkdir(part, mode=0o700, dir_fd=current_fd)
                 except FileExistsError:
                     pass
+                else:
+                    created = True
+            if created:
+                # Persist every new directory entry, not only the deepest
+                # artifact directory. Otherwise a successful publish can be
+                # lost after power failure when one of its ancestors was
+                # still only present in the filesystem cache.
+                os.fsync(current_fd)
             next_fd = os.open(part, _directory_open_flags(), dir_fd=current_fd)
             os.close(current_fd)
             current_fd = next_fd
