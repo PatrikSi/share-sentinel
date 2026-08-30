@@ -37,6 +37,9 @@ def test_scan_candidates_separates_references_orphans_and_multipart(tmp_path, re
     _old(multipart)
     recent = tmp_path / "recent.ndjson"
     recent.write_bytes(b"pending commit")
+    capacity_lock = tmp_path / ".share-sentinel-capacity.lock"
+    capacity_lock.write_bytes(b"")
+    _old(capacity_lock)
 
     orphans, multipart_files, missing, recent_count = reconcile_module.scan_candidates(
         tmp_path,
@@ -45,9 +48,7 @@ def test_scan_candidates_separates_references_orphans_and_multipart(tmp_path, re
     )
 
     assert [item.key for item in orphans] == ["projects/p/runs/old/artifact.ndjson"]
-    assert [item.key for item in multipart_files] == [
-        ".multipart/projects/p/artifact.ndjson/id.part"
-    ]
+    assert [item.key for item in multipart_files] == [".multipart/projects/p/artifact.ndjson/id.part"]
     assert missing == ["missing.ndjson"]
     assert recent_count == 1
 
@@ -63,10 +64,13 @@ def test_delete_candidates_rechecks_database_reference(tmp_path, reconcile_modul
     second = tmp_path / "second.ndjson"
     first.write_bytes(b"first")
     second.write_bytes(b"second")
-    now = datetime.now(tz=UTC)
+    first_candidate = reconcile_module._file_candidate(tmp_path, first, "orphan")
+    second_candidate = reconcile_module._file_candidate(tmp_path, second, "orphan")
+    assert first_candidate is not None
+    assert second_candidate is not None
     candidates = [
-        reconcile_module.Candidate("orphan", "first.ndjson", first, 5, now),
-        reconcile_module.Candidate("orphan", "second.ndjson", second, 6, now),
+        first_candidate,
+        second_candidate,
     ]
 
     class _Result:
@@ -92,7 +96,12 @@ def test_delete_candidates_rechecks_database_reference(tmp_path, reconcile_modul
 
     connection = _Connection()
 
-    deleted, skipped = reconcile_module.delete_candidates(connection, candidates, limit=10)
+    deleted, skipped = reconcile_module.delete_candidates(
+        connection,
+        candidates,
+        root=tmp_path,
+        limit=10,
+    )
 
     assert deleted == ["first.ndjson"]
     assert skipped == ["second.ndjson"]
@@ -100,3 +109,40 @@ def test_delete_candidates_rechecks_database_reference(tmp_path, reconcile_modul
     assert second.exists()
     assert connection.commits == 2
     assert len(connection.audit) == 2
+
+
+def test_secure_delete_rejects_swapped_symlink_parent(tmp_path, reconcile_module) -> None:
+    root = tmp_path / "artifacts"
+    artifact = root / "projects" / "p" / "artifact.ndjson"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"original")
+    candidate = reconcile_module._file_candidate(root, artifact, "orphan")
+    assert candidate is not None
+
+    preserved_tree = tmp_path / "preserved-projects"
+    (root / "projects").rename(preserved_tree)
+    outside = tmp_path / "outside"
+    outside_artifact = outside / "p" / "artifact.ndjson"
+    outside_artifact.parent.mkdir(parents=True)
+    outside_artifact.write_bytes(b"outside")
+    (root / "projects").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(reconcile_module.CandidateChangedError):
+        reconcile_module._unlink_candidate(root, candidate)
+
+    assert (preserved_tree / "p" / "artifact.ndjson").read_bytes() == b"original"
+    assert outside_artifact.read_bytes() == b"outside"
+
+
+def test_secure_delete_rejects_replaced_terminal_file(tmp_path, reconcile_module) -> None:
+    artifact = tmp_path / "artifact.ndjson"
+    artifact.write_bytes(b"original")
+    candidate = reconcile_module._file_candidate(tmp_path, artifact, "orphan")
+    assert candidate is not None
+    artifact.unlink()
+    artifact.write_bytes(b"replacement")
+
+    with pytest.raises(reconcile_module.CandidateChangedError, match="changed after scan"):
+        reconcile_module._unlink_candidate(tmp_path, candidate)
+
+    assert artifact.read_bytes() == b"replacement"
