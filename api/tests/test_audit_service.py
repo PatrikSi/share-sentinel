@@ -14,6 +14,8 @@ def test_sanitize_audit_metadata_redacts_nested_secret_fields() -> None:
             "database_url": "postgresql://user:password@example.invalid/db",
             "nested": {
                 "client-secret": "also-secret",
+                "graphClientSecret": "camel-secret",
+                "authToken": "opaque-secret",
                 "signing_client_assertion": "signed-secret",
                 "api_token_hash": "hashed-but-sensitive",
                 "token_id": "safe-reference",
@@ -26,6 +28,8 @@ def test_sanitize_audit_metadata_redacts_nested_secret_fields() -> None:
     assert payload["seed_admin_password"] == "[redacted]"
     assert payload["database_url"] == "[redacted]"
     assert payload["nested"]["client-secret"] == "[redacted]"
+    assert payload["nested"]["graphClientSecret"] == "[redacted]"
+    assert payload["nested"]["authToken"] == "[redacted]"
     assert payload["nested"]["signing_client_assertion"] == "[redacted]"
     assert payload["nested"]["api_token_hash"] == "[redacted]"
     assert payload["nested"]["token_id"] == "safe-reference"

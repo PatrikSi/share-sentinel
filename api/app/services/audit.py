@@ -65,6 +65,31 @@ SENSITIVE_METADATA_SUFFIXES = (
     "_secret",
     "_token_hash",
 )
+SENSITIVE_METADATA_FINGERPRINT_SUFFIXES = (
+    "accesskey",
+    "accesstoken",
+    "apikey",
+    "assertion",
+    "authorization",
+    "bearertoken",
+    "clientsecret",
+    "connectionstring",
+    "cookie",
+    "credential",
+    "databaseurl",
+    "hashes",
+    "jwt",
+    "lmhash",
+    "nthash",
+    "passphrase",
+    "password",
+    "pem",
+    "privatekey",
+    "refreshtoken",
+    "secret",
+    "token",
+    "tokenhash",
+)
 
 
 def _normalized_key(value: object) -> str:
@@ -73,7 +98,12 @@ def _normalized_key(value: object) -> str:
 
 def _is_sensitive_key(value: object) -> bool:
     normalized = _normalized_key(value)
-    return normalized in SENSITIVE_METADATA_KEYS or normalized.endswith(SENSITIVE_METADATA_SUFFIXES)
+    fingerprint = "".join(character for character in normalized if character.isalnum())
+    return (
+        normalized in SENSITIVE_METADATA_KEYS
+        or normalized.endswith(SENSITIVE_METADATA_SUFFIXES)
+        or fingerprint.endswith(SENSITIVE_METADATA_FINGERPRINT_SUFFIXES)
+    )
 
 
 def _bounded_string(value: object) -> str:
