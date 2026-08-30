@@ -1220,7 +1220,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "      * Kerberos: add --kerberos and use a domain-qualified username or --domain\n"
             "      * Session credentials: use --use-session-creds to use the active Kerberos ticket cache\n"
             "      * Anonymous: set --smb-anonymous or omit SMB credentials\n"
-            "  - NFS export enumeration uses `showmount -e`; if unavailable, only summary issues are recorded.\n"
+            "  - NFS uses a non-mutating v4 NULL probe plus `showmount -e`; neither operation proves filesystem access.\n"
             "  - Progress and diagnostics are written to stderr; NDJSON written to stdout remains clean.\n"
             "  - Ctrl-C drains bounded in-flight work, preserves a partial artifact, and exits 130.\n"
             "  - When no endpoint/resource/item/error data is collected, output files are not written."
@@ -3015,20 +3015,31 @@ def _probe_smb_file_access(
             break
 
 
-def _entry_timestamp(entry: object, method_name: str) -> str | None:
-    method = getattr(entry, method_name, None)
-    if not callable(method):
-        return None
-    try:
-        epoch = float(method())
-        # A zero Windows FILETIME converts to 1601-01-01. Directory listings
-        # commonly use it to mean "unset", so do not publish it as real data.
-        if epoch <= -11_644_473_600:
-            return None
-        value = datetime.fromtimestamp(epoch, tz=UTC)
-    except (AttributeError, OSError, OverflowError, TypeError, ValueError):
-        return None
-    return value.isoformat()
+def _entry_timestamp(entry: object, *method_names: str) -> str | None:
+    """Return the first usable timestamp exposed by an Impacket entry.
+
+    Current Impacket ``SharedFile`` objects expose ``get_mtime_epoch`` as the
+    last-write time.  Some older/adapted objects expose ``get_wtime_epoch``
+    instead.  Trying explicit aliases in semantic order keeps this compatible
+    without relabelling modification time as the distinct NTFS change time.
+    """
+
+    for method_name in method_names:
+        method = getattr(entry, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            epoch = float(method())
+            # A zero Windows FILETIME converts to 1601-01-01. Directory
+            # listings commonly use it to mean "unset", so do not publish it
+            # as real data.
+            if epoch <= -11_644_473_600:
+                continue
+            value = datetime.fromtimestamp(epoch, tz=UTC)
+        except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+            continue
+        return value.isoformat()
+    return None
 
 
 def _entry_metadata(entry: object, *, is_dir: bool) -> dict[str, object]:
@@ -3050,13 +3061,15 @@ def _entry_metadata(entry: object, *, is_dir: bool) -> dict[str, object]:
                 metadata["allocation_size_bytes"] = allocation_size
 
     timestamp_methods = (
-        ("mtime", "get_wtime_epoch"),
-        ("created_at", "get_ctime_epoch"),
-        ("accessed_at", "get_atime_epoch"),
-        ("changed_at", "get_mtime_epoch"),
+        ("mtime", ("get_mtime_epoch", "get_wtime_epoch")),
+        ("created_at", ("get_ctime_epoch", "get_creation_time_epoch")),
+        ("accessed_at", ("get_atime_epoch", "get_access_time_epoch")),
+        # NTFS change time is not the last-write/mtime field. Only emit it
+        # when an entry implementation provides an explicit change-time API.
+        ("changed_at", ("get_changetime_epoch", "get_change_time_epoch", "get_chtime_epoch")),
     )
-    for field_name, method_name in timestamp_methods:
-        value = _entry_timestamp(entry, method_name)
+    for field_name, method_names in timestamp_methods:
+        value = _entry_timestamp(entry, *method_names)
         if value is not None:
             metadata[field_name] = value
 
@@ -3674,7 +3687,184 @@ def _parse_showmount_exports(output: str) -> list[str]:
     return exports
 
 
-def _discover_nfs_exports(host: str, timeout_seconds: float) -> tuple[list[str], str | None]:
+@dataclass(frozen=True)
+class NFSExportDiscovery:
+    exports: tuple[str, ...]
+    status: str
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class NFSV4NullProbe:
+    transport_status: str
+    service_status: str
+    status: str
+    supported_version_min: int | None = None
+    supported_version_max: int | None = None
+
+    def public_metadata(self) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "method": "onc_rpc_null",
+            "program": 100003,
+            "version": 4,
+            "procedure": 0,
+            "credential_flavor": "AUTH_NONE",
+            "mutating": False,
+            "status": self.status,
+        }
+        if self.supported_version_min is not None:
+            metadata["supported_version_min"] = self.supported_version_min
+        if self.supported_version_max is not None:
+            metadata["supported_version_max"] = self.supported_version_max
+        return metadata
+
+
+NFS_RPC_MAX_RECORD_BYTES = 64 * 1024
+NFS_RPC_MAX_FRAGMENTS = 8
+
+
+class _NFSRPCProtocolError(RuntimeError):
+    pass
+
+
+def _recv_exact(connection: object, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = connection.recv(remaining)  # type: ignore[attr-defined]
+        if not chunk:
+            raise _NFSRPCProtocolError("rpc_connection_closed")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _recv_rpc_record(connection: object) -> bytes:
+    payload = bytearray()
+    for _fragment in range(NFS_RPC_MAX_FRAGMENTS):
+        marker = struct.unpack("!I", _recv_exact(connection, 4))[0]
+        final_fragment = bool(marker & 0x80000000)
+        fragment_size = marker & 0x7FFFFFFF
+        if fragment_size > NFS_RPC_MAX_RECORD_BYTES or len(payload) + fragment_size > NFS_RPC_MAX_RECORD_BYTES:
+            raise _NFSRPCProtocolError("rpc_response_too_large")
+        payload.extend(_recv_exact(connection, fragment_size))
+        if final_fragment:
+            return bytes(payload)
+    raise _NFSRPCProtocolError("rpc_fragment_limit_reached")
+
+
+def _parse_nfs_v4_null_reply(payload: bytes, *, expected_xid: int) -> NFSV4NullProbe:
+    if len(payload) < 12:
+        raise _NFSRPCProtocolError("rpc_reply_truncated")
+    xid, message_type, reply_status = struct.unpack_from("!III", payload, 0)
+    if xid != expected_xid:
+        raise _NFSRPCProtocolError("rpc_xid_mismatch")
+    if message_type != 1:
+        raise _NFSRPCProtocolError("rpc_message_type_invalid")
+
+    if reply_status == 1:  # MSG_DENIED
+        if len(payload) < 16:
+            raise _NFSRPCProtocolError("rpc_denied_reply_truncated")
+        reject_status = struct.unpack_from("!I", payload, 12)[0]
+        status = "rpc_version_mismatch" if reject_status == 0 else "rpc_auth_rejected"
+        return NFSV4NullProbe("reachable", "rpc_responded", status)
+    if reply_status != 0:  # MSG_ACCEPTED
+        raise _NFSRPCProtocolError("rpc_reply_status_invalid")
+    if len(payload) < 20:
+        raise _NFSRPCProtocolError("rpc_accepted_reply_truncated")
+
+    _verifier_flavor, verifier_length = struct.unpack_from("!II", payload, 12)
+    if verifier_length > 4096:
+        raise _NFSRPCProtocolError("rpc_verifier_too_large")
+    padded_verifier_length = (verifier_length + 3) & ~3
+    accept_offset = 20 + padded_verifier_length
+    if len(payload) < accept_offset + 4:
+        raise _NFSRPCProtocolError("rpc_verifier_truncated")
+    accept_status = struct.unpack_from("!I", payload, accept_offset)[0]
+    if accept_status == 0:  # SUCCESS
+        return NFSV4NullProbe("reachable", "nfs_v4_confirmed", "supported")
+    if accept_status == 2:  # PROG_MISMATCH
+        if len(payload) < accept_offset + 12:
+            raise _NFSRPCProtocolError("rpc_version_range_truncated")
+        low, high = struct.unpack_from("!II", payload, accept_offset + 4)
+        if low > high:
+            raise _NFSRPCProtocolError("rpc_version_range_invalid")
+        return NFSV4NullProbe(
+            "reachable",
+            "nfs_service_confirmed",
+            "version_not_supported",
+            supported_version_min=low,
+            supported_version_max=high,
+        )
+    status_by_accept_code = {
+        1: "nfs_program_unavailable",
+        3: "null_procedure_unavailable",
+        4: "rpc_garbage_arguments",
+        5: "rpc_system_error",
+    }
+    return NFSV4NullProbe(
+        "reachable",
+        "rpc_responded",
+        status_by_accept_code.get(accept_status, "rpc_accept_status_unknown"),
+    )
+
+
+def _probe_nfs_v4_null(host: str, timeout_seconds: float) -> NFSV4NullProbe:
+    """Issue a bounded, non-mutating NFSv4 NULL call directly to tcp/2049."""
+
+    connection = socket.create_connection((host, 2049), timeout=timeout_seconds)
+    try:
+        settimeout = getattr(connection, "settimeout", None)
+        if callable(settimeout):
+            settimeout(timeout_seconds)
+        xid = random.getrandbits(32)
+        call = struct.pack(
+            "!10I",
+            xid,
+            0,  # CALL
+            2,  # RPC version
+            100003,  # NFS program
+            4,  # NFSv4
+            0,  # NULL procedure
+            0,
+            0,  # AUTH_NONE credential
+            0,
+            0,  # AUTH_NONE verifier
+        )
+        record = struct.pack("!I", 0x80000000 | len(call)) + call
+        try:
+            connection.sendall(record)
+            payload = _recv_rpc_record(connection)
+            return _parse_nfs_v4_null_reply(payload, expected_xid=xid)
+        except (socket.timeout, TimeoutError):
+            return NFSV4NullProbe("reachable", "indeterminate", "response_timeout")
+        except _NFSRPCProtocolError as exc:
+            return NFSV4NullProbe("reachable", "indeterminate", str(exc))
+        except OSError:
+            return NFSV4NullProbe("reachable", "indeterminate", "connection_lost")
+    finally:
+        try:
+            connection.close()
+        except (AttributeError, OSError):
+            pass
+
+
+def _classify_showmount_failure(detail: str) -> str:
+    normalized = detail.casefold()
+    if "program not registered" in normalized or "prognotregistered" in normalized:
+        return "mount_protocol_unavailable"
+    if "access denied" in normalized or "permission denied" in normalized or "authentication error" in normalized:
+        return "permission_denied"
+    if "timed out" in normalized or "timeout" in normalized:
+        return "timed_out"
+    if "name or service not known" in normalized or "temporary failure in name resolution" in normalized:
+        return "name_resolution_failed"
+    if "no route to host" in normalized or "network is unreachable" in normalized:
+        return "transport_unreachable"
+    return "failed"
+
+
+def _discover_nfs_exports(host: str, timeout_seconds: float) -> NFSExportDiscovery:
     timeout = max(1.0, timeout_seconds * 4)
     try:
         completed = subprocess.run(
@@ -3685,17 +3875,18 @@ def _discover_nfs_exports(host: str, timeout_seconds: float) -> tuple[list[str],
             timeout=timeout,
         )
     except FileNotFoundError:
-        return [], "showmount is not available"
+        return NFSExportDiscovery((), "tool_unavailable", "showmount is not available")
     except subprocess.TimeoutExpired:
-        return [], "showmount timed out"
+        return NFSExportDiscovery((), "timed_out", "showmount timed out")
     except OSError as exc:
-        return [], str(exc)
+        detail = _error_detail(exc)
+        return NFSExportDiscovery((), _classify_showmount_failure(detail), detail)
 
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or f"showmount exit code {completed.returncode}"
-        return [], detail
+        return NFSExportDiscovery((), _classify_showmount_failure(detail), detail)
 
-    return _parse_showmount_exports(completed.stdout), None
+    return NFSExportDiscovery(tuple(_parse_showmount_exports(completed.stdout)), "complete")
 
 
 def _error_detail(exc: BaseException) -> str:
@@ -4804,8 +4995,7 @@ def scan_host_nfs(
         return False
     _report_detail(args, f"host {host}: starting NFS discovery")
     try:
-        with socket.create_connection((host, 2049), timeout=args.timeout):
-            pass
+        protocol_probe = _probe_nfs_v4_null(host, args.timeout)
     except socket.gaierror as exc:
         detail = _error_detail(exc)
         message = f"NFS target name resolution failed: {detail}"
@@ -4865,6 +5055,29 @@ def scan_host_nfs(
     if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
         return False
 
+    discovery = _discover_nfs_exports(host, args.timeout)
+    # Retain compatibility with private test/integration shims written for the
+    # previous tuple contract while all collector-produced results now carry a
+    # concrete status.
+    if isinstance(discovery, tuple):
+        exports, legacy_error = discovery
+        discovery = NFSExportDiscovery(
+            tuple(exports),
+            _classify_showmount_failure(str(legacy_error)) if legacy_error else "complete",
+            str(legacy_error) if legacy_error else None,
+        )
+
+    service_status = protocol_probe.service_status
+    if discovery.status == "complete" and service_status != "nfs_v4_confirmed":
+        service_status = "nfs_advertisement_confirmed"
+
+    v4_namespace_unassessed = protocol_probe.status == "supported"
+    structural_coverage = "advertised_exports_only" if discovery.status == "complete" else "partial"
+    limitations = ["access_not_assessed", "content_not_enumerated", "exports_are_advertisements_only"]
+    if v4_namespace_unassessed:
+        structural_coverage = "partial"
+        limitations.append("nfs_v4_pseudofilesystem_not_enumerated")
+
     writer.emit(
         {
             "type": "endpoint",
@@ -4875,39 +5088,90 @@ def scan_host_nfs(
             "domain": args.domain or None,
             "nfs": {
                 "port": 2049,
+                "transport_status": protocol_probe.transport_status,
+                "service_status": service_status,
+                "protocol_probe": protocol_probe.public_metadata(),
+                "export_discovery": {
+                    "method": "showmount_exports",
+                    "status": discovery.status,
+                    "export_count": len(discovery.exports),
+                },
+                "structural_coverage": structural_coverage,
+                "limitations": limitations,
             },
             "auth": {
-                "method": "none",
-                "success": True,
+                "method": "not_assessed",
+                "success": None,
+                "reason": "NFS NULL and export-discovery calls do not authenticate filesystem access",
             },
         }
     )
     with lock:
         stats.endpoints += 1
 
-    if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
-        return True
-
-    exports, export_error = _discover_nfs_exports(host, args.timeout)
-    if export_error:
-        message = f"Failed to enumerate NFS exports on {host}: {export_error}"
+    if protocol_probe.status not in {"supported", "version_not_supported"}:
+        message = (
+            f"NFSv4 protocol confirmation on {host}:2049 was indeterminate "
+            f"({protocol_probe.status}); TCP reachability is retained without claiming NFS access."
+        )
         _emit_error(
             writer,
             run_id,
             severity="warn",
-            code="NFS_EXPORT_ENUM_FAILED",
+            code="NFS_V4_PROBE_INDETERMINATE",
             message=message,
             endpoint_key=endpoint_key,
-            hint="Install and verify `showmount`, and ensure rpcbind/mountd access from this host.",
+            hint="Verify the service on tcp/2049; legacy NFS exports may still be discovered through mountd.",
         )
-        _record_error(stats, lock, "NFS_EXPORT_ENUM_FAILED", message)
+        _record_error(stats, lock, "NFS_V4_PROBE_INDETERMINATE", message)
+
+    if discovery.status != "complete":
+        if discovery.status == "mount_protocol_unavailable" and protocol_probe.status == "supported":
+            code = "NFS_V4_NAMESPACE_NOT_ENUMERATED"
+            message = (
+                f"NFSv4 responded on {host}:2049, but the legacy mount protocol did not advertise exports; "
+                "the NFSv4 pseudo-filesystem remains unenumerated."
+            )
+            hint = "Supply known export paths to a separate read-only mount assessment; showmount cannot enumerate NFSv4-only namespaces."
+        else:
+            code = "NFS_EXPORT_ENUM_FAILED"
+            detail = discovery.detail or discovery.status
+            message = f"Failed to enumerate advertised NFS exports on {host}: {detail}"
+            hint = "Install and verify `showmount`, and ensure rpcbind/mountd access from this host."
+        _emit_error(
+            writer,
+            run_id,
+            severity="warn",
+            code=code,
+            message=message,
+            endpoint_key=endpoint_key,
+            hint=hint,
+        )
+        _record_error(stats, lock, code, message)
+        with lock:
+            stats.structural_coverage_gaps += 1
+    elif v4_namespace_unassessed:
+        message = (
+            f"NFSv4 is available on {host}:2049; showmount covers only advertised legacy exports and "
+            "cannot prove the NFSv4 namespace is complete."
+        )
+        _emit_error(
+            writer,
+            run_id,
+            severity="warn",
+            code="NFS_V4_NAMESPACE_NOT_ENUMERATED",
+            message=message,
+            endpoint_key=endpoint_key,
+            hint="Treat this run as partial for NFSv4; use explicit known exports until read-only namespace enumeration is configured.",
+        )
+        _record_error(stats, lock, "NFS_V4_NAMESPACE_NOT_ENUMERATED", message)
         with lock:
             stats.structural_coverage_gaps += 1
 
-    if not exports:
+    if not discovery.exports:
         return True
 
-    for export_path in exports:
+    for export_path in discovery.exports:
         if getattr(args, "cancel_event", None) is not None and args.cancel_event.is_set():
             break
         writer.emit(
@@ -4920,11 +5184,17 @@ def scan_host_nfs(
                 "name": export_path,
                 "remark": "",
                 "access_level": "unknown",
+                "metadata": {
+                    "discovery_method": "showmount_exports",
+                    "presence": "advertised",
+                    "access_assessment": "not_assessed",
+                    "content_assessment": "not_assessed",
+                },
             }
         )
         with lock:
             stats.resources += 1
-    _report_detail(args, f"host {host}: discovered {len(exports)} NFS export(s)")
+    _report_detail(args, f"host {host}: discovered {len(discovery.exports)} advertised NFS export(s)")
     return True
 
 

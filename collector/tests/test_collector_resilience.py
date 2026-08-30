@@ -283,9 +283,7 @@ def test_main_writes_partial_artifact_and_skips_upload_on_interrupt(monkeypatch,
     monkeypatch.setattr(
         collector,
         "_scan_targets",
-        lambda *_args, **_kwargs: collector.ScanOutcome(
-            1, 0, 0, interrupted=True, targets_cancelled=1
-        ),
+        lambda *_args, **_kwargs: collector.ScanOutcome(1, 0, 0, interrupted=True, targets_cancelled=1),
     )
 
     def _upload(*_args, **_kwargs):
@@ -520,9 +518,6 @@ def test_list_share_entries_emits_safe_file_metadata_and_normalizes_extension() 
         def get_allocsize(self):
             return 4096
 
-        def get_wtime_epoch(self):
-            return mtime_epoch
-
         def get_ctime_epoch(self):
             return mtime_epoch - 120
 
@@ -530,6 +525,9 @@ def test_list_share_entries_emits_safe_file_metadata_and_normalizes_extension() 
             return mtime_epoch + 30
 
         def get_mtime_epoch(self):
+            return mtime_epoch
+
+        def get_changetime_epoch(self):
             return mtime_epoch + 60
 
         def is_archive(self):
@@ -583,9 +581,6 @@ def test_entry_metadata_suppresses_unset_zero_filetime_timestamps() -> None:
         def get_filesize(self):
             return 0
 
-        def get_wtime_epoch(self):
-            return zero_filetime_epoch
-
         def get_ctime_epoch(self):
             return zero_filetime_epoch
 
@@ -593,6 +588,9 @@ def test_entry_metadata_suppresses_unset_zero_filetime_timestamps() -> None:
             return zero_filetime_epoch
 
         def get_mtime_epoch(self):
+            return zero_filetime_epoch
+
+        def get_changetime_epoch(self):
             return zero_filetime_epoch
 
     class _Connection:
@@ -618,6 +616,19 @@ def test_entry_metadata_suppresses_unset_zero_filetime_timestamps() -> None:
             "size_bytes": 0,
         }
     ]
+
+
+def test_entry_metadata_uses_legacy_write_time_only_as_mtime() -> None:
+    collector = _load_collector_module()
+
+    class _LegacyEntry:
+        def get_wtime_epoch(self):
+            return 1_700_000_000
+
+    metadata = collector._entry_metadata(_LegacyEntry(), is_dir=True)
+
+    assert metadata == {"mtime": "2023-11-14T22:13:20+00:00"}
+    assert "changed_at" not in metadata
 
 
 def test_writer_preserves_optional_item_metadata_in_compact_tree(tmp_path) -> None:
@@ -678,9 +689,7 @@ def test_smb_connection_is_closed_when_authentication_fails(monkeypatch) -> None
     )
     writer = SimpleNamespace(records=[], emit=lambda record: writer.records.append(record))
 
-    assert collector.scan_host_smb(
-        "10.0.0.5", args, "run-1", writer, collector.Stats(), threading.Lock()
-    ) is False
+    assert collector.scan_host_smb("10.0.0.5", args, "run-1", writer, collector.Stats(), threading.Lock()) is False
     assert connection.closed is True
 
 
@@ -742,9 +751,10 @@ def test_unexpected_smb_share_parser_failure_emits_degraded_final_and_continues(
         cancel_event=threading.Event(),
     )
 
-    assert collector.scan_host_smb(
-        "10.0.0.20", args, "run-parser-error", writer, collector.Stats(), threading.Lock()
-    ) is True
+    assert (
+        collector.scan_host_smb("10.0.0.20", args, "run-parser-error", writer, collector.Stats(), threading.Lock())
+        is True
+    )
 
     final_resources = {}
     for record in writer.records:
@@ -857,21 +867,37 @@ def test_nfs_advertised_export_does_not_overstate_access(monkeypatch) -> None:
             return False
 
     records = []
-    monkeypatch.setattr(collector.socket, "create_connection", lambda *_args, **_kwargs: _SocketConnection())
-    monkeypatch.setattr(collector, "_discover_nfs_exports", lambda *_args, **_kwargs: (["/srv/public"], None))
+    monkeypatch.setattr(
+        collector,
+        "_probe_nfs_v4_null",
+        lambda *_args, **_kwargs: collector.NFSV4NullProbe(
+            "reachable", "nfs_service_confirmed", "version_not_supported"
+        ),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_discover_nfs_exports",
+        lambda *_args, **_kwargs: collector.NFSExportDiscovery(("/srv/public",), "complete"),
+    )
     args = SimpleNamespace(timeout=1.0, domain="")
 
-    assert collector.scan_host_nfs(
-        "10.0.0.5",
-        args,
-        "run-1",
-        SimpleNamespace(emit=records.append),
-        collector.Stats(),
-        threading.Lock(),
-    ) is True
+    assert (
+        collector.scan_host_nfs(
+            "10.0.0.5",
+            args,
+            "run-1",
+            SimpleNamespace(emit=records.append),
+            collector.Stats(),
+            threading.Lock(),
+        )
+        is True
+    )
 
     resource = next(record for record in records if record["type"] == "resource")
     assert resource["access_level"] == "unknown"
+    endpoint = next(record for record in records if record["type"] == "endpoint")
+    assert endpoint["auth"]["success"] is None
+    assert endpoint["nfs"]["structural_coverage"] == "advertised_exports_only"
 
 
 @pytest.mark.parametrize(

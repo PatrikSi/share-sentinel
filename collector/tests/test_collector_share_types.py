@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import struct
 import sys
 import threading
 from pathlib import Path
@@ -49,6 +50,55 @@ not-a-path value
     exports = collector._parse_showmount_exports(output)
 
     assert exports == ["/srv/public", "/srv/private"]
+
+
+def test_nfs_v4_null_reply_confirms_protocol_without_claiming_authentication() -> None:
+    collector = _load_collector_module()
+    xid = 0x12345678
+    payload = struct.pack("!6I", xid, 1, 0, 0, 0, 0)
+
+    result = collector._parse_nfs_v4_null_reply(payload, expected_xid=xid)
+
+    assert result.transport_status == "reachable"
+    assert result.service_status == "nfs_v4_confirmed"
+    assert result.status == "supported"
+    assert result.public_metadata()["credential_flavor"] == "AUTH_NONE"
+    assert result.public_metadata()["mutating"] is False
+
+
+def test_nfs_v4_null_reply_preserves_supported_version_range() -> None:
+    collector = _load_collector_module()
+    xid = 42
+    payload = struct.pack("!8I", xid, 1, 0, 0, 0, 2, 2, 3)
+
+    result = collector._parse_nfs_v4_null_reply(payload, expected_xid=xid)
+
+    assert result.status == "version_not_supported"
+    assert result.supported_version_min == 2
+    assert result.supported_version_max == 3
+
+
+def test_nfs_v4_null_reply_rejects_mismatched_transaction() -> None:
+    collector = _load_collector_module()
+    payload = struct.pack("!6I", 99, 1, 0, 0, 0, 0)
+
+    with pytest.raises(RuntimeError, match="rpc_xid_mismatch"):
+        collector._parse_nfs_v4_null_reply(payload, expected_xid=100)
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        ("RPC: Program not registered", "mount_protocol_unavailable"),
+        ("mount clntudp_create: RPC: Timed out", "timed_out"),
+        ("clnt_create: RPC: Authentication error", "permission_denied"),
+        ("No route to host", "transport_unreachable"),
+    ],
+)
+def test_showmount_failures_are_classified(detail, expected) -> None:
+    collector = _load_collector_module()
+
+    assert collector._classify_showmount_failure(detail) == expected
 
 
 def test_list_share_entries_emits_limit_callback_when_truncated() -> None:
@@ -1178,8 +1228,18 @@ def test_scan_host_nfs_preserves_empty_endpoint_when_no_exports_found(monkeypatc
         def emit(self, record):
             self.records.append(record)
 
-    monkeypatch.setattr(collector.socket, "create_connection", lambda *_args, **_kwargs: _SocketConn())
-    monkeypatch.setattr(collector, "_discover_nfs_exports", lambda *_args, **_kwargs: ([], None))
+    monkeypatch.setattr(
+        collector,
+        "_probe_nfs_v4_null",
+        lambda *_args, **_kwargs: collector.NFSV4NullProbe(
+            "reachable", "nfs_service_confirmed", "version_not_supported"
+        ),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_discover_nfs_exports",
+        lambda *_args, **_kwargs: collector.NFSExportDiscovery((), "complete"),
+    )
 
     args = SimpleNamespace(timeout=1.0, domain="")
     writer = _Writer()
@@ -1191,6 +1251,11 @@ def test_scan_host_nfs_preserves_empty_endpoint_when_no_exports_found(monkeypatc
     assert stats.endpoints == 1
     assert stats.resources == 0
     assert [row["type"] for row in writer.records] == ["endpoint"]
+    assert writer.records[0]["auth"] == {
+        "method": "not_assessed",
+        "success": None,
+        "reason": "NFS NULL and export-discovery calls do not authenticate filesystem access",
+    }
 
 
 def test_scan_host_nfs_marks_export_enumeration_failure_as_structural_gap(monkeypatch) -> None:
@@ -1205,7 +1270,13 @@ def test_scan_host_nfs_marks_export_enumeration_failure_as_structural_gap(monkey
 
     records = []
     writer = SimpleNamespace(records=records, emit=records.append)
-    monkeypatch.setattr(collector.socket, "create_connection", lambda *_args, **_kwargs: _SocketConn())
+    monkeypatch.setattr(
+        collector,
+        "_probe_nfs_v4_null",
+        lambda *_args, **_kwargs: collector.NFSV4NullProbe(
+            "reachable", "nfs_service_confirmed", "version_not_supported"
+        ),
+    )
     monkeypatch.setattr(
         collector,
         "_discover_nfs_exports",
@@ -1226,6 +1297,40 @@ def test_scan_host_nfs_marks_export_enumeration_failure_as_structural_gap(monkey
     assert stats.structural_coverage_gaps == 1
     assert stats.error_codes["NFS_EXPORT_ENUM_FAILED"] == 1
     assert any(record.get("code") == "NFS_EXPORT_ENUM_FAILED" for record in records)
+
+
+def test_scan_host_nfs_reports_v4_only_namespace_as_partial_without_overclaim(monkeypatch) -> None:
+    collector = _load_collector_module()
+    records = []
+    monkeypatch.setattr(
+        collector,
+        "_probe_nfs_v4_null",
+        lambda *_args, **_kwargs: collector.NFSV4NullProbe("reachable", "nfs_v4_confirmed", "supported"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_discover_nfs_exports",
+        lambda *_args, **_kwargs: collector.NFSExportDiscovery(
+            (), "mount_protocol_unavailable", "RPC: Program not registered"
+        ),
+    )
+    stats = collector.Stats()
+
+    assert collector.scan_host_nfs(
+        "nfs-v4.example",
+        SimpleNamespace(timeout=1.0, domain=""),
+        "run-nfs-v4",
+        SimpleNamespace(emit=records.append),
+        stats,
+        threading.Lock(),
+    )
+
+    endpoint = next(record for record in records if record["type"] == "endpoint")
+    assert endpoint["nfs"]["service_status"] == "nfs_v4_confirmed"
+    assert endpoint["nfs"]["structural_coverage"] == "partial"
+    assert endpoint["auth"]["success"] is None
+    assert stats.structural_coverage_gaps == 1
+    assert stats.error_codes["NFS_V4_NAMESPACE_NOT_ENUMERATED"] == 1
 
 
 def test_scan_host_smb_auth_failure_includes_actionable_hint(monkeypatch) -> None:

@@ -523,8 +523,9 @@ upload.
 The tracked [`examples/sample-artifact.json`](../examples/sample-artifact.json) is synthetic and safe to use for a first ingest test.
 
 SMB entries include nullable UTC ISO-8601 `mtime` (last write), `created_at`,
-`accessed_at`, and `changed_at` (metadata change) values when the server returns
-valid metadata. Files can additionally include `size_bytes`,
+and `accessed_at` values when the server returns valid metadata. `changed_at`
+is emitted only when the SMB library exposes a distinct metadata-change time;
+last-write time is never relabelled as change time. Files can additionally include `size_bytes`,
 `allocation_size_bytes`, and common `file_attributes`. Older entries and NFS
 export-only records remain valid without these fields.
 
@@ -534,12 +535,16 @@ to `required`, `not_required`, or `unknown`: Impacket's
 `isSigningRequired()` signal does not prove the broader server capability
 implied by labels such as `enabled`.
 
-NFS collection currently checks tcp/2049 and enumerates advertised exports via
-`showmount -e`. It does not mount exports or traverse their contents. A missing,
-timed-out, or denied `showmount` command is recorded as a partial-coverage issue
-rather than silently treated as an empty server. Discovered exports are marked
-`unknown`; an advertised export name does not prove that the scanner can mount
-or list it.
+NFS collection issues a bounded, non-mutating ONC RPC NULL call for NFSv4 on
+tcp/2049 and separately enumerates advertised legacy exports via `showmount -e`.
+The NULL call confirms only that the NFS program answered; it is not a filesystem
+authentication or access test. Endpoint artifacts therefore record authentication
+as `not_assessed` with a nullable success value. A missing, timed-out, denied, or
+unavailable mount protocol is classified as partial coverage rather than silently
+treated as an empty server. A confirmed NFSv4 endpoint is also partial because
+`showmount` cannot enumerate an NFSv4-only pseudo-filesystem. The collector does
+not mount exports or traverse their contents. Discovered exports remain `unknown`;
+an advertised export name does not prove that the scanner can mount or list it.
 
 ## Exit codes
 
