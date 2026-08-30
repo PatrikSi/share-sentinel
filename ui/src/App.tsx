@@ -8,13 +8,8 @@ import { TopNav } from "@/components/top-nav";
 import { bootstrapSession, resetSession, useSession } from "@/lib/auth";
 import { DashboardWorkspaceProvider } from "@/lib/dashboard-workspace";
 import { AccountPage } from "@/pages/account-page";
-import { ChangesPage } from "@/pages/changes-page";
-import { FindingsPage } from "@/pages/findings-page";
 import { LoginPage } from "@/pages/login-page";
-import { ProjectImportPage } from "@/pages/project-import-page";
-import { ProjectInventoryPage } from "@/pages/project-inventory-page";
 import { ProjectsPage } from "@/pages/projects-page";
-import { RunDetailPage } from "@/pages/run-detail-page";
 import { SettingsApiTokensPage } from "@/pages/settings-api-tokens-page";
 import { SettingsAuditLogsPage } from "@/pages/settings-audit-logs-page";
 import { SettingsIamPage } from "@/pages/settings-iam-page";
@@ -23,10 +18,27 @@ import { SettingsLayout } from "@/pages/settings-layout";
 import { SettingsOverviewPage } from "@/pages/settings-overview-page";
 import { SettingsProjectDetailPage } from "@/pages/settings-project-detail-page";
 import { SettingsProjectsPage } from "@/pages/settings-projects-page";
-import { SourcesPage } from "@/pages/sources-page";
 
 const ComparisonPage = lazy(() =>
   import("@/pages/comparison-page").then((module) => ({ default: module.ComparisonPage })),
+);
+const FindingsPage = lazy(() =>
+  import("@/pages/findings-page").then((module) => ({ default: module.FindingsPage })),
+);
+const ChangesPage = lazy(() =>
+  import("@/pages/changes-page").then((module) => ({ default: module.ChangesPage })),
+);
+const SourcesPage = lazy(() =>
+  import("@/pages/sources-page").then((module) => ({ default: module.SourcesPage })),
+);
+const ProjectInventoryPage = lazy(() =>
+  import("@/pages/project-inventory-page").then((module) => ({ default: module.ProjectInventoryPage })),
+);
+const RunDetailPage = lazy(() =>
+  import("@/pages/run-detail-page").then((module) => ({ default: module.RunDetailPage })),
+);
+const ProjectImportPage = lazy(() =>
+  import("@/pages/project-import-page").then((module) => ({ default: module.ProjectImportPage })),
 );
 
 function RequireAuth({ children }: { children: JSX.Element }) {
@@ -67,12 +79,12 @@ function RequireAuth({ children }: { children: JSX.Element }) {
 
 function RunDetailRoute() {
   const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
-  return <RunDetailPage key={`${projectId || ""}:${runId || ""}`} />;
+  return <Suspense fallback={<StatePanel description="Loading the run explorer and collected evidence." title="Loading run" />}><RunDetailPage key={`${projectId || ""}:${runId || ""}`} /></Suspense>;
 }
 
 function ProjectInventoryRoute() {
   const { projectId } = useParams<{ projectId: string }>();
-  return <ProjectInventoryPage key={projectId || ""} />;
+  return <Suspense fallback={<StatePanel description="Loading server-paginated project inventory." title="Loading inventory" />}><ProjectInventoryPage key={projectId || ""} /></Suspense>;
 }
 
 function ProjectOverviewRoute() {
@@ -82,17 +94,17 @@ function ProjectOverviewRoute() {
 
 function ProjectFindingsRoute() {
   const { projectId } = useParams<{ projectId: string }>();
-  return <FindingsPage key={projectId || ""} />;
+  return <Suspense fallback={<StatePanel description="Loading the project findings queue." title="Loading findings" />}><FindingsPage key={projectId || ""} /></Suspense>;
 }
 
 function ProjectChangesRoute() {
   const { projectId } = useParams<{ projectId: string }>();
-  return <ChangesPage key={projectId || ""} />;
+  return <Suspense fallback={<StatePanel description="Loading materialized comparison history." title="Loading changes" />}><ChangesPage key={projectId || ""} /></Suspense>;
 }
 
 function ProjectSourcesRoute() {
   const { projectId } = useParams<{ projectId: string }>();
-  return <SourcesPage key={projectId || ""} />;
+  return <Suspense fallback={<StatePanel description="Loading collection source health." title="Loading sources" />}><SourcesPage key={projectId || ""} /></Suspense>;
 }
 
 function ComparisonRoute() {
@@ -106,7 +118,7 @@ function ComparisonRoute() {
 
 function ProjectImportRoute() {
   const { projectId } = useParams<{ projectId: string }>();
-  return <ProjectImportPage key={projectId || ""} />;
+  return <Suspense fallback={<StatePanel description="Loading the validated scan import workflow." title="Loading import" />}><ProjectImportPage key={projectId || ""} /></Suspense>;
 }
 
 function SettingsIamUserRoute() {

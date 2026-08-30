@@ -429,7 +429,7 @@ export function ProjectImportPage() {
               </div>
               <div className="rounded-2xl border border-white/70 bg-white/70 p-4 dark:border-slate-800 dark:bg-slate-950/40">
                 <p className="font-semibold text-slate-900 dark:text-slate-100">3. Monitor ingest</p>
-                <p className="mt-1">The app redirects directly to the run explorer so you can watch queue state, ingest counters, and recorded issues.</p>
+                <p className="mt-1">The app redirects directly to the run explorer so you can watch queue state, ingest counters, and collection issues.</p>
               </div>
             </div>
           </aside>

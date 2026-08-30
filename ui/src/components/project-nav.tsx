@@ -38,6 +38,14 @@ export function ProjectNav() {
             {item.label}
           </Link>
         ))}
+        <Link
+          aria-label="Collection data is snapshot evidence; open Sources to verify freshness"
+          className="project-nav-freshness"
+          title="Collection data is not live. Verify source freshness before drawing conclusions."
+          to={`/projects/${encodeURIComponent(selectedProject)}/sources`}
+        >
+          <span aria-hidden="true" /> Snapshot evidence
+        </Link>
       </nav>
     </div>
   );

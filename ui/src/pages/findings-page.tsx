@@ -12,6 +12,9 @@ import {
   formatMonitoringTimestamp,
   humanizeMonitoringValue,
   type Finding,
+  type FindingActivity,
+  type FindingOccurrence,
+  type FindingPolicy,
   type FindingSeverity,
   type FindingStatus,
   type FindingSummary,
@@ -20,6 +23,7 @@ import {
 const PAGE_LIMIT = 50;
 const FINDING_STATUSES: FindingStatus[] = ["open", "acknowledged", "accepted_risk", "resolved"];
 const FINDING_SEVERITIES: FindingSeverity[] = ["critical", "high", "medium", "low", "info"];
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function readParam(name: string): string {
   if (typeof window === "undefined") return "";
@@ -77,8 +81,108 @@ function EvidenceDetail({ finding }: { finding: Finding }) {
   );
 }
 
+function FindingHistory({ finding }: { finding: Finding }) {
+  const [occurrences, setOccurrences] = useState<FindingOccurrence[]>([]);
+  const [occurrenceCursor, setOccurrenceCursor] = useState<string | null>(null);
+  const [occurrenceLoading, setOccurrenceLoading] = useState(true);
+  const [occurrenceError, setOccurrenceError] = useState<string | null>(null);
+  const [occurrenceNonce, setOccurrenceNonce] = useState(0);
+  const [activity, setActivity] = useState<FindingActivity[]>([]);
+  const [activityCursor, setActivityCursor] = useState<string | null>(null);
+  const [activityLoading, setActivityLoading] = useState(true);
+  const [activityError, setActivityError] = useState<string | null>(null);
+  const [activityNonce, setActivityNonce] = useState(0);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setOccurrenceLoading(true);
+    setOccurrenceError(null);
+    setOccurrences([]);
+    setOccurrenceCursor(null);
+    apiFetch(`/projects/${encodeURIComponent(finding.project_id)}/findings/${encodeURIComponent(finding.id)}/occurrences?limit=20`, { signal: controller.signal })
+      .then((data) => {
+        if (controller.signal.aborted) return;
+        setOccurrences(Array.isArray(data?.items) ? data.items as FindingOccurrence[] : []);
+        setOccurrenceCursor(typeof data?.next_cursor === "string" ? data.next_cursor : null);
+      })
+      .catch((caught) => { if (!controller.signal.aborted && !isAbortError(caught)) setOccurrenceError(caught instanceof Error ? caught.message : "Finding occurrences could not be loaded."); })
+      .finally(() => !controller.signal.aborted && setOccurrenceLoading(false));
+    return () => controller.abort();
+  }, [finding.id, finding.project_id, occurrenceNonce]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setActivityLoading(true);
+    setActivityError(null);
+    setActivity([]);
+    setActivityCursor(null);
+    apiFetch(`/projects/${encodeURIComponent(finding.project_id)}/findings/${encodeURIComponent(finding.id)}/activity?limit=20`, { signal: controller.signal })
+      .then((data) => {
+        if (controller.signal.aborted) return;
+        setActivity(Array.isArray(data?.items) ? data.items as FindingActivity[] : []);
+        setActivityCursor(typeof data?.next_cursor === "string" ? data.next_cursor : null);
+      })
+      .catch((caught) => { if (!controller.signal.aborted && !isAbortError(caught)) setActivityError(caught instanceof Error ? caught.message : "Finding activity could not be loaded."); })
+      .finally(() => !controller.signal.aborted && setActivityLoading(false));
+    return () => controller.abort();
+  }, [activityNonce, finding.id, finding.project_id, finding.revision]);
+
+  async function loadMoreOccurrences() {
+    if (!occurrenceCursor || occurrenceLoading) return;
+    setOccurrenceLoading(true); setOccurrenceError(null);
+    try {
+      const data = await apiFetch(`/projects/${encodeURIComponent(finding.project_id)}/findings/${encodeURIComponent(finding.id)}/occurrences?limit=20&cursor=${encodeURIComponent(occurrenceCursor)}`);
+      setOccurrences((rows) => [...rows, ...((data?.items || []) as FindingOccurrence[])]);
+      setOccurrenceCursor(typeof data?.next_cursor === "string" ? data.next_cursor : null);
+    } catch (caught) { setOccurrenceError(caught instanceof Error ? caught.message : "Additional occurrences could not be loaded."); }
+    finally { setOccurrenceLoading(false); }
+  }
+
+  async function loadMoreActivity() {
+    if (!activityCursor || activityLoading) return;
+    setActivityLoading(true); setActivityError(null);
+    try {
+      const data = await apiFetch(`/projects/${encodeURIComponent(finding.project_id)}/findings/${encodeURIComponent(finding.id)}/activity?limit=20&cursor=${encodeURIComponent(activityCursor)}`);
+      setActivity((rows) => [...rows, ...((data?.items || []) as FindingActivity[])]);
+      setActivityCursor(typeof data?.next_cursor === "string" ? data.next_cursor : null);
+    } catch (caught) { setActivityError(caught instanceof Error ? caught.message : "Additional activity could not be loaded."); }
+    finally { setActivityLoading(false); }
+  }
+
+  return (
+    <section aria-labelledby="finding-history-title" className="monitoring-detail-section">
+      <div className="monitoring-detail-heading"><div><h3 id="finding-history-title">Evidence and decision history</h3><p>Detection occurrences and human lifecycle actions are separate, durable timelines.</p></div></div>
+      <div className="finding-history-grid">
+        <div>
+          <div className="finding-history-heading"><h4>Occurrences</h4><span>{occurrences.length.toLocaleString()} loaded</span></div>
+          {occurrenceError ? <StatusBanner tone="error" title="Occurrence history unavailable"><p>{occurrenceError}</p><button className="mt-2 rounded-md border border-current px-3 py-1.5 text-xs font-semibold" onClick={() => setOccurrenceNonce((value) => value + 1)} type="button">Retry occurrences</button></StatusBanner> : null}
+          {occurrenceLoading && occurrences.length === 0 ? <p className="finding-history-loading" role="status">Loading occurrences…</p> : null}
+          {!occurrenceLoading && !occurrenceError && occurrences.length === 0 ? <p className="finding-history-empty">No occurrence rows are available. Do not infer that the finding was never observed.</p> : null}
+          {occurrences.length > 0 ? <ol className="finding-history-list">{occurrences.map((occurrence) => <li key={occurrence.id}><span className={`evidence-state is-${occurrence.evidence_state}`}>{humanizeMonitoringValue(occurrence.evidence_state)}</span><div><strong>{formatMonitoringTimestamp(occurrence.observed_at)}</strong><small>Policy {occurrence.policy_id} · v{occurrence.policy_version}</small><div className="monitoring-action-row"><Link to={`/projects/${finding.project_id}/runs/${occurrence.run_id}`}>Run evidence</Link>{occurrence.comparison_id ? <Link to={`/projects/${finding.project_id}/comparisons/${occurrence.comparison_id}`}>Comparison</Link> : null}</div></div></li>)}</ol> : null}
+          {occurrenceCursor ? <button className="inventory-button-secondary mt-2" disabled={occurrenceLoading} onClick={() => void loadMoreOccurrences()} type="button">{occurrenceLoading ? "Loading…" : "Load more occurrences"}</button> : null}
+        </div>
+        <div>
+          <div className="finding-history-heading"><h4>Analyst activity</h4><span>{activity.length.toLocaleString()} loaded</span></div>
+          {activityError ? <StatusBanner tone="error" title="Analyst activity unavailable"><p>{activityError}</p><button className="mt-2 rounded-md border border-current px-3 py-1.5 text-xs font-semibold" onClick={() => setActivityNonce((value) => value + 1)} type="button">Retry activity</button></StatusBanner> : null}
+          {activityLoading && activity.length === 0 ? <p className="finding-history-loading" role="status">Loading analyst activity…</p> : null}
+          {!activityLoading && !activityError && activity.length === 0 ? <p className="finding-history-empty">No finding lifecycle actions have been recorded.</p> : null}
+          {activity.length > 0 ? <ol className="finding-history-list">{activity.map((event) => {
+            const metadata = event.metadata || {};
+            const transition = [metadata.old_status, metadata.new_status].filter((value) => typeof value === "string").map((value) => humanizeMonitoringValue(String(value))).join(" → ");
+            const actor = event.actor_user_id ? `User ${event.actor_user_id}` : event.actor_token_id ? `Token ${event.actor_token_id}` : "System";
+            return <li key={event.id}><span className="finding-activity-mark" aria-hidden="true" /><div><strong>{humanizeMonitoringValue(event.action)}</strong><small>{formatMonitoringTimestamp(event.ts)} · {actor}</small>{transition ? <p>{transition}</p> : null}{typeof metadata.note === "string" && metadata.note ? <p>{metadata.note}</p> : null}</div></li>;
+          })}</ol> : null}
+          {activityCursor ? <button className="inventory-button-secondary mt-2" disabled={activityLoading} onClick={() => void loadMoreActivity()} type="button">{activityLoading ? "Loading…" : "Load more activity"}</button> : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 type FindingDetailProps = {
   canManage: boolean;
+  permissionsReady: boolean;
+  permissionError: string | null;
   finding: Finding | null;
   loading: boolean;
   error: string | null;
@@ -87,7 +191,7 @@ type FindingDetailProps = {
   onUpdate: (payload: Record<string, unknown>) => Promise<void>;
 };
 
-function FindingDetail({ canManage, finding, loading, error, busy, onReload, onUpdate }: FindingDetailProps) {
+function FindingDetail({ canManage, permissionsReady, permissionError, finding, loading, error, busy, onReload, onUpdate }: FindingDetailProps) {
   const [status, setStatus] = useState<FindingStatus>("open");
   const [expiry, setExpiry] = useState("");
   const [note, setNote] = useState("");
@@ -145,6 +249,8 @@ function FindingDetail({ canManage, finding, loading, error, busy, onReload, onU
 
       <EvidenceDetail finding={finding} />
 
+      <FindingHistory finding={finding} />
+
       <section aria-labelledby="finding-context-title" className="monitoring-detail-section">
         <div className="monitoring-detail-heading"><div><h3 id="finding-context-title">Investigation context</h3><p>Open the immutable run or comparison evidence that last produced this finding.</p></div></div>
         <div className="monitoring-action-row">
@@ -161,12 +267,12 @@ function FindingDetail({ canManage, finding, loading, error, busy, onReload, onU
         {canManage ? (
           <form className="monitoring-action-form" onSubmit={(event) => void submit(event)}>
             <label>Status<select disabled={busy} onChange={(event) => setStatus(event.target.value as FindingStatus)} value={status}>{FINDING_STATUSES.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label>
-            {status === "accepted_risk" ? <label>Risk acceptance expires<input disabled={busy} min={localDateTimeValue(new Date(Date.now() + 60_000).toISOString())} onChange={(event) => setExpiry(event.target.value)} required type="datetime-local" value={expiry} /></label> : null}
+            {status === "accepted_risk" ? <label>Risk acceptance expires<input aria-invalid={acceptedRiskInvalid} disabled={busy} min={localDateTimeValue(new Date(Date.now() + 60_000).toISOString())} onChange={(event) => setExpiry(event.target.value)} required type="datetime-local" value={expiry} /></label> : null}
             <label className="monitoring-action-note">Analyst note<textarea disabled={busy} maxLength={4000} onChange={(event) => setNote(event.target.value)} placeholder="Explain the decision or handoff context" rows={3} value={note} /></label>
             {acceptedRiskInvalid ? <p className="monitoring-validation" role="alert">Accepted risk requires an expiry time in the future.</p> : null}
             <div className="monitoring-action-row"><button className="inventory-button-primary" disabled={busy || acceptedRiskInvalid} type="submit">{busy ? "Updating…" : "Apply lifecycle update"}</button></div>
           </form>
-        ) : <StatusBanner title="Read-only project role"><p>Operator or project admin access is required to change finding status. Evidence and current state remain available.</p></StatusBanner>}
+        ) : permissionError ? <StatusBanner tone="warning" title="Action permissions unavailable"><p>{permissionError} No lifecycle action is enabled until the project role can be verified.</p></StatusBanner> : permissionsReady ? <StatusBanner title="Read-only project role"><p>Operator or project admin access is required to change finding status. Evidence and current state remain available.</p></StatusBanner> : <StatePanel description="Checking whether this project role can update finding lifecycle state." title="Loading action permissions" />}
       </section>
     </article>
   );
@@ -177,6 +283,8 @@ export function FindingsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [status, setStatus] = useState<FindingStatus | "">(() => normalizeStatus(readParam("status")));
   const [severity, setSeverity] = useState<FindingSeverity | "">(() => normalizeSeverity(readParam("severity")));
+  const [policyId, setPolicyId] = useState(() => readParam("policy"));
+  const [sourceId, setSourceId] = useState(() => readParam("source"));
   const [query, setQuery] = useState(() => readParam("q"));
   const [debouncedQuery, setDebouncedQuery] = useState(query);
   const [cursor, setCursor] = useState<string | null>(() => readParam("cursor") || null);
@@ -195,12 +303,17 @@ export function FindingsPage() {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [detailNonce, setDetailNonce] = useState(0);
   const [role, setRole] = useState<string | null>(null);
+  const [roleReady, setRoleReady] = useState(false);
+  const [roleError, setRoleError] = useState<string | null>(null);
+  const [policies, setPolicies] = useState<FindingPolicy[]>([]);
+  const [policyError, setPolicyError] = useState<string | null>(null);
   const [mutationBusy, setMutationBusy] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const [mutationInfo, setMutationInfo] = useState<string | null>(null);
   const [bulkStatus, setBulkStatus] = useState<Exclude<FindingStatus, "accepted_risk">>("acknowledged");
   const requestProjectRef = useRef(projectId);
   requestProjectRef.current = projectId;
+  const sourceIdInvalid = !!sourceId && !UUID_PATTERN.test(sourceId);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 300);
@@ -211,27 +324,56 @@ export function FindingsPage() {
     const next = new URLSearchParams(searchParams);
     status ? next.set("status", status) : next.delete("status");
     severity ? next.set("severity", severity) : next.delete("severity");
+    policyId ? next.set("policy", policyId) : next.delete("policy");
+    sourceId ? next.set("source", sourceId) : next.delete("source");
     debouncedQuery ? next.set("q", debouncedQuery) : next.delete("q");
     cursor ? next.set("cursor", cursor) : next.delete("cursor");
     selectedId ? next.set("finding", selectedId) : next.delete("finding");
     if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true });
-  }, [cursor, debouncedQuery, searchParams, selectedId, setSearchParams, severity, status]);
+  }, [cursor, debouncedQuery, policyId, searchParams, selectedId, setSearchParams, severity, sourceId, status]);
 
   useEffect(() => {
     if (!projectId) return;
     const controller = new AbortController();
+    setRoleReady(false);
+    setRoleError(null);
     apiFetch(`/projects/${encodeURIComponent(projectId)}/my-role`, { signal: controller.signal })
       .then((data) => !controller.signal.aborted && setRole(typeof data?.role === "string" ? data.role : null))
-      .catch(() => !controller.signal.aborted && setRole(null));
+      .catch((caught) => {
+        if (controller.signal.aborted) return;
+        setRole(null);
+        setRoleError(caught instanceof Error ? caught.message : "Project role could not be verified.");
+      })
+      .finally(() => !controller.signal.aborted && setRoleReady(true));
     return () => controller.abort();
   }, [projectId]);
 
   useEffect(() => {
     if (!projectId) return;
     const controller = new AbortController();
+    setPolicyError(null);
+    apiFetch(`/projects/${encodeURIComponent(projectId)}/finding-policies`, { signal: controller.signal })
+      .then((data) => !controller.signal.aborted && setPolicies(Array.isArray(data?.items) ? data.items as FindingPolicy[] : []))
+      .catch((caught) => { if (!controller.signal.aborted && !isAbortError(caught)) setPolicyError(caught instanceof Error ? caught.message : "Finding policies could not be loaded."); });
+    return () => controller.abort();
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    if (sourceIdInvalid) {
+      setFindings([]);
+      setSummary(null);
+      setNextCursor(null);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+    const controller = new AbortController();
     const params = new URLSearchParams({ limit: String(PAGE_LIMIT) });
     if (status) params.set("status", status);
     if (severity) params.set("severity", severity);
+    if (policyId) params.set("policy_id", policyId);
+    if (sourceId) params.set("source_id", sourceId);
     if (debouncedQuery) params.set("q", debouncedQuery);
     if (cursor) params.set("cursor", cursor);
     setLoading(true);
@@ -251,7 +393,7 @@ export function FindingsPage() {
       })
       .finally(() => !controller.signal.aborted && setLoading(false));
     return () => controller.abort();
-  }, [cursor, debouncedQuery, projectId, reloadNonce, severity, status]);
+  }, [cursor, debouncedQuery, policyId, projectId, reloadNonce, severity, sourceId, sourceIdInvalid, status]);
 
   useEffect(() => {
     if (!projectId || !selectedId) {
@@ -299,7 +441,7 @@ export function FindingsPage() {
       setMutationInfo(`Finding moved to ${humanizeMonitoringValue(updated.status)}.`);
       setReloadNonce((value) => value + 1);
     } catch (caught) {
-      setMutationError(`${caught instanceof Error ? caught.message : "Finding update failed."} Refresh the finding before retrying if another analyst changed it.`);
+      setMutationError(`${caught instanceof Error ? caught.message : "Finding update failed."} The update was not applied. The current finding has been reloaded; review it before retrying.`);
       setDetailNonce((value) => value + 1);
     } finally {
       setMutationBusy(false);
@@ -344,11 +486,15 @@ export function FindingsPage() {
       </section>
 
       <section aria-label="Finding filters" className="monitoring-filter-bar">
-        <label>Search<input onChange={(event) => { setQuery(event.target.value); resetPage(); }} placeholder="Title, resource, policy, or identity" type="search" value={query} /></label>
+        <label>Search<input onChange={(event) => { setQuery(event.target.value); resetPage(); }} placeholder="Title, resource, or policy" type="search" value={query} /></label>
         <label>Severity<select onChange={(event) => { setSeverity(normalizeSeverity(event.target.value)); resetPage(); }} value={severity}><option value="">All severities</option>{FINDING_SEVERITIES.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label>
         <label>Status<select onChange={(event) => { setStatus(normalizeStatus(event.target.value)); resetPage(); }} value={status}><option value="">All statuses</option>{FINDING_STATUSES.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label>
-        {(status || severity || query) ? <button className="inventory-button-secondary" onClick={() => { setStatus(""); setSeverity(""); setQuery(""); resetPage(); }} type="button">Clear filters</button> : null}
+        <label>Policy<select disabled={!!policyError} onChange={(event) => { setPolicyId(event.target.value); resetPage(); }} value={policyId}><option value="">All policies</option>{policies.map((policy) => <option key={policy.id} value={policy.id}>{policy.title}</option>)}</select></label>
+        {(status || severity || query || policyId || sourceId) ? <button className="inventory-button-secondary" onClick={() => { setStatus(""); setSeverity(""); setQuery(""); setPolicyId(""); setSourceId(""); resetPage(); }} type="button">Clear filters</button> : null}
       </section>
+
+      {policyError ? <StatusBanner tone="warning" title="Policy filter unavailable"><p>{policyError} The finding queue can still be filtered by severity, status, and search.</p></StatusBanner> : null}
+      {sourceIdInvalid ? <StatusBanner tone="warning" title="Source scope is invalid"><p>The source parameter is not a complete UUID. No findings request is sent until the scope is cleared.</p><button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={() => setSourceId("")} type="button">Clear source scope</button></StatusBanner> : sourceId ? <StatusBanner title="Source-scoped findings"><p>Only findings registered to source <code>{sourceId}</code> are included.</p><button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={() => { setSourceId(""); resetPage(); }} type="button">Show all sources</button></StatusBanner> : null}
 
       {mutationError ? <StatusBanner tone="error" title="Finding action failed"><p>{mutationError}</p></StatusBanner> : null}
       {mutationInfo ? <StatusBanner tone="success" title="Finding updated"><p>{mutationInfo}</p></StatusBanner> : null}
@@ -359,7 +505,7 @@ export function FindingsPage() {
           {canManage && selectedIds.size > 0 ? <div className="monitoring-bulk-bar" role="region" aria-label="Bulk finding actions"><strong>{selectedIds.size.toLocaleString()} selected on this page</strong><select aria-label="Bulk status" disabled={mutationBusy} onChange={(event) => setBulkStatus(event.target.value as Exclude<FindingStatus, "accepted_risk">)} value={bulkStatus}><option value="acknowledged">Acknowledge</option><option value="resolved">Resolve</option><option value="open">Reopen</option></select><button className="inventory-button-primary" disabled={mutationBusy} onClick={() => void bulkUpdate()} type="button">{mutationBusy ? "Updating…" : "Apply to selected"}</button><button className="inventory-button-secondary" onClick={() => setSelectedIds(new Set())} type="button">Clear selection</button></div> : null}
           {error ? <StatePanel actions={<button className="inventory-button-primary" onClick={() => setReloadNonce((value) => value + 1)} type="button">Retry findings</button>} description={`${error} No new queue state is shown.`} title="Findings unavailable" tone="error" /> : null}
           {loading ? <div aria-label="Loading findings" className="inventory-skeleton" role="status">{Array.from({ length: 8 }, (_, index) => <span key={index} />)}</div> : null}
-          {!loading && !error && findings.length === 0 ? <StatePanel description={status || severity || debouncedQuery ? "No findings match the current server-side filters." : "No findings have been created for this project yet. A successful comparable collection will evaluate the built-in monitoring policies."} title="No findings in view" /> : null}
+          {!sourceIdInvalid && !loading && !error && findings.length === 0 ? <StatePanel description={status || severity || debouncedQuery || policyId || sourceId ? "No findings match the current server-side filters." : "No findings have been created for this project yet. A successful comparable collection will evaluate the built-in monitoring policies."} title="No findings in view" /> : null}
           {!loading && !error && findings.length > 0 ? (
             <div className="monitoring-table-scroll">
               <table className="monitoring-table">
@@ -373,7 +519,7 @@ export function FindingsPage() {
         </section>
 
         <aside aria-label="Selected finding details" className="monitoring-detail-pane">
-          <FindingDetail busy={mutationBusy} canManage={canManage} error={detailError} finding={detail} loading={detailLoading} onReload={() => setDetailNonce((value) => value + 1)} onUpdate={updateFinding} />
+          <FindingDetail busy={mutationBusy} canManage={canManage} error={detailError} finding={detail} loading={detailLoading} onReload={() => setDetailNonce((value) => value + 1)} onUpdate={updateFinding} permissionError={roleError} permissionsReady={roleReady} />
         </aside>
       </div>
     </section>

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 
 import { Dialog } from "@/components/dialog";
 import { CollectionContextPanel } from "@/components/provider-context";
@@ -54,6 +54,17 @@ const RUN_STATUS_COLORS: Record<string, string> = {
   COMPLETE: "bg-emerald-200 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-200",
   FAILED: "bg-rose-200 text-rose-900 dark:bg-rose-900/40 dark:text-rose-200",
 };
+
+const RUN_STATUSES = Object.keys(RUN_STATUS_COLORS);
+
+function readRunFilter(name: string): string {
+  if (typeof window === "undefined") return "";
+  return new URLSearchParams(window.location.search).get(name) || "";
+}
+
+function normalizeRunStatus(value: string): string {
+  return RUN_STATUSES.includes(value) ? value : "all";
+}
 
 function parseLineOffset(progress: RunProgress | null | undefined): number {
   const raw = progress?.line_offset;
@@ -142,19 +153,25 @@ function RunMetric({ label, value }: { label: string; value: number | null | und
 }
 
 export function ProjectsPage() {
+  const { projectId: routeProjectId } = useParams<{ projectId: string }>();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { canCreateProject, projectCount, projectLoadError, projectsReady, selectedProject, selectedProjectName } = useDashboardWorkspace();
   const [projectRole, setProjectRole] = useState<string | null>(null);
 
   const [runs, setRuns] = useState<Run[]>([]);
+  const [runsLoading, setRunsLoading] = useState(false);
   const [runsProjectId, setRunsProjectId] = useState<string | null>(null);
-  const [runSearch, setRunSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("all");
+  const [runSearch, setRunSearch] = useState(() => readRunFilter("q"));
+  const [debouncedRunSearch, setDebouncedRunSearch] = useState(runSearch);
+  const [statusFilter, setStatusFilter] = useState(() => normalizeRunStatus(readRunFilter("status")));
 
-  const [cursor, setCursor] = useState<string | null>(null);
-  const [cursorHistory, setCursorHistory] = useState<Array<string | null>>([]);
+  const [cursor, setCursor] = useState<string | null>(() => readRunFilter("cursor") || null);
+  const [cursorHistory, setCursorHistory] = useState<Array<string | null>>(() => readRunFilter("cursor") ? [null] : []);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
 
   const [projectStats, setProjectStats] = useState<ProjectStats | null>(null);
+  const [latestProjectRun, setLatestProjectRun] = useState<Run | null>(null);
+  const [latestRunProjectId, setLatestRunProjectId] = useState<string | null>(null);
   const [topExtensions, setTopExtensions] = useState<ExtensionStat[]>([]);
   const [insightsProjectId, setInsightsProjectId] = useState<string | null>(null);
   const [loadingStats, setLoadingStats] = useState(false);
@@ -167,11 +184,14 @@ export function ProjectsPage() {
   const [roleProjectId, setRoleProjectId] = useState<string | null>(null);
   const selectedProjectRef = useRef(selectedProject);
   selectedProjectRef.current = selectedProject;
+  const previousProjectRef = useRef(routeProjectId || selectedProject);
 
   async function loadRuns(projectId: string, pageCursor: string | null, signal?: AbortSignal) {
     if (signal?.aborted || selectedProjectRef.current !== projectId) return;
     const query = new URLSearchParams({ limit: "50" });
     if (pageCursor) query.set("cursor", pageCursor);
+    if (debouncedRunSearch) query.set("q", debouncedRunSearch);
+    if (statusFilter !== "all") query.set("status", statusFilter);
     const data = await apiFetch(`/projects/${projectId}/runs?${query.toString()}`, { signal });
     if (signal?.aborted || selectedProjectRef.current !== projectId) return;
     setRuns((data?.items || []) as Run[]);
@@ -183,13 +203,16 @@ export function ProjectsPage() {
     if (signal?.aborted || selectedProjectRef.current !== projectId) return;
     setLoadingStats(true);
     try {
-      const [statsData, extData] = await Promise.all([
+      const [statsData, extData, latestRunData] = await Promise.all([
         apiFetch(`/projects/${projectId}/inventory/stats`, { signal }),
         apiFetch(`/projects/${projectId}/inventory/extensions?limit=8`, { signal }),
+        apiFetch(`/projects/${projectId}/runs?limit=1`, { signal }),
       ]);
       if (signal?.aborted || selectedProjectRef.current !== projectId) return;
       setProjectStats((statsData || null) as ProjectStats | null);
       setTopExtensions(((extData?.items as ExtensionStat[]) || []).filter((entry) => !!entry.ext));
+      setLatestProjectRun(((latestRunData?.items as Run[]) || [])[0] || null);
+      setLatestRunProjectId(projectId);
       setInsightsProjectId(projectId);
     } finally {
       if (!signal?.aborted && selectedProjectRef.current === projectId) setLoadingStats(false);
@@ -200,10 +223,13 @@ export function ProjectsPage() {
     if (signal?.aborted || selectedProjectRef.current !== projectId) return;
     const query = new URLSearchParams({ limit: "50" });
     if (pageCursor) query.set("cursor", pageCursor);
-    const [runsData, statsData, extData] = await Promise.all([
+    if (debouncedRunSearch) query.set("q", debouncedRunSearch);
+    if (statusFilter !== "all") query.set("status", statusFilter);
+    const [runsData, statsData, extData, latestRunData] = await Promise.all([
       apiFetch(`/projects/${projectId}/runs?${query.toString()}`, { signal }),
       apiFetch(`/projects/${projectId}/inventory/stats`, { signal }),
       apiFetch(`/projects/${projectId}/inventory/extensions?limit=8`, { signal }),
+      apiFetch(`/projects/${projectId}/runs?limit=1`, { signal }),
     ]);
     if (signal?.aborted || selectedProjectRef.current !== projectId) return;
     setRuns((runsData?.items || []) as Run[]);
@@ -211,11 +237,28 @@ export function ProjectsPage() {
     setRunsProjectId(projectId);
     setProjectStats((statsData || null) as ProjectStats | null);
     setTopExtensions(((extData?.items as ExtensionStat[]) || []).filter((entry) => !!entry.ext));
+    setLatestProjectRun(((latestRunData?.items as Run[]) || [])[0] || null);
+    setLatestRunProjectId(projectId);
     setInsightsProjectId(projectId);
   }
 
   useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedRunSearch(runSearch.trim()), 300);
+    return () => window.clearTimeout(timer);
+  }, [runSearch]);
+
+  useEffect(() => {
+    const next = new URLSearchParams(searchParams);
+    debouncedRunSearch ? next.set("q", debouncedRunSearch) : next.delete("q");
+    statusFilter !== "all" ? next.set("status", statusFilter) : next.delete("status");
+    cursor ? next.set("cursor", cursor) : next.delete("cursor");
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true });
+  }, [cursor, debouncedRunSearch, searchParams, setSearchParams, statusFilter]);
+
+  useEffect(() => {
     if (!selectedProject) return;
+    if (previousProjectRef.current === selectedProject) return;
+    previousProjectRef.current = selectedProject;
     setCursor(null);
     setCursorHistory([]);
     setInfo(null);
@@ -225,6 +268,8 @@ export function ProjectsPage() {
     setRunsProjectId(null);
     setNextCursor(null);
     setProjectStats(null);
+    setLatestProjectRun(null);
+    setLatestRunProjectId(null);
     setTopExtensions([]);
     setInsightsProjectId(null);
     setProjectRole(null);
@@ -237,18 +282,26 @@ export function ProjectsPage() {
     const controller = new AbortController();
     setError(null);
     setRefreshWarning(null);
-    loadRuns(selectedProject, cursor, controller.signal).catch((err) => {
-      if (!controller.signal.aborted && selectedProjectRef.current === selectedProject && !isAbortError(err)) {
-        setError(err.message);
-      }
-    });
+    setRunsLoading(true);
+    setRuns([]);
+    setRunsProjectId(null);
+    setNextCursor(null);
+    loadRuns(selectedProject, cursor, controller.signal)
+      .catch((err) => {
+        if (!controller.signal.aborted && selectedProjectRef.current === selectedProject && !isAbortError(err)) {
+          setError(err.message);
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted && selectedProjectRef.current === selectedProject) setRunsLoading(false);
+      });
     loadProjectInsights(selectedProject, controller.signal).catch((err) => {
       if (!controller.signal.aborted && selectedProjectRef.current === selectedProject && !isAbortError(err)) {
         setError(err.message);
       }
     });
     return () => controller.abort();
-  }, [selectedProject, cursor, reloadNonce]);
+  }, [selectedProject, cursor, reloadNonce, debouncedRunSearch, statusFilter]);
 
   useEffect(() => {
     if (!selectedProject) {
@@ -313,23 +366,12 @@ export function ProjectsPage() {
       if (timer !== null) window.clearTimeout(timer);
       refreshController?.abort();
     };
-  }, [cursor, selectedProject, shouldPoll]);
+  }, [cursor, debouncedRunSearch, selectedProject, shouldPoll, statusFilter]);
 
-  const visibleRuns = useMemo(() => {
-    return scopedRuns.filter((run) => {
-      const statusOk = statusFilter === "all" || run.status === statusFilter;
-      const search = runSearch.trim().toLowerCase();
-      const searchOk =
-        search === "" ||
-        run.name.toLowerCase().includes(search) ||
-        (run.description || "").toLowerCase().includes(search) ||
-        run.id.toLowerCase().includes(search);
-      return statusOk && searchOk;
-    });
-  }, [scopedRuns, runSearch, statusFilter]);
-
-  const latestRun = scopedRuns.length > 0 ? scopedRuns[0] : null;
-  const activeRunCount = scopedRuns.filter((run) => run.status === "UPLOADED" || run.status === "INGESTING").length;
+  const visibleRuns = scopedRuns;
+  const latestRun = latestRunProjectId === selectedProject ? latestProjectRun : null;
+  const activeRunCount = scopedProjectStats?.runs_ingesting || 0;
+  const runsBusy = runsLoading || runSearch.trim() !== debouncedRunSearch;
 
   function moveNext() {
     if (!nextCursor) return;
@@ -585,9 +627,14 @@ export function ProjectsPage() {
                   Search runs
                   <input
                     className="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900"
-                    placeholder="Name, note, or run ID"
+                    placeholder="Name or note"
+                    type="search"
                     value={runSearch}
-                    onChange={(event) => setRunSearch(event.target.value)}
+                    onChange={(event) => {
+                      setRunSearch(event.target.value);
+                      setCursor(null);
+                      setCursorHistory([]);
+                    }}
                   />
                 </label>
 
@@ -596,7 +643,11 @@ export function ProjectsPage() {
                   <select
                     className="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900"
                     value={statusFilter}
-                    onChange={(event) => setStatusFilter(event.target.value)}
+                    onChange={(event) => {
+                      setStatusFilter(normalizeRunStatus(event.target.value));
+                      setCursor(null);
+                      setCursorHistory([]);
+                    }}
                   >
                     <option value="all">All statuses</option>
                     <option value="PENDING_UPLOAD">Pending upload</option>
@@ -612,14 +663,14 @@ export function ProjectsPage() {
                 <button
                   className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800"
                   onClick={movePrev}
-                  disabled={cursorHistory.length === 0}
+                  disabled={cursorHistory.length === 0 || runsBusy}
                 >
                   Previous
                 </button>
                 <button
                   className="rounded-2xl border border-slate-300 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800"
                   onClick={moveNext}
-                  disabled={!nextCursor}
+                  disabled={!nextCursor || runsBusy}
                 >
                   Next
                 </button>
@@ -629,8 +680,8 @@ export function ProjectsPage() {
                 <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Queue Snapshot</p>
                 <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
                   <div>
-                    <p className="text-sm font-semibold">{visibleRuns.length.toLocaleString()} visible runs</p>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">Filtered from {scopedRuns.length.toLocaleString()} loaded runs.</p>
+                    <p className="text-sm font-semibold">{runsBusy ? "Updating run view…" : `${visibleRuns.length.toLocaleString()} visible runs`}</p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">Server-filtered rows on the current page.</p>
                   </div>
                   <div>
                     <p className="text-sm font-semibold">Auto-refresh while ingesting</p>
@@ -657,7 +708,9 @@ export function ProjectsPage() {
             </aside>
 
             <div className="space-y-3">
-              {visibleRuns.length > 0 ? (
+              {runsBusy ? (
+                <div aria-label="Loading server-filtered runs" className="inventory-skeleton" role="status">{Array.from({ length: 8 }, (_, index) => <span key={index} />)}</div>
+              ) : visibleRuns.length > 0 ? (
                 visibleRuns.map((run) => {
                   const isLatest = latestRun?.id === run.id;
                   const runStatusNote = describeRunCardStatus(run);
@@ -731,7 +784,7 @@ export function ProjectsPage() {
                         <div className="mt-3 rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-amber-900 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-200">
                           <div className="flex flex-wrap items-center justify-between gap-3">
                             <div>
-                              <p className="text-[11px] font-semibold uppercase tracking-[0.18em]">Recorded issues</p>
+                              <p className="text-[11px] font-semibold uppercase tracking-[0.18em]">Collection issues</p>
                               <p className="mt-1 text-sm font-semibold">
                                 {issueCount.toLocaleString()} warning or error record{issueCount === 1 ? "" : "s"} need review.
                               </p>
@@ -740,7 +793,7 @@ export function ProjectsPage() {
                               className="rounded-2xl border border-amber-400/60 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-amber-100 dark:border-amber-700 dark:hover:bg-amber-900/30"
                               to={`/projects/${selectedProject}/runs/${run.id}`}
                             >
-                              Review Issues
+                              Review Collection Issues
                             </Link>
                           </div>
                         </div>

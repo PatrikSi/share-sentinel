@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 
+import { ComparisonItemChanges } from "@/components/comparison-item-changes";
 import { ProviderBadge } from "@/components/provider-context";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
@@ -225,7 +226,7 @@ function ComparisonChangePanel({
 
 export function ComparisonPage() {
   const { projectId, comparisonId } = useParams<{ projectId: string; comparisonId: string }>();
-  const [, setSearchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [comparison, setComparison] = useState<ProjectComparison | null>(null);
   const [comparisonLoading, setComparisonLoading] = useState(true);
   const [comparisonRequestActive, setComparisonRequestActive] = useState(false);
@@ -234,6 +235,7 @@ export function ComparisonPage() {
   const [reloadNonce, setReloadNonce] = useState(0);
   const [pollNonce, setPollNonce] = useState(0);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<Date | null>(null);
+  const [resultLevel, setResultLevel] = useState<"resources" | "items">(() => readSearchParam("level") === "items" ? "items" : "resources");
 
   const [changeType, setChangeTypeState] = useState<ResourceChangeType | "all">(() => normalizeChangeType(readSearchParam("changeType")));
   const [provider, setProviderState] = useState(() => readSearchParam("provider").toLowerCase());
@@ -255,15 +257,17 @@ export function ComparisonPage() {
   const filtersInitialized = useRef(false);
 
   useEffect(() => {
-    const next = new URLSearchParams();
+    const next = new URLSearchParams(searchParams);
+    for (const key of ["changeType", "provider", "category", "q", "cursor", "change", "level"]) next.delete(key);
+    if (resultLevel === "items") next.set("level", "items");
     if (changeType !== "all") next.set("changeType", changeType);
     if (provider) next.set("provider", provider);
     if (category) next.set("category", category);
     if (query.trim()) next.set("q", query.trim());
     if (cursor) next.set("cursor", cursor);
     if (selectedChangeKey) next.set("change", selectedChangeKey);
-    setSearchParams(next, { replace: true });
-  }, [category, changeType, cursor, provider, query, selectedChangeKey, setSearchParams]);
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true });
+  }, [category, changeType, cursor, provider, query, resultLevel, searchParams, selectedChangeKey, setSearchParams]);
 
   useEffect(() => {
     if (!projectId || !comparisonId) {
@@ -325,7 +329,7 @@ export function ComparisonPage() {
   }, [category, changeType, debouncedQuery, provider]);
 
   useEffect(() => {
-    if (!projectId || !comparisonId || comparison?.state !== "complete") {
+    if (!projectId || !comparisonId || comparison?.state !== "complete" || resultLevel !== "resources") {
       setChanges([]);
       setNextCursor(null);
       setChangesLoading(false);
@@ -378,7 +382,7 @@ export function ComparisonPage() {
         if (!controller.signal.aborted) setChangesLoading(false);
       });
     return () => controller.abort();
-  }, [category, changeType, changesReloadNonce, comparison?.state, comparisonId, cursor, debouncedQuery, projectId, provider]);
+  }, [category, changeType, changesReloadNonce, comparison?.state, comparisonId, cursor, debouncedQuery, projectId, provider, resultLevel]);
 
   const selectedChange = useMemo(
     () => changes.find((change, index) => resourceChangeKey(change, index) === selectedChangeKey) || null,
@@ -467,7 +471,7 @@ export function ComparisonPage() {
         <div>
           <nav aria-label="Breadcrumb">
             <Link to="/projects">Projects</Link><span aria-hidden="true">/</span>
-            <Link to={`/projects/${projectId}/inventory`}>Inventory</Link><span aria-hidden="true">/</span>
+            <Link to={`/projects/${projectId}/changes`}>Changes</Link><span aria-hidden="true">/</span>
             <span>Comparison</span>
           </nav>
           <div className="comparison-title-row">
@@ -518,12 +522,18 @@ export function ComparisonPage() {
             {(compatibility?.reasons || []).length > 0 ? <ul className="mt-2 list-disc space-y-1 pl-5">{compatibility?.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul> : null}
           </StatusBanner>
 
-          <StatusBanner tone="info" title="Resource comparison only">
-            <p>Item-level paths were not materialized for this scalable comparison. “Not computed” is distinct from zero change; use the bounded item preview when exact path churn is required.</p>
-            <p className="mt-1">Resource summary counts are {summary?.resource_summary_exact ? "exact for the published comparable scope" : "not marked exact; review coverage before acting"}. Item-level churn is not claimed as exact.</p>
+          <StatusBanner tone="info" title="Dimension-specific change evidence">
+            <p>Resource summary counts are {summary?.resource_summary_exact ? "exact for the published comparable scope" : "not marked exact; review coverage before acting"}. Item history separately reports whether it was computed and exact.</p>
+            <p className="mt-1">“Not computed” is distinct from zero change. The bounded run preview remains available for legacy comparisons that did not materialize item rows.</p>
           </StatusBanner>
 
-          <section aria-label="Resource change filters" className="comparison-filter-bar">
+          <nav aria-label="Comparison result level" className="comparison-level-tabs">
+            <button aria-current={resultLevel === "resources" ? "page" : undefined} className={resultLevel === "resources" ? "is-active" : ""} onClick={() => setResultLevel("resources")} type="button">Resource changes</button>
+            <button aria-current={resultLevel === "items" ? "page" : undefined} className={resultLevel === "items" ? "is-active" : ""} onClick={() => { setResultLevel("items"); setSelectedChangeKey(""); }} type="button">Item history</button>
+          </nav>
+
+          {resultLevel === "resources" ? <>
+            <section aria-label="Resource change filters" className="comparison-filter-bar">
             <div aria-label="Filter by change type" className="comparison-count-filters" role="group">
               {countFilters.map((filter) => (
                 <button aria-pressed={changeType === filter.key} className={changeType === filter.key ? "is-active" : ""} key={filter.key} onClick={() => changeFilter(filter.key)} type="button">
@@ -536,9 +546,9 @@ export function ComparisonPage() {
               <label>Provider<select onChange={(event) => changeProvider(event.target.value)} value={provider}><option value="">All providers</option><option value="smb">SMB</option><option value="nfs">NFS</option><option value="sharepoint">SharePoint</option></select></label>
               <label>Evidence category<select onChange={(event) => changeCategory(event.target.value)} value={category}><option value="">All categories</option>{COMPARISON_CATEGORY_OPTIONS.map((option) => <option key={option} value={option}>{humanizeEvidenceValue(option)}</option>)}</select></label>
             </div>
-          </section>
+            </section>
 
-          <section aria-busy={changesLoading} aria-labelledby="resource-changes-title" className="comparison-results">
+            <section aria-busy={changesLoading} aria-labelledby="resource-changes-title" className="comparison-results">
             <header><div><h2 id="resource-changes-title">Resource changes</h2><p>Server-filtered and cursor-paginated. Inspect a row without losing filter or page context.</p></div><span>Page {cursorHistory.length + 1} · up to {PAGE_LIMIT} rows</span></header>
             {changesError ? <StatusBanner tone="error" title="Resource changes unavailable"><p>{changesError}</p><button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={() => setChangesReloadNonce((value) => value + 1)} type="button">Retry changes</button></StatusBanner> : null}
             {!changesLoading && !changesError && selectedChangeKey && !selectedChange ? (
@@ -580,11 +590,12 @@ export function ComparisonPage() {
               </div>
             ) : null}
             <footer className="inventory-pagination"><span>Opaque cursor pagination preserves stable server order.</span><nav aria-label="Resource change pages" className="inventory-page-controls"><button disabled={cursorHistory.length === 0 || changesLoading} onClick={movePrevious} type="button">Previous</button><span aria-current="page" className="px-2 font-semibold">Page {cursorHistory.length + 1}</span><button disabled={!nextCursor || changesLoading} onClick={moveNext} type="button">Next</button></nav></footer>
-          </section>
+            </section>
+          </> : projectId && comparisonId ? <ComparisonItemChanges comparisonId={comparisonId} projectId={projectId} /> : null}
         </>
       ) : null}
 
-      {selectedChange && projectId ? <ComparisonChangePanel change={selectedChange} onClose={() => setSelectedChangeKey("")} projectId={projectId} /> : null}
+      {resultLevel === "resources" && selectedChange && projectId ? <ComparisonChangePanel change={selectedChange} onClose={() => setSelectedChangeKey("")} projectId={projectId} /> : null}
     </section>
   );
 }

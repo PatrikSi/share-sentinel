@@ -14,7 +14,7 @@ export type Finding = {
   project_id: string;
   source_id?: string | null;
   policy_id: string;
-  policy_version: string;
+  policy_version: number;
   title: string;
   description?: string | null;
   severity: FindingSeverity;
@@ -38,6 +38,37 @@ export type Finding = {
 };
 
 export type FindingSummary = Record<FindingStatus, number> & { total: number };
+
+export type FindingPolicy = {
+  id: string;
+  version: number;
+  title: string;
+  description?: string | null;
+  severity: FindingSeverity;
+  category?: string | null;
+  enabled: boolean;
+  evidence_requirements?: string[] | Record<string, unknown> | null;
+};
+
+export type FindingOccurrence = {
+  id: number;
+  run_id: string;
+  comparison_id?: string | null;
+  policy_id: string;
+  policy_version: number;
+  evidence_state: EvidenceState;
+  evidence?: FindingEvidence | Record<string, unknown> | null;
+  observed_at: string;
+};
+
+export type FindingActivity = {
+  id: number;
+  ts: string;
+  action: string;
+  actor_user_id?: string | null;
+  actor_token_id?: string | null;
+  metadata?: Record<string, unknown> | null;
+};
 
 export type SourceCoverage = {
   state: "complete" | "partial" | "unknown";
@@ -77,12 +108,22 @@ export type MonitoringSource = {
 };
 
 export type EffectiveAccessPrincipal = {
-  id?: string | null;
+  id?: string | number | null;
   display_name?: string | null;
   principal_type?: string | null;
+  kind?: string | null;
   provider_principal_id?: string | null;
+  principal_key?: string | null;
+  login_name?: string | null;
+  email?: string | null;
+  resolution?: string | null;
+  direct_decision?: string | null;
+  effective_decision?: string | null;
   decision?: string | null;
   capabilities?: string[] | Record<string, unknown> | null;
+  allow_rights?: string[] | null;
+  deny_rights?: string[] | null;
+  limitations?: string[] | null;
   explanation?: string | null;
   paths?: string[] | null;
   [key: string]: unknown;

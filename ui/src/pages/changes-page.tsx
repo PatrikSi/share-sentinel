@@ -15,6 +15,7 @@ import { formatMonitoringTimestamp, humanizeMonitoringValue } from "@/lib/monito
 
 const PAGE_LIMIT = 50;
 const COMPARISON_STATES: ComparisonState[] = ["queued", "running", "complete", "failed"];
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function readParam(name: string): string {
   if (typeof window === "undefined") return "";
@@ -52,6 +53,7 @@ export function ChangesPage() {
   const [error, setError] = useState<string | null>(null);
   const [lastLoadedAt, setLastLoadedAt] = useState<Date | null>(null);
   const [reloadNonce, setReloadNonce] = useState(0);
+  const sourceIdInvalid = !!sourceId && !UUID_PATTERN.test(sourceId);
 
   useEffect(() => {
     const next = new URLSearchParams(searchParams);
@@ -63,6 +65,13 @@ export function ChangesPage() {
 
   useEffect(() => {
     if (!projectId) return;
+    if (sourceIdInvalid) {
+      setComparisons([]);
+      setNextCursor(null);
+      setLoading(false);
+      setError(null);
+      return;
+    }
     const controller = new AbortController();
     const params = new URLSearchParams({ limit: String(PAGE_LIMIT) });
     if (state) params.set("state", state);
@@ -82,7 +91,7 @@ export function ChangesPage() {
       })
       .finally(() => !controller.signal.aborted && setLoading(false));
     return () => controller.abort();
-  }, [cursor, projectId, reloadNonce, sourceId, state]);
+  }, [cursor, projectId, reloadNonce, sourceId, sourceIdInvalid, state]);
 
   function resetPage() {
     setCursor(null);
@@ -102,13 +111,13 @@ export function ChangesPage() {
         {(state || sourceId) ? <button className="inventory-button-secondary" onClick={() => { setState(""); setSourceId(""); resetPage(); }} type="button">Clear filters</button> : null}
       </section>
 
-      {sourceId ? <StatusBanner title="Source-scoped history"><p>Showing comparisons registered to source <code>{sourceId}</code>. Open Sources to inspect its coverage and freshness.</p></StatusBanner> : null}
+      {sourceIdInvalid ? <StatusBanner tone="warning" title="Source filter is incomplete"><p>Enter a complete source UUID or clear the filter. No server request is sent for an invalid identifier.</p></StatusBanner> : sourceId ? <StatusBanner title="Source-scoped history"><p>Showing comparisons registered to source <code>{sourceId}</code>. Open Sources to inspect its coverage and freshness.</p></StatusBanner> : null}
 
       <section aria-busy={loading} aria-labelledby="comparison-history-title" className="monitoring-queue">
         <header className="monitoring-queue-header"><div><h2 id="comparison-history-title">Comparison history</h2><p>Each row is a materialized, immutable comparison attempt with explicit interpretation limits.</p></div><span>Page {cursorHistory.length + 1}</span></header>
         {error ? <StatePanel actions={<button className="inventory-button-primary" onClick={() => setReloadNonce((value) => value + 1)} type="button">Retry history</button>} description={`${error} Previously opened comparisons remain addressable by URL.`} title="Comparison history unavailable" tone="error" /> : null}
         {loading ? <div aria-label="Loading comparisons" className="inventory-skeleton" role="status">{Array.from({ length: 8 }, (_, index) => <span key={index} />)}</div> : null}
-        {!loading && !error && comparisons.length === 0 ? <StatePanel description={state || sourceId ? "No comparisons match the current server-side filters." : "No materialized comparisons exist yet. A comparable successful run can be evaluated against its previous source baseline."} title="No comparisons in view" /> : null}
+        {!sourceIdInvalid && !loading && !error && comparisons.length === 0 ? <StatePanel description={state || sourceId ? "No comparisons match the current server-side filters." : "No materialized comparisons exist yet. A comparable successful run can be evaluated against its previous source baseline."} title="No comparisons in view" /> : null}
         {!loading && !error && comparisons.length > 0 ? (
           <div className="monitoring-table-scroll">
             <table className="monitoring-table comparison-history-table">

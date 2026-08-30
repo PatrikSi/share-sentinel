@@ -2,6 +2,7 @@ import type { AccessEvidenceSummary } from "@/lib/access-evidence";
 
 export type ComparisonState = "queued" | "running" | "complete" | "failed";
 export type ResourceChangeType = "appeared" | "disappeared" | "changed" | "indeterminate";
+export type ItemChangeType = "added" | "removed" | "moved" | "renamed" | "metadata_changed" | "permission_changed" | "indeterminate";
 
 export type ComparisonRun = {
   id: string;
@@ -113,6 +114,47 @@ export type ResourceComparisonChange = {
 export type ResourceChangePage = {
   items: ResourceComparisonChange[];
   next_cursor: string | null;
+};
+
+export type ItemComparisonSnapshot = {
+  id?: number | null;
+  item_id?: number | null;
+  resource_id?: number | null;
+  path?: string | null;
+  name?: string | null;
+  is_dir?: boolean | null;
+  size_bytes?: number | null;
+  mtime?: string | null;
+  provider_item_id?: string | null;
+  resource_name?: string | null;
+  endpoint_key?: string | null;
+  [key: string]: unknown;
+};
+
+export type ItemComparisonChange = {
+  id: number;
+  resource_change_id?: number | null;
+  identity_key: string;
+  change_type: ItemChangeType;
+  provider?: string | null;
+  before?: ItemComparisonSnapshot | null;
+  after?: ItemComparisonSnapshot | null;
+  change_categories?: string[];
+  evidence_state: "exact" | "bounded" | "indeterminate";
+  limitations?: string[];
+  match?: { basis?: string | null; quality?: string | null } | null;
+  impact_rank?: number | null;
+};
+
+export type ItemChangePage = {
+  items: ItemComparisonChange[];
+  next_cursor: string | null;
+  comparison_state: ComparisonState;
+  interpretation?: {
+    state?: string | null;
+    exact?: boolean;
+    limitations?: string[];
+  } | null;
 };
 
 export type ComparisonTone = "success" | "warning" | "error" | "info";

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AccessCapabilityCell, type AccessCapabilities } from "@/components/access-capability-cell";
+import { EffectiveAccessAnalysisSection } from "@/components/effective-access-analysis";
 import { CollectionContextPanel } from "@/components/provider-context";
 import { StatePanel } from "@/components/state-panel";
 import { StatusBanner } from "@/components/status-banner";
@@ -542,6 +543,8 @@ export function AccessEvidencePanel({
                   />
                 ) : null}
               </section>
+
+              <EffectiveAccessAnalysisSection projectId={projectId} resourceId={resourceId} runId={runId} />
 
               <section aria-labelledby="evidence-provenance-title" className="access-evidence-section">
                 <div className="access-evidence-section-heading">

@@ -192,8 +192,8 @@ const RUN_DETAIL_TAB_COPY: Record<RunDetailTab, { label: string; description: st
     description: "Status, baseline context, and next actions for this collector run.",
   },
   issues: {
-    label: "Issues",
-    description: "Inspect ingest warnings and errors with source, resource, and path context.",
+    label: "Collection issues",
+    description: "Inspect collection and ingest warnings or errors with source, resource, and path context.",
   },
   diff: {
     label: "Diff",
@@ -407,7 +407,7 @@ function activityDetail(event: RunActivityEvent): string {
   if (event.action === "INGEST_COMPLETED") {
     const counts = (event.metadata.counts || {}) as Record<string, unknown>;
     const lineOffset = Number(event.metadata.line_offset || 0);
-    return `Finished at line ${lineOffset.toLocaleString()} with ${Number(counts.endpoints || 0).toLocaleString()} sources, ${Number(counts.resources || 0).toLocaleString()} resources, ${Number(counts.items || 0).toLocaleString()} items, and ${Number(counts.errors || 0).toLocaleString()} issues.`;
+    return `Finished at line ${lineOffset.toLocaleString()} with ${Number(counts.endpoints || 0).toLocaleString()} sources, ${Number(counts.resources || 0).toLocaleString()} resources, ${Number(counts.items || 0).toLocaleString()} items, and ${Number(counts.errors || 0).toLocaleString()} collection issues.`;
   }
 
   if (event.action === "INGEST_PAUSED") {
@@ -519,7 +519,7 @@ function describeRunStatus(run: RunInfo | null) {
   if (run.status === "FAILED") {
     return {
       headline: "Ingest failed before completion",
-      detail: lastError || "The worker reported a failure. Review the recorded issues and the last checkpoint below.",
+      detail: lastError || "The worker reported a failure. Review the collection issues and the last checkpoint below.",
       progressTone: "bg-rose-500",
       progressWidth: "100%",
       animate: false,
@@ -531,7 +531,7 @@ function describeRunStatus(run: RunInfo | null) {
 
   if (issueCount > 0) {
     return {
-      headline: "Ingest completed with recorded issues",
+      headline: "Ingest completed with collection issues",
       detail: `The ingest finished, but ${issueCount.toLocaleString()} warning or error record${issueCount === 1 ? "" : "s"} ${issueCount === 1 ? "was" : "were"} stored for operator review.`,
       progressTone: "bg-amber-500",
       progressWidth: "100%",
@@ -544,7 +544,7 @@ function describeRunStatus(run: RunInfo | null) {
 
   return {
     headline: "Ingest completed cleanly",
-    detail: "The worker finished parsing the artifact and no ingest issues were recorded.",
+    detail: "The worker finished parsing the artifact and no collection issues were recorded.",
     progressTone: "bg-emerald-500",
     progressWidth: "100%",
     animate: false,
@@ -1578,11 +1578,11 @@ export function RunDetailPage() {
               <div>
                 <h2 className="text-lg font-semibold">Run Summary</h2>
                 <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-                  Use the tabs below to move between issue review, diff analysis, hierarchical exploration, and targeted search without losing operational context.
+                  Use the tabs below to move between collection issue review, diff analysis, hierarchical exploration, and targeted search without losing operational context.
                 </p>
               </div>
               {(run?.summary?.errors || 0) > 0 ? (
-                <StatusBanner tone="warning" title="Recorded Ingest Issues">
+                <StatusBanner tone="warning" title="Recorded Collection Issues">
                   <div className="space-y-3">
                     <p>
                       {(run?.summary?.errors || 0).toLocaleString()} warning or error record{(run?.summary?.errors || 0) === 1 ? "" : "s"} {((run?.summary?.errors || 0) === 1) ? "was" : "were"} captured during ingest.
@@ -1593,7 +1593,7 @@ export function RunDetailPage() {
                         onClick={() => setActiveTab("issues")}
                         type="button"
                       >
-                        Review Issues
+                        Review Collection Issues
                       </button>
                       {issuePreview.map((issue) => (
                         <button
@@ -1641,7 +1641,7 @@ export function RunDetailPage() {
                 </StatusBanner>
               ) : run?.status === "INGESTING" ? (
                 <StatusBanner tone="info" title="Live Ingest Status">
-                  <p>The worker is actively parsing this artifact. Re-open the Issues tab if you want to watch new warnings and errors arrive.</p>
+                  <p>The worker is actively parsing this artifact. Re-open Collection issues to watch new warnings and errors arrive.</p>
                 </StatusBanner>
               ) : null}
               {targetScopeEntries.length > 0 ? (
@@ -1676,7 +1676,7 @@ export function RunDetailPage() {
                   onClick={() => setActiveTab("issues")}
                   type="button"
                 >
-                  Open Issues
+                  Open Collection Issues
                 </button>
                 <button
                   className="rounded-2xl border border-slate-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] transition hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
@@ -1780,7 +1780,7 @@ export function RunDetailPage() {
         <div aria-labelledby="run-tab-issues" className="workspace-section grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]" id="run-panel-issues" role="tabpanel" tabIndex={0}>
           <div aria-busy={issuesBusy} className="workspace-card">
             <div>
-              <h2 className="text-lg font-semibold">Issue Log</h2>
+              <h2 className="text-lg font-semibold">Collection Issue Log</h2>
               <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
                 Filter ingest warnings and errors, then open an entry to inspect the exact source, resource, and path context.
               </p>
@@ -1788,7 +1788,7 @@ export function RunDetailPage() {
 
             <div className="mt-4 grid gap-3">
               <label className="text-sm font-medium text-slate-700 dark:text-slate-300">
-                Search issue text
+                Search collection issue text
                 <input
                   className="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-3 py-3 text-sm dark:border-slate-700 dark:bg-slate-900"
                   placeholder="Code, message, source, resource, or path"
@@ -1815,7 +1815,7 @@ export function RunDetailPage() {
                 busy={issuesBusy}
                 canNext={!!issueNext}
                 canPrevious={issueHistory.length > 0}
-                label="Issue log"
+                label="Collection issue log"
                 onNext={() => moveCursor(issueNext, issueCursor, setIssueCursor, setIssueHistory)}
                 onPrevious={() => moveBack(setIssueCursor, setIssueHistory)}
                 page={issueHistory.length + 1}
@@ -1824,21 +1824,21 @@ export function RunDetailPage() {
 
             {issuesError ? (
               <div className="mt-4">
-                <StatusBanner tone="error" title="Issue Log Unavailable">
+                <StatusBanner tone="error" title="Collection Issue Log Unavailable">
                   <p>{issuesError}</p>
-                  <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">Retry issue log</button>
+                  <button className="mt-2 rounded-md border border-current px-3 py-2 text-xs font-semibold" onClick={retryRunData} type="button">Retry collection issue log</button>
                 </StatusBanner>
               </div>
             ) : null}
 
-            {issuesBusy ? <p className="mt-4 text-sm text-slate-500" role="status">Updating recorded issues…</p> : null}
+            {issuesBusy ? <p className="mt-4 text-sm text-slate-500" role="status">Updating collection issues…</p> : null}
             {!issuesBusy && !issuesError && issues.length === 0 ? (
               <div className="mt-4">
                 <StatePanel
-                  title="No Issues In View"
+                  title="No Collection Issues In View"
                   description={
                     (run?.summary?.errors || 0) > 0
-                      ? "No issues match the current filter. Clear the search or severity filter to broaden the view."
+                      ? "No collection issues match the current filter. Clear the search or severity filter to broaden the view."
                       : run?.status === "INGESTING"
                         ? "The worker is still ingesting, but no warnings or errors have been recorded yet."
                         : "No warnings or errors were recorded for this run."
@@ -1882,7 +1882,7 @@ export function RunDetailPage() {
               <div className="space-y-5">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Selected Issue</p>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Selected Collection Issue</p>
                     <h2 className="mt-2 text-2xl font-semibold tracking-tight">{selectedIssue.code}</h2>
                   </div>
                   <span className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] ${issueSeverityTone(selectedIssue.severity)}`}>
@@ -1909,7 +1909,7 @@ export function RunDetailPage() {
                     <p className="mt-1 text-sm font-semibold">{new Date(selectedIssue.created_at).toLocaleString()}</p>
                   </div>
                   <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/80">
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Issue ID</p>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Collection Issue ID</p>
                     <p className="mt-1 text-sm font-semibold">{selectedIssue.id}</p>
                   </div>
                 </div>
@@ -1947,10 +1947,10 @@ export function RunDetailPage() {
               </div>
             ) : (
               <StatePanel
-                title="Select An Issue"
+                title="Select A Collection Issue"
                 description={
                   (run?.summary?.errors || 0) > 0
-                    ? `Choose an issue from the list to inspect the recorded message and pivot into ${sharePointRun ? "site" : "host"} or item review.`
+                    ? `Choose a collection issue from the list to inspect the recorded message and pivot into ${sharePointRun ? "site" : "host"} or item review.`
                     : "No ingest warnings or errors are currently available for this run."
                 }
               />
@@ -2060,7 +2060,7 @@ export function RunDetailPage() {
                   </StatusBanner>
                 ) : run.status === "FAILED" ? (
                   <StatusBanner tone="error" title="Comparison unavailable for failed run">
-                    <p>Ingestion did not complete, so no trustworthy diff can be generated. Review the recorded issue and submit a corrected artifact as a new run.</p>
+                    <p>Ingestion did not complete, so no trustworthy diff can be generated. Review the recorded collection issue and submit a corrected artifact as a new run.</p>
                   </StatusBanner>
                 ) : (
                   <StatusBanner tone="info" title="Comparison is not available">

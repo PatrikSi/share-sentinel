@@ -31,11 +31,13 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
-function SourceDetail({ source, loading, error, canManage, busy, onReload, onUpdate }: {
+function SourceDetail({ source, loading, error, canManage, permissionsReady, permissionError, busy, onReload, onUpdate }: {
   source: MonitoringSource | null;
   loading: boolean;
   error: string | null;
   canManage: boolean;
+  permissionsReady: boolean;
+  permissionError: string | null;
   busy: boolean;
   onReload: () => void;
   onUpdate: (payload: Record<string, unknown>) => Promise<void>;
@@ -55,7 +57,7 @@ function SourceDetail({ source, loading, error, canManage, busy, onReload, onUpd
     event.preventDefault();
     if (!source) return;
     const parsedInterval = interval.trim() === "" ? null : Number(interval);
-    if (parsedInterval !== null && (!Number.isSafeInteger(parsedInterval) || parsedInterval <= 0)) return;
+    if (!displayName.trim() || (parsedInterval !== null && (!Number.isSafeInteger(parsedInterval) || parsedInterval < 300 || parsedInterval > 31_536_000))) return;
     await onUpdate({ display_name: displayName.trim(), enabled, expected_interval_seconds: parsedInterval });
   }
 
@@ -65,7 +67,8 @@ function SourceDetail({ source, loading, error, canManage, busy, onReload, onUpd
 
   const coverageReasons = source.coverage?.reasons || [];
   const healthReasons = source.health_reasons || [];
-  const intervalInvalid = interval.trim() !== "" && (!Number.isSafeInteger(Number(interval)) || Number(interval) <= 0);
+  const nameInvalid = !displayName.trim();
+  const intervalInvalid = interval.trim() !== "" && (!Number.isSafeInteger(Number(interval)) || Number(interval) < 300 || Number(interval) > 31_536_000);
   return (
     <article className="monitoring-detail-card">
       <header className="monitoring-detail-header">
@@ -91,6 +94,7 @@ function SourceDetail({ source, loading, error, canManage, busy, onReload, onUpd
         <div className="monitoring-detail-heading"><div><h3 id="source-actions-title">Investigation paths</h3><p>Use source-scoped history before treating a missing resource as a confirmed disappearance.</p></div></div>
         <div className="monitoring-action-row">
           {source.last_run_id ? <Link className="inventory-button-secondary" to={`/projects/${source.project_id}/runs/${source.last_run_id}`}>Open latest run</Link> : null}
+          <Link className="inventory-button-secondary" to={`/projects/${source.project_id}/findings?${new URLSearchParams({ source: source.id }).toString()}`}>Open findings</Link>
           <Link className="inventory-button-secondary" to={`/projects/${source.project_id}/changes?${new URLSearchParams({ source: source.id }).toString()}`}>Open change history</Link>
           {source.last_comparison_id ? <Link className="inventory-button-secondary" to={`/projects/${source.project_id}/comparisons/${source.last_comparison_id}`}>Open latest comparison</Link> : null}
         </div>
@@ -103,7 +107,7 @@ function SourceDetail({ source, loading, error, canManage, busy, onReload, onUpd
 
       <section aria-labelledby="source-config-title" className="monitoring-detail-section">
         <div className="monitoring-detail-heading"><div><h3 id="source-config-title">Monitoring configuration</h3><p>Changing cadence affects freshness evaluation only; it does not remotely schedule or run a collector.</p></div></div>
-        {canManage ? <form className="monitoring-action-form" onSubmit={(event) => void submit(event)}><label>Display name<input disabled={busy} maxLength={200} onChange={(event) => setDisplayName(event.target.value)} required value={displayName} /></label><label>Expected interval (seconds)<input disabled={busy} inputMode="numeric" min="1" onChange={(event) => setInterval(event.target.value)} placeholder="Unset" type="number" value={interval} /></label><label className="monitoring-checkbox"><input checked={enabled} disabled={busy} onChange={(event) => setEnabled(event.target.checked)} type="checkbox" />Enable freshness monitoring</label>{intervalInvalid ? <p className="monitoring-validation" role="alert">Expected interval must be a positive whole number of seconds or left unset.</p> : null}<div className="monitoring-action-row"><button className="inventory-button-primary" disabled={busy || intervalInvalid} type="submit">{busy ? "Saving…" : "Save source settings"}</button></div></form> : <StatusBanner title="Admin permission required"><p>Project admins can rename sources, enable monitoring, and set the expected collection interval. No credentials are managed here.</p></StatusBanner>}
+        {canManage ? <form className="monitoring-action-form" onSubmit={(event) => void submit(event)}><label>Display name<input aria-invalid={nameInvalid} disabled={busy} maxLength={255} onChange={(event) => setDisplayName(event.target.value)} required value={displayName} /></label><label>Expected interval (seconds)<input aria-invalid={intervalInvalid} disabled={busy} inputMode="numeric" max="31536000" min="300" onChange={(event) => setInterval(event.target.value)} placeholder="Unset" type="number" value={interval} /></label><label className="monitoring-checkbox"><input checked={enabled} disabled={busy} onChange={(event) => setEnabled(event.target.checked)} type="checkbox" />Enable freshness monitoring</label>{nameInvalid ? <p className="monitoring-validation" role="alert">Display name cannot be blank.</p> : null}{intervalInvalid ? <p className="monitoring-validation" role="alert">Expected interval must be a whole number from 300 to 31,536,000 seconds, or left unset.</p> : null}<div className="monitoring-action-row"><button className="inventory-button-primary" disabled={busy || intervalInvalid || nameInvalid} type="submit">{busy ? "Saving…" : "Save source settings"}</button></div></form> : permissionError ? <StatusBanner tone="warning" title="Action permissions unavailable"><p>{permissionError} Source configuration remains disabled until the project role can be verified.</p></StatusBanner> : permissionsReady ? <StatusBanner title="Admin permission required"><p>Project admins can rename sources, enable monitoring, and set the expected collection interval. No credentials are managed here.</p></StatusBanner> : <StatePanel description="Checking whether this project role can configure collection monitoring." title="Loading action permissions" />}
       </section>
     </article>
   );
@@ -130,6 +134,8 @@ export function SourcesPage() {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [detailNonce, setDetailNonce] = useState(0);
   const [role, setRole] = useState<string | null>(null);
+  const [roleReady, setRoleReady] = useState(false);
+  const [roleError, setRoleError] = useState<string | null>(null);
   const [mutationBusy, setMutationBusy] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const [mutationInfo, setMutationInfo] = useState<string | null>(null);
@@ -149,7 +155,9 @@ export function SourcesPage() {
   useEffect(() => {
     if (!projectId) return;
     const controller = new AbortController();
-    apiFetch(`/projects/${encodeURIComponent(projectId)}/my-role`, { signal: controller.signal }).then((data) => !controller.signal.aborted && setRole(typeof data?.role === "string" ? data.role : null)).catch(() => !controller.signal.aborted && setRole(null));
+    setRoleReady(false);
+    setRoleError(null);
+    apiFetch(`/projects/${encodeURIComponent(projectId)}/my-role`, { signal: controller.signal }).then((data) => !controller.signal.aborted && setRole(typeof data?.role === "string" ? data.role : null)).catch((caught) => { if (!controller.signal.aborted) { setRole(null); setRoleError(caught instanceof Error ? caught.message : "Project role could not be verified."); } }).finally(() => !controller.signal.aborted && setRoleReady(true));
     return () => controller.abort();
   }, [projectId]);
 
@@ -202,7 +210,7 @@ export function SourcesPage() {
     <section className="monitoring-workspace">
       <header className="monitoring-page-header"><div><p>Collection operations</p><h1>Sources</h1><span>Verify which scopes are monitored, whether their evidence is fresh, and why collection confidence is degraded.</span></div><div className="monitoring-freshness"><strong>{lastLoadedAt ? `Updated ${lastLoadedAt.toLocaleTimeString()}` : "Not loaded"}</strong><span>Metadata only · no credentials stored</span></div></header>
 
-      <section aria-label="Source filters" className="monitoring-filter-bar"><label>Search<input onChange={(event) => { setQuery(event.target.value); resetPage(); }} placeholder="Name, source key, or identity" type="search" value={query} /></label><label>Provider<select onChange={(event) => { setProvider(event.target.value); resetPage(); }} value={provider}><option value="">All providers</option>{PROVIDERS.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label><label>Health<select onChange={(event) => { setHealth(normalizeHealth(event.target.value)); resetPage(); }} value={health}><option value="">All health states</option>{SOURCE_HEALTH.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label>{(provider || health || query) ? <button className="inventory-button-secondary" onClick={() => { setProvider(""); setHealth(""); setQuery(""); resetPage(); }} type="button">Clear filters</button> : null}</section>
+      <section aria-label="Source filters" className="monitoring-filter-bar"><label>Search<input onChange={(event) => { setQuery(event.target.value); resetPage(); }} placeholder="Name, provider, identity, or scope" type="search" value={query} /></label><label>Provider<select onChange={(event) => { setProvider(event.target.value); resetPage(); }} value={provider}><option value="">All providers</option>{PROVIDERS.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label><label>Health<select onChange={(event) => { setHealth(normalizeHealth(event.target.value)); resetPage(); }} value={health}><option value="">All health states</option>{SOURCE_HEALTH.map((value) => <option key={value} value={value}>{humanizeMonitoringValue(value)}</option>)}</select></label>{(provider || health || query) ? <button className="inventory-button-secondary" onClick={() => { setProvider(""); setHealth(""); setQuery(""); resetPage(); }} type="button">Clear filters</button> : null}</section>
 
       {mutationError ? <StatusBanner tone="error" title="Source update failed"><p>{mutationError} The last confirmed configuration remains visible.</p></StatusBanner> : null}
       {mutationInfo ? <StatusBanner tone="success" title="Source updated"><p>{mutationInfo}</p></StatusBanner> : null}
@@ -215,7 +223,7 @@ export function SourcesPage() {
           {!loading && !error && sources.length > 0 ? <div className="monitoring-table-scroll"><table className="monitoring-table"><caption className="sr-only">Registered collection sources</caption><thead><tr><th>Health</th><th>Source</th><th>Provider</th><th>Coverage</th><th>Freshness</th><th>Last success</th></tr></thead><tbody>{sources.map((source) => <tr className={selectedId === source.id ? "is-selected" : ""} key={source.id}><td><span className={`source-health is-${source.health_status}`}>{humanizeMonitoringValue(source.health_status)}</span></td><td><button className="monitoring-row-title" onClick={() => setSelectedId(source.id)} type="button"><strong>{source.display_name}</strong><span title={source.source_key}>{source.assessed_identity || source.source_key}</span></button></td><td><ProviderBadge provider={source.provider} /></td><td><span className={`evidence-state is-${source.coverage?.state === "complete" ? "exact" : source.coverage?.state === "partial" ? "bounded" : "indeterminate"}`}>{humanizeMonitoringValue(source.coverage?.state)}</span></td><td><span className={`source-freshness is-${source.freshness?.state}`}>{humanizeMonitoringValue(source.freshness?.state)}</span><small>Age {formatDuration(source.freshness?.age_seconds)}</small></td><td>{formatMonitoringTimestamp(source.last_success_at)}</td></tr>)}</tbody></table></div> : null}
           <footer className="monitoring-pagination"><span>{sources.length.toLocaleString()} source{sources.length === 1 ? "" : "s"} loaded on this page.</span><nav aria-label="Source pages"><button disabled={cursorHistory.length === 0 || loading} onClick={() => { const previous = cursorHistory[cursorHistory.length - 1] ?? null; setCursorHistory((values) => values.slice(0, -1)); setCursor(previous); }} type="button">Previous</button><strong aria-current="page">{cursorHistory.length + 1}</strong><button disabled={!nextCursor || loading} onClick={() => { setCursorHistory((values) => [...values, cursor]); setCursor(nextCursor); }} type="button">Next</button></nav></footer>
         </section>
-        <aside aria-label="Selected source details" className="monitoring-detail-pane"><SourceDetail busy={mutationBusy} canManage={canManageSources(role)} error={detailError} loading={detailLoading} onReload={() => setDetailNonce((value) => value + 1)} onUpdate={updateSource} source={detail} /></aside>
+        <aside aria-label="Selected source details" className="monitoring-detail-pane"><SourceDetail busy={mutationBusy} canManage={canManageSources(role)} error={detailError} loading={detailLoading} onReload={() => setDetailNonce((value) => value + 1)} onUpdate={updateSource} permissionError={roleError} permissionsReady={roleReady} source={detail} /></aside>
       </div>
     </section>
   );
