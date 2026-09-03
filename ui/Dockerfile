@@ -5,7 +5,7 @@ RUN if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-f
 COPY . .
 RUN npm run build
 
-FROM nginx:1.31.3-alpine
+FROM nginx:1.31.5-alpine
 RUN apk upgrade --no-cache \
     && addgroup -S -g 10001 app \
     && adduser -S -D -H -u 10001 -G app app
